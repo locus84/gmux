@@ -37,7 +37,8 @@ gmux gmuxd
 # Agent handoff/scratch docs
 .memory/
 
-# Pi runtime state
+# Pi local/runtime state
+.pi/settings.json
 .pi/subagent-runs/
 .pi/subagent-results/
 .pi/tmp/
