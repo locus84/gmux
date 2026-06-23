@@ -674,3 +674,84 @@ func TestBuildLaunchArgs(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildRunnerEnvPinsDaemonPaths(t *testing.T) {
+	t.Setenv("GMUX_STATE_DIR", "/daemon/state")
+	t.Setenv("GMUX_SOCKET_DIR", "/daemon/sockets")
+	env := buildRunnerEnv([]string{
+		"PATH=/usr/bin",
+		"XDG_STATE_HOME=/login/state",
+		"XDG_RUNTIME_DIR=/login/runtime",
+		"GMUX_STATE_DIR=/login/gmux-state",
+		"GMUX_SOCKET_DIR=/login/sockets",
+	})
+
+	if got := envValue(env, "GMUX_STATE_DIR"); got != "/daemon/state" {
+		t.Fatalf("GMUX_STATE_DIR = %q, want daemon state dir", got)
+	}
+	if got := envValue(env, "GMUX_SOCKET_DIR"); got != "/daemon/sockets" {
+		t.Fatalf("GMUX_SOCKET_DIR = %q, want daemon socket dir", got)
+	}
+	if got := envValue(env, "XDG_STATE_HOME"); got != "/login/state" {
+		t.Fatalf("XDG_STATE_HOME = %q, want login env preserved for child command", got)
+	}
+}
+
+func TestLaunchGmuxWaitsForHandshake(t *testing.T) {
+	t.Setenv("SHELL", "")
+	t.Setenv("GMUX_STATE_DIR", "/daemon/state")
+	t.Setenv("GMUX_SOCKET_DIR", "/daemon/sockets")
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gmux")
+	script := `#!/bin/sh
+if [ "$GMUX_STATE_DIR" != "/daemon/state" ]; then exit 10; fi
+if [ "$GMUX_SOCKET_DIR" != "/daemon/sockets" ]; then exit 11; fi
+if [ "$GMUX_HANDSHAKE_FD" != "3" ]; then exit 12; fi
+eval "printf 'sess-fake\\n' >&$GMUX_HANDSHAKE_FD"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, id, err := launchGmux(bin, []string{"pi"}, dir, "sess-requested", 120, 40)
+	if err != nil {
+		t.Fatalf("launchGmux error: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("pid = %d", pid)
+	}
+	if id != "sess-fake" {
+		t.Fatalf("registered id = %q", id)
+	}
+}
+
+func TestReadRunnerHandshake(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	go func() {
+		_, _ = w.WriteString("sess-registered\n")
+		_ = w.Close()
+	}()
+
+	id, err := readRunnerHandshake(r, time.Second)
+	if err != nil {
+		t.Fatalf("readRunnerHandshake error: %v", err)
+	}
+	if id != "sess-registered" {
+		t.Fatalf("id = %q", id)
+	}
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
+}

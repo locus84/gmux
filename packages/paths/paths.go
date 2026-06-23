@@ -58,7 +58,13 @@ func SessionSocketDir() string {
 }
 
 // StateDir returns the gmux state directory (~/.local/state/gmux).
+// GMUX_STATE_DIR is an internal gmux override used to pin daemon-launched
+// runners to the same state directory even when a login shell changes
+// XDG_STATE_HOME for the wrapped command.
 func StateDir() string {
+	if dir := os.Getenv("GMUX_STATE_DIR"); dir != "" {
+		return dir
+	}
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
 		return filepath.Join(dir, "gmux")
 	}

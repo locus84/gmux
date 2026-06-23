@@ -1155,14 +1155,12 @@ func buildChildEnv(parent, extra []string, version string) []string {
 	}
 	env := make([]string, 0, len(parent)+len(extra)+5)
 	for _, e := range parent {
-		// GMUX_RESUME_ID is a private daemon→runner directive (see
-		// ADR 0003). Inheriting it into PTY children would let a
-		// nested `gmux foo` invocation inside a session try to
-		// re-bind the parent runner's id; it'd survive on the
-		// collision fallback, but that's exactly the safety-net
-		// dependency the dedicated env var name was supposed to
-		// avoid. Strip on the way out.
-		if strings.HasPrefix(e, "GMUX_RESUME_ID=") {
+		// GMUX_RESUME_ID and GMUX_HANDSHAKE_FD are private daemon/parent→runner
+		// directives. Inheriting them into PTY children would let a nested `gmux`
+		// invocation try to re-bind the parent runner's id, or interpret fd 3 as a
+		// stale handshake pipe and close/write to an unrelated descriptor. Strip
+		// both on the runner→child boundary.
+		if strings.HasPrefix(e, "GMUX_RESUME_ID=") || strings.HasPrefix(e, "GMUX_HANDSHAKE_FD=") {
 			continue
 		}
 		env = append(env, e)

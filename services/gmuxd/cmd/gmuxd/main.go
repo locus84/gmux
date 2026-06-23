@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -60,6 +61,11 @@ var version = "dev"
 // edge (with a 413) instead of silently truncating inside the
 // runner.
 const maxInputBytes = 1 << 20 // 1 MiB
+
+const (
+	runnerHandshakeFDEnv   = "GMUX_HANDSHAKE_FD"
+	runnerHandshakeTimeout = 5 * time.Second
+)
 
 type LaunchConfig struct {
 	DefaultLauncher string             `json:"default_launcher"`
@@ -157,7 +163,7 @@ func launcherStates(ls []adapter.Launcher) []string {
 }
 
 // launchGmux forks a gmux runner with the given command and cwd.
-// Returns the PID on success.
+// Returns the PID and runner-registered session id once registration succeeds.
 //
 // resumeID, when non-empty, is passed via --resume-id so the
 // runner uses the daemon-supplied id instead of generating a fresh
@@ -179,7 +185,7 @@ func launcherStates(ls []adapter.Launcher) []string {
 // contract is greppable and shows up in `ps`. The runner still
 // honours the legacy GMUX_RESUME_ID env var as a fallback for
 // rolling upgrades, but this code path no longer sets it.
-func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, error) {
+func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, string, error) {
 	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialCols, initialRows, command)...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -195,13 +201,68 @@ func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialC
 	// processes don't inherit a parent session's identity (a leaked
 	// GMUX_SESSION_ID/GMUX_SOCKET/GMUX_ADAPTER would otherwise be
 	// stamped onto every launched session). See packages/sessionenv.
-	cmd.Env = sessionenv.Strip(captureLoginEnv(gmuxBin, cwd))
+	cmd.Env = buildRunnerEnv(sessionenv.Strip(captureLoginEnv(gmuxBin, cwd)))
+
+	handshakeRead, handshakeWrite, err := os.Pipe()
+	if err != nil {
+		return 0, "", fmt.Errorf("handshake pipe: %w", err)
+	}
+	defer handshakeRead.Close()
+	cmd.ExtraFiles = []*os.File{handshakeWrite}
+	cmd.Env = upsertEnv(cmd.Env, runnerHandshakeFDEnv, "3")
 
 	if err := cmd.Start(); err != nil {
-		return 0, err
+		handshakeWrite.Close()
+		return 0, "", err
 	}
+	// The child owns the write end now; close the daemon's copy so EOF/timeout
+	// reflects the runner's registration path rather than our own fd leak.
+	handshakeWrite.Close()
 	go cmd.Wait()
-	return cmd.Process.Pid, nil
+
+	registeredID, err := readRunnerHandshake(handshakeRead, runnerHandshakeTimeout)
+	if err != nil {
+		return cmd.Process.Pid, "", fmt.Errorf("registration handshake: %w", err)
+	}
+	return cmd.Process.Pid, registeredID, nil
+}
+
+func buildRunnerEnv(env []string) []string {
+	// A login shell may override XDG_STATE_HOME/XDG_RUNTIME_DIR while sourcing
+	// dotfiles. That is good for user commands, but gmux's own runner must still
+	// talk to this daemon and bind sockets in the directory this daemon scans.
+	// Pin gmux-specific path overrides without changing the generic XDG vars that
+	// the child application sees.
+	env = upsertEnv(env, "GMUX_STATE_DIR", paths.StateDir())
+	env = upsertEnv(env, "GMUX_SOCKET_DIR", paths.SessionSocketDir())
+	return env
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	entry := prefix + value
+	for i, e := range env {
+		if e == key || strings.HasPrefix(e, prefix) {
+			env[i] = entry
+			return env
+		}
+	}
+	return append(env, entry)
+}
+
+func readRunnerHandshake(r *os.File, timeout time.Duration) (string, error) {
+	if err := r.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
+	}
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(line)
+	if id == "" {
+		return "", errors.New("empty session id from runner")
+	}
+	return id, nil
 }
 
 // buildLaunchArgs assembles the gmux runner argv for the internal
@@ -1311,17 +1372,17 @@ func serve(stderr io.Writer) int {
 		// added; fixing /launch requires a protocol change to
 		// carry cols/rows in the launch request and is left as a
 		// follow-up.
-		pid, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
+		pid, registeredID, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
 		if err != nil {
 			log.Printf("launch: failed to start gmux: %v", err)
 			writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
 			return
 		}
 
-		log.Printf("launch: started gmux pid=%d cwd=%s cmd=%v", pid, cwd, req.Command)
+		log.Printf("launch: registered gmux pid=%d session=%s cwd=%s cmd=%v", pid, registeredID, cwd, req.Command)
 		writeJSON(w, map[string]any{
 			"ok":   true,
-			"data": map[string]any{"pid": pid},
+			"data": map[string]any{"pid": pid, "session_id": registeredID},
 		})
 	})
 
@@ -1409,7 +1470,7 @@ func serve(stderr io.Writer) int {
 			// fork; without them claude / vim / prompt frameworks
 			// reading $COLUMNS at startup would clamp to 80.
 			resumeCwd := projects.NormalizePath(sess.Cwd)
-			pid, err := launchGmux(gmuxBin, sess.Command, resumeCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("resume: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1420,10 +1481,14 @@ func serve(stderr io.Writer) int {
 			// until the runner calls POST /register and the
 			// re-registration upsert flips alive=true.
 			// The frontend shows a local "resuming" indicator.
-			log.Printf("resume: started gmux pid=%d for %s cwd=%s", pid, sessionID, resumeCwd)
+			if registeredID != sessionID {
+				log.Printf("resume: requested %s but runner registered %s (collision fallback) pid=%d cwd=%s", sessionID, registeredID, pid, resumeCwd)
+			} else {
+				log.Printf("resume: registered gmux pid=%d for %s cwd=%s", pid, sessionID, resumeCwd)
+			}
 			writeJSON(w, map[string]any{
 				"ok":   true,
-				"data": map[string]any{"pid": pid, "session_id": sessionID},
+				"data": map[string]any{"pid": pid, "session_id": registeredID},
 			})
 
 		case "restart":
@@ -1493,16 +1558,20 @@ func serve(stderr io.Writer) int {
 			// session id; Register's re-registration branch handles
 			// the rest.
 			restartCwd := projects.NormalizePath(sess.Cwd)
-			pid, err := launchGmux(gmuxBin, sess.Command, restartCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("restart: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
 				return
 			}
-			log.Printf("restart: started gmux pid=%d for %s cwd=%s", pid, sessionID, restartCwd)
+			if registeredID != sessionID {
+				log.Printf("restart: requested %s but runner registered %s (collision fallback) pid=%d cwd=%s", sessionID, registeredID, pid, restartCwd)
+			} else {
+				log.Printf("restart: registered gmux pid=%d for %s cwd=%s", pid, sessionID, restartCwd)
+			}
 			writeJSON(w, map[string]any{
 				"ok":   true,
-				"data": map[string]any{"pid": pid, "session_id": sessionID},
+				"data": map[string]any{"pid": pid, "session_id": registeredID},
 			})
 
 		case "kill":

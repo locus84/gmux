@@ -37,6 +37,10 @@ func TestCanonicalizePath(t *testing.T) {
 	if err != nil {
 		t.Skip("no home dir")
 	}
+	tmpWant := filepath.Clean("/tmp")
+	if resolved, err := filepath.EvalSymlinks(tmpWant); err == nil {
+		tmpWant = resolved
+	}
 
 	tests := []struct {
 		input string
@@ -46,7 +50,7 @@ func TestCanonicalizePath(t *testing.T) {
 		{home + "/dev/gmux", "~/dev/gmux"},
 		{home + "/", "~"},
 		{"/opt/data", "/opt/data"},
-		{"/tmp/../tmp", "/tmp"},
+		{"/tmp/../tmp", tmpWant},
 		{"", ""},
 		// Already canonical: passes through unchanged.
 		{"~/dev/gmux", "~/dev/gmux"},
@@ -59,6 +63,27 @@ func TestCanonicalizePath(t *testing.T) {
 		}
 	}
 }
+func TestStateDir(t *testing.T) {
+	t.Run("GMUX_STATE_DIR overrides XDG_STATE_HOME", func(t *testing.T) {
+		t.Setenv("GMUX_STATE_DIR", "/tmp/gmux-state")
+		t.Setenv("XDG_STATE_HOME", "/tmp/xdg-state")
+		if got := StateDir(); got != "/tmp/gmux-state" {
+			t.Errorf("StateDir() = %q, want /tmp/gmux-state", got)
+		}
+		if got := SocketPath(); got != filepath.Join("/tmp/gmux-state", "gmuxd.sock") {
+			t.Errorf("SocketPath() = %q", got)
+		}
+	})
+
+	t.Run("falls back to XDG_STATE_HOME", func(t *testing.T) {
+		t.Setenv("GMUX_STATE_DIR", "")
+		t.Setenv("XDG_STATE_HOME", "/tmp/xdg-state")
+		if got := StateDir(); got != filepath.Join("/tmp/xdg-state", "gmux") {
+			t.Errorf("StateDir() = %q", got)
+		}
+	})
+}
+
 func TestSessionSocketDir(t *testing.T) {
 	t.Run("GMUX_SOCKET_DIR overrides everything", func(t *testing.T) {
 		t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
@@ -108,16 +133,16 @@ func TestIsValidSessionID(t *testing.T) {
 
 	invalid := []string{
 		"",
-		"abcd1234",          // missing prefix
-		"sess-",             // empty suffix
-		"sess-../escape",    // path traversal
-		"sess-..",           // parent dir
-		"../sess-abcd",      // leading traversal
-		"sess-a/b",          // separator
-		`sess-a\b`,          // backslash separator
-		"sess-a::b",         // folder-key separator
-		"sess-a b",          // space
-		"sess-a\n",          // newline
+		"abcd1234",       // missing prefix
+		"sess-",          // empty suffix
+		"sess-../escape", // path traversal
+		"sess-..",        // parent dir
+		"../sess-abcd",   // leading traversal
+		"sess-a/b",       // separator
+		`sess-a\b`,       // backslash separator
+		"sess-a::b",      // folder-key separator
+		"sess-a b",       // space
+		"sess-a\n",       // newline
 	}
 	for _, id := range invalid {
 		if IsValidSessionID(id) {

@@ -1557,24 +1557,22 @@ func TestKillReleasesSocketPathBeforeResponding(t *testing.T) {
 	ln.Close()
 }
 
-// TestBuildChildEnv_StripsResumeID guards the runner→child boundary
-// against leaking GMUX_RESUME_ID. The runner inherits this env var
-// from gmuxd as a private "use this id when you bind" directive
-// (ADR 0003); leaking it to the PTY child would let a nested
-// `gmux foo` invocation try to re-bind the parent runner's id and
-// rely on the collision fallback as a safety net, which is exactly
-// the scenario the dedicated env var name was meant to eliminate.
-func TestBuildChildEnv_StripsResumeID(t *testing.T) {
+// TestBuildChildEnv_StripsPrivateRunnerDirectives guards the runner→child
+// boundary against leaking private parent→runner directives. GMUX_RESUME_ID
+// would let a nested `gmux` try to re-bind the parent id; GMUX_HANDSHAKE_FD
+// would let it treat a stale fd 3 as a live parent handshake pipe.
+func TestBuildChildEnv_StripsPrivateRunnerDirectives(t *testing.T) {
 	parent := []string{
 		"PATH=/usr/bin",
 		"GMUX_RESUME_ID=sess-parent",
+		"GMUX_HANDSHAKE_FD=3",
 		"GMUX_SESSION_ID=sess-parent", // intentionally NOT stripped (children consume this)
 		"HOME=/home/u",
 	}
 	env := buildChildEnv(parent, nil, "1.2.3")
 	for _, e := range env {
-		if strings.HasPrefix(e, "GMUX_RESUME_ID=") {
-			t.Errorf("child env must not contain GMUX_RESUME_ID; got %q", e)
+		if strings.HasPrefix(e, "GMUX_RESUME_ID=") || strings.HasPrefix(e, "GMUX_HANDSHAKE_FD=") {
+			t.Errorf("child env must not contain private runner directive; got %q", e)
 		}
 	}
 	if !hasEnv(env, "GMUX_SESSION_ID") {

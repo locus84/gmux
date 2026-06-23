@@ -15,6 +15,7 @@ func TestStrip(t *testing.T) {
 		"GMUX_RUNNER_VERSION=dev",
 		"GMUX_RESUME_ID=sess-abc",
 		"GMUX_HANDSHAKE_FD=3",
+		"GMUX_STATE_DIR=/tmp/state",
 		"GMUX_SOCKET_DIR=/tmp/custom",
 		"GMUXD_LISTEN=0.0.0.0",
 		"GMUXD_TOKEN=secret",
@@ -22,6 +23,7 @@ func TestStrip(t *testing.T) {
 	}
 	want := []string{
 		"PATH=/usr/bin",
+		"GMUX_STATE_DIR=/tmp/state",
 		"GMUX_SOCKET_DIR=/tmp/custom",
 		"GMUXD_LISTEN=0.0.0.0",
 		"GMUXD_TOKEN=secret",

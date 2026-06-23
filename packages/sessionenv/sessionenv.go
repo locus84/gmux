@@ -17,13 +17,14 @@ package sessionenv
 import "strings"
 
 // preserve lists GMUX_-prefixed variables that are *configuration*,
-// not session identity, and must survive Strip. GMUX_SOCKET_DIR tells
-// both the daemon (discovery scan) and the runner (where to bind its
-// socket) which directory session sockets live in; stripping it would
-// make an auto-started daemon scan a different directory than the
-// runner that triggered the auto-start, so they could never find each
-// other.
+// not session identity, and must survive Strip. GMUX_STATE_DIR tells
+// the runner which daemon state directory (and therefore gmuxd.sock)
+// to use; GMUX_SOCKET_DIR tells both the daemon (discovery scan) and
+// the runner (where to bind its socket) which directory session sockets
+// live in. Stripping either can make a daemon-launched runner register
+// with the wrong daemon or bind sockets where the daemon is not scanning.
 var preserve = map[string]bool{
+	"GMUX_STATE_DIR":  true,
 	"GMUX_SOCKET_DIR": true,
 }
 
