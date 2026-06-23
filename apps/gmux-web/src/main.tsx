@@ -289,8 +289,6 @@ function MobileTerminalBar({
   // its value re-fires the arrival pulse when another session starts
   // waiting.
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const composerInputRef = useRef<HTMLInputElement>(null)
-  const [composerText, setComposerText] = useState('')
   const waitingCount = unreadCount.value
   const waiting = waitingCount > 0
   const arrival = useArrivalPulse(waiting ? 'unread' : 'none', waitingCount)
@@ -341,66 +339,8 @@ function MobileTerminalBar({
     if (file) onAttachFile(file)
   }
 
-  const submitComposer = (ev: Event) => {
-    ev.preventDefault()
-    const text = composerText
-    if (!text || !canSend) return
-    onSend(text + '\r')
-    setComposerText('')
-  }
-
-  const focusComposer = (ev: Event) => {
-    // iOS Safari tries to scroll a bottom-positioned input into view before
-    // visualViewport/app-height settle, which can shove the terminal chrome
-    // upward and leave the top of the app visually corrupted. Focus inside the
-    // tap gesture with preventScroll and immediately restore page scroll; the
-    // app itself is viewport-sized, so page scroll is never useful here.
-    ev.preventDefault()
-    const input = composerInputRef.current
-    if (!input || input.disabled) return
-    try {
-      input.focus({ preventScroll: true })
-    } catch {
-      input.focus()
-    }
-    const resyncViewport = () => {
-      const vv = window.visualViewport
-      if (vv) {
-        document.documentElement.style.setProperty('--app-height', `${vv.height}px`)
-        if (isTouchDevice()) keyboardOpen.value = window.innerHeight - vv.height > KEYBOARD_PRESENCE_PX
-      }
-      window.dispatchEvent(new Event('gmux:viewport-resync'))
-    }
-    const restorePageScroll = () => {
-      window.scrollTo(0, 0)
-      document.documentElement.scrollTop = 0
-      document.body.scrollTop = 0
-      resyncViewport()
-    }
-    restorePageScroll()
-    requestAnimationFrame(restorePageScroll)
-    for (const delay of [80, 160, 320, 520]) window.setTimeout(restorePageScroll, delay)
-  }
-
   return (
     <div class="mobile-input-stack">
-      <form class="mobile-composer" onSubmit={submitComposer}>
-        <input
-          ref={composerInputRef}
-          class="mobile-composer-input"
-          value={composerText}
-          onTouchStart={focusComposer}
-          onMouseDown={focusComposer}
-          onInput={(ev) => setComposerText((ev.currentTarget as HTMLInputElement).value)}
-          placeholder="한글/긴 문장 입력…"
-          autoCapitalize="none"
-          autoComplete="off"
-          autoCorrect="off"
-          spellcheck={false}
-          disabled={!canSend}
-        />
-        <button class="mobile-composer-send" type="submit" disabled={!canSend || !composerText}>전송</button>
-      </form>
       <div class="mobile-bottom-bar" role="toolbar" aria-label="Terminal keys" onMouseDown={keepFocus}>
       <button
         class={`mobile-bottom-action menu-btn mk-menu${waiting ? ' bg-waiting' : ''}${arrival ? ` bg-${arrival}` : ''}`}

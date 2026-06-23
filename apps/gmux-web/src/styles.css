@@ -2391,47 +2391,6 @@ body {
     z-index: 3;
   }
 
-  .mobile-composer {
-    display: flex;
-    gap: 0.3571em;
-    min-height: 2.8571em;
-  }
-
-  .mobile-composer-input {
-    flex: 1;
-    min-width: 0;
-    border: 1px solid oklch(from var(--border-strong) l c h / 0.72);
-    border-radius: 0.4615em;
-    background: color-mix(in oklch, var(--bg-surface) 92%, var(--terminal-bg, #0f141a) 8%);
-    color: var(--text);
-    padding: 0 0.8571em;
-    font: 600 16px 'Source Sans 3', sans-serif;
-    outline: none;
-  }
-
-  .mobile-composer-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-
-  .mobile-composer-input::placeholder {
-    color: var(--text-muted);
-  }
-
-  .mobile-composer-send {
-    appearance: none;
-    border: 1px solid oklch(from var(--accent) l c h / 0.75);
-    border-radius: 0.4615em;
-    background: color-mix(in oklch, var(--accent) 20%, var(--bg-surface) 80%);
-    color: var(--text);
-    padding: 0 0.8571em;
-    font: 700 14px 'Source Sans 3', sans-serif;
-    touch-action: manipulation;
-  }
-
-  .mobile-composer-send:disabled {
-    opacity: 0.45;
-  }
 
   .mobile-bottom-bar {
     position: relative;
