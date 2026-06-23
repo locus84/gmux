@@ -16,9 +16,12 @@ import {
   updateProjects, reorderSessions,
   peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
   unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
+  vsCodeServerUrl, vsCodeServerHomeDir,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
+import { buildVSCodeServerUrl } from './vscode-server'
+import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
 import type { Session, Folder } from './types'
 
 // ── Types ──
@@ -46,6 +49,29 @@ export const IconSettings = () => (
     <path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/>
     <circle cx="10.5" cy="4.5" r="1.7"/>
     <circle cx="5.5" cy="11.5" r="1.7"/>
+  </svg>
+)
+
+export const IconRefresh = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
+    <path d="M13 5.2A5.2 5.2 0 0 0 3.4 4" />
+    <path d="M13 2.5v2.7h-2.7" />
+    <path d="M3 10.8A5.2 5.2 0 0 0 12.6 12" />
+    <path d="M3 13.5v-2.7h2.7" />
+  </svg>
+)
+
+export const IconVSCode = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.5 2.5 5 7.8l6.5 5.7 2-1V3.5l-2-1Z" />
+    <path d="M5 7.8 2.8 5.7 2 6.3v3l.8.6L5 7.8Z" />
+  </svg>
+)
+
+export const IconFiles = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z" />
+    <path d="M2.5 4.5V3.8a1 1 0 0 1 1-1h2.7l1.1 1.2" />
   </svg>
 )
 
@@ -92,6 +118,49 @@ function reorder<T>(arr: T[], from: number, to: number): T[] {
   const [item] = next.splice(from, 1)
   next.splice(to, 0, item)
   return next
+}
+
+function folderWorkspacePath(folder: Folder, visible: Session[]): string {
+  if (folder.launchCwd?.trim()) return folder.launchCwd
+  const session = visible.find(s => s.alive && (s.workspace_root?.trim() || s.cwd?.trim()))
+    ?? visible.find(s => s.workspace_root?.trim() || s.cwd?.trim())
+  return session?.workspace_root?.trim() || session?.cwd?.trim() || ''
+}
+
+function FilesButton({ session, projectSlug, onClick }: { session?: Session; projectSlug?: string; onClick?: () => void }) {
+  const root = session ? session.workspace_root || session.cwd : projectSlug || 'project files'
+  return (
+    <a
+      class="folder-file-btn"
+      href={session ? fileBrowserPath(session.id) : projectFileBrowserPath(projectSlug || '')}
+      title={`Browse ${root}`}
+      aria-label={`Browse ${root}`}
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick?.()
+      }}
+    >
+      <IconFiles />
+    </a>
+  )
+}
+
+function VSCodeServerButton({ href, workspacePath }: { href: string; workspacePath: string }) {
+  return (
+    <button
+      class="folder-vscode-btn"
+      type="button"
+      title={`Open ${workspacePath} in VS Code Server`}
+      aria-label={`Open ${workspacePath} in VS Code Server`}
+      onClick={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        window.open(href, '_blank', 'noopener,noreferrer')
+      }}
+    >
+      <IconVSCode />
+    </button>
+  )
 }
 
 function SessionItem({
@@ -257,6 +326,9 @@ function FolderGroup({
   // sessions agree, per-row markers are noise.
   const folderPeers = new Set(visible.map(s => s.peer ?? ''))
   const mixedHosts = folderPeers.size > 1
+  const workspacePath = folderWorkspacePath(folder, visible)
+  const codeHref = buildVSCodeServerUrl(vsCodeServerUrl.value, workspacePath, vsCodeServerHomeDir.value)
+  const fileSession = visible.find(s => s.workspace_root?.trim() || s.cwd?.trim())
   return (
     <div class="folder">
       <div class="folder-header">
@@ -278,13 +350,17 @@ function FolderGroup({
           )}
         </a>
         {!folder.unresolved && (
-          <LaunchButton
-            sessions={folder.sessions}
-            selectedId={selId}
-            fallbackCwd={folder.launchCwd ?? ''}
-            peer={folder.peer}
-            className="folder-launch-btn"
-          />
+          <div class="folder-header-actions">
+            {(fileSession || (!folder.peer && folder.launchCwd)) && <FilesButton session={fileSession} projectSlug={folder.slug} onClick={onClick} />}
+            {codeHref && <VSCodeServerButton href={codeHref} workspacePath={workspacePath} />}
+            <LaunchButton
+              sessions={folder.sessions}
+              selectedId={selId}
+              fallbackCwd={folder.launchCwd ?? ''}
+              peer={folder.peer}
+              className="folder-launch-btn"
+            />
+          </div>
         )}
       </div>
       <div class="folder-sessions">
@@ -371,6 +447,14 @@ export function Sidebar({
             href="/"
             onClick={onClose}
           >gmux</a>
+          <button
+            class="sidebar-refresh-btn"
+            onClick={() => location.reload()}
+            aria-label="Refresh app"
+            title="Refresh app"
+          >
+            <IconRefresh />
+          </button>
           <button
             class="sidebar-settings-btn"
             onClick={onOpenSettings}

@@ -20,6 +20,7 @@
 import type { Session, ProjectItem } from './types'
 import { buildProjectTopology } from './projects'
 import { sessionPath } from './routing'
+import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
 import { LaunchButton } from './launcher'
 import {
   sessions, projects, peers, localPeerNames, partitionForProject,
@@ -28,6 +29,7 @@ import {
 import { HostSuffix } from './host-suffix'
 import { SessionRow } from './session-row'
 import { Section } from './home'
+import { MobileMenuButton, MobileRefreshButton } from './mobile-menu-button'
 
 function projectRemote(p: ProjectItem | undefined): string | undefined {
   return p?.match?.find(r => r.remote)?.remote
@@ -41,9 +43,10 @@ interface ProjectHubProps {
   projectSlug: string
   projectPeer?: string
   onCloseSession: (session: Session) => void
+  onOpenMenu: () => void
 }
 
-export function ProjectHub({ projectSlug, projectPeer, onCloseSession }: ProjectHubProps) {
+export function ProjectHub({ projectSlug, projectPeer, onCloseSession, onOpenMenu }: ProjectHubProps) {
   const projectsVal = projects.value
   const project = projectsVal.find(p =>
     p.slug === projectSlug && (p.peer ?? '') === (projectPeer ?? ''),
@@ -78,6 +81,12 @@ export function ProjectHub({ projectSlug, projectPeer, onCloseSession }: Project
   const mixedHosts = uniqueHosts.size > 1
 
   const { needsAttention, running, rest } = partitionForProject(allSessions)
+  const fileSession = allSessions.find(s => s.workspace_root?.trim() || s.cwd?.trim())
+  const filesHref = fileSession
+    ? fileBrowserPath(fileSession.id)
+    : !projectPeer && projectFirstPath(project)
+      ? projectFileBrowserPath(projectSlug)
+      : null
 
   const renderRow = (s: Session) => (
     <SessionRow
@@ -99,16 +108,25 @@ export function ProjectHub({ projectSlug, projectPeer, onCloseSession }: Project
           Home
         </a>
         <div class="hub-title-row">
+          <MobileMenuButton onOpen={onOpenMenu} />
           <h2 class="hub-title">
             {projectSlug}
             <HostSuffix peer={projectPeer ?? localHostLabel.value} local={!projectPeer} />
           </h2>
-          <LaunchButton
-            sessions={allSessions}
-            fallbackCwd={sharedCwd ?? projectFirstPath(project) ?? ''}
-            peer={projectPeer}
-            className="hub-header-launch"
-          />
+          <div class="hub-header-actions">
+            <MobileRefreshButton />
+            {filesHref && (
+              <a class="hub-files-btn" href={filesHref}>
+                Files
+              </a>
+            )}
+            <LaunchButton
+              sessions={allSessions}
+              fallbackCwd={sharedCwd ?? projectFirstPath(project) ?? ''}
+              peer={projectPeer}
+              className="hub-header-launch"
+            />
+          </div>
         </div>
         {(remote || sharedCwd) && (
           <div class="hub-subtitle">

@@ -1,5 +1,17 @@
-import { describe, it, expect } from 'vitest'
-import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, pickBinaryDataTransferItem } from './keyboard'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, handleBlobPasteAction, handlePasteAction, pickBinaryDataTransferItem } from './keyboard'
+
+function clipboardItem(types: string[], values: Record<string, Blob>): ClipboardItem {
+  return {
+    types,
+    getType: (type: string) => Promise.resolve(values[type]),
+  } as unknown as ClipboardItem
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
 
 // Build an array-like stand-in for DataTransferItemList. Vitest runs in
 // node by default, where the real DOM type isn't available; a plain
@@ -53,6 +65,108 @@ describe('pickBinaryDataTransferItem', () => {
       { kind: 'file', type: 'image/png' },
     ])
     expect(pickBinaryDataTransferItem(items)?.type).toBe('image/jpeg')
+  })
+})
+
+describe('handleBlobPasteAction', () => {
+  it('uploads a chosen file and emits the returned path', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ok: true,
+      data: { path: '/tmp/paste-2.jpg' },
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const emit = vi.fn()
+
+    await handleBlobPasteAction({
+      blob: new File(['jpeg-bytes'], 'photo.jpg', { type: 'image/jpeg' }),
+      sessionId: 'sess-1',
+      bracketedPasteMode: false,
+      feedback: vi.fn(),
+      emit,
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/sessions/sess-1/clipboard', expect.objectContaining({
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+    }))
+    expect(emit).toHaveBeenCalledWith('/tmp/paste-2.jpg')
+  })
+
+  it('reports a missing session without uploading', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const feedback = vi.fn()
+
+    await handleBlobPasteAction({
+      blob: new Blob(['x']),
+      sessionId: '',
+      bracketedPasteMode: false,
+      feedback,
+      emit: vi.fn(),
+    })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(feedback).toHaveBeenCalledWith('error', 'Paste failed: no session bound')
+  })
+})
+
+describe('handlePasteAction', () => {
+  it('emits text from clipboard.read without falling back to readText', async () => {
+    const readText = vi.fn()
+    vi.stubGlobal('navigator', {
+      clipboard: {
+        read: vi.fn().mockResolvedValue([
+          clipboardItem(['text/plain'], { 'text/plain': new Blob(['hello']) }),
+        ]),
+        readText,
+      },
+    })
+    const emit = vi.fn()
+
+    await handlePasteAction({ sessionId: 'sess-1', bracketedPasteMode: false, feedback: vi.fn(), emit })
+
+    expect(emit).toHaveBeenCalledWith('hello')
+    expect(readText).not.toHaveBeenCalled()
+  })
+
+  it('uploads binary clipboard data and emits the returned path', async () => {
+    vi.stubGlobal('navigator', {
+      clipboard: {
+        read: vi.fn().mockResolvedValue([
+          clipboardItem(['image/png', 'text/plain'], {
+            'image/png': new Blob(['png-bytes'], { type: 'image/png' }),
+            'text/plain': new Blob(['alt text']),
+          }),
+        ]),
+      },
+    })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ok: true,
+      data: { path: '/tmp/paste-1.png' },
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const emit = vi.fn()
+
+    await handlePasteAction({ sessionId: 'sess-1', bracketedPasteMode: true, feedback: vi.fn(), emit })
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/sessions/sess-1/clipboard', expect.objectContaining({
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png' },
+    }))
+    expect(emit).toHaveBeenCalledWith('\x1b[200~/tmp/paste-1.png\x1b[201~')
+  })
+
+  it('falls back to readText when clipboard.read is unavailable', async () => {
+    vi.stubGlobal('navigator', {
+      clipboard: {
+        readText: vi.fn().mockResolvedValue('fallback'),
+      },
+    })
+    const emit = vi.fn()
+
+    await handlePasteAction({ sessionId: 'sess-1', bracketedPasteMode: false, feedback: vi.fn(), emit })
+
+    expect(emit).toHaveBeenCalledWith('fallback')
   })
 })
 

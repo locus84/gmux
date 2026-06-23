@@ -13,14 +13,17 @@ import {
 import { SessionRow } from './session-row'
 import { sessionPath } from './routing'
 import { IconBell, type NotifPermission } from './sidebar'
+import { MobileMenuButton, MobileRefreshButton } from './mobile-menu-button'
 import type { Folder, Session } from './types'
 
 export function Home({
   onManageProjects,
+  onOpenMenu,
   notifPermission,
   onRequestNotifPermission,
 }: {
   onManageProjects: () => void
+  onOpenMenu: () => void
   notifPermission: NotifPermission
   onRequestNotifPermission: () => void
 }) {
@@ -62,7 +65,9 @@ export function Home({
     <div class="page">
       <header class="hub-header">
         <div class="home-activity-header">
+          <MobileMenuButton onOpen={onOpenMenu} />
           <h2 class="hub-title">Activity</h2>
+          <MobileRefreshButton />
           <NotifPrompt
             permission={notifPermission}
             onRequest={onRequestNotifPermission}

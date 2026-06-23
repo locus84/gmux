@@ -4,6 +4,7 @@
 // Launcher definitions come from the store's health signal (populated
 // from /v1/health). The component reads them reactively.
 
+import { createPortal } from 'preact/compat'
 import { useState, useRef, useEffect, useMemo } from 'preact/hooks'
 import type { Session, LauncherDef, PeerInfo } from './types'
 import { launchers as launchersSignal, defaultLauncher as defaultLauncherSignal, peers as peersSignal, launchSession } from './store'
@@ -125,6 +126,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
   const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
 
   // Read launcher config from the store (populated by /v1/health).
   const hasLaunchers = launchersSignal.value.length > 0
@@ -163,18 +165,21 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
     })
   }
 
-  // Close on outside click
+  // Close on outside press. The menu is portaled to <body> so it can
+  // escape transformed/clipped ancestors such as the mobile sidebar; treat
+  // both the original button container and the portaled menu as "inside".
   useEffect(() => {
     if (state !== 'open') return
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setState('idle')
-      }
+    const handler = (e: Event) => {
+      const targetNode = e.target as Node
+      const inContainer = !!containerRef.current?.contains(targetNode)
+      const inMenu = !!menuRef.current?.contains(targetNode)
+      if (!inContainer && !inMenu) setState('idle')
     }
-    const timer = setTimeout(() => document.addEventListener('mousedown', handler), 0)
+    const timer = setTimeout(() => document.addEventListener('pointerdown', handler), 0)
     return () => {
       clearTimeout(timer)
-      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('pointerdown', handler)
     }
   }, [state])
 
@@ -200,6 +205,39 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
     others = resolved.launchers.filter(l => l.id !== resolved.default_launcher)
   }
 
+  const menu = isOpen && menuPos ? (
+    <div
+      ref={menuRef}
+      class="launch-inline-menu"
+      style={{ top: menuPos.top, right: menuPos.right }}
+    >
+      {showTarget && (
+        <>
+          <div class="launch-target-line">{formatTarget(target)}</div>
+          <div class="launch-inline-divider" />
+        </>
+      )}
+      {defLauncher && (
+        <button
+          class="launch-inline-item launch-inline-default"
+          onClick={(e) => { e.stopPropagation(); handleLaunch(defLauncher!.id) }}
+        >
+          {defLauncher.label}
+        </button>
+      )}
+      {others.map((l, i) => (
+        <button
+          key={l.id}
+          class="launch-inline-item"
+          style={{ animationDelay: `${(i + 1) * 50}ms` }}
+          onClick={(e) => { e.stopPropagation(); handleLaunch(l.id) }}
+        >
+          {l.label}
+        </button>
+      ))}
+    </div>
+  ) : null
+
   return (
     <div class={`launch-container ${className ?? ''}`} ref={containerRef}>
       <button
@@ -217,37 +255,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
           </svg>
         ) : '+'}
       </button>
-      {isOpen && menuPos && (
-        <div
-          class="launch-inline-menu"
-          style={{ top: menuPos.top, right: menuPos.right }}
-        >
-          {showTarget && (
-            <>
-              <div class="launch-target-line">{formatTarget(target)}</div>
-              <div class="launch-inline-divider" />
-            </>
-          )}
-          {defLauncher && (
-            <button
-              class="launch-inline-item launch-inline-default"
-              onClick={(e) => { e.stopPropagation(); handleLaunch(defLauncher!.id) }}
-            >
-              {defLauncher.label}
-            </button>
-          )}
-          {others.map((l, i) => (
-            <button
-              key={l.id}
-              class="launch-inline-item"
-              style={{ animationDelay: `${(i + 1) * 50}ms` }}
-              onClick={(e) => { e.stopPropagation(); handleLaunch(l.id) }}
-            >
-              {l.label}
-            </button>
-          ))}
-        </div>
-      )}
+      {menu && typeof document !== 'undefined' && createPortal(menu, document.body)}
     </div>
   )
 }

@@ -92,6 +92,22 @@ async function uploadAndFormatPath(
   return formatPasteText(result.path, bracketedPasteMode)
 }
 
+export async function handleBlobPasteAction(args: {
+  blob: Blob
+  sessionId: string
+  bracketedPasteMode: boolean
+  feedback: PasteFeedback
+  emit: SendFn
+}): Promise<void> {
+  const { blob, sessionId, bracketedPasteMode, feedback, emit } = args
+  if (!sessionId) {
+    feedback('error', 'Paste failed: no session bound')
+    return
+  }
+  const out = await uploadAndFormatPath(blob, sessionId, bracketedPasteMode, feedback)
+  if (out !== null) emit(out)
+}
+
 function pasteErrorMessage(code: string): string {
   switch (code) {
     case 'too_large':
@@ -545,12 +561,7 @@ export async function handlePasteAction(args: {
         const binMime = firstBinaryType(item.types)
         if (!binMime) continue
         const blob = await item.getType(binMime)
-        if (!sessionId) {
-          feedback('error', 'Paste failed: no session bound')
-          return
-        }
-        const out = await uploadAndFormatPath(blob, sessionId, bracketedPasteMode, feedback)
-        if (out !== null) emit(out)
+        await handleBlobPasteAction({ blob, sessionId, bracketedPasteMode, feedback, emit })
         return
       }
       // No binary; extract text from the items we already have so we
