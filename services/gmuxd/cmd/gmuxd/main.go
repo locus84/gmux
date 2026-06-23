@@ -2190,15 +2190,18 @@ func serve(stderr io.Writer) int {
 		if tsSeed == "" {
 			tsSeed = tsauth.SeedFromHostname(hostname)
 		}
-		// The tailnet handler is the *token-authenticated* handler, not the
-		// raw mux: tsauth's identity check is the outer gate (only the
-		// owner's tailnet login may reach the prompt) and netauth's bearer
-		// token is the inner gate (ADR 0008). A passing tailnet identity no
-		// longer grants the full API on its own.
+		tailnetHandler := authedHandler
+		if !cfg.Tailscale.RequireToken {
+			// Compatibility/mobile-first mode: Tailscale WhoIs + allow-list is
+			// the trust boundary, so browsers on allowed tailnet identities do
+			// not need to paste a gmux token before they can steer sessions.
+			log.Printf("tsauth: gmux token disabled for Tailscale listener; relying on Tailscale identity allow-list")
+			tailnetHandler = mux
+		}
 		tsListener = tsauth.Start(tsauth.Config{
 			Hostname: tsSeed,
 			Allow:    cfg.Tailscale.Allow,
-		}, stateDir, authedHandler)
+		}, stateDir, tailnetHandler)
 		defer tsListener.Shutdown()
 	}
 

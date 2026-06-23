@@ -20,6 +20,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Tailscale.Enabled {
 		t.Error("tailscale should be disabled by default")
 	}
+	if !cfg.Tailscale.RequireToken {
+		t.Error("tailscale.require_token should default to true")
+	}
 	if !cfg.Discovery.Devcontainers {
 		t.Error("discovery.devcontainers should default to true")
 	}
@@ -34,6 +37,7 @@ web_dir = "~/.local/state/gmux/web"
 
 [tailscale]
 enabled = true
+require_token = false
 allow = ["alice@github", "bob@github"]
 `)
 
@@ -49,6 +53,9 @@ allow = ["alice@github", "bob@github"]
 	}
 	if !cfg.Tailscale.Enabled {
 		t.Error("tailscale should be enabled")
+	}
+	if cfg.Tailscale.RequireToken {
+		t.Error("tailscale.require_token should load false")
 	}
 	if len(cfg.Tailscale.Allow) != 2 {
 		t.Fatalf("allow = %v, want 2 entries", cfg.Tailscale.Allow)
@@ -306,7 +313,6 @@ func TestListenAddrIPv6(t *testing.T) {
 		t.Errorf("addr = %q, want %q", addr, "[fd12::1]:8790")
 	}
 }
-
 
 // ── [[peers]] ──
 

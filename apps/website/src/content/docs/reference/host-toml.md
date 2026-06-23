@@ -25,6 +25,7 @@ port = 8790
 [tailscale]
 enabled = false
 allow = []               # additional login names (owner is auto-whitelisted)
+require_token = true     # set false to trust allowed Tailscale identities directly
 
 # Auto-discover devcontainer peers. Defaults to true.
 [discovery]
@@ -56,6 +57,7 @@ There is **no `[[peers]]` config**. Add a host you want to aggregate sessions fr
 |-------|------|---------|-------------|
 | `enabled` | `boolean` | `false` | Enable Tailscale remote access. |
 | `allow` | `string[]` | `[]` | Additional Tailscale login names to allow (owner is auto-whitelisted). Each must contain `@`. |
+| `require_token` | `boolean` | `true` | Require the gmux bearer/cookie token after the Tailscale identity allow-list passes. Set to `false` to restore the older mobile-friendly behavior where allowed tailnet identities can open gmux directly. |
 
 ### `[discovery]`
 
