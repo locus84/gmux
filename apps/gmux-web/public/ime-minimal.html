@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>gmux iOS Korean IME minimal probe</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; padding: max(14px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom)); background: #0b1020; color: #eef2ff; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p { color: #aab3d1; line-height: 1.45; margin: 8px 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    button { min-height: 44px; border: 1px solid #394262; border-radius: 10px; background: #182038; color: #eef2ff; padding: 0 12px; font-size: 15px; }
+    button:active { background: #263250; }
+    .card { border: 1px solid #29324e; border-radius: 14px; background: #11182c; padding: 12px; margin: 12px 0; }
+    label { display: block; font-weight: 700; margin-bottom: 8px; }
+    textarea, .editable { box-sizing: border-box; width: 100%; min-height: 86px; border: 1px solid #445071; border-radius: 10px; background: #050914; color: #eef2ff; padding: 10px; font: 16px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; outline: none; }
+    textarea:focus, .editable:focus { border-color: #7aa2ff; box-shadow: 0 0 0 2px rgba(122,162,255,.25); }
+    .editable:empty::before { content: attr(data-placeholder); color: #64708f; }
+    .xterm-host { position: relative; min-height: 54px; border: 1px dashed #445071; border-radius: 10px; background: #070b16; overflow: hidden; }
+    .xterm-host textarea { position: absolute; left: 8px; top: 8px; width: 2em; height: 1.4em; min-height: 0; padding: 0; border: 0; border-radius: 0; color: transparent; caret-color: transparent; background: transparent; resize: none; opacity: .01; font-size: 16px; }
+    .xterm-host .hint { position: absolute; left: 10px; top: 30px; color: #7f89a8; font-size: 13px; }
+    .metrics { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .metric { background: #050914; border: 1px solid #29324e; border-radius: 10px; padding: 8px; }
+    .metric b { display: block; color: #a9c1ff; margin-bottom: 4px; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #050914; border: 1px solid #29324e; border-radius: 10px; padding: 10px; max-height: 42vh; overflow: auto; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .small { font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>iOS Korean IME minimal probe</h1>
+  <p>iPad에서 각 입력칸을 눌러 <b>가</b>, <b>한</b>, <b>한국어</b>를 쳐보세요. 목표는 브라우저가 <code>ㄱ + DEL + 가</code>를 주는지, 아니면 <code>ㄱ + ㅏ</code>만 주는지 확인하는 것입니다.</p>
+
+  <div class="row">
+    <button id="clear">Clear</button>
+    <button id="copy">Copy report</button>
+    <button id="focusVisible">Focus visible textarea</button>
+    <button id="focusXterm">Focus xterm-like textarea</button>
+    <button id="focusCE">Focus contentEditable</button>
+  </div>
+
+  <section class="card">
+    <label for="visibleTa">1. visible textarea</label>
+    <textarea id="visibleTa" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="text" placeholder="여기에 한글 입력"></textarea>
+  </section>
+
+  <section class="card">
+    <label for="xtermTa">2. xterm-like transparent textarea</label>
+    <div class="xterm-host" id="xtermHost">
+      <textarea id="xtermTa" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="text"></textarea>
+      <div class="hint">tap/focus then type Korean; textarea is tiny + transparent like terminal helpers</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <label for="ce">3. contentEditable div</label>
+    <div id="ce" class="editable" contenteditable="true" inputmode="text" autocorrect="off" autocapitalize="off" spellcheck="false" data-placeholder="여기에 한글 입력"></div>
+  </section>
+
+  <section class="card metrics">
+    <div class="metric"><b>Active target</b><span id="active">-</span></div>
+    <div class="metric"><b>Current value/text</b><span id="current">-</span></div>
+    <div class="metric"><b>Rewrite stream preview</b><span id="stream">-</span></div>
+  </section>
+
+  <section class="card">
+    <label>Event log</label>
+    <pre id="log"></pre>
+  </section>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log');
+  const activeEl = $('active');
+  const currentEl = $('current');
+  const streamEl = $('stream');
+  const targets = [
+    { name: 'visible textarea', el: $('visibleTa'), kind: 'value' },
+    { name: 'xterm-like textarea', el: $('xtermTa'), kind: 'value' },
+    { name: 'contentEditable', el: $('ce'), kind: 'text' },
+  ];
+  const state = new Map(targets.map(t => [t.el, { prev: '', stream: '' }]));
+  const started = performance.now();
+
+  function val(el, kind) { return kind === 'text' ? (el.textContent || '') : (el.value || ''); }
+  function hex(s) { return Array.from(new TextEncoder().encode(s)).map(b => b.toString(16).padStart(2, '0')).join(' '); }
+  function cps(s) { return Array.from(s).map(ch => 'U+' + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')).join(' '); }
+  function showCtl(s) { return (s || '').replace(/\x7f/g, '␡').replace(/\r/g, '␍').replace(/\n/g, '␊').replace(/\t/g, '␉'); }
+  function commonPrefix(a, b) { let i = 0; while (i < a.length && i < b.length && a[i] === b[i]) i++; return i; }
+  function commonSuffix(a, b, start) { let i = 0; while (i + start < a.length && i + start < b.length && a[a.length - 1 - i] === b[b.length - 1 - i]) i++; return i; }
+  function append(line) {
+    logEl.textContent += line + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function entry(t, ev, extra = '') {
+    const now = (performance.now() - started).toFixed(1).padStart(7);
+    const text = val(t.el, t.kind);
+    const sel = 'selectionStart' in t.el ? `${t.el.selectionStart}/${t.el.selectionEnd}` : String(document.getSelection()?.anchorOffset ?? '-');
+    append(`${now} ${t.name} ${ev.type}`
+      + ` inputType=${ev.inputType || '-'} data=${JSON.stringify(ev.data ?? null)}`
+      + ` composing=${ev.isComposing === true}`
+      + ` sel=${sel}`
+      + ` value=${JSON.stringify(text)} cps=[${cps(text)}] bytes=[${hex(text)}]`
+      + (extra ? ` ${extra}` : ''));
+    activeEl.textContent = t.name;
+    currentEl.textContent = `${JSON.stringify(text)} cps=[${cps(text)}] bytes=[${hex(text)}]`;
+  }
+  function updateStream(t) {
+    const st = state.get(t.el);
+    const next = val(t.el, t.kind);
+    const prev = st.prev;
+    const p = commonPrefix(prev, next);
+    const s = commonSuffix(prev, next, p);
+    const delCount = Array.from(prev.slice(p, prev.length - s)).length;
+    const ins = next.slice(p, next.length - s).normalize('NFC');
+    const chunk = '\x7f'.repeat(delCount) + ins;
+    if (chunk) st.stream += chunk;
+    st.prev = next;
+    streamEl.textContent = `chunk=${JSON.stringify(showCtl(chunk))} total=${JSON.stringify(showCtl(st.stream))} bytes=[${hex(st.stream)}]`;
+    return `rewriteChunk=${JSON.stringify(showCtl(chunk))}`;
+  }
+
+  for (const t of targets) {
+    for (const name of ['focus','blur','keydown','keyup','compositionstart','compositionupdate','compositionend','beforeinput','input','selectionchange']) {
+      const target = name === 'selectionchange' ? document : t.el;
+      target.addEventListener(name, ev => {
+        if (name === 'selectionchange' && document.activeElement !== t.el) return;
+        let extra = '';
+        if (name === 'input') extra = updateStream(t);
+        entry(t, ev, extra);
+      }, true);
+    }
+  }
+
+  $('clear').onclick = () => {
+    for (const t of targets) {
+      if (t.kind === 'text') t.el.textContent = ''; else t.el.value = '';
+      state.set(t.el, { prev: '', stream: '' });
+    }
+    logEl.textContent = '';
+    activeEl.textContent = '-'; currentEl.textContent = '-'; streamEl.textContent = '-';
+  };
+  $('copy').onclick = async () => {
+    const report = [
+      `UA: ${navigator.userAgent}`,
+      `platform: ${navigator.platform} maxTouchPoints=${navigator.maxTouchPoints}`,
+      `language: ${navigator.language}`,
+      '', logEl.textContent,
+    ].join('\n');
+    await navigator.clipboard.writeText(report);
+    append('--- copied report ---');
+  };
+  $('focusVisible').onclick = () => $('visibleTa').focus();
+  $('focusXterm').onclick = () => $('xtermTa').focus();
+  $('xtermHost').onclick = () => $('xtermTa').focus();
+  $('focusCE').onclick = () => $('ce').focus();
+
+  append(`UA: ${navigator.userAgent}`);
+  append(`platform: ${navigator.platform} maxTouchPoints=${navigator.maxTouchPoints} language=${navigator.language}`);
+})();
+</script>
+</body>
+</html>

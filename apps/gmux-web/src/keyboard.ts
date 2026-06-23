@@ -23,6 +23,7 @@ import {
   type UploadResult,
 } from './clipboard-upload'
 import { selectionToText } from './selection'
+import { shouldBlockMobileWebKitImeKey } from './mobile-input'
 
 type SendFn = (data: string) => void
 
@@ -120,6 +121,13 @@ export function attachKeyboardHandler(
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): void {
   term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    // iPadOS Safari/WKWebView Korean IME can leak raw jamo from xterm's
+    // keydown path. Returning false here blocks xterm key processing without
+    // preventDefault(), so WebKit's native IME still receives the key.
+    if (ev.type === 'keydown' && shouldBlockMobileWebKitImeKey(ev)) {
+      return false
+    }
+
     // Mobile Enter → newline (not submit).
     // Bare Enter with no modifiers on a touch device sends \n so the user
     // can compose multi-line messages. The mobile toolbar send button sends

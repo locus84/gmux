@@ -8,6 +8,9 @@ patchedDependencies:
   '@xterm/addon-webgl@0.20.0-beta.194':
     hash: d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1
     path: patches/@xterm__addon-webgl@0.20.0-beta.194.patch
+  '@xterm/xterm@6.1.0-beta.195':
+    hash: dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6
+    path: patches/@xterm__xterm@6.1.0-beta.195.patch
 
 importers:
 
@@ -54,19 +57,19 @@ importers:
         version: 11.12.0(@trpc/server@11.12.0(typescript@5.9.3))(typescript@5.9.3)
       '@xterm/addon-fit':
         specifier: 0.12.0-beta.195
-        version: 0.12.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)
+        version: 0.12.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))
       '@xterm/addon-image':
         specifier: github:gmuxapp/xterm.js#v6.1.0-beta.195-gmux.2&path:addons/addon-image
         version: https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed#path:addons/addon-image
       '@xterm/addon-web-links':
         specifier: 0.13.0-beta.195
-        version: 0.13.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)
+        version: 0.13.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))
       '@xterm/addon-webgl':
         specifier: 0.20.0-beta.194
-        version: 0.20.0-beta.194(patch_hash=d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1)(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)
+        version: 0.20.0-beta.194(patch_hash=d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1)(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))
       '@xterm/xterm':
         specifier: github:gmuxapp/xterm.js#v6.1.0-beta.195-gmux.2
-        version: https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed
+        version: https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6)
       preact:
         specifier: ^10.26.4
         version: 10.29.0
@@ -4219,21 +4222,21 @@ snapshots:
       loupe: 3.2.1
       tinyrainbow: 2.0.0
 
-  '@xterm/addon-fit@0.12.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)':
+  '@xterm/addon-fit@0.12.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))':
     dependencies:
-      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed
+      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6)
 
   '@xterm/addon-image@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed#path:addons/addon-image': {}
 
-  '@xterm/addon-web-links@0.13.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)':
+  '@xterm/addon-web-links@0.13.0-beta.195(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))':
     dependencies:
-      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed
+      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6)
 
-  '@xterm/addon-webgl@0.20.0-beta.194(patch_hash=d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1)(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed)':
+  '@xterm/addon-webgl@0.20.0-beta.194(patch_hash=d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1)(@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6))':
     dependencies:
-      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed
+      '@xterm/xterm': https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6)
 
-  '@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed': {}
+  '@xterm/xterm@https://codeload.github.com/gmuxapp/xterm.js/tar.gz/a8d82b583c09be14a98d7a092a294b154dc5deed(patch_hash=dba90883183ae3321a2ee2e140457b997a15a8fb9ad2af02bcd87c39953f6ea6)': {}
 
   acorn-jsx@5.3.2(acorn@8.16.0):
     dependencies:

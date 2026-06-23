@@ -8,12 +8,13 @@ import { loadWebglRenderer } from './webgl-renderer'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handlePasteAction } from './keyboard'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
-import { attachMobileInputHandler } from './mobile-input'
+import { attachMobileInputHandler, flushMobileWebKitImePending, shouldSkipMobileWebKitImeData } from './mobile-input'
 import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
 import { createLongPressRecognizer } from './long-press'
+import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
@@ -483,6 +484,7 @@ export function TerminalView({
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
+    const disposeImeResidueGuard = attachImeResidueGuard(term)
     loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
@@ -543,7 +545,8 @@ export function TerminalView({
       sendRawInput(r.seq)
     }
 
-    onInputReady?.(sendRawInput)
+    const sendToolbarInput = (data: string) => sendAfterFlushingComposition(term, sendRawInput, data)
+    onInputReady?.(sendToolbarInput)
     terminalScrollToBottom.value = () => term.scrollToBottom()
     // The paste trigger reads bracketedPasteMode and the clipboard fresh
     // on every invocation: bracketed mode flips at runtime as TUIs come
@@ -560,7 +563,14 @@ export function TerminalView({
     }
     onFocusReady?.(() => focusTerminalInput(term))
 
-    const dataDisposable = term.onData((data) => sendInput(data))
+    const dataDisposable = term.onData((data) => {
+      // iPadOS Safari/WKWebView can leak raw Korean compatibility jamo through
+      // xterm.onData before/around beforeinput. The mobile input handler owns
+      // that IME path and sends composed Hangul, so drop the leaked echo here.
+      if (shouldSkipMobileWebKitImeData(data)) return
+      flushMobileWebKitImePending()
+      sendInput(data)
+    })
     attachKeyboardHandler(term, sendInput, sendRawInput, keybinds, macCommandIsCtrl, session.id)
     const disposePasteHandler = attachPasteHandler(term, containerRef.current!, sendRawInput, session.id)
     const disposeMobileHandler = attachMobileInputHandler(term, containerRef.current!, sendRawInput)
@@ -800,6 +810,7 @@ export function TerminalView({
       shell?.removeEventListener('touchcancel', clearTouchPan, true)
       disposePasteHandler()
       disposeMobileHandler()
+      disposeImeResidueGuard()
       osc52Disposable.dispose()
       dataDisposable.dispose()
       scrollDisposable.dispose()
