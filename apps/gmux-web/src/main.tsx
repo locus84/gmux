@@ -574,7 +574,10 @@ function App() {
 
   const handleResume = useCallback((id: string) => {
     setResumingId(id)
-    resumeSession(id).catch(err => {
+    resumeSession(id).then(result => {
+      const registeredId = result?.session_id
+      if (registeredId && registeredId !== id) setResumingId(registeredId)
+    }).catch(err => {
       console.error('resume failed:', err)
       setResumingId(prev => prev === id ? null : prev)
     })

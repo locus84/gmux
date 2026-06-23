@@ -675,6 +675,17 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 }
 
+func TestResumableRunnerID(t *testing.T) {
+	if got := resumableRunnerID("sess-abc123"); got != "sess-abc123" {
+		t.Fatalf("valid session id = %q", got)
+	}
+	for _, id := range []string{"019eedf4-f2ec-7fae-82b1-6283edb68e18", "../sess-bad", ""} {
+		if got := resumableRunnerID(id); got != "" {
+			t.Fatalf("resumableRunnerID(%q) = %q, want fresh id", id, got)
+		}
+	}
+}
+
 func TestBuildRunnerEnvPinsDaemonPaths(t *testing.T) {
 	t.Setenv("GMUX_STATE_DIR", "/daemon/state")
 	t.Setenv("GMUX_SOCKET_DIR", "/daemon/sockets")

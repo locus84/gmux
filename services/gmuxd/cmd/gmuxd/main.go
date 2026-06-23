@@ -265,6 +265,13 @@ func readRunnerHandshake(r *os.File, timeout time.Duration) (string, error) {
 	return id, nil
 }
 
+func resumableRunnerID(sessionID string) string {
+	if paths.IsValidSessionID(sessionID) {
+		return sessionID
+	}
+	return ""
+}
+
 // buildLaunchArgs assembles the gmux runner argv for the internal
 // `gmux __run [directives] -- <command>` form (ADR 0009): the hidden
 // __run verb, any non-empty daemon→runner directive flags, then a `--`
@@ -1478,7 +1485,11 @@ func serve(stderr io.Writer) int {
 			// fork; without them claude / vim / prompt frameworks
 			// reading $COLUMNS at startup would clamp to 80.
 			resumeCwd := projects.NormalizePath(sess.Cwd)
-			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			requestedID := resumableRunnerID(sessionID)
+			if requestedID == "" {
+				log.Printf("resume: %s is not a runner-owned session id; launching replacement session", sessionID)
+			}
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, requestedID, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("resume: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1566,7 +1577,11 @@ func serve(stderr io.Writer) int {
 			// session id; Register's re-registration branch handles
 			// the rest.
 			restartCwd := projects.NormalizePath(sess.Cwd)
-			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			requestedID := resumableRunnerID(sessionID)
+			if requestedID == "" {
+				log.Printf("restart: %s is not a runner-owned session id; launching replacement session", sessionID)
+			}
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, requestedID, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("restart: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())

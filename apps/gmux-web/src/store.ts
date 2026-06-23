@@ -1222,19 +1222,20 @@ export async function reorderSessions(
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
-async function postAction(endpoint: string, body?: Record<string, unknown>): Promise<void> {
-  try {
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      ...(body ? {
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      } : {}),
-    })
-    if (!resp.ok) console.warn(`${endpoint} failed:`, resp.status, await resp.text().catch(() => ''))
-  } catch (err) {
-    console.warn(`${endpoint} error:`, err)
+async function postAction<T = unknown>(endpoint: string, body?: Record<string, unknown>): Promise<T | undefined> {
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    ...(body ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    } : {}),
+  })
+  const text = typeof resp.text === 'function' ? await resp.text().catch(() => '') : ''
+  const parsed = text ? JSON.parse(text) as { ok?: boolean; data?: T; error?: { message?: string } } : null
+  if (!resp.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error?.message || text || `${endpoint} failed (${resp.status})`)
   }
+  return parsed?.data
 }
 
 export function killSession(sessionId: string): Promise<void> {
@@ -1250,12 +1251,17 @@ export function dismissSession(sessionId: string): Promise<void> {
   return postAction(`/v1/sessions/${sessionId}/dismiss`)
 }
 
-export function resumeSession(sessionId: string): Promise<void> {
-  return postAction(`/v1/sessions/${sessionId}/resume`)
+export interface SessionActionResult {
+  pid?: number
+  session_id?: string
 }
 
-export function restartSession(sessionId: string): Promise<void> {
-  return postAction(`/v1/sessions/${sessionId}/restart`)
+export function resumeSession(sessionId: string): Promise<SessionActionResult | undefined> {
+  return postAction<SessionActionResult>(`/v1/sessions/${sessionId}/resume`)
+}
+
+export function restartSession(sessionId: string): Promise<SessionActionResult | undefined> {
+  return postAction<SessionActionResult>(`/v1/sessions/${sessionId}/restart`)
 }
 
 // ── Launch ───────────────────────────────────────────────────────────────────
