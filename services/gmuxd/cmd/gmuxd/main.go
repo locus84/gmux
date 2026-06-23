@@ -2039,16 +2039,17 @@ func serve(stderr io.Writer) int {
 		}
 	})
 
-	// ── Embedded frontend (SPA fallback) ──
-
-	mux.Handle("/", spaHandler())
-
 	// ── Load config ──
 
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("FATAL: %v", err)
 	}
+
+	// ── Frontend (SPA fallback) ──
+
+	mux.Handle("/", spaHandler(cfg.WebDir))
+
 	// ── Resolve TCP listen address and auth token ──
 
 	resolved, err := cfg.ListenAddr()

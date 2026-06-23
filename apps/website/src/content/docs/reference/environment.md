@@ -13,9 +13,10 @@ Variables that affect the daemon.
 |----------|---------|---------|
 | `GMUXD_LISTEN` | TCP bind address (IPv4 or IPv6). | `127.0.0.1` |
 | `GMUXD_TOKEN` | Seed the auth token file on first start. | *(none)* |
+| `GMUXD_WEB_DIR` | Serve frontend assets from a local build directory instead of the embedded bundle. Overrides `web_dir` in `host.toml`. | *(none)* |
 | `XDG_CONFIG_HOME` | Base directory for config files. | `~/.config` |
 | `XDG_STATE_HOME` | Base directory for runtime state (socket, auth token). | `~/.local/state` |
-| `GMUXD_DEV_PROXY` | Proxy frontend requests to a Vite dev server (development only). | *(none)* |
+| `GMUXD_DEV_PROXY` | Proxy frontend requests to a Vite dev server (development only). Takes precedence over `GMUXD_WEB_DIR` and `web_dir`. | *(none)* |
 
 ### Bind address
 
@@ -28,6 +29,23 @@ GMUXD_LISTEN=0.0.0.0 gmuxd run
 ```
 
 The bind address is controlled exclusively by the `GMUXD_LISTEN` environment variable. It is not a config file option because it is a deployment concern, not a user preference.
+
+### Web asset override
+
+By default gmuxd serves the frontend bundled into the `gmuxd` binary. For local UI development or web-only installs, point gmuxd at an external built frontend directory:
+
+```toml
+# ~/.config/gmux/host.toml
+web_dir = "~/.local/state/gmux/web"
+```
+
+Then update just the web assets without stopping gmuxd:
+
+```bash
+./scripts/install-web.sh
+```
+
+`GMUXD_WEB_DIR=/path/to/dist gmuxd start` is the environment-variable equivalent and takes precedence over `web_dir`. `GMUXD_DEV_PROXY` still has the highest precedence and is intended for Vite/HMR development.
 
 ### Auth token
 

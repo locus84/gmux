@@ -16,6 +16,10 @@ Daemon behavior. gmuxd reads this file once at startup. Create or edit it manual
 # Default: 8790
 port = 8790
 
+# Optional: serve web assets from a local build directory instead of the
+# frontend embedded in gmuxd. Useful for web-only local installs.
+# web_dir = "~/.local/state/gmux/web"
+
 # Optional Tailscale remote access.
 # See the Remote Access guide for setup.
 [tailscale]
@@ -44,6 +48,7 @@ There is **no `[[peers]]` config**. Add a host you want to aggregate sessions fr
 | Field | Type | Default | Range | Description |
 |-------|------|---------|-------|-------------|
 | `port` | `number` | `8790` | 1–65535 | TCP port for the HTTP listener. |
+| `web_dir` | `string` | *(embedded frontend)* | local directory containing `index.html` | Serve web assets from a local build directory instead of the embedded bundle. `~` is supported. Overridden by `GMUXD_WEB_DIR`, and ignored when `GMUXD_DEV_PROXY` is set. |
 
 ### `[tailscale]`
 

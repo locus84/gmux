@@ -30,6 +30,7 @@ func TestLoadFromFile(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	writeConfig(t, dir, `
 port = 9999
+web_dir = "~/.local/state/gmux/web"
 
 [tailscale]
 enabled = true
@@ -42,6 +43,9 @@ allow = ["alice@github", "bob@github"]
 	}
 	if cfg.Port != 9999 {
 		t.Errorf("port = %d, want 9999", cfg.Port)
+	}
+	if cfg.WebDir != "~/.local/state/gmux/web" {
+		t.Errorf("web_dir = %q, want configured path", cfg.WebDir)
 	}
 	if !cfg.Tailscale.Enabled {
 		t.Error("tailscale should be enabled")

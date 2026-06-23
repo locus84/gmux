@@ -23,6 +23,11 @@ type Config struct {
 	// Port is the TCP port for the HTTP listener (default 8790).
 	Port int `toml:"port"`
 
+	// WebDir, when set, serves frontend assets from this directory instead
+	// of the embedded build. Intended for local web-only installs and
+	// development; the directory must contain index.html.
+	WebDir string `toml:"web_dir"`
+
 	Tailscale TailscaleConfig `toml:"tailscale"`
 	Discovery DiscoveryConfig `toml:"discovery"`
 
