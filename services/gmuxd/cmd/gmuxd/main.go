@@ -1060,6 +1060,14 @@ func serve(stderr io.Writer) int {
 		writeJSON(w, map[string]any{"ok": true, "data": item})
 	})
 
+	mux.HandleFunc("GET /v1/projects/{slug}/files", func(w http.ResponseWriter, r *http.Request) {
+		workspaceProjectFilesListHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+
+	mux.HandleFunc("GET /v1/projects/{slug}/file", func(w http.ResponseWriter, r *http.Request) {
+		workspaceProjectFilesContentHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+
 	mux.HandleFunc("PATCH /v1/projects/{slug}/sessions", func(w http.ResponseWriter, r *http.Request) {
 		slug := r.PathValue("slug")
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
@@ -1396,8 +1404,8 @@ func serve(stderr io.Writer) int {
 		}
 		sessionID := parts[2]
 		action := ""
-		if len(parts) == 4 {
-			action = parts[3]
+		if len(parts) >= 4 {
+			action = strings.Join(parts[3:], "/")
 		}
 
 		// Route to peer if this is a remote session.
@@ -1663,6 +1671,12 @@ func serve(stderr io.Writer) int {
 
 		case "scrollback":
 			scrollbackBrokerHandler(w, r, sessionID, sessions, metaStore.SessionDir)
+
+		case "files":
+			workspaceSessionFilesListHandler(w, r, sessionID, sessions)
+
+		case "file", "files/content":
+			workspaceSessionFilesContentHandler(w, r, sessionID, sessions)
 
 		case "clipboard":
 			// Materialize a clipboard binary payload as a file in this
