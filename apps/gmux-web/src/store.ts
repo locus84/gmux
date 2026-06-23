@@ -21,7 +21,7 @@ import { navigateWithReload } from './version-watch'
 import { buildProjectFolders, discoverProjects } from './projects'
 import { resolveReferences, removeReferenceItems, removeHostReferenceItems, refKey, type UnresolvedHost } from './references'
 
-import { fetchFrontendConfig, buildTerminalOptions, resolveKeybinds, type ResolvedKeybind } from './config'
+import { fetchFrontendConfig, buildTerminalOptions, resolveUiScale, resolveKeybinds, type ResolvedKeybind } from './config'
 import { MOCK_SESSIONS, MOCK_PROJECTS, MOCK_PEERS, MOCK_HEALTH } from './mock-data/index'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import type { Session as ProtocolSession } from '@gmux/protocol'
@@ -391,9 +391,86 @@ export const peerAppearance = computed<ReadonlyMap<string, PeerAppearance>>(() =
   return map
 })
 
-export const terminalOptions = signal<ResolvedTerminalOptions | null>(null)
+const terminalOptionsBase = signal<ResolvedTerminalOptions | null>(null)
 export const keybinds = signal<ResolvedKeybind[] | null>(null)
 export const macCommandIsCtrl = signal(false)
+export const vsCodeServerUrl = signal('')
+export const vsCodeServerHomeDir = signal('')
+
+export const UI_SCALE_MIN = 0.7
+export const UI_SCALE_MAX = 2
+const UI_SCALE_STORAGE_KEY = 'gmux.uiScale'
+
+export const uiScaleDefault = signal(1)
+export const uiScaleOverride = signal<number | null>(null)
+export const uiScaleEffective = computed(() => uiScaleOverride.value ?? uiScaleDefault.value)
+export const terminalOptions = computed<ResolvedTerminalOptions | null>(() => {
+  const base = terminalOptionsBase.value
+  if (!base) return null
+  return {
+    ...base,
+    fontSize: base.fontSize * uiScaleEffective.value,
+  }
+})
+
+export function clampUiScale(scale: number): number {
+  if (!Number.isFinite(scale)) return 1
+  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale))
+}
+
+function readBrowserUiScale(): number | null {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(UI_SCALE_STORAGE_KEY)
+    if (raw == null || raw.trim() === '') return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? clampUiScale(parsed) : null
+  } catch {
+    return null
+  }
+}
+
+function writeBrowserUiScale(scale: number | null) {
+  if (typeof localStorage === 'undefined') return
+  try {
+    if (scale == null) localStorage.removeItem(UI_SCALE_STORAGE_KEY)
+    else localStorage.setItem(UI_SCALE_STORAGE_KEY, String(scale))
+  } catch {
+    // Storage may be unavailable (private mode / locked-down browser). The
+    // in-memory signal still updates for this tab; persistence just fails.
+  }
+}
+
+function applyUiScale(scale: number) {
+  if (typeof document === 'undefined') return
+  const root = document.documentElement.style
+  root.setProperty('--ui-scale', String(scale))
+  root.setProperty('--ui-font-size', `${14 * scale}px`)
+  root.setProperty('--sidebar-width', `${272 * scale}px`)
+  root.setProperty('--header-height', `${44 * scale}px`)
+  root.setProperty('--radius', `${6 * scale}px`)
+}
+
+function applyConfiguredUiScale(defaultScale: number) {
+  const nextDefault = clampUiScale(defaultScale)
+  const nextOverride = readBrowserUiScale()
+  uiScaleDefault.value = nextDefault
+  uiScaleOverride.value = nextOverride
+  applyUiScale(nextOverride ?? nextDefault)
+}
+
+export function setBrowserUiScale(scale: number) {
+  const next = clampUiScale(scale)
+  writeBrowserUiScale(next)
+  uiScaleOverride.value = next
+  applyUiScale(next)
+}
+
+export function resetBrowserUiScale() {
+  writeBrowserUiScale(null)
+  uiScaleOverride.value = null
+  applyUiScale(uiScaleDefault.value)
+}
 
 /**
  * True while the on-screen keyboard is open, detected via visual-viewport
@@ -1252,6 +1329,20 @@ export function navigateToSession(sessionId: string, replace?: boolean): boolean
   return true
 }
 
+async function redirectToLoginIfUnauthorized() {
+  try {
+    const resp = await fetch('/v1/health', {
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+    if (resp.status === 401) location.replace('/auth/login')
+  } catch {
+    // Real network/daemon failures should keep showing the connection
+    // error state instead of bouncing to the login page.
+  }
+}
+
 /**
  * Start the store: connect SSE, fetch initial data, start timers.
  * Call once from the app root.
@@ -1270,8 +1361,11 @@ export function initStore(): () => void {
       sessionsLoaded.value = true
       worldLoaded.value = true
       connState.value = 'connected'
-      terminalOptions.value = buildTerminalOptions(null, null)
+      terminalOptionsBase.value = buildTerminalOptions(null, null)
+      applyConfiguredUiScale(resolveUiScale(null))
       keybinds.value = resolveKeybinds(null, false)
+      vsCodeServerUrl.value = ''
+      vsCodeServerHomeDir.value = ''
     })
     const activeIds = MOCK_SESSIONS.filter(s => s.mockActive).map(s => s.id)
     activeIds.forEach(id => { handleActivity(id) })
@@ -1288,9 +1382,12 @@ export function initStore(): () => void {
   fetchFrontendConfig().then(fc => {
     const macCtrl = fc.settings?.macCommandIsCtrl === true
     batch(() => {
-      terminalOptions.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      terminalOptionsBase.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      applyConfiguredUiScale(resolveUiScale(fc.settings))
       macCommandIsCtrl.value = macCtrl
       keybinds.value = resolveKeybinds(fc.settings?.keybinds ?? null, macCtrl)
+      vsCodeServerUrl.value = (fc.settings?.vsCodeServerUrl ?? '').trim()
+      vsCodeServerHomeDir.value = (fc.settings?.vsCodeServerHomeDir ?? '').trim()
     })
   })
 
@@ -1303,7 +1400,10 @@ export function initStore(): () => void {
     // Browser EventSource auto-reconnects; flag the UI as degraded
     // until the next snapshot arrives. `sessionsLoaded` stays true
     // once it has flipped, so reconnect doesn't blank the sidebar.
-    if (connState.value === 'connecting') connState.value = 'error'
+    if (connState.value === 'connecting') {
+      connState.value = 'error'
+      void redirectToLoginIfUnauthorized()
+    }
   })
 
   // Protocol 2 (ADR 0001). The server pushes two snapshot kinds plus

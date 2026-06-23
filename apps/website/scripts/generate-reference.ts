@@ -210,6 +210,10 @@ const SETTINGS_EXAMPLE = `\
   "cursorBlink": true,
   "scrollback": 10000,
 
+  // Optional: show a VS Code button on project rows.
+  // Expose your VS Code Server with trnsrv/tsnsrv and paste its base URL here.
+  "vsCodeServerUrl": "https://code-host.example.ts.net",
+
   // Keybind overrides
   "keybinds": [
     { "key": "ctrl+alt+t", "action": "sendKeys", "args": "ctrl+t" },
