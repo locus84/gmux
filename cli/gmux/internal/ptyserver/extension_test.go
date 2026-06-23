@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -273,6 +274,92 @@ func TestSessionSlugPrefersExplicitSlug(t *testing.T) {
 }
 
 // TestApplyTurnEnd pins the outcome→sidebar-state policy directly (no node).
+func TestPiDefaultWindowTitleIsPlaceholder(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+	if srv.isUsefulTitle("π - gmux") {
+		t.Fatal("pi default window title should be treated as a placeholder")
+	}
+}
+
+func TestHookGenericPiTitleFallsBackToSessionFile(t *testing.T) {
+	dir := t.TempDir()
+	sessFile := filepath.Join(dir, "2026-06-23_sess-title.jsonl")
+	if err := os.WriteFile(sessFile, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"abc-123","timestamp":"2026-06-23T10:00:00Z","cwd":"/tmp/test"}`,
+		`{"type":"message","id":"u1","timestamp":"2026-06-23T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"Fix the sidebar title"}]}}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	st.SetSessionFile(sessFile)
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(`{"op":"turn","phase":"end","outcome":"completed","title":"π - gmux"}`))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := st.Title(); got != "Fix the sidebar title" {
+		t.Fatalf("title = %q, want parsed session-file title", got)
+	}
+	if got := st.SlugSnapshot(); got != "fix-the-sidebar-title" {
+		t.Fatalf("slug = %q, want title-derived slug", got)
+	}
+}
+
+func TestHookUsefulPiNameDerivesSlug(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(`{"op":"session","id":"abc-123","name":"Useful title from pi"}`))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := st.Title(); got != "Useful title from pi" {
+		t.Fatalf("title = %q, want hook name", got)
+	}
+	if got := st.SlugSnapshot(); got != "useful-title-from-pi" {
+		t.Fatalf("slug = %q, want title-derived slug", got)
+	}
+}
+
+func TestHookSessionGenericPiNameDoesNotReplaceParsedTitle(t *testing.T) {
+	dir := t.TempDir()
+	sessFile := filepath.Join(dir, "2026-06-23_sess-name.jsonl")
+	if err := os.WriteFile(sessFile, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"abc-123","timestamp":"2026-06-23T10:00:00Z","cwd":"/tmp/test"}`,
+		`{"type":"message","id":"u1","timestamp":"2026-06-23T10:01:00Z","message":{"role":"user","content":[{"type":"text","text":"Investigate gmux title updates"}]}}`,
+		`{"type":"session_info","name":"Useful custom title"}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+
+	body := `{"op":"session","path":` + strconv.Quote(sessFile) + `,"id":"abc-123","name":"π - gmux"}`
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := st.Title(); got != "Useful custom title" {
+		t.Fatalf("title = %q, want parsed custom title", got)
+	}
+	if got := st.SlugSnapshot(); got != "useful-custom-title" {
+		t.Fatalf("slug = %q, want custom-title slug", got)
+	}
+}
+
 func TestApplyTurnEnd(t *testing.T) {
 	cases := []struct {
 		outcome    string

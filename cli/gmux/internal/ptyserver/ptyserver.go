@@ -554,15 +554,20 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 		if ev.Path != "" {
 			s.state.SetSessionFile(ev.Path)
 		}
-		if ev.Name != "" {
-			s.state.SetAdapterTitle(ev.Name)
+		if title, slug := s.resolveHookTitle(ev.Name, ev.Path); title != "" {
+			s.state.SetAdapterTitle(title)
+			if slug != "" {
+				s.state.SetSlug(slug)
+			}
 		}
 		// Slug source, in order of preference: an explicit slug the agent
 		// reports (e.g. codex, whose session id is a UUID that slugifies badly,
 		// sends a title-derived slug), else the identity to slugify.
+		// A title-derived slug from resolveHookTitle is stronger than the id
+		// fallback, so don't replace it unless the hook provided an explicit slug.
 		if ev.Slug != "" {
 			s.state.SetSlug(adapter.Slugify(ev.Slug))
-		} else if ev.ID != "" {
+		} else if ev.ID != "" && s.state.SlugSnapshot() == "" {
 			s.state.SetSlug(adapter.Slugify(ev.ID))
 		}
 	case "turn":
@@ -572,9 +577,60 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 			s.state.SetStatus(&adapter.Status{Working: true})
 			break
 		}
-		s.applyTurnEnd(ev.Outcome, ev.Title)
+		title, slug := s.resolveHookTitle(ev.Title, "")
+		s.applyTurnEnd(ev.Outcome, title)
+		if slug != "" {
+			s.state.SetSlug(slug)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) resolveHookTitle(rawTitle, path string) (title, slug string) {
+	title = strings.TrimSpace(rawTitle)
+	if s.isUsefulTitle(title) {
+		return title, s.slugFromTitle(title)
+	}
+
+	if path == "" {
+		path = s.state.SessionFileSnapshot()
+	}
+	filer, ok := s.adapter.(adapter.SessionFiler)
+	if !ok || path == "" {
+		return "", ""
+	}
+	info, err := filer.ParseSessionFile(path)
+	if err != nil || info == nil {
+		return "", ""
+	}
+	parsed := strings.TrimSpace(info.Title)
+	if !s.isUsefulTitle(parsed) {
+		return "", ""
+	}
+	return parsed, adapter.Slugify(info.Slug)
+}
+
+func (s *Server) slugFromTitle(title string) string {
+	if s.adapter != nil && s.adapter.Name() == "pi" {
+		return adapter.Slugify(title)
+	}
+	return ""
+}
+
+func (s *Server) isUsefulTitle(title string) bool {
+	title = strings.TrimSpace(title)
+	if title == "" || title == "(new)" {
+		return false
+	}
+	// pi's session manager reports a default window label like "π - gmux"
+	// before a conversation has a real first-message or /name title. Treat it
+	// as a placeholder so the parsed session file can supply the useful title.
+	if s.adapter != nil && s.adapter.Name() == "pi" {
+		if title == "pi" || strings.HasPrefix(title, "π - ") {
+			return false
+		}
+	}
+	return true
 }
 
 // applyTurnEnd maps a normalized turn outcome to sidebar state. This is the
@@ -994,7 +1050,7 @@ func (s *Server) readPTY() {
 		accum = nil
 
 		// Process adapter/title hooks on the accumulated chunk.
-		if title := adapters.ParseOSCTitle(data); title != "" {
+		if title := adapters.ParseOSCTitle(data); title != "" && s.isUsefulTitle(title) {
 			s.state.SetShellTitle(title)
 		}
 		if s.adapter != nil {
