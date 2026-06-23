@@ -133,6 +133,34 @@ describe('toolbar composition flushing', () => {
     expect(textarea.selectionEnd).toBe(0)
   })
 
+  it('flushes Android keyCode-229 textarea diff before toolbar submit', () => {
+    vi.useFakeTimers()
+    try {
+      const events: string[] = []
+      const textarea = createFakeTextarea()
+      textarea.value = '안'
+      textarea.selectionStart = textarea.selectionEnd = 1
+      const lateTimer = setTimeout(() => events.push('late xterm diff'), 0) as unknown as number
+      const helper = liveHelper({ _textareaChangeTimer: lateTimer })
+      const term = termWithHelper(helper, textarea)
+      const dispose = attachImeResidueGuard(term, 150)
+
+      textarea.dispatch('keydown')
+      textarea.value = '안녕'
+      textarea.selectionStart = textarea.selectionEnd = 2
+
+      sendAfterFlushingComposition(term, data => events.push(data), '\r')
+      vi.runAllTimers()
+
+      expect(events).toEqual(['녕', '\r'])
+      expect(helper._textareaChangeTimer).toBeUndefined()
+      expect(textarea.value).toBe('')
+      dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not flush or clear textarea for non-submit toolbar keys during live composition', () => {
     const events: string[] = []
     const textarea = { value: '오케이', selectionStart: 3, selectionEnd: 3 }

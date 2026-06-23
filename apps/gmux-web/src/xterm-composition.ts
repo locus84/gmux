@@ -23,6 +23,8 @@ interface XtermPrivateTerminal {
   options?: { screenReaderMode?: boolean }
 }
 
+const textareaValueBeforeImeKey = new WeakMap<HTMLTextAreaElement, string>()
+
 /**
  * Flush an active xterm IME composition before sending toolbar bytes.
  *
@@ -111,6 +113,30 @@ function clearIdleTextareaResidue(term: Terminal): boolean {
   return true
 }
 
+function pendingTextareaDiff(term: Terminal): string | null {
+  const ta = textarea(term)
+  const helper = compositionHelper(term)
+  if (!ta?.value || hasTextareaSelection(ta)) return null
+  if (helper?._textareaChangeTimer === undefined) return null
+
+  clearTimeout(helper._textareaChangeTimer)
+  helper._textareaChangeTimer = undefined
+
+  const oldValue = textareaValueBeforeImeKey.get(ta) ?? ''
+  const newValue = ta.value
+  if (newValue.length > oldValue.length) return newValue.replace(oldValue, '')
+  if (newValue.length < oldValue.length) return '\x7f'
+  if (newValue !== oldValue) return newValue
+  return null
+}
+
+function flushPendingTextareaDiff(term: Terminal, send: (data: string) => void): boolean {
+  const diff = pendingTextareaDiff(term)
+  if (!diff) return false
+  send(diff)
+  return true
+}
+
 function suppressResidualImeEvents(term: Terminal): void {
   const ta = textarea(term)
   if (!ta || typeof ta.addEventListener !== 'function') return
@@ -190,7 +216,10 @@ export function attachImeResidueGuard(term: Terminal, delayMs = 50): () => void 
   }
   const handleKeydown = () => {
     // Re-arm after every keydown so the clear cannot land between xterm's
-    // keyCode-229 handling and its delayed textarea diff read.
+    // keyCode-229 handling and its delayed textarea diff read. Also snapshot
+    // the value before Android/Gboard mutates it; toolbar Send may need to
+    // flush that pending 0ms diff before writing Enter.
+    textareaValueBeforeImeKey.set(ta, ta.value)
     schedule()
   }
   const handleInput = () => schedule()
@@ -221,7 +250,8 @@ export function sendAfterFlushingComposition(
 ): void {
   const isSubmit = data.includes('\r')
   const flushed = isSubmit && flushPendingComposition(term)
-  if (flushed) {
+  const flushedPendingDiff = !flushed && isSubmit && flushPendingTextareaDiff(term, send)
+  if (flushed || flushedPendingDiff) {
     suppressResidualImeEvents(term)
   } else {
     // When no live composition is being finalized, toolbar buttons should not
@@ -233,7 +263,7 @@ export function sendAfterFlushingComposition(
 
   send(data)
 
-  if (flushed) {
+  if (flushed || flushedPendingDiff) {
     // The browser can still deliver the native compositionend/input cascade
     // after the toolbar forced xterm to send the composition synchronously.
     // Empty xterm's private composition snapshot so that late cascade observes
