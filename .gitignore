@@ -37,3 +37,10 @@ tests/pi-adapter/pi-adapter
 
 # Agent handoff/scratch docs
 .memory/
+
+# Pi runtime state
+.pi/subagent-runs/
+.pi/subagent-results/
+.pi/tmp/
+.pi/worktrees/
+.pi/worktree-runs/
