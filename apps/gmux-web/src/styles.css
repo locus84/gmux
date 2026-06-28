@@ -2119,6 +2119,16 @@ body {
   flex-direction: column;
   gap: 2px;
 }
+.mp-push-error {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 35%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--status-error) 9%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
 .mp-configured-row {
   display: flex;
   align-items: center;

@@ -24,7 +24,8 @@ export const webPushBusy = signal(false)
 export const webPushError = signal<string | null>(null)
 
 export function isWebPushAvailable(): boolean {
-  return 'serviceWorker' in navigator
+  return window.isSecureContext
+    && 'serviceWorker' in navigator
     && 'PushManager' in window
     && 'Notification' in window
 }
@@ -75,10 +76,16 @@ export async function enableWebPushForProjects(projectSlugs: string[]): Promise<
   webPushBusy.value = true
   webPushError.value = null
   try {
+    if (Notification.permission === 'denied') {
+      webPushEnabled.value = false
+      webPushError.value = 'Notifications are blocked for this site. Enable them in browser settings first.'
+      return
+    }
+
     const permission = await Notification.requestPermission()
     if (permission !== 'granted') {
       webPushEnabled.value = false
-      webPushError.value = 'Notifications are not allowed.'
+      webPushError.value = 'Notifications were not allowed.'
       return
     }
 
@@ -94,7 +101,7 @@ export async function enableWebPushForProjects(projectSlugs: string[]): Promise<
     await saveSubscription(sub, projectSlugs)
   } catch (err) {
     console.warn('web push enable failed:', err)
-    webPushError.value = 'Could not enable Web Push.'
+    webPushError.value = describeWebPushError(err, 'Could not enable Web Push.')
   } finally {
     webPushBusy.value = false
   }
@@ -128,7 +135,7 @@ export async function setWebPushProject(slug: string, enabled: boolean): Promise
     webPushProjectSlugs.value = next
   } catch (err) {
     console.warn('web push project update failed:', err)
-    webPushError.value = 'Could not update push projects.'
+    webPushError.value = describeWebPushError(err, 'Could not update push projects.')
   } finally {
     webPushBusy.value = false
   }
@@ -142,6 +149,7 @@ async function currentSubscription(): Promise<PushSubscription | null> {
 
 async function fetchVapidPublicKey(): Promise<string> {
   const resp = await fetch('/v1/push/vapid-public-key')
+  if (resp.status === 404) throw new Error('push_api_missing')
   if (!resp.ok) throw new Error(`public key failed: ${resp.status}`)
   const body = await resp.json() as { data?: { public_key?: string } }
   if (!body.data?.public_key) throw new Error('missing public key')
@@ -168,6 +176,7 @@ async function saveSubscription(sub: PushSubscription, projectSlugs: string[]): 
       device_label: navigator.userAgent,
     }),
   })
+  if (resp.status === 404) throw new Error('push_api_missing')
   if (!resp.ok) throw new Error(`subscribe failed: ${resp.status}`)
   const body = await resp.json() as { data?: StoredPushSubscription }
   webPushEnabled.value = true
@@ -176,6 +185,20 @@ async function saveSubscription(sub: PushSubscription, projectSlugs: string[]): 
 
 export function localProjectSlugs(projects: { slug: string; peer?: string }[]): string[] {
   return projects.filter(p => !p.peer).map(p => p.slug)
+}
+
+function describeWebPushError(err: unknown, fallback: string): string {
+  const message = err instanceof Error ? err.message : String(err)
+  if (message === 'push_api_missing') {
+    return 'This gmuxd has no Web Push API yet. Reinstall/restart gmuxd, then try again.'
+  }
+  if (message.includes('NotAllowedError')) {
+    return 'Notifications are blocked for this site. Enable them in browser settings first.'
+  }
+  if (message.includes('AbortError') || message.includes('NotSupportedError')) {
+    return 'Web Push is unavailable here. On iOS/iPadOS, open gmux from an HTTPS Home Screen PWA.'
+  }
+  return fallback
 }
 
 function urlBase64ToArrayBuffer(base64String: string): ArrayBuffer {

@@ -32,6 +32,7 @@ import {
   setWebPushProject,
   webPushBusy,
   webPushEnabled,
+  webPushError,
   webPushProjectSlugs,
   webPushSupported,
 } from './push-subscriptions'
@@ -667,6 +668,9 @@ function ConfiguredProjectsSection({ configured }: { configured: ProjectItem[] }
   return (
     <section class="mp-section">
       <div class="mp-section-label">Your projects</div>
+      {webPushError.value && (
+        <div class="mp-push-error" role="status">{webPushError.value}</div>
+      )}
       <div class="mp-configured-list">
         {dragItems.map((p, i) => {
           const folderKey = `${p.peer ?? ''}::${p.slug}`
@@ -767,7 +771,7 @@ function ConfiguredProjectRow({
           title={pushOn ? 'Disable push notifications for this project' : 'Enable push notifications for this project'}
           aria-label={pushOn ? `Disable push notifications for ${project.slug}` : `Enable push notifications for ${project.slug}`}
         >
-          {pushOn ? '🔔' : '🔕'}
+          {webPushBusy.value ? '…' : pushOn ? '🔔' : '🔕'}
         </button>
       )}
       <button
