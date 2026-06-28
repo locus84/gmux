@@ -79,6 +79,8 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
   let pending = ''
   let pendingKittyBase64 = ''
   let pendingKittyColumns: number | undefined
+  let pendingKittyRows: number | undefined
+  let pendingKittyCursorMovement: number | undefined
 
   const encode = (value: string): Uint8Array => {
     const out = new Uint8Array(value.length)
@@ -201,6 +203,8 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
       pending = ''
       pendingKittyBase64 = ''
       pendingKittyColumns = undefined
+      pendingKittyRows = undefined
+      pendingKittyCursorMovement = undefined
     },
   }
 
@@ -216,26 +220,40 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
 
     const more = params.get('m') === '1'
     const columns = parsePositiveInteger(params.get('c'))
+    const rows = parsePositiveInteger(params.get('r'))
+    const parsedCursorMovement = parseNonNegativeInteger(params.get('C'))
     if (columns) pendingKittyColumns = columns
+    if (rows) pendingKittyRows = rows
+    if (parsedCursorMovement !== undefined) pendingKittyCursorMovement = parsedCursorMovement
     pendingKittyBase64 += payload
 
     if (more) return ''
 
     const base64 = pendingKittyBase64
     const requestedColumns = pendingKittyColumns
+    const requestedRows = pendingKittyRows
+    const cursorMovement = pendingKittyCursorMovement
     pendingKittyBase64 = ''
     pendingKittyColumns = undefined
+    pendingKittyRows = undefined
+    pendingKittyCursorMovement = undefined
     if (!base64) return ''
 
     const maxRows = mobileInlineImageMaxRows(term.rows)
     const dims = imageDimensionsFromBase64(base64)
-    const constraint = dims
-      ? chooseInlineImageConstraint(term, dims, maxRows, requestedColumns)
+    const placement = dims
+      ? chooseInlineImagePlacement(term, dims, maxRows, requestedColumns)
       : requestedColumns
-        ? `width=${requestedColumns}`
-        : `height=${maxRows}`
-    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${constraint};preserveAspectRatio=1:${base64}\x07`
+        ? { constraint: `width=${requestedColumns}`, rows: requestedRows ?? 1 }
+        : { constraint: `height=${maxRows}`, rows: Math.min(requestedRows ?? maxRows, maxRows) }
+    const restoreCursor = cursorMovement === 1 && placement.rows > 1 ? `\x1b[${placement.rows - 1}A` : ''
+    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${placement.constraint};preserveAspectRatio=1:${base64}\x07${restoreCursor}`
   }
+}
+
+interface InlineImagePlacement {
+  constraint: string
+  rows: number
 }
 
 function mobileInlineImageMaxRows(rows: number): number {
@@ -243,13 +261,20 @@ function mobileInlineImageMaxRows(rows: number): number {
 }
 
 function chooseInlineImageConstraint(term: Terminal, dims: ImageDimensions, maxRows: number, requestedCols?: number): string {
+  return chooseInlineImagePlacement(term, dims, maxRows, requestedCols).constraint
+}
+
+function chooseInlineImagePlacement(term: Terminal, dims: ImageDimensions, maxRows: number, requestedCols?: number): InlineImagePlacement {
   const activeBuffer = term.buffer.active as unknown as { cursorX?: number }
   const availableCols = Math.max(1, term.cols - (activeBuffer.cursorX ?? 0))
   const maxCols = Math.max(1, Math.min(availableCols, requestedCols ?? availableCols))
   const cellWidth = term.dimensions?.css.cell.width || 1
   const cellHeight = term.dimensions?.css.cell.height || 2
-  const rowsAtFullWidth = maxCols * (dims.height / dims.width) * (cellWidth / cellHeight)
-  return rowsAtFullWidth <= maxRows ? `width=${maxCols}` : `height=${maxRows}`
+  const rowsAtFullWidth = Math.max(1, maxCols * (dims.height / dims.width) * (cellWidth / cellHeight))
+  if (rowsAtFullWidth <= maxRows) {
+    return { constraint: `width=${maxCols}`, rows: Math.max(1, Math.ceil(rowsAtFullWidth)) }
+  }
+  return { constraint: `height=${maxRows}`, rows: maxRows }
 }
 
 function parseKittyParams(value: string): Map<string, string> {
@@ -266,6 +291,12 @@ function parsePositiveInteger(value: string | undefined): number | undefined {
   if (!value) return undefined
   const parsed = Number.parseInt(value, 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+}
+
+function parseNonNegativeInteger(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
 }
 
 function estimateBase64DecodedSize(value: string): number {
