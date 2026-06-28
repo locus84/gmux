@@ -9,14 +9,30 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { connectPresence } from './presence'
 import type { NotifyMessage, CancelMessage } from './presence'
-import { selectedId, sessions, navigateToSession } from './store'
+import { selectedId, sessions, navigateToSession, projects } from './store'
 import type { NotifPermission } from './sidebar'
+import { enableWebPushForProjects, localProjectSlugs, refreshWebPushState } from './push-subscriptions'
 
 const USE_MOCK = import.meta.env.VITE_MOCK === '1' || location.search.includes('mock')
 
 interface UsePresenceResult {
   notifPermission: NotifPermission
   requestNotifPermission: () => void
+}
+
+function showWindowNotification(
+  msg: NotifyMessage,
+  options: NotificationOptions,
+  activeNotifs: Map<string, Notification>,
+): void {
+  const n = new Notification(msg.title, options)
+  activeNotifs.set(msg.id, n)
+  n.onclose = () => activeNotifs.delete(msg.id)
+  n.onclick = () => {
+    window.focus()
+    if (msg.session_id) navigateToSession(msg.session_id)
+    n.close()
+  }
 }
 
 export function usePresence(): UsePresenceResult {
@@ -29,35 +45,67 @@ export function usePresence(): UsePresenceResult {
     ? 'granted'
     : ('Notification' in window ? Notification.permission : 'unavailable')
 
-  // Show a notification when the daemon tells us to.
+  // Show a notification when the daemon tells us to. Mobile browsers route
+  // notifications through the service worker; `new Notification()` is not
+  // reliable on Android Chrome and is not the path iOS installed web apps use.
   const handleNotify = useCallback((msg: NotifyMessage) => {
     if (!('Notification' in window) || Notification.permission !== 'granted') return
-    const n = new Notification(msg.title, {
+
+    const options: NotificationOptions = {
       body: msg.body,
       tag: msg.tag,
       icon: '/favicon.svg',
-    })
-    activeNotifsRef.current.set(msg.id, n)
-    n.onclose = () => activeNotifsRef.current.delete(msg.id)
-    n.onclick = () => {
-      window.focus()
-      if (msg.session_id) navigateToSession(msg.session_id)
-      n.close()
+      data: { id: msg.id, session_id: msg.session_id },
     }
+
+    if ('serviceWorker' in navigator) {
+      void navigator.serviceWorker.ready
+        .then(reg => reg.showNotification(msg.title, options))
+        .catch(() => showWindowNotification(msg, options, activeNotifsRef.current))
+      return
+    }
+
+    showWindowNotification(msg, options, activeNotifsRef.current)
   }, [])
 
   // Dismiss a notification when the daemon tells us to.
   const handleCancel = useCallback((msg: CancelMessage) => {
     const n = activeNotifsRef.current.get(msg.id)
     if (n) { n.close(); activeNotifsRef.current.delete(msg.id) }
+
+    if ('serviceWorker' in navigator) {
+      void navigator.serviceWorker.ready.then(async reg => {
+        const notifications = await reg.getNotifications()
+        for (const notification of notifications) {
+          const data = notification.data as { id?: string } | undefined
+          if (data?.id === msg.id) notification.close()
+        }
+      }).catch(() => {})
+    }
   }, [])
 
   // Connect presence WebSocket on mount.
   useEffect(() => {
     const p = connectPresence({ onNotify: handleNotify, onCancel: handleCancel })
     presenceRef.current = p
+    void refreshWebPushState()
     return () => { p.close(); presenceRef.current = null }
   }, [handleNotify, handleCancel])
+
+  // Service-worker notification clicks are delivered back to the page so the
+  // existing client-side session routing stays the single source of truth.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+    const onMessage = (ev: MessageEvent) => {
+      const msg = ev.data as { type?: string; session_id?: string } | undefined
+      if (msg?.type === 'gmux-notification-click' && msg.session_id) {
+        window.focus()
+        navigateToSession(msg.session_id)
+      }
+    }
+    navigator.serviceWorker.addEventListener('message', onMessage)
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage)
+  }, [])
 
   // Track last user interaction for idle detection.
   useEffect(() => {
@@ -112,6 +160,9 @@ export function usePresence(): UsePresenceResult {
     await Notification.requestPermission()
     forceNotifPermUpdate(n => n + 1)
     presenceRef.current?.sendPermission(Notification.permission)
+    if (Notification.permission === 'granted') {
+      await enableWebPushForProjects(localProjectSlugs(projects.value))
+    }
   }, [])
 
   return { notifPermission, requestNotifPermission }

@@ -40,6 +40,7 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/peerstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/presence"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/projects"
+	pushpkg "github.com/gmuxapp/gmux/services/gmuxd/internal/push"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionfiles"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionmeta"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sleep"
@@ -675,6 +676,13 @@ func serve(stderr io.Writer) int {
 	// State directory for persistent files (projects.json, auth-token, etc).
 	stateDir := paths.StateDir()
 
+	pushMgr, err := pushpkg.Open(stateDir)
+	if err != nil {
+		log.Printf("push: disabled: %v", err)
+	} else {
+		notifRouter.SetPushSender(pushMgr)
+	}
+
 	// Stable, opaque per-node identity (ADR 0007). Generated once and
 	// persisted alongside the auth token; used for peer dedup, never
 	// shown or routed.
@@ -943,6 +951,120 @@ func serve(stderr io.Writer) int {
 				"settings": settings,
 			},
 		})
+	})
+
+	// ── Web Push ──
+
+	mux.HandleFunc("GET /v1/push/vapid-public-key", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		key, err := pushMgr.PublicKey()
+		if err != nil {
+			log.Printf("push: public key: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to load push key")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": map[string]string{"public_key": key}})
+	})
+
+	mux.HandleFunc("POST /v1/push/lookup", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := readJSONLimited(r, 4096, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, ok, err := pushMgr.Lookup(req.Endpoint)
+		if err != nil {
+			log.Printf("push: lookup: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to load push subscription")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"found": ok, "subscription": sub}})
+	})
+
+	mux.HandleFunc("POST /v1/push/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Subscription struct {
+				Endpoint string       `json:"endpoint"`
+				Keys     pushpkg.Keys `json:"keys"`
+			} `json:"subscription"`
+			Projects    []string `json:"projects"`
+			DeviceLabel string   `json:"device_label"`
+		}
+		if err := readJSONLimited(r, 64*1024, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, err := pushMgr.Upsert(pushpkg.Subscription{
+			Endpoint:    req.Subscription.Endpoint,
+			Keys:        req.Subscription.Keys,
+			Projects:    localProjectSubset(projectMgr, req.Projects),
+			DeviceLabel: req.DeviceLabel,
+			UserAgent:   r.UserAgent(),
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": sub})
+	})
+
+	mux.HandleFunc("PATCH /v1/push/subscription", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string   `json:"endpoint"`
+			Projects []string `json:"projects"`
+		}
+		if err := readJSONLimited(r, 64*1024, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, ok, err := pushMgr.UpdateProjects(req.Endpoint, localProjectSubset(projectMgr, req.Projects))
+		if err != nil {
+			log.Printf("push: update projects: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to update push subscription")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found", "push subscription not found")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": sub})
+	})
+
+	mux.HandleFunc("DELETE /v1/push/subscription", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := readJSONLimited(r, 4096, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		if err := pushMgr.Delete(req.Endpoint); err != nil {
+			log.Printf("push: delete: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to remove push subscription")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
 	})
 
 	// ── Projects ──
@@ -2603,6 +2725,38 @@ func sendSSE(w http.ResponseWriter, event string, payload any) {
 		return
 	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, bytes)
+}
+
+func readJSONLimited(r *http.Request, limit int64, dst any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
+	if err != nil {
+		return fmt.Errorf("read error")
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		return fmt.Errorf("invalid JSON")
+	}
+	return nil
+}
+
+func localProjectSubset(projectMgr *projects.Manager, requested []string) []string {
+	state, err := projectMgr.Load()
+	if err != nil {
+		log.Printf("push: projects load: %v", err)
+		return nil
+	}
+	local := make(map[string]bool)
+	for _, item := range state.Items {
+		if !item.IsReference() {
+			local[item.Slug] = true
+		}
+	}
+	out := make([]string, 0, len(requested))
+	for _, slug := range requested {
+		if local[slug] {
+			out = append(out, slug)
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {

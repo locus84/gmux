@@ -24,7 +24,7 @@ import {
   sessions, connState, selected, selectedId, view, health, peers,
   terminalOptions, keybinds, macCommandIsCtrl,
   unreadCount, keyboardOpen, terminalScrolledUp, terminalScrollToBottom,
-  urlPath, urlSearch,
+  urlPath, urlSearch, projects,
   initStore, setNavigate, navigateToSession,
   dismissSession, resumeSession, restartSession,
   sessionStaleness,
@@ -504,6 +504,14 @@ function App() {
   const macCtrl = macCommandIsCtrl.value
 
   const { notifPermission, requestNotifPermission } = usePresence()
+
+  // Navigate a freshly opened PWA window from a Web Push notification once
+  // the session/project snapshot has loaded enough to build its canonical URL.
+  useEffect(() => {
+    const sessionId = loc.query.notificationSession
+    if (typeof sessionId !== 'string' || !sessionId) return
+    navigateToSession(sessionId, true)
+  }, [loc, sessionsVal, projects.value])
 
   // ── Resume ──
   const [resumingId, setResumingId] = useState<string | null>(null)

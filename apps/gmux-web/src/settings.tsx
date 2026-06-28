@@ -27,6 +27,14 @@ import {
 import { HostSuffix } from './host-suffix'
 import { hostStatus } from './host-status'
 import { projectAvailability } from './projects'
+import {
+  refreshWebPushState,
+  setWebPushProject,
+  webPushBusy,
+  webPushEnabled,
+  webPushProjectSlugs,
+  webPushSupported,
+} from './push-subscriptions'
 import type { ProjectItem, DiscoveredProject, Folder, PeerInfo } from './types'
 import type { UnresolvedHost } from './references'
 
@@ -67,6 +75,7 @@ export function SettingsModal({
       setDiscoveredQuery('')
       setPathDraft('')
       setPathError('')
+      void refreshWebPushState()
     }
   }, [open])
 
@@ -701,6 +710,8 @@ function ConfiguredProjectRow({
   const alive = f.sessions.filter(s => s.alive).length
   const resumable = f.sessions.filter(s => !s.alive && s.resumable).length
   const isReference = !!project.peer
+  const pushOn = webPushEnabled.value && webPushProjectSlugs.value.has(project.slug)
+  const canTogglePush = !isReference && webPushSupported.value
   // Mirror the sidebar: a reference whose host is unresolved, dangling,
   // or offline reads as unavailable here too — muted row + a marker
   // sharing the sidebar's pip vocabulary.
@@ -744,6 +755,21 @@ function ConfiguredProjectRow({
           {alive === 0 && resumable === 0 && <span class="mp-configured-rest">no sessions</span>}
         </span>
       </div>
+      {canTogglePush && (
+        <button
+          class={`mp-configured-notify${pushOn ? ' active' : ''}`}
+          disabled={webPushBusy.value}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            void setWebPushProject(project.slug, !pushOn)
+          }}
+          title={pushOn ? 'Disable push notifications for this project' : 'Enable push notifications for this project'}
+          aria-label={pushOn ? `Disable push notifications for ${project.slug}` : `Enable push notifications for ${project.slug}`}
+        >
+          {pushOn ? '🔔' : '🔕'}
+        </button>
+      )}
       <button
         class="mp-configured-remove"
         onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(project) }}
