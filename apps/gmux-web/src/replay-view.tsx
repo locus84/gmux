@@ -5,6 +5,7 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ITerminalOptions } from '@xterm/xterm'
 import { loadWebglRenderer } from './webgl-renderer'
+import { isTouchDevice } from './touch'
 import type { Session } from './types'
 import { fetchScrollback, type ScrollbackResult } from './replay-fetch'
 import { JumpToBottom } from './jump-to-bottom'
@@ -104,7 +105,10 @@ export function ReplayView({
     term.loadAddon(new ImageAddon())
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
-    loadWebglRenderer(term)
+    // Mobile Safari/WebKit is prone to black/blank canvases when xterm's
+    // image addon and WebGL renderer share the terminal screen. Keep replay
+    // image rendering on the safer built-in renderer for touch devices.
+    if (!isTouchDevice()) loadWebglRenderer(term)
     // Vertical-only fit: use FitAddon's proposal for rows, but keep cols
     // pinned to the recording. FitAddon already knows the cell metrics
     // and shell-padding accounting; reusing it for the row dimension is

@@ -498,7 +498,10 @@ export function TerminalView({
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
-    loadWebglRenderer(term)
+    // Mobile Safari/WebKit can turn the terminal black after inline image
+    // output when xterm's image addon is combined with WebGL. Prefer the
+    // safer built-in renderer on touch devices; desktop keeps WebGL.
+    if (!isTouchDevice()) loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
     const disposeIconFontWatch = refreshAtlasWhenIconFontLoads(term, terminalOptions.fontSize)
@@ -1366,7 +1369,7 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
-    loadWebglRenderer(term)
+    if (!isTouchDevice()) loadWebglRenderer(term)
     fit.fit()
 
     const mock = MOCK_BY_ID[sessionId]
