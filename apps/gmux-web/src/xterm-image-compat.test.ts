@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createTouchInlineImageSanitizer } from './xterm-image-compat'
+import { createTouchInlineImageSanitizer, shouldUseTouchInlineImageDecodeFallback } from './xterm-image-compat'
 
 if (typeof globalThis.window === 'undefined') {
   ;(globalThis as any).window = globalThis
@@ -17,10 +17,30 @@ const matchMediaMock = vi.fn().mockImplementation((query: string) => ({
 }))
 
 Object.defineProperty(window, 'matchMedia', { value: matchMediaMock, writable: true, configurable: true })
-Object.defineProperty(globalThis, 'navigator', {
-  value: { ...(globalThis.navigator ?? {}), maxTouchPoints: 1 },
-  configurable: true,
-})
+function setNavigator(value: { maxTouchPoints: number; platform: string; userAgent: string }): void {
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { ...(globalThis.navigator ?? {}), ...value },
+    configurable: true,
+  })
+}
+
+function setIpadNavigator(): void {
+  setNavigator({
+    maxTouchPoints: 5,
+    platform: 'MacIntel',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+  })
+}
+
+function setAndroidEdgeNavigator(): void {
+  setNavigator({
+    maxTouchPoints: 5,
+    platform: 'Linux armv81',
+    userAgent: 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36 EdgA/125.0.0.0',
+  })
+}
+
+setIpadNavigator()
 
 function fakeTerm(cols = 80, rows = 40) {
   return {
@@ -60,9 +80,28 @@ function text(chunks: Uint8Array[]): string {
   return chunks.map(chunk => String.fromCharCode(...chunk)).join('')
 }
 
+describe('shouldUseTouchInlineImageDecodeFallback', () => {
+  beforeEach(() => {
+    matchMediaMock.mockClear()
+  })
+
+  it('uses the canvas decode fallback on Android Edge Chromium touch', () => {
+    setAndroidEdgeNavigator()
+
+    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(true)
+  })
+
+  it('uses the canvas decode fallback on iPad WebKit', () => {
+    setIpadNavigator()
+
+    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(true)
+  })
+})
+
 describe('createTouchInlineImageSanitizer', () => {
   beforeEach(() => {
     matchMediaMock.mockClear()
+    setIpadNavigator()
   })
 
   it('caps tall iTerm inline images by terminal rows on touch devices', () => {
@@ -93,7 +132,7 @@ describe('createTouchInlineImageSanitizer', () => {
     expect(rewritten).toContain('height=18;preserveAspectRatio=1')
   })
 
-  it('converts kitty graphics output to iTerm inline images on touch devices', () => {
+  it('converts kitty graphics output to iTerm inline images on WebKit touch devices', () => {
     const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
     const image = pngBase64(720, 1280)
     const payload = `before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=18;${image}\x1b\\after`
@@ -107,7 +146,7 @@ describe('createTouchInlineImageSanitizer', () => {
     expect(rewritten).not.toContain('\x1b_G')
   })
 
-  it('does not restore the cursor for kitty graphics when C=1 is absent', () => {
+  it('does not restore the cursor for converted kitty graphics when C=1 is absent', () => {
     const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
     const image = pngBase64(720, 1280)
 
@@ -117,7 +156,21 @@ describe('createTouchInlineImageSanitizer', () => {
     expect(rewritten).not.toContain('\x1b[17A')
   })
 
-  it('joins chunked kitty graphics payloads before converting', () => {
+  it('converts kitty graphics on Android Edge while using the canvas decode fallback', () => {
+    setAndroidEdgeNavigator()
+    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(true)
+    const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
+    const image = pngBase64(720, 1280)
+    const payload = `before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=18;${image}\x1b\\after`
+
+    const rewritten = text(sanitizer.transform(bytes(payload)))
+
+    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;height=18;preserveAspectRatio=1:')
+    expect(rewritten).toContain('\x07\x1b[17Aafter')
+    expect(rewritten).not.toContain('\x1b_G')
+  })
+
+  it('joins chunked kitty graphics payloads before converting on WebKit touch devices', () => {
     const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
     const image = pngBase64(1280, 320)
     const first = image.slice(0, 20)

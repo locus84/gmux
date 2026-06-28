@@ -2,5 +2,6 @@ packages:
   - apps/*
   - packages/*
 patchedDependencies:
+  '@xterm/addon-image@0.9.0': patches/@xterm__addon-image@0.9.0.patch
   '@xterm/addon-webgl@0.20.0-beta.194': patches/@xterm__addon-webgl@0.20.0-beta.194.patch
   '@xterm/xterm@6.1.0-beta.195': patches/@xterm__xterm@6.1.0-beta.195.patch

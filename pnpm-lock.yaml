@@ -5,6 +5,9 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
+  '@xterm/addon-image@0.9.0':
+    hash: eaf370f56756886fbc4d639ee1e148c5fb7bd2c444e71791fd9e3db5431d7c89
+    path: patches/@xterm__addon-image@0.9.0.patch
   '@xterm/addon-webgl@0.20.0-beta.194':
     hash: d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1
     path: patches/@xterm__addon-webgl@0.20.0-beta.194.patch
