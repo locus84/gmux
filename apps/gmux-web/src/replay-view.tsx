@@ -101,14 +101,17 @@ export function ReplayView({
       },
     })
     const fit = new FitAddon()
+    const touchDevice = isTouchDevice()
     term.loadAddon(fit)
-    term.loadAddon(new ImageAddon())
+    // On touch devices, terminal readability wins over inline image previews:
+    // xterm's image addon owns canvas layers that can leave Mobile Safari's
+    // terminal black/blank even without WebGL.
+    if (!touchDevice) term.loadAddon(new ImageAddon())
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
-    // Mobile Safari/WebKit is prone to black/blank canvases when xterm's
-    // image addon and WebGL renderer share the terminal screen. Keep replay
-    // image rendering on the safer built-in renderer for touch devices.
-    if (!isTouchDevice()) loadWebglRenderer(term)
+    // Desktop keeps WebGL acceleration; touch devices use the safer built-in
+    // renderer and skip ImageAddon above.
+    if (!touchDevice) loadWebglRenderer(term)
     // Vertical-only fit: use FitAddon's proposal for rows, but keep cols
     // pinned to the recording. FitAddon already knows the cell metrics
     // and shell-padding accounting; reusing it for the row dimension is
