@@ -492,20 +492,16 @@ export function TerminalView({
       },
     })
     const fitAddon = new FitAddon()
-    const touchDevice = isTouchDevice()
     term.loadAddon(fitAddon)
-    // Mobile Safari/WebKit can turn the terminal black after inline image
-    // output. WebGL was the first suspect, but xterm's image addon also
-    // owns full-screen canvas layers, so skip image rendering entirely on
-    // touch devices to preserve terminal continuity.
-    if (!touchDevice) term.loadAddon(new ImageAddon())
+    term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
-    // Desktop keeps WebGL acceleration; touch devices use the safer built-in
-    // renderer and skip ImageAddon above.
-    if (!touchDevice) loadWebglRenderer(term)
+    // Mobile Safari/WebKit can turn the terminal black after inline image
+    // output when xterm's image addon is combined with WebGL. Prefer the
+    // safer built-in renderer on touch devices; desktop keeps WebGL.
+    if (!isTouchDevice()) loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
     const disposeIconFontWatch = refreshAtlasWhenIconFontLoads(term, terminalOptions.fontSize)
