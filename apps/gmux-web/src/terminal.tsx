@@ -16,7 +16,7 @@ import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
-import { installTouchInlineImageDecodeFallback } from './xterm-image-compat'
+import { createTouchInlineImageSanitizer, installTouchInlineImageDecodeFallback, type InlineImageSanitizer } from './xterm-image-compat'
 import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
@@ -259,6 +259,7 @@ export function TerminalView({
   const ctrlArmedRef = useRef(ctrlArmed)
   const altArmedRef = useRef(altArmed)
   const termIoRef = useRef<ReturnType<typeof createTerminalIO> | null>(null)
+  const inlineImageSanitizerRef = useRef<InlineImageSanitizer | null>(null)
   const termEpochRef = useRef(0)
 
   // True once the terminal's font is downloaded; gates xterm mount.
@@ -303,11 +304,17 @@ export function TerminalView({
   }, [])
 
   const queueData = useCallback((data: Uint8Array, onWritten?: () => void) => {
-    termIoRef.current?.enqueue(data, termEpochRef.current, onWritten)
+    const chunks = inlineImageSanitizerRef.current?.transform(data) ?? [data]
+    if (!chunks.length) return
+    termIoRef.current?.enqueueMany(chunks, termEpochRef.current, onWritten)
   }, [])
 
   const queueMany = useCallback((chunks: Uint8Array[], onWritten?: () => void) => {
-    termIoRef.current?.enqueueMany(chunks, termEpochRef.current, onWritten)
+    const sanitized = inlineImageSanitizerRef.current
+      ? chunks.flatMap(chunk => inlineImageSanitizerRef.current?.transform(chunk) ?? [chunk])
+      : chunks
+    if (!sanitized.length) return
+    termIoRef.current?.enqueueMany(sanitized, termEpochRef.current, onWritten)
   }, [])
 
   const resetResizeEchoGate = useCallback(() => {
@@ -495,6 +502,7 @@ export function TerminalView({
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     installTouchInlineImageDecodeFallback()
+    inlineImageSanitizerRef.current = createTouchInlineImageSanitizer(term)
     term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
@@ -541,7 +549,8 @@ export function TerminalView({
       const bin = atob(b64)
       const bytes = new Uint8Array(bin.length)
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-      termIoRef.current?.enqueue(bytes, termEpochRef.current)
+      const chunks = inlineImageSanitizerRef.current?.transform(bytes) ?? [bytes]
+      if (chunks.length) termIoRef.current?.enqueueMany(chunks, termEpochRef.current)
     }
 
     const sendRawInput = (data: string) => {
@@ -1271,6 +1280,7 @@ export function TerminalView({
       intentionalClose = true
       termEpochRef.current = epoch + 1
       termIoRef.current?.reset(termEpochRef.current)
+      inlineImageSanitizerRef.current?.reset()
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       reconnectTimer.current = null
       resetResizeEchoGate()

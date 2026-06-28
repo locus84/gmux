@@ -6,7 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ITerminalOptions } from '@xterm/xterm'
 import { loadWebglRenderer } from './webgl-renderer'
 import { isTouchDevice } from './touch'
-import { installTouchInlineImageDecodeFallback } from './xterm-image-compat'
+import { createTouchInlineImageSanitizer, installTouchInlineImageDecodeFallback } from './xterm-image-compat'
 import type { Session } from './types'
 import { fetchScrollback, type ScrollbackResult } from './replay-fetch'
 import { JumpToBottom } from './jump-to-bottom'
@@ -33,6 +33,17 @@ function resumeButtonLabel(kind: string, busy: boolean): string {
   const isAgent = RESUMABLE_AGENT_KINDS.has(kind)
   if (busy) return isAgent ? 'Resuming…' : 'Rerunning…'
   return isAgent ? 'Resume' : 'Rerun'
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.length
+  }
+  return out
 }
 
 /**
@@ -104,6 +115,7 @@ export function ReplayView({
     const fit = new FitAddon()
     term.loadAddon(fit)
     installTouchInlineImageDecodeFallback()
+    const inlineImageSanitizer = createTouchInlineImageSanitizer(term)
     term.loadAddon(new ImageAddon())
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
@@ -140,7 +152,9 @@ export function ReplayView({
       if (cancelled) return
       setState(result)
       if (result.kind === 'bytes') {
-        term.write(result.bytes, () => {
+        const chunks = inlineImageSanitizer.transform(result.bytes)
+        const writePayload = chunks.length === 1 ? chunks[0] : concatBytes(chunks)
+        term.write(writePayload, () => {
           // The write callback is async: between term.write and the
           // callback firing, the effect's cleanup may have run
           // (component unmount / session.id switch) and disposed
@@ -163,6 +177,7 @@ export function ReplayView({
       window.removeEventListener('resize', onResize)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null
       setTerm(null)
+      inlineImageSanitizer.reset()
       term.dispose()
     }
   }, [session.id])
