@@ -902,18 +902,7 @@ export function TerminalView({
         // so the link can't be activated twice. When a link opens, skip
         // the keyboard focus/scroll — the tap was navigation, not input
         // intent.
-        const tappedLink = linkAtPoint(term, touchPanState.start.x, touchPanState.start.y)
-        const fileTarget = tappedLink ? fileBrowserTargetForLink(tappedLink, sessionRef.current, sessionsSignal.value) : null
-        if (fileTarget) {
-          ev.preventDefault()
-          navigate(fileBrowserPath(fileTarget.sessionId, fileTarget.path))
-          cancelDragScroll(true)
-          cancelScrollMomentum()
-          resetTouchPan()
-          return
-        }
-
-        if (tappedLink && openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+        if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
           ev.preventDefault()
           cancelDragScroll(true)
           cancelScrollMomentum()
