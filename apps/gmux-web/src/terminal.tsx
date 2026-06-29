@@ -16,7 +16,6 @@ import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
-import { installTouchInlineImageDecodeFallback } from './xterm-image-compat'
 import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
@@ -494,7 +493,6 @@ export function TerminalView({
     })
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
-    installTouchInlineImageDecodeFallback()
     term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
