@@ -20,7 +20,7 @@ export function installTouchInlineImageDecodeFallback(): void {
   if (installed) return
   installed = true
 
-  if (!isTouchDevice()) return
+  if (!shouldDisableCreateImageBitmapOnTouch()) return
   if (!window.createImageBitmap) return
 
   try {
@@ -40,7 +40,30 @@ export function installTouchInlineImageDecodeFallback(): void {
 }
 
 export function shouldUseTouchInlineImageDecodeFallback(): boolean {
-  return isTouchDevice()
+  return shouldDisableCreateImageBitmapOnTouch()
+}
+
+function shouldDisableCreateImageBitmapOnTouch(): boolean {
+  if (!isTouchDevice()) return false
+  // Android Chromium/Edge needs native createImageBitmap for xterm's native
+  // Kitty graphics path. Only force the HTMLImageElement fallback on WebKit,
+  // where ImageBitmap-backed inline images have been observed to render blank
+  // or black.
+  return isWebKitWithoutChromium()
+}
+
+function shouldPreserveNativeKittyGraphics(): boolean {
+  return isAndroidChromium()
+}
+
+function isAndroidChromium(): boolean {
+  const ua = navigator.userAgent
+  return /Android/i.test(ua) && /(?:Chrome|CriOS|EdgA|EdgiOS|SamsungBrowser)\//i.test(ua)
+}
+
+function isWebKitWithoutChromium(): boolean {
+  const ua = navigator.userAgent
+  return /AppleWebKit/i.test(ua) && !/(?:Chrome|CriOS|Chromium|Edg|EdgA|OPR|SamsungBrowser)\//i.test(ua)
 }
 
 const IIP_FILE_PREFIX = '\x1b]1337;File='
@@ -83,6 +106,10 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
   let pendingKittyColumns: number | undefined
   let pendingKittyRows: number | undefined
   let pendingKittyCursorMovement: number | undefined
+  let pendingNativeKittyRows: number | undefined
+  let pendingNativeKittyPlacedRows: number | undefined
+  let pendingNativeKittyCursorMovement: number | undefined
+  let pendingCursorDownRewrite: { from: number; to: number } | undefined
 
   const encode = (value: string): Uint8Array => {
     const out = new Uint8Array(value.length)
@@ -138,7 +165,17 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
       let value = pending + decode(data)
       pending = ''
 
+      const preserveNativeKitty = shouldPreserveNativeKittyGraphics()
       while (value.length) {
+        if (pendingCursorDownRewrite) {
+          const rewritten = rewritePendingCursorDown(value)
+          if (!rewritten.ready) {
+            pending = value
+            break
+          }
+          value = rewritten.value
+        }
+
         const iipStart = value.indexOf(IIP_FILE_PREFIX)
         const kittyStart = value.indexOf(KITTY_GRAPHICS_PREFIX)
         const starts = [iipStart, kittyStart].filter(index => index >= 0)
@@ -160,8 +197,11 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
             value = ''
             break
           }
-          const converted = convertKittyGraphicsCommand(value.slice(0, end + APC_TERMINATOR.length))
-          if (converted) out.push(encode(converted))
+          const command = value.slice(0, end + APC_TERMINATOR.length)
+          const rewritten = preserveNativeKitty
+            ? rewriteNativeKittyGraphicsCommand(command)
+            : convertKittyGraphicsCommand(command)
+          if (rewritten) out.push(encode(rewritten))
           value = value.slice(end + APC_TERMINATOR.length)
           continue
         }
@@ -207,7 +247,61 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
       pendingKittyColumns = undefined
       pendingKittyRows = undefined
       pendingKittyCursorMovement = undefined
+      pendingNativeKittyRows = undefined
+      pendingNativeKittyPlacedRows = undefined
+      pendingNativeKittyCursorMovement = undefined
+      pendingCursorDownRewrite = undefined
     },
+  }
+
+  function rewritePendingCursorDown(value: string): { ready: boolean; value: string } {
+    const rewrite = pendingCursorDownRewrite
+    if (!rewrite) return { ready: true, value }
+    const fromSeq = `\x1b[${rewrite.from}B`
+    if (value.length < fromSeq.length && fromSeq.startsWith(value)) return { ready: false, value }
+    pendingCursorDownRewrite = undefined
+    if (!value.startsWith(fromSeq)) return { ready: true, value }
+    const toSeq = rewrite.to > 0 ? `\x1b[${rewrite.to}B` : ''
+    return { ready: true, value: `${toSeq}${value.slice(fromSeq.length)}` }
+  }
+
+  function rewriteNativeKittyGraphicsCommand(command: string): string {
+    const body = command.slice(KITTY_GRAPHICS_PREFIX.length, -APC_TERMINATOR.length)
+    const separator = body.indexOf(';')
+    if (separator === -1) return command
+
+    const paramText = body.slice(0, separator)
+    const params = parseKittyParams(paramText)
+    const action = params.get('a') ?? ''
+    if (action && action !== 'T' && action !== 't') return command
+
+    const rows = parsePositiveInteger(params.get('r'))
+    const cursorMovement = parseNonNegativeInteger(params.get('C'))
+    const maxRows = mobileNativeKittyMaxRows(term.rows)
+    const placedRows = rows ? Math.min(rows, maxRows) : undefined
+    if (rows) {
+      pendingNativeKittyRows = rows
+      pendingNativeKittyPlacedRows = placedRows
+    }
+    if (cursorMovement !== undefined) pendingNativeKittyCursorMovement = cursorMovement
+
+    const more = params.get('m') === '1'
+    const rewrittenParams = rows && placedRows && placedRows < rows
+      ? rewriteKittyParam(paramText, 'r', String(placedRows))
+      : paramText
+    if (!more) {
+      const requested = pendingNativeKittyRows
+      const placed = pendingNativeKittyPlacedRows
+      const cursor = pendingNativeKittyCursorMovement
+      pendingNativeKittyRows = undefined
+      pendingNativeKittyPlacedRows = undefined
+      pendingNativeKittyCursorMovement = undefined
+      if (cursor === 1 && requested && placed && placed < requested) {
+        pendingCursorDownRewrite = { from: Math.max(0, requested - 1), to: Math.max(0, placed - 1) }
+      }
+    }
+
+    return `${KITTY_GRAPHICS_PREFIX}${rewrittenParams};${body.slice(separator + 1)}${APC_TERMINATOR}`
   }
 
   function convertKittyGraphicsCommand(command: string): string {
@@ -265,6 +359,10 @@ function mobileInlineImageMaxRows(rows: number): number {
   return Math.max(4, Math.min(18, Math.floor(rows * 0.45) || 18))
 }
 
+function mobileNativeKittyMaxRows(rows: number): number {
+  return Math.max(6, Math.min(12, Math.floor(rows * 0.3) || 12))
+}
+
 function chooseInlineImageConstraint(term: Terminal, dims: ImageDimensions, maxRows: number, requestedCols?: number): string {
   return chooseInlineImagePlacement(term, dims, maxRows, requestedCols).constraint
 }
@@ -292,6 +390,18 @@ function chooseFixedCellInlineImagePlacement(term: Terminal, requestedCols: numb
     rows,
     preserveAspectRatio: 0,
   }
+}
+
+function rewriteKittyParam(value: string, key: string, nextValue: string): string {
+  let found = false
+  const parts = value.split(',').map(part => {
+    const eq = part.indexOf('=')
+    if (eq <= 0 || part.slice(0, eq) !== key) return part
+    found = true
+    return `${key}=${nextValue}`
+  })
+  if (!found) parts.push(`${key}=${nextValue}`)
+  return parts.join(',')
 }
 
 function parseKittyParams(value: string): Map<string, string> {

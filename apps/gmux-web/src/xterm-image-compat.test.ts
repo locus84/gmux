@@ -85,10 +85,10 @@ describe('shouldUseTouchInlineImageDecodeFallback', () => {
     matchMediaMock.mockClear()
   })
 
-  it('uses the canvas decode fallback on Android Edge Chromium touch', () => {
+  it('keeps native ImageBitmap on Android Edge Chromium touch for Kitty graphics', () => {
     setAndroidEdgeNavigator()
 
-    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(true)
+    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(false)
   })
 
   it('uses the canvas decode fallback on iPad WebKit', () => {
@@ -157,19 +157,18 @@ describe('createTouchInlineImageSanitizer', () => {
     expect(rewritten).not.toContain('\x1b[17A')
   })
 
-  it('converts kitty graphics on Android Edge while using the canvas decode fallback', () => {
+  it('keeps native kitty graphics on Android Edge while capping reserved image rows', () => {
     setAndroidEdgeNavigator()
-    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(true)
+    expect(shouldUseTouchInlineImageDecodeFallback()).toBe(false)
     const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
     const image = pngBase64(720, 1280)
-    const payload = `before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=18;${image}\x1b\\after`
+    const payload = `before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=18;${image}\x1b\\\x1b[17Bafter`
 
     const rewritten = text(sanitizer.transform(bytes(payload)))
 
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=49;height=18;preserveAspectRatio=0;doNotMoveCursor=1:')
-    expect(rewritten).toContain('\x07after')
-    expect(rewritten).not.toContain('\x1b[17A')
-    expect(rewritten).not.toContain('\x1b_G')
+    expect(rewritten).toContain(`before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=12;${image}\x1b\\`)
+    expect(rewritten).toContain('\x1b[11Bafter')
+    expect(rewritten).not.toContain('\x1b]1337;File=')
   })
 
   it('clamps oversized kitty cell placements to the mobile viewport', () => {
