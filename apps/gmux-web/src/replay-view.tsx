@@ -5,7 +5,7 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ITerminalOptions } from '@xterm/xterm'
 import { loadWebglRenderer } from './webgl-renderer'
-import { configureImageCanvasDprCorrection, imageAddonOptionsForTouchDevice, shouldLoadWebglRenderer } from './terminal-image'
+import { imageAddonOptionsForTouchDevice, shouldLoadWebglRenderer } from './terminal-image'
 import { isTouchDevice } from './touch'
 import type { Session } from './types'
 import { fetchScrollback, type ScrollbackResult } from './replay-fetch'
@@ -107,7 +107,6 @@ export function ReplayView({
     term.loadAddon(new ImageAddon(imageAddonOptionsForTouchDevice(touchDevice)))
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
-    configureImageCanvasDprCorrection(containerRef.current, touchDevice)
     if (shouldLoadWebglRenderer(touchDevice)) loadWebglRenderer(term)
     // Vertical-only fit: use FitAddon's proposal for rows, but keep cols
     // pinned to the recording. FitAddon already knows the cell metrics
