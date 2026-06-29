@@ -250,8 +250,8 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
         : requestedColumns
           ? { constraint: `width=${requestedColumns}`, rows: requestedRows ?? 1, preserveAspectRatio: 1 }
           : { constraint: `height=${maxRows}`, rows: Math.min(requestedRows ?? maxRows, maxRows), preserveAspectRatio: 1 }
-    const noCursorMove = cursorMovement === 1 ? ';doNotMoveCursor=1' : ''
-    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${placement.constraint};preserveAspectRatio=${placement.preserveAspectRatio}${noCursorMove}:${base64}\x07`
+    const restoreCursor = cursorMovement === 1 && placement.rows > 1 ? `\x1b[${placement.rows - 1}A` : ''
+    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${placement.constraint};preserveAspectRatio=${placement.preserveAspectRatio}:${base64}\x07${restoreCursor}`
   }
 }
 

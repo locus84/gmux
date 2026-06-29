@@ -140,10 +140,9 @@ describe('createTouchInlineImageSanitizer', () => {
     const rewritten = text(sanitizer.transform(bytes(payload)))
 
     expect(rewritten).toContain('before')
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=49;height=18;preserveAspectRatio=0;doNotMoveCursor=1:')
+    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=49;height=18;preserveAspectRatio=0:')
     expect(rewritten).toContain(image)
-    expect(rewritten).toContain('\x07after')
-    expect(rewritten).not.toContain('\x1b[17A')
+    expect(rewritten).toContain('\x07\x1b[17Aafter')
     expect(rewritten).not.toContain('\x1b_G')
   })
 
@@ -166,9 +165,8 @@ describe('createTouchInlineImageSanitizer', () => {
 
     const rewritten = text(sanitizer.transform(bytes(payload)))
 
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=49;height=18;preserveAspectRatio=0;doNotMoveCursor=1:')
-    expect(rewritten).toContain('\x07after')
-    expect(rewritten).not.toContain('\x1b[17A')
+    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=49;height=18;preserveAspectRatio=0:')
+    expect(rewritten).toContain('\x07\x1b[17Aafter')
     expect(rewritten).not.toContain('\x1b_G')
   })
 
@@ -179,8 +177,8 @@ describe('createTouchInlineImageSanitizer', () => {
 
     const rewritten = text(sanitizer.transform(bytes(payload)))
 
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=80;height=18;preserveAspectRatio=0;doNotMoveCursor=1:')
-    expect(rewritten).toContain('\x07after')
+    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=80;height=18;preserveAspectRatio=0:')
+    expect(rewritten).toContain('\x07\x1b[17Aafter')
   })
 
   it('joins chunked kitty graphics payloads before converting on WebKit touch devices', () => {
