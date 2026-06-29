@@ -34,7 +34,7 @@
  * and tap-vs-pan-vs-long-press discrimination lives in the touch
  * handler regardless. The tap decision stays a flat branch there.
  */
-import type { Terminal } from '@xterm/xterm'
+import type { ILinkProvider, Terminal } from '@xterm/xterm'
 import type { Session } from './types'
 
 /**
@@ -147,6 +147,61 @@ export interface FileBrowserLinkTarget {
   path: string
 }
 
+export function createFileLinkProvider(term: Terminal, activate: (uri: string) => void): ILinkProvider {
+  return {
+    provideLinks(y, callback) {
+      const line = term.buffer.active.getLine(y - 1)
+      if (!line) { callback(undefined); return }
+      const text = line.translateToString(false)
+      const links = terminalFileLinksInLine(text, y).map(link => ({
+        text: link.text,
+        range: link.range,
+        activate: (_event: MouseEvent, uri: string) => activate(uri),
+      }))
+      callback(links)
+    },
+  }
+}
+
+export function terminalFileLinksInLine(text: string, y: number): InternalLink[] {
+  const links: InternalLink[] = []
+  const occupied: Array<{ start: number; end: number }> = []
+  const add = (startIndex: number, label: string, uri: string) => {
+    const endIndex = startIndex + label.length
+    if (occupied.some(r => startIndex < r.end && endIndex > r.start)) return
+    occupied.push({ start: startIndex, end: endIndex })
+    links.push({
+      text: uri,
+      range: {
+        start: { x: startIndex + 1, y },
+        end: { x: endIndex, y },
+      },
+    })
+  }
+
+  for (const match of text.matchAll(/file:\/\/(?:localhost)?\/[^\s<>"'`)}\]]+/g)) {
+    const raw = trimTrailingLinkPunctuation(match[0])
+    if (absolutePathFromFileUri(raw)) add(match.index ?? 0, raw, raw)
+  }
+
+  for (const match of text.matchAll(/(^|[\s([{"'`])((?:\/[^/\s<>"'`)}\]]+)+\.[A-Za-z0-9][A-Za-z0-9._+-]{0,15})/g)) {
+    const prefix = match[1] ?? ''
+    const raw = trimTrailingLinkPunctuation(match[2] ?? '')
+    if (!raw) continue
+    add((match.index ?? 0) + prefix.length, raw, pathToFileUri(raw))
+  }
+
+  return links
+}
+
+function trimTrailingLinkPunctuation(value: string): string {
+  return value.replace(/[.,;:!?]+$/g, '')
+}
+
+function pathToFileUri(path: string): string {
+  return `file://${path.split('/').map((part, idx) => idx === 0 ? '' : encodeURIComponent(part)).join('/')}`
+}
+
 /** Resolve a terminal `file://` link into an existing gmux file-browser target.
  * The backend still enforces workspace-root safety; this helper only chooses a
  * session whose advertised workspace root/cwd contains the absolute file path.
@@ -167,6 +222,15 @@ export function fileBrowserTargetForLink(link: LinkInfo, currentSession: Session
     }
   }
   return best ? { sessionId: best.sessionId, path: best.path } : null
+}
+
+export function isSafeExternalLinkUri(uri: string): boolean {
+  try {
+    const url = new URL(uri)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
 }
 
 export function absolutePathFromFileUri(uri: string): string | null {

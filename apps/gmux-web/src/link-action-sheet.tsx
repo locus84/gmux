@@ -20,9 +20,10 @@ export interface LinkActionSheetProps {
   onClose: () => void
   openLabel?: string
   onOpen?: () => void
+  canOpen?: boolean
 }
 
-export function LinkActionSheet({ link, onClose, openLabel = 'Open', onOpen }: LinkActionSheetProps) {
+export function LinkActionSheet({ link, onClose, openLabel = 'Open', onOpen, canOpen = true }: LinkActionSheetProps) {
   const showLabel = link.label !== link.uri
 
   const handleOpen = () => {
@@ -40,7 +41,7 @@ export function LinkActionSheet({ link, onClose, openLabel = 'Open', onOpen }: L
         </div>
         <div class="link-sheet-actions">
           <CopyButton label="Copy URL" text={link.uri} />
-          <SheetButton primary onActivate={handleOpen}>{openLabel}</SheetButton>
+          {canOpen && <SheetButton primary onActivate={handleOpen}>{openLabel}</SheetButton>}
         </div>
       </div>
     </SheetBackdrop>
