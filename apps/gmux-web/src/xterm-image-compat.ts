@@ -42,8 +42,6 @@ export function installTouchInlineImageDecodeFallback(): void {
 }
 
 const IIP_FILE_PREFIX = '\x1b]1337;File='
-const KITTY_GRAPHICS_PREFIX = '\x1b_G'
-const APC_TERMINATOR = '\x1b\\'
 const MAX_IIP_HEADER_CHARS = 2048
 const MAX_IMAGE_PROBE_BASE64_CHARS = 8192
 const COMMON_HEADER_PROBE_BASE64_CHARS = 160
@@ -77,8 +75,6 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
   }
 
   let pending = ''
-  let pendingKittyBase64 = ''
-  let pendingKittyColumns: number | undefined
 
   const encode = (value: string): Uint8Array => {
     const out = new Uint8Array(value.length)
@@ -93,10 +89,7 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
   }
 
   const flushNormalPrefix = (value: string, out: Uint8Array[]): string => {
-    const keep = Math.max(
-      suffixPrefixLength(value, IIP_FILE_PREFIX),
-      suffixPrefixLength(value, KITTY_GRAPHICS_PREFIX),
-    )
+    const keep = suffixPrefixLength(value, IIP_FILE_PREFIX)
     if (keep === value.length) return value
     const emit = value.slice(0, value.length - keep)
     if (emit) out.push(encode(emit))
@@ -106,16 +99,13 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
   const rewriteHeader = (header: string, probeBase64: string): string => {
     const colon = header.length - 1
     const argText = header.slice(IIP_FILE_PREFIX.length, colon)
-    let hasSize = false
     const args = argText
       .split(';')
       .filter(Boolean)
       .filter(arg => {
         const key = arg.slice(0, arg.indexOf('=') === -1 ? arg.length : arg.indexOf('='))
-        if (key === 'size') hasSize = true
         return key !== 'width' && key !== 'height' && key !== 'preserveAspectRatio'
       })
-    if (!hasSize) args.push(`size=${estimateBase64DecodedSize(probeBase64)}`)
 
     const maxRows = mobileInlineImageMaxRows(term.rows)
     const dims = imageDimensionsFromBase64(probeBase64)
@@ -135,10 +125,7 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
       pending = ''
 
       while (value.length) {
-        const iipStart = value.indexOf(IIP_FILE_PREFIX)
-        const kittyStart = value.indexOf(KITTY_GRAPHICS_PREFIX)
-        const starts = [iipStart, kittyStart].filter(index => index >= 0)
-        const start = starts.length ? Math.min(...starts) : -1
+        const start = value.indexOf(IIP_FILE_PREFIX)
         if (start === -1) {
           pending = flushNormalPrefix(value, out)
           break
@@ -147,19 +134,6 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
         if (start > 0) {
           out.push(encode(value.slice(0, start)))
           value = value.slice(start)
-        }
-
-        if (value.startsWith(KITTY_GRAPHICS_PREFIX)) {
-          const end = value.indexOf(APC_TERMINATOR, KITTY_GRAPHICS_PREFIX.length)
-          if (end === -1) {
-            pending = value
-            value = ''
-            break
-          }
-          const converted = convertKittyGraphicsCommand(value.slice(0, end + APC_TERMINATOR.length))
-          if (converted) out.push(encode(converted))
-          value = value.slice(end + APC_TERMINATOR.length)
-          continue
         }
 
         const colon = value.indexOf(':', IIP_FILE_PREFIX.length)
@@ -199,42 +173,7 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
 
     reset(): void {
       pending = ''
-      pendingKittyBase64 = ''
-      pendingKittyColumns = undefined
     },
-  }
-
-  function convertKittyGraphicsCommand(command: string): string {
-    const body = command.slice(KITTY_GRAPHICS_PREFIX.length, -APC_TERMINATOR.length)
-    const separator = body.indexOf(';')
-    if (separator === -1) return command
-
-    const params = parseKittyParams(body.slice(0, separator))
-    const payload = body.slice(separator + 1)
-    const action = params.get('a') ?? (pendingKittyBase64 ? 'T' : '')
-    if (action && action !== 'T' && action !== 't') return command
-
-    const more = params.get('m') === '1'
-    const columns = parsePositiveInteger(params.get('c'))
-    if (columns) pendingKittyColumns = columns
-    pendingKittyBase64 += payload
-
-    if (more) return ''
-
-    const base64 = pendingKittyBase64
-    const requestedColumns = pendingKittyColumns
-    pendingKittyBase64 = ''
-    pendingKittyColumns = undefined
-    if (!base64) return ''
-
-    const maxRows = mobileInlineImageMaxRows(term.rows)
-    const dims = imageDimensionsFromBase64(base64)
-    const constraint = dims
-      ? chooseInlineImageConstraint(term, dims, maxRows, requestedColumns)
-      : requestedColumns
-        ? `width=${requestedColumns}`
-        : `height=${maxRows}`
-    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${constraint};preserveAspectRatio=1:${base64}\x07`
   }
 }
 
@@ -242,37 +181,13 @@ function mobileInlineImageMaxRows(rows: number): number {
   return Math.max(4, Math.min(18, Math.floor(rows * 0.45) || 18))
 }
 
-function chooseInlineImageConstraint(term: Terminal, dims: ImageDimensions, maxRows: number, requestedCols?: number): string {
+function chooseInlineImageConstraint(term: Terminal, dims: ImageDimensions, maxRows: number): string {
   const activeBuffer = term.buffer.active as unknown as { cursorX?: number }
   const availableCols = Math.max(1, term.cols - (activeBuffer.cursorX ?? 0))
-  const maxCols = Math.max(1, Math.min(availableCols, requestedCols ?? availableCols))
   const cellWidth = term.dimensions?.css.cell.width || 1
   const cellHeight = term.dimensions?.css.cell.height || 2
-  const rowsAtFullWidth = maxCols * (dims.height / dims.width) * (cellWidth / cellHeight)
-  return rowsAtFullWidth <= maxRows ? `width=${maxCols}` : `height=${maxRows}`
-}
-
-function parseKittyParams(value: string): Map<string, string> {
-  const params = new Map<string, string>()
-  for (const part of value.split(',')) {
-    const eq = part.indexOf('=')
-    if (eq <= 0) continue
-    params.set(part.slice(0, eq), part.slice(eq + 1))
-  }
-  return params
-}
-
-function parsePositiveInteger(value: string | undefined): number | undefined {
-  if (!value) return undefined
-  const parsed = Number.parseInt(value, 10)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
-}
-
-function estimateBase64DecodedSize(value: string): number {
-  const clean = value.replace(/[^A-Za-z0-9+/=]/g, '')
-  if (!clean) return 0
-  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0
-  return Math.max(0, Math.floor(clean.length * 3 / 4) - padding)
+  const rowsAtFullWidth = availableCols * (dims.height / dims.width) * (cellWidth / cellHeight)
+  return rowsAtFullWidth <= maxRows ? `width=${availableCols}` : `height=${maxRows}`
 }
 
 function suffixPrefixLength(value: string, prefix: string): number {

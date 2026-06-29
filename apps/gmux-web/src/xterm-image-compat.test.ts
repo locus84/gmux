@@ -81,7 +81,7 @@ describe('createTouchInlineImageSanitizer', () => {
 
     const rewritten = text(sanitizer.transform(bytes(payload)))
 
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;width=80;preserveAspectRatio=1:')
+    expect(rewritten).toContain('\x1b]1337;File=inline=1;width=80;preserveAspectRatio=1:')
   })
 
   it('waits for a split inline image header before rewriting', () => {
@@ -91,33 +91,5 @@ describe('createTouchInlineImageSanitizer', () => {
     const rewritten = text(sanitizer.transform(bytes(`le=inline=1:${pngBase64(720, 1280)}\x07`)))
 
     expect(rewritten).toContain('height=18;preserveAspectRatio=1')
-  })
-
-  it('converts kitty graphics output to iTerm inline images on touch devices', () => {
-    const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
-    const image = pngBase64(720, 1280)
-    const payload = `before\x1b_Ga=T,f=100,q=2,C=1,c=49,r=18;${image}\x1b\\after`
-
-    const rewritten = text(sanitizer.transform(bytes(payload)))
-
-    expect(rewritten).toContain('before')
-    expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;height=18;preserveAspectRatio=1:')
-    expect(rewritten).toContain(image)
-    expect(rewritten).toContain('after')
-    expect(rewritten).not.toContain('\x1b_G')
-  })
-
-  it('joins chunked kitty graphics payloads before converting', () => {
-    const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
-    const image = pngBase64(1280, 320)
-    const first = image.slice(0, 20)
-    const second = image.slice(20)
-
-    const firstOut = text(sanitizer.transform(bytes(`\x1b_Ga=T,f=100,m=1,c=40;${first}\x1b\\`)))
-    const secondOut = text(sanitizer.transform(bytes(`\x1b_Gm=0;${second}\x1b\\`)))
-
-    expect(firstOut).toBe('')
-    expect(secondOut).toContain('\x1b]1337;File=inline=1;size=32;width=40;preserveAspectRatio=1:')
-    expect(secondOut).toContain(image)
   })
 })
