@@ -6,6 +6,7 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import { loadWebglRenderer } from './webgl-renderer'
+import { imageAddonOptionsForTouchDevice, shouldLoadWebglRenderer } from './terminal-image'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handleBlobPasteAction, handlePasteAction } from './keyboard'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
@@ -492,13 +493,14 @@ export function TerminalView({
       },
     })
     const fitAddon = new FitAddon()
+    const touchDevice = isTouchDevice()
     term.loadAddon(fitAddon)
-    term.loadAddon(new ImageAddon())
+    term.loadAddon(new ImageAddon(imageAddonOptionsForTouchDevice(touchDevice)))
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
-    loadWebglRenderer(term)
+    if (shouldLoadWebglRenderer(touchDevice)) loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
     const disposeIconFontWatch = refreshAtlasWhenIconFontLoads(term, terminalOptions.fontSize)
