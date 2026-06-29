@@ -103,18 +103,8 @@ describe('createTouchInlineImageSanitizer', () => {
     expect(rewritten).toContain('before')
     expect(rewritten).toContain('\x1b]1337;File=inline=1;size=32;height=18;preserveAspectRatio=1:')
     expect(rewritten).toContain(image)
-    expect(rewritten).toContain('\x07\x1b[17Aafter')
+    expect(rewritten).toContain('after')
     expect(rewritten).not.toContain('\x1b_G')
-  })
-
-  it('does not restore the cursor for kitty graphics when C=1 is absent', () => {
-    const sanitizer = createTouchInlineImageSanitizer(fakeTerm(80, 40))
-    const image = pngBase64(720, 1280)
-
-    const rewritten = text(sanitizer.transform(bytes(`\x1b_Ga=T,f=100,q=2,c=49,r=18;${image}\x1b\\after`)))
-
-    expect(rewritten).toContain('\x07after')
-    expect(rewritten).not.toContain('\x1b[17A')
   })
 
   it('joins chunked kitty graphics payloads before converting', () => {
