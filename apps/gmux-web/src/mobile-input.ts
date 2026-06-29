@@ -122,22 +122,22 @@ export function isAppleMobileWebKit(): boolean {
 }
 
 export function shouldDropMobileWebKitRawJamo(data: string): boolean {
-  // iPadOS may present as desktop Safari, so gate this on Apple WebKit rather
-  // than the stricter mobile heuristic. This runs only in the terminal input
-  // path; the mobile IME handler sends composed Hangul separately.
-  return isAppleWebKit() && [...data].length === 1 && isCompatibilityJamo(data)
+  // Only the mobile/iPad WebKit workaround owns raw jamo. Desktop Korean IMEs
+  // legitimately emit compatibility jamo as composition data; dropping it on
+  // Mac Chrome/Edge/Safari makes repeated consonants like ㅇㅇ disappear.
+  return isAppleMobileWebKit() && [...data].length === 1 && isCompatibilityJamo(data)
 }
 
 export function shouldSkipMobileWebKitImeData(data: string): boolean {
-  return isAppleWebKit() && (activeWebKitIme?.shouldSkip(data) ?? shouldDropMobileWebKitRawJamo(data))
+  return isAppleMobileWebKit() && (activeWebKitIme?.shouldSkip(data) ?? shouldDropMobileWebKitRawJamo(data))
 }
 
 export function flushMobileWebKitImePending(): void {
-  if (isAppleWebKit()) activeWebKitIme?.flushPending()
+  if (isAppleMobileWebKit()) activeWebKitIme?.flushPending()
 }
 
 export function shouldBlockMobileWebKitImeKey(ev: KeyboardEvent): boolean {
-  if (!isAppleWebKit()) return false
+  if (!isAppleMobileWebKit()) return false
   // Some iPad Korean IMEs report Backspace with keyCode 229; let the mobile
   // input handler process editing keys instead of xterm's generic IME block.
   if (ev.key === 'Backspace' || ev.key === 'Delete' || ev.keyCode === 8 || ev.keyCode === 46) return false

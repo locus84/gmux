@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { attachMobileInputHandler, createKoreanJamoInputFilter, shouldBlockMobileWebKitImeKey, shouldDropMobileWebKitRawJamo } from './mobile-input'
+import { attachMobileInputHandler, createKoreanJamoInputFilter, shouldBlockMobileWebKitImeKey, shouldDropMobileWebKitRawJamo, shouldSkipMobileWebKitImeData } from './mobile-input'
 
 // Mock window.matchMedia to simulate a touch-primary device.
 // The handler guards on (pointer: coarse) and is a no-op on desktop.
@@ -371,6 +371,22 @@ describe('attachMobileInputHandler', () => {
     expect(shouldDropMobileWebKitRawJamo('ㅏ')).toBe(true)
     expect(shouldDropMobileWebKitRawJamo('가')).toBe(false)
     expect(shouldDropMobileWebKitRawJamo('a')).toBe(false)
+  })
+
+  it('does not treat desktop Mac WebKit Korean IME data as mobile raw-jamo leakage', () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        ...(globalThis.navigator ?? {}),
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0',
+        platform: 'MacIntel',
+        maxTouchPoints: 0,
+      },
+      configurable: true,
+    })
+
+    expect(shouldDropMobileWebKitRawJamo('ㅇ')).toBe(false)
+    expect(shouldSkipMobileWebKitImeData('ㅇ')).toBe(false)
+    expect(shouldBlockMobileWebKitImeKey({ key: 'ㅇ', keyCode: 229 } as KeyboardEvent)).toBe(false)
   })
 
   it('does not let the xterm key blocker swallow iPad Backspace reported as 229', () => {
