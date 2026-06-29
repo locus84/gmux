@@ -6,9 +6,6 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ITerminalOptions } from '@xterm/xterm'
 import { loadWebglRenderer } from './webgl-renderer'
 import { isTouchDevice } from './touch'
-import { fileBrowserPath } from './file-browser'
-import { createFileLinkProvider, fileBrowserTargetForLink, isSafeExternalLinkUri } from './terminal-link'
-import { navigate, sessions as sessionsSignal } from './store'
 import type { Session } from './types'
 import { fetchScrollback, type ScrollbackResult } from './replay-fetch'
 import { JumpToBottom } from './jump-to-bottom'
@@ -89,15 +86,6 @@ export function ReplayView({
     const recordedCols = session.terminal_cols ?? 80
     const recordedRows = session.terminal_rows ?? 24
 
-    const activateTerminalLink = (text: string) => {
-      const fileTarget = fileBrowserTargetForLink({ uri: text, label: text }, session, sessionsSignal.value)
-      if (fileTarget) {
-        navigate(fileBrowserPath(fileTarget.sessionId, fileTarget.path))
-        return
-      }
-      if (isSafeExternalLinkUri(text)) window.open(text, '_blank', 'noopener')
-    }
-
     const term = new Terminal({
       ...terminalOptions,
       cols: recordedCols,
@@ -107,9 +95,8 @@ export function ReplayView({
       cursorBlink: false,
       cursorInactiveStyle: 'none',
       linkHandler: {
-        allowNonHttpProtocols: true,
         activate(_event, text) {
-          activateTerminalLink(text)
+          window.open(text, '_blank', 'noopener')
         },
       },
     })
@@ -118,7 +105,6 @@ export function ReplayView({
     term.loadAddon(fit)
     if (!touchDevice) term.loadAddon(new ImageAddon())
     term.loadAddon(new WebLinksAddon())
-    term.registerLinkProvider(createFileLinkProvider(term, activateTerminalLink))
     term.open(containerRef.current)
     loadWebglRenderer(term)
     // Vertical-only fit: use FitAddon's proposal for rows, but keep cols

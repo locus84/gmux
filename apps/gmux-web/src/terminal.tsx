@@ -13,7 +13,7 @@ import { attachMobileInputHandler, flushMobileWebKitImePending, shouldSkipMobile
 import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
-import { createFileLinkProvider, fileBrowserTargetForLink, isSafeExternalLinkUri, linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
+import { fileBrowserTargetForLink, linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
 import { fileBrowserPath } from './file-browser'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
@@ -484,24 +484,11 @@ export function TerminalView({
     disposed.current = false
 
     // Add non-serializable options that can't live in JSON config.
-    const activateTerminalLink = (text: string) => {
-      const fileTarget = fileBrowserTargetForLink({ uri: text, label: text }, sessionRef.current, sessionsSignal.value)
-      if (fileTarget) {
-        navigate(fileBrowserPath(fileTarget.sessionId, fileTarget.path))
-        return
-      }
-      if (isSafeExternalLinkUri(text)) window.open(text, '_blank', 'noopener')
-    }
-
     const term = new Terminal({
       ...terminalOptions,
       linkHandler: {
-        // Needed for OSC 8 file:// links. Activation below is deliberately
-        // scheme-gated: local files route into gmux's file browser, http(s)
-        // opens externally, and everything else is ignored.
-        allowNonHttpProtocols: true,
         activate(_event, text) {
-          activateTerminalLink(text)
+          window.open(text, '_blank', 'noopener')
         },
       },
     })
@@ -513,9 +500,8 @@ export function TerminalView({
     // route those links into gmux's file browser instead of letting xterm's
     // image canvas layers fight terminal replay/resize.
     if (!touchDevice) term.loadAddon(new ImageAddon())
-    // Detect plain-text URLs and file paths in terminal output and make them clickable.
+    // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
-    term.registerLinkProvider(createFileLinkProvider(term, activateTerminalLink))
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
     loadWebglRenderer(term)
@@ -1364,13 +1350,11 @@ export function TerminalView({
       )}
       {linkSheet && (() => {
         const fileTarget = fileBrowserTargetForLink(linkSheet, session, sessionsSignal.value)
-        const canOpen = !!fileTarget || isSafeExternalLinkUri(linkSheet.uri)
         return (
           <LinkActionSheet
             link={linkSheet}
             onClose={() => setLinkSheet(null)}
             openLabel={fileTarget ? 'Open in files' : 'Open'}
-            canOpen={canOpen}
             onOpen={fileTarget ? () => navigate(fileBrowserPath(fileTarget.sessionId, fileTarget.path)) : undefined}
           />
         )

@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from 'vitest'
 import type { Terminal } from '@xterm/xterm'
-import { absolutePathFromFileUri, fileBrowserTargetForLink, isSafeExternalLinkUri, linkAtPoint, openLinkAtPoint, terminalFileLinksInLine } from './terminal-link'
+import { absolutePathFromFileUri, fileBrowserTargetForLink, linkAtPoint, openLinkAtPoint } from './terminal-link'
 
 // Node has Event/EventTarget but not MouseEvent; polyfill enough for
 // the synthetic handshake the module dispatches.
@@ -155,28 +155,6 @@ describe('file browser link targets', () => {
 
   test('rejects non-local file authorities', () => {
     expect(absolutePathFromFileUri('file://server/share/image.png')).toBeNull()
-  })
-
-  test('external opening is limited to http and https', () => {
-    expect(isSafeExternalLinkUri('https://example.com')).toBe(true)
-    expect(isSafeExternalLinkUri('http://example.com')).toBe(true)
-    expect(isSafeExternalLinkUri('file:///Users/rhee/image.png')).toBe(false)
-    expect(isSafeExternalLinkUri('javascript:alert(1)')).toBe(false)
-    expect(isSafeExternalLinkUri('mailto:test@example.com')).toBe(false)
-  })
-
-  test('detects visible file uri text for snapshot/replay fallback', () => {
-    expect(terminalFileLinksInLine('open file:///Users/rhee/WorkSpace/gmux/.pi/tmp/a.png', 7)).toEqual([{
-      text: 'file:///Users/rhee/WorkSpace/gmux/.pi/tmp/a.png',
-      range: { start: { x: 6, y: 7 }, end: { x: 52, y: 7 } },
-    }])
-  })
-
-  test('detects visible absolute file paths for snapshot/replay fallback', () => {
-    expect(terminalFileLinksInLine('image: /Users/rhee/WorkSpace/gmux/.pi/tmp/a.png.', 2)).toEqual([{
-      text: 'file:///Users/rhee/WorkSpace/gmux/.pi/tmp/a.png',
-      range: { start: { x: 8, y: 2 }, end: { x: 47, y: 2 } },
-    }])
   })
 })
 
