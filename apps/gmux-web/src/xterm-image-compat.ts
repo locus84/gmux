@@ -243,19 +243,22 @@ export function createTouchInlineImageSanitizer(term: Terminal): InlineImageSani
 
     const maxRows = mobileInlineImageMaxRows(term.rows)
     const dims = imageDimensionsFromBase64(base64)
-    const placement = dims
-      ? chooseInlineImagePlacement(term, dims, maxRows, requestedColumns)
-      : requestedColumns
-        ? { constraint: `width=${requestedColumns}`, rows: requestedRows ?? 1 }
-        : { constraint: `height=${maxRows}`, rows: Math.min(requestedRows ?? maxRows, maxRows) }
+    const placement = requestedColumns && requestedRows
+      ? chooseFixedCellInlineImagePlacement(term, requestedColumns, requestedRows, maxRows)
+      : dims
+        ? chooseInlineImagePlacement(term, dims, maxRows, requestedColumns)
+        : requestedColumns
+          ? { constraint: `width=${requestedColumns}`, rows: requestedRows ?? 1, preserveAspectRatio: 1 }
+          : { constraint: `height=${maxRows}`, rows: Math.min(requestedRows ?? maxRows, maxRows), preserveAspectRatio: 1 }
     const restoreCursor = cursorMovement === 1 && placement.rows > 1 ? `\x1b[${placement.rows - 1}A` : ''
-    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${placement.constraint};preserveAspectRatio=1:${base64}\x07${restoreCursor}`
+    return `${IIP_FILE_PREFIX}inline=1;size=${estimateBase64DecodedSize(base64)};${placement.constraint};preserveAspectRatio=${placement.preserveAspectRatio}:${base64}\x07${restoreCursor}`
   }
 }
 
 interface InlineImagePlacement {
   constraint: string
   rows: number
+  preserveAspectRatio: 0 | 1
 }
 
 function mobileInlineImageMaxRows(rows: number): number {
@@ -274,9 +277,21 @@ function chooseInlineImagePlacement(term: Terminal, dims: ImageDimensions, maxRo
   const cellHeight = term.dimensions?.css.cell.height || 2
   const rowsAtFullWidth = Math.max(1, maxCols * (dims.height / dims.width) * (cellWidth / cellHeight))
   if (rowsAtFullWidth <= maxRows) {
-    return { constraint: `width=${maxCols}`, rows: Math.max(1, Math.ceil(rowsAtFullWidth)) }
+    return { constraint: `width=${maxCols}`, rows: Math.max(1, Math.ceil(rowsAtFullWidth)), preserveAspectRatio: 1 }
   }
-  return { constraint: `height=${maxRows}`, rows: maxRows }
+  return { constraint: `height=${maxRows}`, rows: maxRows, preserveAspectRatio: 1 }
+}
+
+function chooseFixedCellInlineImagePlacement(term: Terminal, requestedCols: number, requestedRows: number, maxRows: number): InlineImagePlacement {
+  const activeBuffer = term.buffer.active as unknown as { cursorX?: number }
+  const availableCols = Math.max(1, term.cols - (activeBuffer.cursorX ?? 0))
+  const cols = Math.max(1, Math.min(availableCols, requestedCols))
+  const rows = Math.max(1, Math.min(maxRows, requestedRows))
+  return {
+    constraint: `width=${cols};height=${rows}`,
+    rows,
+    preserveAspectRatio: 0,
+  }
 }
 
 function parseKittyParams(value: string): Map<string, string> {
