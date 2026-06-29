@@ -5,7 +5,6 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ITerminalOptions } from '@xterm/xterm'
 import { loadWebglRenderer } from './webgl-renderer'
-import { isTouchDevice } from './touch'
 import type { Session } from './types'
 import { fetchScrollback, type ScrollbackResult } from './replay-fetch'
 import { JumpToBottom } from './jump-to-bottom'
@@ -101,9 +100,8 @@ export function ReplayView({
       },
     })
     const fit = new FitAddon()
-    const touchDevice = isTouchDevice()
     term.loadAddon(fit)
-    if (!touchDevice) term.loadAddon(new ImageAddon())
+    term.loadAddon(new ImageAddon())
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
     loadWebglRenderer(term)

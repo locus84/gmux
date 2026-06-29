@@ -13,8 +13,7 @@ import { attachMobileInputHandler, flushMobileWebKitImePending, shouldSkipMobile
 import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
-import { fileBrowserTargetForLink, linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
-import { fileBrowserPath } from './file-browser'
+import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 import { LinkActionSheet } from './link-action-sheet'
@@ -22,7 +21,7 @@ import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import { decideViewportResize, sameSize } from './terminal-resize'
-import { keyboardOpen, navigate, sessions as sessionsSignal, terminalScrolledUp, terminalScrollToBottom } from './store'
+import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { MOCK_BY_ID } from './mock-data/index'
 import type { Session } from './types'
 
@@ -493,13 +492,8 @@ export function TerminalView({
       },
     })
     const fitAddon = new FitAddon()
-    const touchDevice = isTouchDevice()
     term.loadAddon(fitAddon)
-    // Mobile terminal continuity wins over inline image previews. Pi/read
-    // output already exposes file:// OSC8 links for image files; on touch we
-    // route those links into gmux's file browser instead of letting xterm's
-    // image canvas layers fight terminal replay/resize.
-    if (!touchDevice) term.loadAddon(new ImageAddon())
+    term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
@@ -1337,17 +1331,9 @@ export function TerminalView({
           End ↓
         </button>
       )}
-      {linkSheet && (() => {
-        const fileTarget = fileBrowserTargetForLink(linkSheet, session, sessionsSignal.value)
-        return (
-          <LinkActionSheet
-            link={linkSheet}
-            onClose={() => setLinkSheet(null)}
-            openLabel={fileTarget ? 'Open in files' : 'Open'}
-            onOpen={fileTarget ? () => navigate(fileBrowserPath(fileTarget.sessionId, fileTarget.path)) : undefined}
-          />
-        )
-      })()}
+      {linkSheet && (
+        <LinkActionSheet link={linkSheet} onClose={() => setLinkSheet(null)} />
+      )}
       {textSheet && (
         <TerminalTextSheet
           lines={textSheet.lines}

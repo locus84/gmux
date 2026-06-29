@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from 'vitest'
 import type { Terminal } from '@xterm/xterm'
-import { absolutePathFromFileUri, fileBrowserTargetForLink, linkAtPoint, openLinkAtPoint } from './terminal-link'
+import { linkAtPoint, openLinkAtPoint } from './terminal-link'
 
 // Node has Event/EventTarget but not MouseEvent; polyfill enough for
 // the synthetic handshake the module dispatches.
@@ -117,44 +117,6 @@ describe('openLinkAtPoint', () => {
 
     expect(openLinkAtPoint(term, 5, 5)).toBe(false)
     expect(received).toEqual([])
-  })
-})
-
-describe('file browser link targets', () => {
-  test('maps file uri under current absolute workspace root', () => {
-    expect(fileBrowserTargetForLink(
-      { uri: 'file:///Users/rhee/WorkSpace/gmux/src/main.ts', label: 'src/main.ts' },
-      { id: 'sess-1', kind: 'pi', cwd: '/Users/rhee/WorkSpace/gmux' } as any,
-      [],
-    )).toEqual({ sessionId: 'sess-1', path: 'src/main.ts' })
-  })
-
-  test('maps file uri under a tilde workspace root', () => {
-    expect(fileBrowserTargetForLink(
-      { uri: 'file:///Users/rhee/WorkSpace/gd-idle/.pi/tmp/image.png', label: '~/WorkSpace/gd-idle/.pi/tmp/image.png' },
-      { id: 'current', kind: 'pi', cwd: '~/WorkSpace/gmux' } as any,
-      [{ id: 'gd', kind: 'pi', cwd: '~/WorkSpace/gd-idle' } as any],
-    )).toEqual({ sessionId: 'gd', path: '.pi/tmp/image.png' })
-  })
-
-  test('chooses the most specific matching session root', () => {
-    expect(fileBrowserTargetForLink(
-      { uri: 'file:///repo/app/src/main.ts', label: 'main.ts' },
-      { id: 'repo', kind: 'pi', cwd: '/repo' } as any,
-      [{ id: 'app', kind: 'pi', cwd: '/repo/app' } as any],
-    )).toEqual({ sessionId: 'app', path: 'src/main.ts' })
-  })
-
-  test('rejects file uri outside known session roots', () => {
-    expect(fileBrowserTargetForLink(
-      { uri: 'file:///private/secret.txt', label: 'secret.txt' },
-      { id: 'sess-1', kind: 'pi', cwd: '/Users/rhee/WorkSpace/gmux' } as any,
-      [],
-    )).toBeNull()
-  })
-
-  test('rejects non-local file authorities', () => {
-    expect(absolutePathFromFileUri('file://server/share/image.png')).toBeNull()
   })
 })
 
