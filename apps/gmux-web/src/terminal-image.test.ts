@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { imageAddonOptionsForTouchDevice, mobilePiImageCellSizeResponse, MOBILE_IMAGE_ADDON_OPTIONS, shouldLoadWebglRenderer } from './terminal-image'
+import { imageAddonOptionsForTouchDevice, MOBILE_IMAGE_ADDON_OPTIONS, shouldLoadWebglRenderer } from './terminal-image'
 
 describe('mobile terminal image runtime', () => {
   test('keeps desktop image addon defaults by passing no override', () => {
@@ -17,17 +17,5 @@ describe('mobile terminal image runtime', () => {
     const b = imageAddonOptionsForTouchDevice(true)
     expect(a).toEqual(b)
     expect(a).not.toBe(b)
-  })
-
-  test('builds a mobile Pi cell-size response with reduced row height', () => {
-    expect(mobilePiImageCellSizeResponse({
-      css: { cell: { width: 10.4, height: 17 } },
-    })).toBe('\x1b[6;10;10t')
-  })
-
-  test('ignores missing or invalid mobile Pi cell metrics', () => {
-    expect(mobilePiImageCellSizeResponse(null)).toBeNull()
-    expect(mobilePiImageCellSizeResponse({ css: { cell: { width: 0, height: 17 } } })).toBeNull()
-    expect(mobilePiImageCellSizeResponse({ css: { cell: { width: 10, height: Number.NaN } } })).toBeNull()
   })
 })
