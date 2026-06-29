@@ -18,13 +18,16 @@ import { CopyButton, SheetBackdrop, SheetButton } from './sheet'
 export interface LinkActionSheetProps {
   link: LinkInfo
   onClose: () => void
+  openLabel?: string
+  onOpen?: () => void
 }
 
-export function LinkActionSheet({ link, onClose }: LinkActionSheetProps) {
+export function LinkActionSheet({ link, onClose, openLabel = 'Open', onOpen }: LinkActionSheetProps) {
   const showLabel = link.label !== link.uri
 
   const handleOpen = () => {
-    window.open(link.uri, '_blank', 'noopener,noreferrer')
+    if (onOpen) onOpen()
+    else window.open(link.uri, '_blank', 'noopener,noreferrer')
     onClose()
   }
 
@@ -37,7 +40,7 @@ export function LinkActionSheet({ link, onClose }: LinkActionSheetProps) {
         </div>
         <div class="link-sheet-actions">
           <CopyButton label="Copy URL" text={link.uri} />
-          <SheetButton primary onActivate={handleOpen}>Open</SheetButton>
+          <SheetButton primary onActivate={handleOpen}>{openLabel}</SheetButton>
         </div>
       </div>
     </SheetBackdrop>

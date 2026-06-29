@@ -35,6 +35,7 @@
  * handler regardless. The tap decision stays a flat branch there.
  */
 import type { Terminal } from '@xterm/xterm'
+import type { Session } from './types'
 
 /**
  * Internal Linkifier surface we rely on (stable in our pinned fork).
@@ -139,4 +140,97 @@ export function openLinkAtPoint(term: Terminal, clientX: number, clientY: number
   screen.dispatchEvent(new MouseEvent('mousedown', { ...init, button: 0, buttons: 1 }))
   screen.dispatchEvent(new MouseEvent('mouseup', { ...init, button: 0 }))
   return true
+}
+
+export interface FileBrowserLinkTarget {
+  sessionId: string
+  path: string
+}
+
+/** Resolve a terminal `file://` link into an existing gmux file-browser target.
+ * The backend still enforces workspace-root safety; this helper only chooses a
+ * session whose advertised workspace root/cwd contains the absolute file path.
+ */
+export function fileBrowserTargetForLink(link: LinkInfo, currentSession: Session, allSessions: Session[]): FileBrowserLinkTarget | null {
+  const absPath = absolutePathFromFileUri(link.uri)
+  if (!absPath) return null
+
+  const ordered = [currentSession, ...allSessions.filter(s => s.id !== currentSession.id)]
+  let best: (FileBrowserLinkTarget & { rootLength: number }) | null = null
+  for (const session of ordered) {
+    for (const root of [session.workspace_root, session.cwd]) {
+      const match = relativePathUnderRoot(absPath, root)
+      if (!match) continue
+      if (!best || match.rootLength > best.rootLength) {
+        best = { sessionId: session.id, path: match.path, rootLength: match.rootLength }
+      }
+    }
+  }
+  return best ? { sessionId: best.sessionId, path: best.path } : null
+}
+
+export function absolutePathFromFileUri(uri: string): string | null {
+  if (!uri.startsWith('file://')) return null
+  try {
+    const url = new URL(uri)
+    if (url.protocol !== 'file:') return null
+    // Browser file links for local terminal paths are hostless or localhost.
+    // Other authorities would be remote filesystem references we cannot safely
+    // map to a local gmux workspace.
+    if (url.hostname && url.hostname !== 'localhost') return null
+    return cleanAbsolutePath(decodeURIComponent(url.pathname))
+  } catch {
+    return null
+  }
+}
+
+function relativePathUnderRoot(absPath: string, root?: string): { path: string; rootLength: number } | null {
+  if (!root?.trim()) return null
+  const cleanAbs = cleanAbsolutePath(absPath)
+  const cleanRoot = cleanRootPath(root)
+  if (!cleanRoot) return null
+
+  if (cleanRoot.startsWith('/')) return relativePathForAbsoluteRoot(cleanAbs, cleanRoot)
+
+  if (cleanRoot === '~') return null
+  if (cleanRoot.startsWith('~/')) {
+    const suffix = `/${cleanRoot.slice(2)}`
+    const idx = cleanAbs.indexOf(suffix)
+    if (idx <= 0) return null
+    const inferredRoot = cleanAbs.slice(0, idx) + suffix
+    return relativePathForAbsoluteRoot(cleanAbs, inferredRoot)
+  }
+
+  return null
+}
+
+function relativePathForAbsoluteRoot(absPath: string, root: string): { path: string; rootLength: number } | null {
+  const cleanRoot = cleanAbsolutePath(root)
+  if (absPath === cleanRoot) return { path: '', rootLength: cleanRoot.length }
+  const prefix = cleanRoot.endsWith('/') ? cleanRoot : `${cleanRoot}/`
+  if (!absPath.startsWith(prefix)) return null
+  return { path: absPath.slice(prefix.length), rootLength: cleanRoot.length }
+}
+
+function cleanRootPath(path: string): string {
+  const trimmed = path.trim()
+  const fromFileUri = absolutePathFromFileUri(trimmed)
+  if (fromFileUri) return fromFileUri
+  if (trimmed === '~') return '~'
+  if (trimmed.startsWith('~/')) return `~/${trimmed.slice(2).split('/').filter(Boolean).join('/')}`
+  if (trimmed.startsWith('/')) return cleanAbsolutePath(trimmed)
+  return trimmed.replace(/\/+$/g, '')
+}
+
+function cleanAbsolutePath(path: string): string {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      parts.pop()
+      continue
+    }
+    parts.push(part)
+  }
+  return `/${parts.join('/')}`
 }
