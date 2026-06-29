@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@xterm/addon-image@0.9.0':
-    hash: e9b014e68b85432dafb43be7f1c4c5f7d23a576bee4d6ffa10931c46e2339aee
+    hash: ef5bf328be20c10e17800cc6b1f42240d3dad6cc75709fec64b2f8a11d1c9cf5
     path: patches/@xterm__addon-image@0.9.0.patch
   '@xterm/addon-webgl@0.20.0-beta.194':
     hash: d9125d12d13397d8171c9874eae71c1adcc92e3510a7b24eafdb4d19339489a1
