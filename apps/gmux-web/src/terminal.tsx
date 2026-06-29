@@ -6,7 +6,7 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import { loadWebglRenderer } from './webgl-renderer'
-import { imageAddonOptionsForTouchDevice, shouldLoadWebglRenderer } from './terminal-image'
+import { imageAddonOptionsForTouchDevice, mobilePiImageCellSizeResponse, shouldLoadWebglRenderer } from './terminal-image'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handleBlobPasteAction, handlePasteAction } from './keyboard'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
@@ -331,6 +331,16 @@ export function TerminalView({
     processViewportResizeRef.current?.(true)
   }, [])
 
+  const sendMobilePiImageCellSizeHint = useCallback(() => {
+    if (sessionRef.current.kind !== 'pi' || !isTouchDevice()) return
+    const ws = wsRef.current
+    const term = termRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN || !term) return
+    const response = mobilePiImageCellSizeResponse(term.dimensions)
+    if (!response) return
+    ws.send(new TextEncoder().encode(response))
+  }, [])
+
   const applyOwnedResize = useCallback((size: TerminalSize, options: { forceAnnounce?: boolean } = {}) => {
     const prevPty = ptySizeRef.current
     const forceAnnounce = options.forceAnnounce === true
@@ -351,12 +361,13 @@ export function TerminalView({
     if (!ws || ws.readyState !== WebSocket.OPEN) return
 
     announceResize(ws, size)
+    sendMobilePiImageCellSizeHint()
     const gate = resizeEchoGateRef.current
     gate.awaitingEcho = size
     gate.timer = setTimeout(() => {
       releaseResizeEchoGate(size)
     }, 2000)
-  }, [queueResize, releaseResizeEchoGate, resetResizeEchoGate])
+  }, [queueResize, releaseResizeEchoGate, resetResizeEchoGate, sendMobilePiImageCellSizeHint])
 
   const processViewportResize = useCallback((forceDrive = false) => {
     const term = termRef.current
