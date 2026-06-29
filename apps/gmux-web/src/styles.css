@@ -2484,7 +2484,27 @@ body {
     background: transparent;
   }
   .terminal-container .xterm-screen {
+    background: transparent;
+    isolation: isolate;
+  }
+
+  /* xterm-addon-image normally places a full-screen transparent canvas above
+     the DOM text layer. On real mobile Safari/WebKit that canvas can composite
+     as an opaque layer when an image is drawn, making all terminal text vanish.
+     Keep mobile images behind the text layer instead; the terminal background
+     stays on .xterm so the negative image layer remains visible but cannot
+     cover glyphs. */
+  .terminal-container .xterm {
     background: var(--terminal-bg, #0f141a);
+  }
+  .terminal-container .xterm-image-layer-top {
+    z-index: -1 !important;
+    pointer-events: none;
+  }
+  .terminal-container .xterm-rows {
+    position: relative;
+    z-index: 0;
+    background: transparent;
   }
   /* The floating scroll-to-end pill is desktop-only; on touch the toolbar's
      top-right key takes over. */
