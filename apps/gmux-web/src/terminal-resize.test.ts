@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { decideViewportResize, sameSize } from './terminal-resize'
+import { decideReconnectResize, decideViewportResize, sameSize } from './terminal-resize'
 
 describe('sameSize', () => {
   test('matches identical sizes', () => {
@@ -10,6 +10,29 @@ describe('sameSize', () => {
     expect(sameSize(null, { cols: 80, rows: 24 })).toBe(false)
     expect(sameSize({ cols: 80, rows: 24 }, null)).toBe(false)
     expect(sameSize({ cols: 80, rows: 24 }, { cols: 81, rows: 24 })).toBe(false)
+  })
+})
+
+describe('decideReconnectResize', () => {
+  test('reasserts when the viewport still owns the PTY size', () => {
+    expect(decideReconnectResize({
+      viewportSize: { cols: 80, rows: 24 },
+      ptySize: { cols: 80, rows: 24 },
+    })).toEqual({ kind: 'reassert', size: { cols: 80, rows: 24 } })
+  })
+
+  test('follows when reconnect metadata belongs to another size owner', () => {
+    expect(decideReconnectResize({
+      viewportSize: { cols: 100, rows: 30 },
+      ptySize: { cols: 80, rows: 24 },
+    })).toEqual({ kind: 'follow', size: { cols: 80, rows: 24 } })
+  })
+
+  test('does nothing without any PTY size', () => {
+    expect(decideReconnectResize({
+      viewportSize: { cols: 80, rows: 24 },
+      ptySize: null,
+    })).toEqual({ kind: 'noop' })
   })
 })
 

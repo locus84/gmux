@@ -159,15 +159,16 @@ type Server struct {
 	adapter  adapter.Adapter
 	state    *session.State
 
-	mu             sync.Mutex
-	clients        map[*wsClient]struct{}
-	localOut       io.Writer      // optional local terminal output sink
-	scrollback     io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
-	ptyCols        uint16         // last applied PTY cols (guarded by mu)
-	ptyRows        uint16         // last applied PTY rows (guarded by mu)
-	cursorHidden   bool           // tracks DECTCEM via callback (guarded by mu)
-	screenPending  []byte         // raw PTY data not yet fed to screen (guarded by mu)
-	lastClientLeft time.Time      // when the last WS client disconnected (guarded by mu)
+	mu                    sync.Mutex
+	clients               map[*wsClient]struct{}
+	localOut              io.Writer      // optional local terminal output sink
+	scrollback            io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
+	ptyCols               uint16         // last applied PTY cols (guarded by mu)
+	ptyRows               uint16         // last applied PTY rows (guarded by mu)
+	hiddenReconnectShrink bool           // true when ptyCols was internally shrunk for reconnect redraw (guarded by mu)
+	cursorHidden          bool           // tracks DECTCEM via callback (guarded by mu)
+	screenPending         []byte         // raw PTY data not yet fed to screen (guarded by mu)
+	lastClientLeft        time.Time      // when the last WS client disconnected (guarded by mu)
 
 	done    chan struct{} // closed when child exits
 	ptyDone chan struct{} // closed when readPTY finishes draining
@@ -822,6 +823,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		cancel: cancel,
 	}
 
+	// If this is the first viewer after output already happened, apply the
+	// same hidden shrink normally done after the last disconnect. The browser's
+	// first/next real resize will then force a SIGWINCH redraw after it is
+	// connected, causing TUIs to re-emit inline image escape sequences that the
+	// text-only replay frame cannot reconstruct.
+	s.shrinkForReconnect()
+
 	// Replay screen state, then register for live data.
 	// All steps happen under s.mu so readPTY cannot send live data to
 	// this client before the snapshot frame.
@@ -916,8 +924,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 // whose viewport matches the current PTY size would get a stale snapshot
 // (missing kitty images, possible drift from the emulator's reconstruction).
 //
-// Called when the last viewer (WS client or local terminal) disconnects.
-// The shrink happens while no one is watching, so there's no visible
+// Called when the last viewer (WS client or local terminal) disconnects,
+// and before replay for the first viewer of a live process. The shrink
+// happens before anyone is registered as a viewer, so there's no visible
 // flicker. The child TUI redraws at cols-1, but nobody sees it.
 //
 // Safety: re-checks that no viewer has connected between the call-site
@@ -935,11 +944,12 @@ func (s *Server) shrinkForReconnect() {
 	}
 
 	s.mu.Lock()
-	if s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil {
+	if s.hiddenReconnectShrink || s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil {
 		s.mu.Unlock()
 		return
 	}
 	s.ptyCols--
+	s.hiddenReconnectShrink = true
 	cols := s.ptyCols
 	rows := s.ptyRows
 	s.drainScreenLocked()
@@ -971,6 +981,10 @@ func (s *Server) resize(msg ResizeMsg) {
 		s.drainScreenLocked()
 		s.screen.Resize(int(msg.Cols), int(msg.Rows))
 	}
+	// Any explicit client resize resolves the hidden reconnect shrink. If the
+	// size changed, the SIGWINCH below is the intended redraw trigger; if not,
+	// the client deliberately accepted the current dimensions.
+	s.hiddenReconnectShrink = false
 	s.mu.Unlock()
 
 	if sizeChanged {

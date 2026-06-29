@@ -21,7 +21,7 @@ import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
-import { decideViewportResize, sameSize } from './terminal-resize'
+import { decideReconnectResize, decideViewportResize, sameSize } from './terminal-resize'
 import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { MOCK_BY_ID } from './mock-data/index'
 import type { Session } from './types'
@@ -331,8 +331,9 @@ export function TerminalView({
     processViewportResizeRef.current?.(true)
   }, [])
 
-  const applyOwnedResize = useCallback((size: TerminalSize) => {
+  const applyOwnedResize = useCallback((size: TerminalSize, options: { forceAnnounce?: boolean } = {}) => {
     const prevPty = ptySizeRef.current
+    const forceAnnounce = options.forceAnnounce === true
 
     // Optimistically sync ptySize so the pill hides immediately, before the
     // server echoes the resize back. Without this, ptySize would lag behind
@@ -340,7 +341,7 @@ export function TerminalView({
     setPtySize(size); ptySizeRef.current = size
     queueResize(size)
 
-    if (sameSize(prevPty, size)) return
+    if (!forceAnnounce && sameSize(prevPty, size)) return
 
     // A new outbound resize supersedes any older echo wait or pending dirty
     // viewport event. The server echo for this exact size re-opens the gate.
@@ -1181,6 +1182,25 @@ export function TerminalView({
               setPtySize(size); ptySizeRef.current = size
               queueResize(size)
             }
+          }
+
+          // If this browser still matches the session's authoritative size,
+          // reassert that size even when our cache says nothing changed. The
+          // runner may have applied a hidden one-column shrink while there were
+          // no viewers; the explicit resize restores the real size and triggers
+          // the TUI redraw that re-emits inline image sequences.
+          const measured = termRef.current && shellRef.current
+            ? measureTerminalFit(termRef.current, shellRef.current)
+            : viewportSizeRef.current
+          const reconnectDecision = decideReconnectResize({
+            viewportSize: measured,
+            ptySize: ptySizeRef.current,
+          })
+          if (reconnectDecision.kind === 'reassert') {
+            setViewportSize(reconnectDecision.size); viewportSizeRef.current = reconnectDecision.size
+            applyOwnedResize(reconnectDecision.size, { forceAnnounce: true })
+          } else if (reconnectDecision.kind === 'follow') {
+            queueResize(reconnectDecision.size)
           }
           return
         }
