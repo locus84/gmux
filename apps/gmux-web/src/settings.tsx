@@ -33,6 +33,7 @@ import {
   webPushBusy,
   webPushEnabled,
   webPushError,
+  webPushPendingProjectSlug,
   webPushProjectSlugs,
   webPushSupported,
 } from './push-subscriptions'
@@ -715,6 +716,7 @@ function ConfiguredProjectRow({
   const resumable = f.sessions.filter(s => !s.alive && s.resumable).length
   const isReference = !!project.peer
   const pushOn = webPushEnabled.value && webPushProjectSlugs.value.has(project.slug)
+  const pushPending = webPushPendingProjectSlug.value === project.slug
   const canTogglePush = !isReference && webPushSupported.value
   // Mirror the sidebar: a reference whose host is unresolved, dangling,
   // or offline reads as unavailable here too — muted row + a marker
@@ -771,7 +773,7 @@ function ConfiguredProjectRow({
           title={pushOn ? 'Disable push notifications for this project' : 'Enable push notifications for this project'}
           aria-label={pushOn ? `Disable push notifications for ${project.slug}` : `Enable push notifications for ${project.slug}`}
         >
-          {webPushBusy.value ? '…' : pushOn ? '🔔' : '🔕'}
+          {pushPending ? '…' : pushOn ? '🔔' : '🔕'}
         </button>
       )}
       <button

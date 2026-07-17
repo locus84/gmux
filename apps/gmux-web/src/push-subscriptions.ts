@@ -21,7 +21,35 @@ export const webPushSupported = signal(false)
 export const webPushEnabled = signal(false)
 export const webPushProjectSlugs = signal<Set<string>>(new Set())
 export const webPushBusy = signal(false)
+export const webPushPendingProjectSlug = signal<string | null>(null)
 export const webPushError = signal<string | null>(null)
+
+let activeWebPushOperations = 0
+let webPushMutationRevision = 0
+let webPushRefreshRevision = 0
+let webPushMutationQueue = Promise.resolve()
+
+function queueWebPushMutation<T>(projectSlug: string | null, mutate: () => Promise<T>): Promise<T> {
+  activeWebPushOperations++
+  webPushMutationRevision++
+  webPushBusy.value = true
+
+  const run = async () => {
+    if (projectSlug) webPushPendingProjectSlug.value = projectSlug
+    try {
+      return await mutate()
+    } finally {
+      activeWebPushOperations--
+      webPushBusy.value = activeWebPushOperations > 0
+      if (projectSlug && webPushPendingProjectSlug.value === projectSlug) {
+        webPushPendingProjectSlug.value = null
+      }
+    }
+  }
+  const result = webPushMutationQueue.then(run, run)
+  webPushMutationQueue = result.then(() => undefined, () => undefined)
+  return result
+}
 
 export function isWebPushAvailable(): boolean {
   return window.isSecureContext
@@ -31,6 +59,12 @@ export function isWebPushAvailable(): boolean {
 }
 
 export async function refreshWebPushState(): Promise<void> {
+  const refreshRevision = ++webPushRefreshRevision
+  const mutationRevision = webPushMutationRevision
+  const canApply = () => refreshRevision === webPushRefreshRevision
+    && mutationRevision === webPushMutationRevision
+    && activeWebPushOperations === 0
+
   webPushSupported.value = isWebPushAvailable()
   webPushError.value = null
   if (!webPushSupported.value) {
@@ -42,6 +76,7 @@ export async function refreshWebPushState(): Promise<void> {
   try {
     const reg = await navigator.serviceWorker.ready
     const sub = await reg.pushManager.getSubscription()
+    if (!canApply()) return
     if (!sub) {
       webPushEnabled.value = false
       webPushProjectSlugs.value = new Set()
@@ -55,10 +90,12 @@ export async function refreshWebPushState(): Promise<void> {
     })
     if (!resp.ok) throw new Error(`lookup failed: ${resp.status}`)
     const body = await resp.json() as { data?: { found?: boolean; subscription?: StoredPushSubscription } }
+    if (!canApply()) return
     const stored = body.data?.subscription
     webPushEnabled.value = !!body.data?.found
     webPushProjectSlugs.value = new Set(stored?.projects ?? [])
   } catch (err) {
+    if (!canApply()) return
     console.warn('web push state refresh failed:', err)
     webPushEnabled.value = false
     webPushProjectSlugs.value = new Set()
@@ -66,14 +103,17 @@ export async function refreshWebPushState(): Promise<void> {
   }
 }
 
-export async function enableWebPushForProjects(projectSlugs: string[]): Promise<void> {
+export function enableWebPushForProjects(projectSlugs: string[]): Promise<void> {
+  return queueWebPushMutation(null, () => enableWebPushForProjectsNow(projectSlugs))
+}
+
+async function enableWebPushForProjectsNow(projectSlugs: string[]): Promise<void> {
   if (!isWebPushAvailable()) {
     webPushSupported.value = false
     webPushError.value = 'Web Push is not supported in this browser.'
     return
   }
 
-  webPushBusy.value = true
   webPushError.value = null
   try {
     if (Notification.permission === 'denied') {
@@ -102,43 +142,40 @@ export async function enableWebPushForProjects(projectSlugs: string[]): Promise<
   } catch (err) {
     console.warn('web push enable failed:', err)
     webPushError.value = describeWebPushError(err, 'Could not enable Web Push.')
-  } finally {
-    webPushBusy.value = false
   }
 }
 
-export async function setWebPushProject(slug: string, enabled: boolean): Promise<void> {
-  const next = new Set(webPushProjectSlugs.value)
-  if (enabled) next.add(slug)
-  else next.delete(slug)
+export function setWebPushProject(slug: string, enabled: boolean): Promise<void> {
+  return queueWebPushMutation(slug, async () => {
+    const next = new Set(webPushProjectSlugs.value)
+    if (enabled) next.add(slug)
+    else next.delete(slug)
 
-  if (!webPushEnabled.value) {
-    await enableWebPushForProjects([...next])
-    return
-  }
+    webPushError.value = null
+    try {
+      if (!webPushEnabled.value) {
+        await enableWebPushForProjectsNow([...next])
+        return
+      }
 
-  webPushBusy.value = true
-  webPushError.value = null
-  try {
-    const sub = await currentSubscription()
-    if (!sub) {
-      await enableWebPushForProjects([...next])
-      return
+      const sub = await currentSubscription()
+      if (!sub) {
+        await enableWebPushForProjectsNow([...next])
+        return
+      }
+      const resp = await fetch('/v1/push/subscription', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint, projects: [...next] }),
+      })
+      if (!resp.ok) throw new Error(`update failed: ${resp.status}`)
+      webPushEnabled.value = true
+      webPushProjectSlugs.value = next
+    } catch (err) {
+      console.warn('web push project update failed:', err)
+      webPushError.value = describeWebPushError(err, 'Could not update push projects.')
     }
-    const resp = await fetch('/v1/push/subscription', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ endpoint: sub.endpoint, projects: [...next] }),
-    })
-    if (!resp.ok) throw new Error(`update failed: ${resp.status}`)
-    webPushEnabled.value = true
-    webPushProjectSlugs.value = next
-  } catch (err) {
-    console.warn('web push project update failed:', err)
-    webPushError.value = describeWebPushError(err, 'Could not update push projects.')
-  } finally {
-    webPushBusy.value = false
-  }
+  })
 }
 
 async function currentSubscription(): Promise<PushSubscription | null> {
