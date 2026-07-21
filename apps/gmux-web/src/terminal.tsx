@@ -6,7 +6,6 @@ import { ImageAddon } from '@xterm/addon-image'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import { loadWebglRenderer } from './webgl-renderer'
-import { imageAddonOptionsForTouchDevice, shouldLoadWebglRenderer } from './terminal-image'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handleBlobPasteAction, handlePasteAction } from './keyboard'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
@@ -22,7 +21,7 @@ import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import { shouldHandleTerminalSocketClose } from './terminal-connection'
-import { decideReconnectResize, decideViewportResize, sameSize } from './terminal-resize'
+import { decideViewportResize, sameSize } from './terminal-resize'
 import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { MOCK_BY_ID } from './mock-data/index'
 import type { Session } from './types'
@@ -332,9 +331,8 @@ export function TerminalView({
     processViewportResizeRef.current?.(true)
   }, [])
 
-  const applyOwnedResize = useCallback((size: TerminalSize, options: { forceAnnounce?: boolean } = {}) => {
+  const applyOwnedResize = useCallback((size: TerminalSize) => {
     const prevPty = ptySizeRef.current
-    const forceAnnounce = options.forceAnnounce === true
 
     // Optimistically sync ptySize so the pill hides immediately, before the
     // server echoes the resize back. Without this, ptySize would lag behind
@@ -342,7 +340,7 @@ export function TerminalView({
     setPtySize(size); ptySizeRef.current = size
     queueResize(size)
 
-    if (!forceAnnounce && sameSize(prevPty, size)) return
+    if (sameSize(prevPty, size)) return
 
     // A new outbound resize supersedes any older echo wait or pending dirty
     // viewport event. The server echo for this exact size re-opens the gate.
@@ -495,14 +493,13 @@ export function TerminalView({
       },
     })
     const fitAddon = new FitAddon()
-    const touchDevice = isTouchDevice()
     term.loadAddon(fitAddon)
-    term.loadAddon(new ImageAddon(imageAddonOptionsForTouchDevice(touchDevice)))
+    term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
-    if (shouldLoadWebglRenderer(touchDevice)) loadWebglRenderer(term)
+    loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
     const disposeIconFontWatch = refreshAtlasWhenIconFontLoads(term, terminalOptions.fontSize)
@@ -1183,25 +1180,6 @@ export function TerminalView({
               setPtySize(size); ptySizeRef.current = size
               queueResize(size)
             }
-          }
-
-          // If this browser still matches the session's authoritative size,
-          // reassert that size even when our cache says nothing changed. The
-          // runner may have applied a hidden one-column shrink while there were
-          // no viewers; the explicit resize restores the real size and triggers
-          // the TUI redraw that re-emits inline image sequences.
-          const measured = termRef.current && shellRef.current
-            ? measureTerminalFit(termRef.current, shellRef.current)
-            : viewportSizeRef.current
-          const reconnectDecision = decideReconnectResize({
-            viewportSize: measured,
-            ptySize: ptySizeRef.current,
-          })
-          if (reconnectDecision.kind === 'reassert') {
-            setViewportSize(reconnectDecision.size); viewportSizeRef.current = reconnectDecision.size
-            applyOwnedResize(reconnectDecision.size, { forceAnnounce: true })
-          } else if (reconnectDecision.kind === 'follow') {
-            queueResize(reconnectDecision.size)
           }
           return
         }

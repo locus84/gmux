@@ -2484,25 +2484,7 @@ body {
     background: transparent;
   }
   .terminal-container .xterm-screen {
-    background: transparent;
-    isolation: isolate;
-  }
-
-  /* On real mobile Safari/WebKit a full-screen image canvas above the DOM
-     renderer can composite as opaque and hide terminal text. Keep rows above
-     image canvases without collapsing beta.288's top (z-index 0) and bottom
-     (z-index -1) image layers into the same layer. */
-  .terminal-container .xterm {
     background: var(--terminal-bg, #0f141a);
-  }
-  .terminal-container .xterm-image-layer-top,
-  .terminal-container .xterm-image-layer-bottom {
-    pointer-events: none;
-  }
-  .terminal-container .xterm-rows {
-    position: relative;
-    z-index: 1;
-    background: transparent;
   }
   /* The floating scroll-to-end pill is desktop-only; on touch the toolbar's
      top-right key takes over. */

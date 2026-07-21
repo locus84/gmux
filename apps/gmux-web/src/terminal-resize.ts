@@ -18,25 +18,6 @@ type ResizeDecision
   | { kind: 'follow'; size: TerminalSize }
   | { kind: 'noop' }
 
-type ReconnectResizeDecision
-  = { kind: 'reassert'; size: TerminalSize }
-  | { kind: 'follow'; size: TerminalSize }
-  | { kind: 'noop' }
-
-export function decideReconnectResize({
-  viewportSize,
-  ptySize,
-}: {
-  viewportSize: TerminalSize | null
-  ptySize: TerminalSize | null
-}): ReconnectResizeDecision {
-  if (viewportSize && ptySize && sameSize(viewportSize, ptySize)) {
-    return { kind: 'reassert', size: viewportSize }
-  }
-  if (ptySize) return { kind: 'follow', size: ptySize }
-  return { kind: 'noop' }
-}
-
 export function decideViewportResize({
   prevViewport,
   ptySize,
