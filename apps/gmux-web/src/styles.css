@@ -2488,22 +2488,20 @@ body {
     isolation: isolate;
   }
 
-  /* xterm-addon-image normally places a full-screen transparent canvas above
-     the DOM text layer. On real mobile Safari/WebKit that canvas can composite
-     as an opaque layer when an image is drawn, making all terminal text vanish.
-     Keep mobile images behind the text layer instead; the terminal background
-     stays on .xterm so the negative image layer remains visible but cannot
-     cover glyphs. */
+  /* On real mobile Safari/WebKit a full-screen image canvas above the DOM
+     renderer can composite as opaque and hide terminal text. Keep rows above
+     image canvases without collapsing beta.288's top (z-index 0) and bottom
+     (z-index -1) image layers into the same layer. */
   .terminal-container .xterm {
     background: var(--terminal-bg, #0f141a);
   }
-  .terminal-container .xterm-image-layer-top {
-    z-index: -1 !important;
+  .terminal-container .xterm-image-layer-top,
+  .terminal-container .xterm-image-layer-bottom {
     pointer-events: none;
   }
   .terminal-container .xterm-rows {
     position: relative;
-    z-index: 0;
+    z-index: 1;
     background: transparent;
   }
   /* The floating scroll-to-end pill is desktop-only; on touch the toolbar's

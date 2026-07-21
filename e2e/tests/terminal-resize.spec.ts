@@ -59,7 +59,7 @@ test.describe('terminal resize', () => {
 })
 
 test.describe('terminal resize — reconnect', () => {
-  test('reconnect after network blip does not re-claim', async ({ page, context }) => {
+  test('reconnect after network blip reasserts the owned size once', async ({ page, context }) => {
     // Instrument WS.send and expose a helper to force-close WebSockets,
     // since context.setOffline doesn't immediately sever WS connections.
     await page.addInitScript(() => {
@@ -110,10 +110,12 @@ test.describe('terminal resize — reconnect', () => {
     // Extra settle time.
     await page.waitForTimeout(1000)
 
-    // No resize messages should have been sent during reconnect.
+    // Reassert the same owned size exactly once. The runner may have applied a
+    // hidden one-column shrink while detached; this restores the real PTY size
+    // and triggers a TUI redraw so inline images are emitted again.
     const reconnectCount = await page.evaluate(
       () => ((window as any).__wsResizes as string[]).length,
     )
-    expect(reconnectCount).toBe(0)
+    expect(reconnectCount).toBe(1)
   })
 })
