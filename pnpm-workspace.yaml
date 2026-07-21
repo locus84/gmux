@@ -2,5 +2,4 @@ packages:
   - apps/*
   - packages/*
 patchedDependencies:
-  '@xterm/addon-webgl@0.20.0-beta.194': patches/@xterm__addon-webgl@0.20.0-beta.194.patch
-  '@xterm/xterm@6.1.0-beta.195': patches/@xterm__xterm@6.1.0-beta.195.patch
+  '@xterm/xterm@6.1.0-beta.288': patches/@xterm__xterm@6.1.0-beta.288.patch
