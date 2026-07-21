@@ -12,6 +12,7 @@
  * it never reads live buffer state, so terminal output scrolling the
  * link away can't make it lie, and there's no reason to auto-dismiss.
  */
+import { useLocation } from 'preact-iso'
 import type { LinkInfo } from './terminal-link'
 import { CopyButton, SheetBackdrop, SheetButton } from './sheet'
 
@@ -21,10 +22,12 @@ export interface LinkActionSheetProps {
 }
 
 export function LinkActionSheet({ link, onClose }: LinkActionSheetProps) {
+  const loc = useLocation()
   const showLabel = link.label !== link.uri
 
   const handleOpen = () => {
-    window.open(link.uri, '_blank', 'noopener,noreferrer')
+    if (link.internalFile) loc.route(link.uri)
+    else window.open(link.uri, '_blank', 'noopener,noreferrer')
     onClose()
   }
 

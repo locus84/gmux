@@ -1,5 +1,6 @@
 import { effect } from '@preact/signals'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
+import { useLocation } from 'preact-iso'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ImageAddon } from '@xterm/addon-image'
@@ -14,6 +15,8 @@ import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
+import { createTerminalFileLinkProvider } from './terminal-file-link'
+import { fileBrowserPath } from './file-browser'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 import { LinkActionSheet } from './link-action-sheet'
@@ -248,6 +251,7 @@ export function TerminalView({
   onAttachFileReady?: (attach: ((file: File) => void) | null) => void
   onFocusReady?: (focus: (() => void) | null) => void
 }) {
+  const loc = useLocation()
   const shellRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -260,6 +264,13 @@ export function TerminalView({
   const altArmedRef = useRef(altArmed)
   const termIoRef = useRef<ReturnType<typeof createTerminalIO> | null>(null)
   const termEpochRef = useRef(0)
+  const fileHrefRef = useRef<(sessionId: string, path: string) => string>(() => '')
+  const openFileRef = useRef<(sessionId: string, path: string) => void>(() => {})
+  fileHrefRef.current = (sessionId, path) => {
+    const search = loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''
+    return fileBrowserPath(sessionId, path, loc.path, search)
+  }
+  openFileRef.current = (sessionId, path) => loc.route(fileHrefRef.current(sessionId, path))
 
   // True once the terminal's font is downloaded; gates xterm mount.
   // See the preload effect below for why this matters.
@@ -495,6 +506,22 @@ export function TerminalView({
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.loadAddon(new ImageAddon())
+    // Detect workspace paths using the live session context. Register this
+    // before WebLinksAddon; path candidates explicitly reject URL schemes, so
+    // normal web and OSC 8 links retain their existing providers/handlers.
+    term.registerLinkProvider(createTerminalFileLinkProvider(
+      term,
+      () => {
+        const current = sessionRef.current
+        return {
+          sessionId: current.id,
+          root: current.workspace_root?.trim() || current.cwd.trim(),
+          cwd: current.cwd.trim(),
+        }
+      },
+      (sessionId, path) => fileHrefRef.current(sessionId, path),
+      (sessionId, path) => openFileRef.current(sessionId, path),
+    ))
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
     term.open(containerRef.current)

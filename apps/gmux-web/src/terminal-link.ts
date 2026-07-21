@@ -45,6 +45,8 @@ import type { Terminal } from '@xterm/xterm'
  */
 interface InternalLink {
   text: string
+  /** Marker carried by gmux's current-session file link provider. */
+  gmuxFile?: true
   range: {
     start: { x: number, y: number }
     end: { x: number, y: number }
@@ -59,6 +61,8 @@ interface CoreWithLinkifier {
 export interface LinkInfo {
   /** The target URI (what activation would open). */
   uri: string
+  /** Internal file routes should use SPA navigation instead of a new tab. */
+  internalFile?: boolean
   /** The text painted in the terminal for this link. Equals `uri` for
    * plain-text URLs; differs for OSC 8 hyperlinks, where the buffer
    * shows a label and the URI is hidden — surfacing both lets the user
@@ -121,7 +125,11 @@ function labelForLink(term: Terminal, link: InternalLink): string {
 export function linkAtPoint(term: Terminal, clientX: number, clientY: number): LinkInfo | null {
   const resolved = resolveLinkAtPoint(term, clientX, clientY)
   if (!resolved) return null
-  return { uri: resolved.link.text, label: labelForLink(term, resolved.link) }
+  return {
+    uri: resolved.link.text,
+    label: labelForLink(term, resolved.link),
+    ...(resolved.link.gmuxFile ? { internalFile: true } : {}),
+  }
 }
 
 /**
