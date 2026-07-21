@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/packages/workspace"
 )
 
@@ -68,7 +69,11 @@ func TestCreateWorktreeDefaultPathAndAgentLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPath := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+"-wt", "fix-login")
+	repoPath, err := mirroredWorktreeRepoPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(paths.WorktreesDir(), repoPath, "fix-login")
 	if got.Path != cleanWorktreePath(wantPath) || launchedPath != got.Path || sentPrompt != "fix it" || got.SessionID != "sess-test" {
 		t.Fatalf("result=%#v launched=%q prompt=%q", got, launchedPath, sentPrompt)
 	}
@@ -89,7 +94,11 @@ func TestCreateWorktreeLaunchFailurePreservesCheckout(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "worktree preserved") {
 		t.Fatalf("launch error = %v", err)
 	}
-	path := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+"-wt", "failed")
+	repoPath, pathErr := mirroredWorktreeRepoPath(repo)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	path := filepath.Join(paths.WorktreesDir(), repoPath, "failed")
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("worktree was not preserved: %v", statErr)
 	}
@@ -111,7 +120,11 @@ func TestCreateWorktreePromptFailureKillsSessionAndPreservesCheckout(t *testing.
 	if killed != "sess-prompt" {
 		t.Fatalf("killed = %q", killed)
 	}
-	path := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+"-wt", "prompt-failed")
+	repoPath, pathErr := mirroredWorktreeRepoPath(repo)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	path := filepath.Join(paths.WorktreesDir(), repoPath, "prompt-failed")
 	if _, statErr := os.Stat(path); statErr != nil {
 		t.Fatalf("worktree was not preserved: %v", statErr)
 	}
@@ -128,6 +141,84 @@ func TestCreateWorktreePromptFailureReportsKillFailure(t *testing.T) {
 	_, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "kill-failed", Agent: "pi", Prompt: "fix"}, deps)
 	if err == nil || !strings.Contains(err.Error(), "could not stop session sess-live") {
 		t.Fatalf("prompt error = %v", err)
+	}
+}
+
+func TestCreateWorktreeMirrorsCanonicalRepoPath(t *testing.T) {
+	repo := initCLIWorktreeRepo(t)
+	link := filepath.Join(filepath.Dir(repo), "repo-alias")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := createWorktree(worktreeCreateRequest{Repo: link, Name: "via/link"}, worktreeCreateDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoPath, err := mirroredWorktreeRepoPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(paths.WorktreesDir(), repoPath, "via-link")
+	if got.Path != cleanWorktreePath(want) {
+		t.Fatalf("path = %q, want %q", got.Path, cleanWorktreePath(want))
+	}
+}
+
+func TestCreateWorktreeExplicitPathRemainsUnchanged(t *testing.T) {
+	repo := initCLIWorktreeRepo(t)
+	want := filepath.Join(t.TempDir(), "custom", "checkout")
+	got, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "custom-path", Path: want}, worktreeCreateDeps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != cleanWorktreePath(want) {
+		t.Fatalf("path = %q, want %q", got.Path, cleanWorktreePath(want))
+	}
+}
+
+func TestMirroredWorktreeRepoPathKeepsFullPath(t *testing.T) {
+	root := t.TempDir()
+	one, err := mirroredWorktreeRepoPath(filepath.Join(root, "one", "app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := mirroredWorktreeRepoPath(filepath.Join(root, "two", "app"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one == two {
+		t.Fatalf("same-named repositories collided at %q", one)
+	}
+	if filepath.Base(one) != "app" || filepath.Base(two) != "app" {
+		t.Fatalf("mirrored paths = %q, %q", one, two)
+	}
+	if filepath.IsAbs(one) || filepath.IsAbs(two) {
+		t.Fatalf("mirrored paths must be relative: %q, %q", one, two)
+	}
+
+	rootPath, err := mirroredWorktreeRepoPath(string(filepath.Separator))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootPath != "_root" {
+		t.Fatalf("root path = %q, want _root", rootPath)
+	}
+}
+
+func TestMirroredWorktreeVolumeStripsWindowsDeviceSyntax(t *testing.T) {
+	tests := []struct {
+		volume string
+		want   string
+	}{
+		{`C:`, "C"},
+		{`\\server\share`, filepath.Join("server", "share")},
+		{`\\?\C:`, "C"},
+		{`\\?\UNC\server\share`, filepath.Join("server", "share")},
+	}
+	for _, tt := range tests {
+		if got := mirroredWorktreeVolume(tt.volume); got != tt.want {
+			t.Errorf("mirroredWorktreeVolume(%q) = %q, want %q", tt.volume, got, tt.want)
+		}
 	}
 }
 
@@ -171,6 +262,7 @@ func TestCreateWorktreeRejectsInvalidBranchBeforeLauncher(t *testing.T) {
 
 func initCLIWorktreeRepo(t *testing.T) string {
 	t.Helper()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "data"))
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}

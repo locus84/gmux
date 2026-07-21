@@ -151,6 +151,13 @@ gmux worktree create fix-login \
 gmux worktree ps
 ```
 
+By default, gmux mirrors the repository's canonical absolute path under
+`$XDG_DATA_HOME/gmux/worktrees` (normally `~/.local/share/gmux/worktrees`) and
+flattens branch slashes in the final directory name. For example,
+`/Users/me/src/app` plus `fix/login` becomes
+`~/.local/share/gmux/worktrees/Users/me/src/app/fix-login`. Pass `--path` to
+choose a different destination.
+
 The bundled [`gmux-worktree` skill](skills/gmux-worktree/SKILL.md) teaches
 coding agents this workflow. From a source checkout, make it globally available
 to Agent Skills-compatible tools without duplicating it:

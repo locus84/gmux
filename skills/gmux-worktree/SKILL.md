@@ -68,7 +68,7 @@ Defaults:
 
 - repository: the enclosing Git checkout
 - base: `HEAD`
-- destination: `../<repo>-wt/<name>`; slashes in the branch become dashes in the path
+- destination: `$XDG_DATA_HOME/gmux/worktrees/<full-repository-path>/<name>`, defaulting to `~/.local/share/gmux/worktrees/...`; slashes in the branch become dashes in the final directory name
 - no agent session unless `--agent` is supplied
 
 Use `--repo <path>` and `--path <path>` when defaults are inappropriate. gmux

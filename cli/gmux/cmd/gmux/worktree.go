@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/packages/workspace"
 )
 
@@ -110,8 +111,11 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 	}
 	path := req.Path
 	if path == "" {
-		primary := items[0].Path
-		path = filepath.Join(filepath.Dir(primary), filepath.Base(primary)+"-wt", worktreePathName(req.Name))
+		repoPath, err := mirroredWorktreeRepoPath(items[0].Path)
+		if err != nil {
+			return worktreeCreateResult{}, fmt.Errorf("resolve managed worktree path: %w", err)
+		}
+		path = filepath.Join(paths.WorktreesDir(), repoPath, worktreePathName(req.Name))
 	} else if !filepath.IsAbs(path) {
 		path, err = filepath.Abs(path)
 		if err != nil {
@@ -175,6 +179,45 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 func worktreePathName(branch string) string {
 	replacer := strings.NewReplacer("/", "-", "\\", "-", string(filepath.Separator), "-")
 	return replacer.Replace(branch)
+}
+
+// mirroredWorktreeRepoPath converts a canonical absolute repository path into
+// a safe relative namespace beneath paths.WorktreesDir. The full path keeps
+// same-named clones distinct without opaque hashes.
+func mirroredWorktreeRepoPath(repo string) (string, error) {
+	repo = cleanWorktreePath(repo)
+	volume := filepath.VolumeName(repo)
+	rel := strings.TrimPrefix(repo, volume)
+	rel = strings.TrimLeft(rel, "/\\")
+
+	if volume != "" {
+		rel = filepath.Join(mirroredWorktreeVolume(volume), rel)
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		if filepath.IsAbs(repo) {
+			return "_root", nil
+		}
+		return "", fmt.Errorf("repository path %q cannot be mirrored safely", repo)
+	}
+	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("repository path %q cannot be mirrored safely", repo)
+	}
+	return rel, nil
+}
+
+func mirroredWorktreeVolume(volume string) string {
+	// Windows extended/device prefixes are path syntax, not valid namespace
+	// components beneath the managed worktree root.
+	volume = strings.TrimPrefix(volume, `\\?\`)
+	volume = strings.TrimPrefix(volume, `\\.\`)
+	if len(volume) >= 4 && strings.EqualFold(volume[:4], `UNC\`) {
+		volume = volume[4:]
+	}
+	volume = strings.Trim(volume, "/\\")
+	volume = strings.ReplaceAll(volume, ":", "")
+	volume = strings.ReplaceAll(volume, "\\", string(filepath.Separator))
+	return strings.ReplaceAll(volume, "/", string(filepath.Separator))
 }
 
 func gitOutput(dir string, args ...string) (string, error) {

@@ -139,9 +139,13 @@ gmux tail "$id" -n 200
 git -C "$path" status --short
 ```
 
-The default destination is `../<repo>-wt/<name>`. Worktree operations are
-local-only, reject branch/path collisions, and do not include uncommitted source
-checkout changes in a worktree created from `HEAD`. Install or load the
+The default destination mirrors the repository's canonical absolute path under
+`$XDG_DATA_HOME/gmux/worktrees` (normally `~/.local/share/gmux/worktrees`) and
+flattens branch slashes in the final directory name. For example,
+`/Users/me/src/app` plus `fix/login` becomes
+`~/.local/share/gmux/worktrees/Users/me/src/app/fix-login`. Worktree operations
+are local-only, reject branch/path collisions, and do not include uncommitted
+source checkout changes in a worktree created from `HEAD`. Install or load the
 [`gmux-worktree` skill](https://github.com/gmuxapp/gmux/blob/main/skills/gmux-worktree/SKILL.md)
 for parallel tracking, recovery, review, and cleanup guidance.
 

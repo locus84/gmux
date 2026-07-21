@@ -82,11 +82,12 @@ On first start, gmuxd writes the token to disk. On subsequent starts, the file a
 
 ## gmux (CLI)
 
-Variables that affect the session runner.
+Variables used by the gmux CLI and session runner.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `GMUX_ADAPTER` | Force a specific adapter instead of auto-detection. | *(auto)* |
+| `XDG_DATA_HOME` | Base directory for worktrees created by `gmux worktree create` without `--path`. | `~/.local/share` |
 | `GMUX_SOCKET_DIR` | Directory for per-session Unix sockets. | `/tmp/gmux-sessions` |
 | `GMUX_NO_AGENT_HOOK` | Disable injecting the gmux agent extension/hook (e.g. the pi extension). An escape hatch if an agent release breaks the extension: the agent runs unmodified, and gmux loses hook-driven title/status/attribution for it. Any value other than `0`/empty disables. Read by the runner, so it covers foreground and `-d` launches; for daemon-initiated launches set it in the daemon's environment. | *(unset)* |
 

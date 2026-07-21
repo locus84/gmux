@@ -339,7 +339,7 @@ func parseWorktree(args []string) (*command, error) {
 	case "create":
 		fs.StringVar(&c.worktreeRepo, "repo", "", "repository path (default current directory)")
 		fs.StringVar(&c.worktreeBase, "base", "HEAD", "base ref")
-		fs.StringVar(&c.worktreePath, "path", "", "destination path")
+		fs.StringVar(&c.worktreePath, "path", "", "destination path (default: managed XDG data directory)")
 		fs.StringVar(&c.worktreeAgent, "agent", "", "gmux launcher id")
 		fs.StringVar(&c.worktreePrompt, "prompt", "", "initial agent prompt")
 		fs.BoolVar(&c.json, "json", false, "emit JSON")

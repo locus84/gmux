@@ -17,6 +17,21 @@ Created by the user. gmux does not write to these, except that `gmux remote` can
 
 `~/.config` can be overridden with `XDG_CONFIG_HOME`.
 
+## Managed worktrees
+
+Worktrees created by `gmux worktree create` without `--path` live under
+`~/.local/share/gmux/worktrees` (or `$XDG_DATA_HOME/gmux/worktrees`). gmux
+mirrors the canonical absolute repository path beneath that root and flattens
+slashes in the branch name for the final directory:
+
+```text
+/Users/me/src/app + fix/login
+→ ~/.local/share/gmux/worktrees/Users/me/src/app/fix-login
+```
+
+Existing worktrees are not moved. Use the `.path` field from `--json` rather
+than reconstructing the destination in scripts.
+
 ## Runtime state
 
 Created by gmuxd. Lives under `~/.local/state/gmux` (or `$XDG_STATE_HOME/gmux`).

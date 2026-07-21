@@ -103,7 +103,7 @@ messages directly. Rules that follow from this:
 
 ## Worktree agent workflows
 
-- `skills/gmux-worktree/SKILL.md` is the canonical skill for creating persistent, browser-visible gmux agent sessions in sibling Git worktrees. Keep its source in this repository; global and Hermes installations should symlink to that directory rather than copying it. Agents must inspect `gmux worktree ps --json` first, reuse a matching checkout/session, and create at most one worktree per logical task.
+- `skills/gmux-worktree/SKILL.md` is the canonical skill for creating persistent, browser-visible gmux agent sessions in centrally managed Git worktrees. Keep its source in this repository; global and Hermes installations should symlink to that directory rather than copying it. Agents must inspect `gmux worktree ps --json` first, reuse a matching checkout/session, and create at most one worktree per logical task.
 - The locus `pi-harness` `worktree-agents` extension is complementary, not a duplicate: use `start_worktree_agent` for one-shot child Pi implementation runs and `gmux worktree create` when a human needs to watch or steer a durable session from the web/mobile UI.
 - Do not move or duplicate `gmux-worktree` into `locus-skills`; distinct ownership and trigger descriptions prevent drift and accidental tool substitution.
 

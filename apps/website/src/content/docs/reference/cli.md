@@ -215,10 +215,13 @@ Options:
 
 - `--repo PATH` — source repository; defaults to the current checkout.
 - `--base REF` — creation ref; defaults to `HEAD`.
-- `--path PATH` — destination; defaults to `../<repo>-wt/<name>`.
+- `--path PATH` — destination; defaults to the mirrored canonical repository path under `$XDG_DATA_HOME/gmux/worktrees` (normally `~/.local/share/gmux/worktrees`). Branch slashes become dashes in the final directory name.
 - `--agent LAUNCHER` — an available gmux launcher such as `pi`, `claude`, or `codex`.
 - `--prompt TEXT` — initial PTY input; requires `--agent`.
 - `--json` — emit the created worktree and optional session id.
+
+For example, repository `/Users/me/src/app` and branch `fix/login` produce
+`~/.local/share/gmux/worktrees/Users/me/src/app/fix-login` by default.
 
 Existing branches and paths are rejected. If agent startup or prompt delivery
 fails, gmux preserves the checkout and reports its path; a lost daemon response

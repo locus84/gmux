@@ -63,6 +63,34 @@ func TestCanonicalizePath(t *testing.T) {
 		}
 	}
 }
+func TestDataDir(t *testing.T) {
+	t.Run("uses XDG_DATA_HOME", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "/tmp/xdg-data")
+		if got := DataDir(); got != filepath.Join("/tmp/xdg-data", "gmux") {
+			t.Errorf("DataDir() = %q", got)
+		}
+		if got := WorktreesDir(); got != filepath.Join("/tmp/xdg-data", "gmux", "worktrees") {
+			t.Errorf("WorktreesDir() = %q", got)
+		}
+	})
+
+	t.Run("falls back to home data directory", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "")
+		t.Setenv("HOME", "/tmp/gmux-home")
+		if got := DataDir(); got != filepath.Join("/tmp/gmux-home", ".local", "share", "gmux") {
+			t.Errorf("DataDir() = %q", got)
+		}
+	})
+
+	t.Run("ignores relative XDG_DATA_HOME", func(t *testing.T) {
+		t.Setenv("XDG_DATA_HOME", "relative/data")
+		t.Setenv("HOME", "/tmp/gmux-home")
+		if got := DataDir(); got != filepath.Join("/tmp/gmux-home", ".local", "share", "gmux") {
+			t.Errorf("DataDir() = %q", got)
+		}
+	})
+}
+
 func TestStateDir(t *testing.T) {
 	t.Run("GMUX_STATE_DIR overrides XDG_STATE_HOME", func(t *testing.T) {
 		t.Setenv("GMUX_STATE_DIR", "/tmp/gmux-state")
