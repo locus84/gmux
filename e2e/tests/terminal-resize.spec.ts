@@ -59,7 +59,7 @@ test.describe('terminal resize', () => {
 })
 
 test.describe('terminal resize — reconnect', () => {
-  test('reconnect after network blip does not re-claim', async ({ page, context }) => {
+  test('reconnect reasserts the authoritative size without reclaiming the viewport', async ({ page }) => {
     // Instrument WS.send and expose a helper to force-close WebSockets,
     // since context.setOffline doesn't immediately sever WS connections.
     await page.addInitScript(() => {
@@ -86,11 +86,13 @@ test.describe('terminal resize — reconnect', () => {
     await openApp(page)
     await gotoTestSession(page)
 
-    // Initial claim should have sent at least one resize.
+    // Initial claim should have sent at least one resize, and xterm should be
+    // aligned with that authoritative size before the network blip.
     const initialCount = await page.evaluate(
       () => ((window as any).__wsResizes as string[]).length,
     )
     expect(initialCount).toBeGreaterThan(0)
+    const beforeReconnect = await getTermState(page)
 
     // Reset capture.
     await page.evaluate(() => { (window as any).__wsResizes = [] })
@@ -110,10 +112,18 @@ test.describe('terminal resize — reconnect', () => {
     // Extra settle time.
     await page.waitForTimeout(1000)
 
-    // No resize messages should have been sent during reconnect.
-    const reconnectCount = await page.evaluate(
-      () => ((window as any).__wsResizes as string[]).length,
+    // Reconnect must send exactly one authoritative resize even when the
+    // logical size did not change. The runner hides a one-column shrink while
+    // detached; this message restores it and triggers the intended TUI redraw.
+    const reconnectResizes = await page.evaluate(
+      () => (window as any).__wsResizes as string[],
     )
-    expect(reconnectCount).toBe(0)
+    expect(reconnectResizes).toHaveLength(1)
+    expect(JSON.parse(reconnectResizes[0])).toEqual({
+      type: 'resize',
+      cols: beforeReconnect.termCols,
+      rows: beforeReconnect.termRows,
+    })
+    expect(await isPillVisible(page)).toBe(false)
   })
 })

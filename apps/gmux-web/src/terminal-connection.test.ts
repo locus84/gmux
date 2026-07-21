@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { shouldHandleTerminalSocketClose } from './terminal-connection'
+import { fetchAuthoritativeReconnectSize, shouldHandleTerminalSocketClose } from './terminal-connection'
 
 const activeSocket = {}
 
@@ -27,5 +27,35 @@ describe('shouldHandleTerminalSocketClose', () => {
     expect(shouldHandle({ intentionalClose: true })).toBe(false)
     expect(shouldHandle({ disposed: true })).toBe(false)
     expect(shouldHandle({ sessionStillCurrent: false })).toBe(false)
+  })
+})
+
+describe('fetchAuthoritativeReconnectSize', () => {
+  it('reads the current session size without allowing a cached response', async () => {
+    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.cache).toBe('no-store')
+      return new Response(JSON.stringify({
+        data: [
+          { id: 'other', terminal_cols: 70, terminal_rows: 20 },
+          { id: 'sess-1', terminal_cols: 120, terminal_rows: 40 },
+        ],
+      }))
+    }
+
+    await expect(fetchAuthoritativeReconnectSize('sess-1', fetcher)).resolves.toEqual({ cols: 120, rows: 40 })
+  })
+
+  it('returns null for missing or invalid session dimensions', async () => {
+    const fetcher = async () => new Response(JSON.stringify({
+      data: [{ id: 'sess-1', terminal_cols: 0, terminal_rows: 24 }],
+    }))
+
+    await expect(fetchAuthoritativeReconnectSize('sess-1', fetcher)).resolves.toBeNull()
+    await expect(fetchAuthoritativeReconnectSize('missing', fetcher)).resolves.toBeNull()
+  })
+
+  it('returns null when the fresh read fails', async () => {
+    const fetcher = async () => { throw new Error('offline') }
+    await expect(fetchAuthoritativeReconnectSize('sess-1', fetcher)).resolves.toBeNull()
   })
 })

@@ -20,7 +20,7 @@ import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
-import { shouldHandleTerminalSocketClose } from './terminal-connection'
+import { fetchAuthoritativeReconnectSize, shouldHandleTerminalSocketClose } from './terminal-connection'
 import { decideViewportResize, sameSize } from './terminal-resize'
 import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { MOCK_BY_ID } from './mock-data/index'
@@ -1167,20 +1167,27 @@ export function TerminalView({
         setWsState('open')
 
         if (!isFirstConnect) {
-          // Reconnect: re-sync ptySize from session metadata in case a
-          // terminal_resize WS event was missed during the drop. Session
-          // metadata is updated via SSE independently, so it may be
-          // fresher than our cached ptySize after a network blip.
+          // Reconnect: fetch the daemon's current logical size instead of using
+          // the component/SSE cache, which may be stale after mobile suspend.
+          // Even when the fresh size matches our cache, reassert it once: the
+          // runner intentionally hides a one-column shrink after the last
+          // client disconnects and expects the next explicit resize to restore
+          // the logical size and trigger a TUI redraw. Following the fresh
+          // daemon value avoids reclaiming a size chosen by another device.
           resetResizeEchoGate()
-          const sess = sessionRef.current
-          if (sess.terminal_cols && sess.terminal_rows) {
+          void fetchAuthoritativeReconnectSize(session.id).then((size) => {
+            if (!size
+              || wsRef.current !== ws
+              || ws.readyState !== WebSocket.OPEN
+              || currentSessionId.current !== session.id) return
+
             const cached = ptySizeRef.current
-            if (!cached || cached.cols !== sess.terminal_cols || cached.rows !== sess.terminal_rows) {
-              const size = { cols: sess.terminal_cols, rows: sess.terminal_rows }
+            if (!sameSize(cached, size)) {
               setPtySize(size); ptySizeRef.current = size
-              queueResize(size)
             }
-          }
+            queueResize(size)
+            announceResize(ws, size)
+          })
           return
         }
         isFirstConnect = false

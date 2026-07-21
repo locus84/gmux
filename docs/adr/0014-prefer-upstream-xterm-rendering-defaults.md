@@ -43,10 +43,10 @@ The web client therefore:
 3. does not override `.xterm-image-layer-top` or
    `.xterm-image-layer-bottom` stacking on mobile;
 4. does not recreate WebGL addons after xterm reports context loss; and
-5. does not send a same-size resize solely to force inline-image redraw after a
-   WebSocket reconnect.
+5. does not send a same-size resize solely as a browser-side inline-image
+   redraw trick after a WebSocket reconnect.
 
-Two narrow exceptions remain:
+Three narrow exceptions remain:
 
 - The beta.288 core patch for iPad/WKWebView Korean IME behavior is retained.
   Input correctness was an explicit requirement and is independent of image
@@ -54,10 +54,21 @@ Two narrow exceptions remain:
 - The stale-WebSocket close guard is retained. It prevents an obsolete socket
   from marking its replacement disconnected and is connection-generation
   correctness, not a rendering workaround.
+- An automatic reconnect fetches and reasserts the daemon's current logical
+  PTY size exactly once. The runner deliberately hides a one-column shrink
+  while no client is attached, without changing session metadata, and requires
+  the next explicit resize to restore that logical size and trigger `SIGWINCH`.
+  Skipping the matching resize caused a reproduced mobile foreground
+  regression: a snapshot rendered at `cols-1` was parsed by an xterm grid still
+  at `cols`, displacing and overlaying TUI regions. The client uses a fresh,
+  uncached session read rather than its viewport or suspended SSE/component
+  cache, so it follows a size chosen by another device instead of reclaiming
+  ownership.
 
-The runner-side hidden reconnect shrink remains in the installed CLI for now.
-It is outside the web-only baseline deployment and can only be removed and
-validated through a separately approved full CLI/daemon install.
+The runner-side hidden reconnect shrink remains part of the runner protocol.
+The web client must acknowledge it with the freshly resolved reconnect resize
+above until that protocol is replaced and existing runner processes have been
+restarted.
 
 ## Reapplication rule
 
@@ -80,8 +91,10 @@ separate product decision explicitly requires them.
 - Mobile devices receive the same addon defaults as desktop, so real-device
   observation is required for memory pressure and Safari compositing failures.
 - Reconnected or additional viewers may still be unable to reconstruct inline
-  image protocol state from replayed text. If that is reproduced, fix the
-  stream/replay boundary rather than automatically restoring a resize trick.
+  image protocol state from replayed text. The authoritative reconnect resize
+  only completes the runner's existing hidden-shrink handshake; broader image
+  recovery still belongs at the stream/replay boundary rather than in canvas
+  or renderer tricks.
 - A target-device smoke test after deployment showed the upgraded inline image
   rendering correctly, so no downstream rendering workaround was reapplied.
 
