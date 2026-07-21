@@ -21,6 +21,7 @@ import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
+import { shouldHandleTerminalSocketClose } from './terminal-connection'
 import { decideReconnectResize, decideViewportResize, sameSize } from './terminal-resize'
 import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { MOCK_BY_ID } from './mock-data/index'
@@ -1267,11 +1268,16 @@ export function TerminalView({
       }
 
       ws.onclose = () => {
+        if (!shouldHandleTerminalSocketClose({
+          closedSocket: ws,
+          currentSocket: wsRef.current,
+          intentionalClose,
+          disposed: disposed.current,
+          sessionStillCurrent: currentSessionId.current === session.id,
+        })) return
+
         resetResizeEchoGate()
         setWsState(prev => prev === 'open' ? 'lost' : prev)
-        if (disposed.current || intentionalClose) return
-        if (currentSessionId.current !== session.id) return
-
         const delay = Math.min(500 * Math.pow(2, attempt), 8000)
         attempt++
         reconnectTimer.current = setTimeout(connect, delay)
