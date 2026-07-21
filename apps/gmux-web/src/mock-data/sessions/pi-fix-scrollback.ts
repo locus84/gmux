@@ -13,6 +13,7 @@ export default {
   command: ['pi'],
   cwd: '/home/user/dev/my-project',
   workspace_root: '/home/user/dev/my-project',
+  git_layout: 'worktree',
   remotes: { origin: 'github.com/acme/my-project' },
   kind: 'pi',
   alive: true,

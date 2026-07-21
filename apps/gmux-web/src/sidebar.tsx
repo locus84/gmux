@@ -20,6 +20,7 @@ import {
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
+import { GitLayoutIcon } from './git-layout-icon'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
 import type { Session, Folder } from './types'
@@ -211,6 +212,7 @@ function SessionItem({
     dragging ? 'session-dragging' : '',
     dropTarget ? 'session-drop-target' : '',
     unavailable ? 'unavailable' : '',
+    onClose ? 'has-close' : '',
   ].filter(Boolean).join(' ')
 
   return (
@@ -251,11 +253,13 @@ function SessionItem({
           </div>
         )}
       </div>
+      <GitLayoutIcon layout={session.git_layout} />
       {onClose && (
         <button
           class="session-close-btn"
           onClick={(e) => { e.stopPropagation(); e.preventDefault(); onClose() }}
           title={session.alive ? 'Kill session' : 'Dismiss'}
+          aria-label={session.alive ? 'Kill session' : 'Dismiss session'}
         >
           ×
         </button>

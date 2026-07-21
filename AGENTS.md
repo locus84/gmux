@@ -101,8 +101,15 @@ messages directly. Rules that follow from this:
   Discord announcement falls back to the auto-generated bullet list
   so subscribers can still see what changed without clicking through.
 
+## Worktree agent workflows
+
+- `skills/gmux-worktree/SKILL.md` is the canonical skill for creating persistent, browser-visible gmux agent sessions in sibling Git worktrees. Keep its source in this repository; global and Hermes installations should symlink to that directory rather than copying it. Agents must inspect `gmux worktree ps --json` first, reuse a matching checkout/session, and create at most one worktree per logical task.
+- The locus `pi-harness` `worktree-agents` extension is complementary, not a duplicate: use `start_worktree_agent` for one-shot child Pi implementation runs and `gmux worktree create` when a human needs to watch or steer a durable session from the web/mobile UI.
+- Do not move or duplicate `gmux-worktree` into `locus-skills`; distinct ownership and trigger descriptions prevent drift and accidental tool substitution.
+
 ## Other rules
 
 - Push changes and create pull requests. Don't commit directly to
   `main`.
-- Use `./scripts/install.sh` when asked to install locally.
+- Use `./scripts/install.sh` only when the user explicitly approves a **full local install and gmuxd restart**. The script has no help/dry-run mode: even `./scripts/install.sh --help` performs the full build, replaces both `gmux` and `gmuxd`, and restarts the daemon. Never invoke it to inspect usage or for a web-only request.
+- For a web-only install, use `./scripts/install-web.sh`. It builds the frontend and atomically replaces the configured external web directory without replacing or restarting gmuxd. The daemon must already have `web_dir = "~/.local/state/gmux/web"` (or the chosen `--dir`) in `~/.config/gmux/host.toml`; verify that configuration first. `install-web.sh --help` is safe and does not install.

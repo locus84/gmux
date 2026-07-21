@@ -135,6 +135,36 @@ graph TD
 - **Web-first** — works on desktop, tablet, phone. Same URL everywhere.
 - **Zero config** — run `gmux <command>`, open a browser
 
+## Agent worktrees
+
+Create an isolated branch and worktree, launch an agent there, and keep the
+session available in the browser or on mobile:
+
+```bash
+gmux worktree ps --json  # reuse a matching checkout/session when present
+
+gmux worktree create fix-login \
+  --base origin/main \
+  --agent pi \
+  --prompt "Implement the login fix and run focused tests"
+
+gmux worktree ps
+```
+
+The bundled [`gmux-worktree` skill](skills/gmux-worktree/SKILL.md) teaches
+coding agents this workflow. From a source checkout, make it globally available
+to Agent Skills-compatible tools without duplicating it:
+
+```bash
+mkdir -p ~/.agents/skills
+ln -s "$(pwd)/skills/gmux-worktree" ~/.agents/skills/gmux-worktree
+```
+
+This complements Pi harnesses that launch one-shot child processes in managed
+worktrees. Use `gmux-worktree` when the session should remain visible and
+steerable; use a harness-native worktree worker for short-lived autonomous
+implementation jobs.
+
 ## Extensibility
 
 | Layer | Mechanism | Runs in | What it does |

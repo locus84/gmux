@@ -16,19 +16,26 @@ import (
 // session is the subset of gmuxd's Session model that the CLI cares
 // about. Defined locally to avoid pulling in the gmuxd store package.
 type cliSession struct {
-	ID         string `json:"id"`
-	Peer       string `json:"peer,omitempty"`
-	Cwd        string `json:"cwd,omitempty"`
-	Kind       string `json:"kind"`
-	Alive      bool   `json:"alive"`
-	Pid        int    `json:"pid,omitempty"`
-	Title      string `json:"title,omitempty"`
-	Slug       string `json:"slug,omitempty"`
-	SocketPath string `json:"socket_path,omitempty"`
-	Command    []string `json:"command,omitempty"`
-	StartedAt  string `json:"started_at,omitempty"`
-	ExitedAt   string `json:"exited_at,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
+	ID         string     `json:"id"`
+	Peer       string     `json:"peer,omitempty"`
+	Cwd        string     `json:"cwd,omitempty"`
+	Kind       string     `json:"kind"`
+	Alive      bool       `json:"alive"`
+	Pid        int        `json:"pid,omitempty"`
+	Title      string     `json:"title,omitempty"`
+	Slug       string     `json:"slug,omitempty"`
+	SocketPath string     `json:"socket_path,omitempty"`
+	Command    []string   `json:"command,omitempty"`
+	StartedAt  string     `json:"started_at,omitempty"`
+	ExitedAt   string     `json:"exited_at,omitempty"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	Status     *cliStatus `json:"status,omitempty"`
+}
+
+type cliStatus struct {
+	Label   string `json:"label,omitempty"`
+	Working bool   `json:"working,omitempty"`
+	Error   bool   `json:"error,omitempty"`
 }
 
 // fetchSessions queries gmuxd for the full session list. Starts gmuxd

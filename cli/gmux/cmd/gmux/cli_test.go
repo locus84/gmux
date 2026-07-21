@@ -59,6 +59,25 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "worktree current json", args: []string{"worktree", "current", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "current" || !c.json {
+					t.Errorf("sub=%q json=%v", c.worktreeSub, c.json)
+				}
+			}},
+		{name: "worktree ps selector", args: []string{"worktree", "ps", "branch:feature/x", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "ps" || c.worktreeSelector != "branch:feature/x" || !c.json {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+		{name: "worktree create", args: []string{"worktree", "create", "fix-login", "--base", "origin/main", "--agent", "pi", "--prompt", "fix it", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "create" || c.worktreeName != "fix-login" || c.worktreeBase != "origin/main" || c.worktreeAgent != "pi" || c.worktreePrompt != "fix it" || !c.json {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
 		{name: "attach", args: []string{"attach", "abc"}, wantMode: modeAttach,
 			check: func(t *testing.T, c *command) {
 				if c.ref != "abc" {
@@ -176,6 +195,12 @@ func TestParseCLI(t *testing.T) {
 
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
+		{"worktree"},
+		{"worktree", "unknown"},
+		{"worktree", "current", "extra"},
+		{"worktree", "ps", "one", "two"},
+		{"worktree", "create"},
+		{"worktree", "create", "name", "--prompt", "fix", "--agent", ""},
 		{"-d"},                     // detach without command
 		{"-d", "ls"},               // detach only pairs with --
 		{"--"},                     // run with no command
@@ -185,10 +210,10 @@ func TestParseCLIErrors(t *testing.T) {
 		{"tail"},                   // missing id
 		{"tail", "-n", "0", "abc"}, // non-positive count
 		{"wait"},                   // missing id
-		{"send-keys", "C-c"},     // missing -t
-		{"daemon"},               // missing subcommand
-		{"daemon", "frobnicate"}, // unknown subcommand
-		{"ls", "stray"},          // ls takes no positional
+		{"send-keys", "C-c"},       // missing -t
+		{"daemon"},                 // missing subcommand
+		{"daemon", "frobnicate"},   // unknown subcommand
+		{"ls", "stray"},            // ls takes no positional
 	}
 	for _, args := range bad {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {

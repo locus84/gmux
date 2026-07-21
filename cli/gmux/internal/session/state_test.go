@@ -27,6 +27,21 @@ func TestNewState(t *testing.T) {
 	}
 }
 
+func TestNewStateIncludesGitLayout(t *testing.T) {
+	s := New(Config{ID: "s", Kind: "shell", GitLayout: "worktree"})
+	data, err := s.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["git_layout"] != "worktree" {
+		t.Fatalf("git_layout = %v, want worktree", got["git_layout"])
+	}
+}
+
 func TestTitleFallsBackToCommandBasename(t *testing.T) {
 	s := New(Config{ID: "s", Command: []string{"/usr/bin/pi"}, Kind: "pi"})
 	if s.Title() != "pi" {

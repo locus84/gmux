@@ -18,6 +18,7 @@ import {
 } from './store'
 import { useArrivalPulse } from './use-arrival-pulse'
 import { HostSuffix } from './host-suffix'
+import { GitLayoutIcon } from './git-layout-icon'
 
 export interface SessionRowProps {
   session: Session
@@ -162,14 +163,20 @@ export function SessionRow({
           </div>
         )}
       </div>
-      {onClose && (
-        <button
-          class="session-row-close"
-          onClick={(e) => { e.stopPropagation(); e.preventDefault(); onClose() }}
-          title={session.alive ? 'Kill session' : 'Dismiss'}
-        >
-          ×
-        </button>
+      {(session.git_layout || onClose) && (
+        <div class="session-row-trailing">
+          <GitLayoutIcon layout={session.git_layout} />
+          {onClose && (
+            <button
+              class="session-row-close"
+              onClick={(e) => { e.stopPropagation(); e.preventDefault(); onClose() }}
+              title={session.alive ? 'Kill session' : 'Dismiss'}
+              aria-label={session.alive ? 'Kill session' : 'Dismiss session'}
+            >
+              ×
+            </button>
+          )}
+        </div>
       )}
     </a>
   )

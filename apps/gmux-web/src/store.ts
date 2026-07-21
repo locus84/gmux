@@ -913,6 +913,7 @@ export function toUISession(s: ProtocolSession): Session {
     command: s.command ?? [],
     cwd: s.cwd ?? '',
     workspace_root: s.workspace_root ?? undefined,
+    git_layout: s.git_layout ?? undefined,
     remotes: s.remotes ?? undefined,
     kind: s.kind ?? 'shell',
     alive: s.alive,

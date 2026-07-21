@@ -23,6 +23,7 @@ type State struct {
 	Cwd           string            `json:"cwd"`
 	Kind          string            `json:"kind"`
 	WorkspaceRoot string            `json:"workspace_root,omitempty"`
+	GitLayout     string            `json:"git_layout,omitempty"`
 	Remotes       map[string]string `json:"remotes,omitempty"`
 
 	// Process state (owned by runner)
@@ -84,6 +85,7 @@ type Config struct {
 	BinaryHash    string
 	RunnerVersion string
 	WorkspaceRoot string
+	GitLayout     string
 	Remotes       map[string]string
 }
 
@@ -96,6 +98,7 @@ func New(cfg Config) *State {
 		Cwd:           cfg.Cwd,
 		Kind:          cfg.Kind,
 		WorkspaceRoot: cfg.WorkspaceRoot,
+		GitLayout:     cfg.GitLayout,
 		Remotes:       cfg.Remotes,
 		SocketPath:    cfg.SocketPath,
 		BinaryHash:    cfg.BinaryHash,

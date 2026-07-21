@@ -25,6 +25,7 @@ type Session struct {
 	Cwd           string            `json:"cwd,omitempty"`
 	Kind          string            `json:"kind"`
 	WorkspaceRoot string            `json:"workspace_root,omitempty"`
+	GitLayout     string            `json:"git_layout,omitempty"`
 	Remotes       map[string]string `json:"remotes,omitempty"`
 	Alive         bool              `json:"alive"`
 	Pid           int               `json:"pid,omitempty"`
@@ -122,6 +123,7 @@ func (s Session) MarshalJSON() ([]byte, error) {
 		Cwd           string            `json:"cwd,omitempty"`
 		Kind          string            `json:"kind"`
 		WorkspaceRoot string            `json:"workspace_root,omitempty"`
+	GitLayout     string            `json:"git_layout,omitempty"`
 		Remotes       map[string]string `json:"remotes,omitempty"`
 		Alive         bool              `json:"alive"`
 		Pid           int               `json:"pid,omitempty"`
@@ -147,7 +149,7 @@ func (s Session) MarshalJSON() ([]byte, error) {
 	return json.Marshal(wire{
 		ID: s.ID, Peer: s.Peer, CreatedAt: s.CreatedAt, Command: s.Command,
 		Cwd: s.Cwd, Kind: s.Kind, WorkspaceRoot: s.WorkspaceRoot,
-		Remotes: s.Remotes, Alive: s.Alive, Pid: s.Pid,
+		GitLayout: s.GitLayout, Remotes: s.Remotes, Alive: s.Alive, Pid: s.Pid,
 		ExitCode: s.ExitCode, StartedAt: s.StartedAt, ExitedAt: s.ExitedAt,
 		Title: s.Title, Subtitle: s.Subtitle, Status: s.Status,
 		Unread: s.Unread, Resumable: s.Resumable,

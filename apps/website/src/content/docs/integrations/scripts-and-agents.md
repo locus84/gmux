@@ -120,6 +120,31 @@ done
 
 The agents run concurrently because `gmux -d -- pi <prompt>` returns as soon as the session registers and prints just the session id (no grep needed); the wait loop gates the harvest step on every agent reaching idle.
 
+## Isolated Git worktrees
+
+When parallel agents must edit independently, create the checkout and gmux
+session as one operation:
+
+```bash
+gmux worktree ps --json  # reuse a matching checkout/session when present
+
+result=$(gmux worktree create fix-login \
+  --base origin/main --agent pi \
+  --prompt "Implement the login fix and run focused tests" --json)
+id=$(printf '%s' "$result" | jq -r '.session_id')
+path=$(printf '%s' "$result" | jq -r '.path')
+
+gmux wait "$id" --timeout 900
+gmux tail "$id" -n 200
+git -C "$path" status --short
+```
+
+The default destination is `../<repo>-wt/<name>`. Worktree operations are
+local-only, reject branch/path collisions, and do not include uncommitted source
+checkout changes in a worktree created from `HEAD`. Install or load the
+[`gmux-worktree` skill](https://github.com/gmuxapp/gmux/blob/main/skills/gmux-worktree/SKILL.md)
+for parallel tracking, recovery, review, and cleanup guidance.
+
 ## Nested gmux
 
 When `gmux -- <cmd>` runs inside an existing gmux session (detected via the `GMUX=1` env var), gmux auto-detaches into a headless background process so you don't get a PTY-within-PTY. The auto-detach only triggers when stdin is a TTY: agent harnesses whose stdin is a pipe land in the piped flow above and behave normally. You don't need to special-case nested invocations.

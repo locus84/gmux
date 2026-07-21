@@ -12,23 +12,24 @@ import (
 type mode int
 
 const (
-	modeHelp      mode = iota // print usage and exit
-	modeVersion               // print version and exit
-	modeOpen                  // open the web UI
-	modeRun                   // run a command in a new session (gmux -- <cmd>)
-	modeList                  // gmux ls
-	modeAttach                // gmux attach <id>
-	modeTail                  // gmux tail <id>
-	modeKill                  // gmux kill <id>
-	modeSend                  // gmux send <id> <text> [keys...]
-	modeSendKeys              // gmux send-keys -t <id> ... (tmux-compat)
-	modeWait                  // gmux wait <id>
-	modeDaemon                // gmux daemon <start|stop|restart|status|log-path>
-	modeAuth                  // gmux auth
-	modeRemote                // gmux remote
-	modeDumpEnv               // (internal) gmux __dump-env
-	modeCodexHook             // (internal) gmux __codex-hook <Event>
-	modeClaudeHook            // (internal) gmux __claude-hook
+	modeHelp       mode = iota // print usage and exit
+	modeVersion                // print version and exit
+	modeOpen                   // open the web UI
+	modeRun                    // run a command in a new session (gmux -- <cmd>)
+	modeList                   // gmux ls
+	modeAttach                 // gmux attach <id>
+	modeTail                   // gmux tail <id>
+	modeKill                   // gmux kill <id>
+	modeSend                   // gmux send <id> <text> [keys...]
+	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
+	modeWait                   // gmux wait <id>
+	modeWorktree               // gmux worktree <current|ps|create>
+	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path>
+	modeAuth                   // gmux auth
+	modeRemote                 // gmux remote
+	modeDumpEnv                // (internal) gmux __dump-env
+	modeCodexHook              // (internal) gmux __codex-hook <Event>
+	modeClaudeHook             // (internal) gmux __claude-hook
 )
 
 // command is the fully-parsed CLI invocation. One struct for every
@@ -66,6 +67,16 @@ type command struct {
 	// wait
 	timeout int // --timeout seconds (0 = none)
 
+	// worktree
+	worktreeSub      string
+	worktreeSelector string
+	worktreeName     string
+	worktreeRepo     string
+	worktreeBase     string
+	worktreePath     string
+	worktreeAgent    string
+	worktreePrompt   string
+
 	// daemon
 	daemonSub string // start|stop|restart|status|log-path
 
@@ -79,7 +90,7 @@ type command struct {
 // command in the error-only migration shim.
 var reservedVerbs = []string{
 	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "daemon", "auth", "remote", "version", "help",
+	"wait", "worktree", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -161,6 +172,8 @@ func parseCLI(args []string) (*command, error) {
 		return parseSendKeys(rest)
 	case "wait":
 		return parseWait(rest)
+	case "worktree":
+		return parseWorktree(rest)
 	case "daemon":
 		return parseDaemon(rest)
 	case "auth":
@@ -292,6 +305,57 @@ func parseSendKeys(args []string) (*command, error) {
 	c.keys = fs.Args()
 	if len(c.keys) == 0 {
 		return nil, errors.New("send-keys requires at least one key or string")
+	}
+	return c, nil
+}
+
+func parseWorktree(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("worktree requires one of: current, ps, create")
+	}
+	c := &command{mode: modeWorktree, worktreeSub: args[0], worktreeBase: "HEAD"}
+	fs := newFlagSet("worktree " + c.worktreeSub)
+	switch c.worktreeSub {
+	case "current":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return nil, err
+		}
+		if len(fs.Args()) != 0 {
+			return nil, errors.New("worktree current takes no arguments")
+		}
+	case "ps":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) > 1 {
+			return nil, errors.New("worktree ps takes at most one selector")
+		}
+		if len(pos) == 1 {
+			c.worktreeSelector = pos[0]
+		}
+	case "create":
+		fs.StringVar(&c.worktreeRepo, "repo", "", "repository path (default current directory)")
+		fs.StringVar(&c.worktreeBase, "base", "HEAD", "base ref")
+		fs.StringVar(&c.worktreePath, "path", "", "destination path")
+		fs.StringVar(&c.worktreeAgent, "agent", "", "gmux launcher id")
+		fs.StringVar(&c.worktreePrompt, "prompt", "", "initial agent prompt")
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) != 1 {
+			return nil, errors.New("worktree create requires exactly one name")
+		}
+		c.worktreeName = pos[0]
+		if c.worktreePrompt != "" && c.worktreeAgent == "" {
+			return nil, errors.New("--prompt requires --agent")
+		}
+	default:
+		return nil, fmt.Errorf("unknown worktree command %q", c.worktreeSub)
 	}
 	return c, nil
 }
@@ -445,6 +509,11 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
   gmux wait <id> [--timeout N]      block until an agent session is idle
   gmux kill <id>                    terminate a session
+
+Git worktrees (local only):
+  gmux worktree current [--json]    show the enclosing worktree
+  gmux worktree ps [ref] [--json]   show worktrees and their live sessions
+  gmux worktree create <name> ...   create a worktree and optionally launch an agent
 
 UI & pairing:
   gmux open                         open the web UI

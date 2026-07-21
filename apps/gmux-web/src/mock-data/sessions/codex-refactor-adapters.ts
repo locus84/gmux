@@ -21,6 +21,7 @@ export default {
   command: ["codex"],
   cwd: '/home/user/dev/my-project',
   workspace_root: '/home/user/dev/my-project',
+  git_layout: 'repository',
   remotes: { origin: 'github.com/acme/my-project' },
   kind: 'codex',
   alive: true,

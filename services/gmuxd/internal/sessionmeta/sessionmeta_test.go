@@ -83,6 +83,7 @@ func TestRoundTripFullSession(t *testing.T) {
 		Cwd:           "~/work",
 		Kind:          "shell",
 		WorkspaceRoot: "~/work/repo",
+		GitLayout:     "repository",
 		Remotes:       map[string]string{"origin": "github.com/me/repo"},
 		Alive:         false,
 		Pid:           12345,

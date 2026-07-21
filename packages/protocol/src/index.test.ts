@@ -27,6 +27,13 @@ describe('protocol schemas', () => {
     expect(result.terminal_rows).toBe(40)
   })
 
+  it('parses Git layout and keeps legacy absence unknown', () => {
+    expect(SessionSchema.parse({ id: 'repo', alive: true, git_layout: 'repository' }).git_layout).toBe('repository')
+    expect(SessionSchema.parse({ id: 'worktree', alive: true, git_layout: 'worktree' }).git_layout).toBe('worktree')
+    expect(SessionSchema.parse({ id: 'legacy', alive: false }).git_layout).toBeUndefined()
+    expect(() => SessionSchema.parse({ id: 'bad', alive: true, git_layout: 'bare' })).toThrow()
+  })
+
   it('parses session with null status', () => {
     const result = SessionSchema.parse({
       id: 'sess-2',

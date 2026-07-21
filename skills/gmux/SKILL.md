@@ -61,6 +61,10 @@ gmux tail $id -n 100
 
 ## Parallel orchestration
 
+For isolated branches and working directories, load the separate
+`gmux-worktree` skill and use `gmux worktree create` rather than manually
+combining Git worktree and session setup.
+
 ```bash
 ids=()
 for ticket in fa-48 fa-49 fa-52; do

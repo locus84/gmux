@@ -16,6 +16,8 @@ export interface Session {
   command: string[]
   cwd: string
   workspace_root?: string
+  /** Git layout detected by the owning runner when the session started. */
+  git_layout?: 'repository' | 'worktree'
   remotes?: Record<string, string>
   kind: string
   alive: boolean

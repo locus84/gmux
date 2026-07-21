@@ -176,6 +176,56 @@ session marked dead — the same path as the UI's kill button.
 gmux kill a3f20187
 ```
 
+## Git worktrees
+
+Worktree commands are local-only. They read Git metadata on this machine and
+never interpret a peer session's filesystem path locally.
+
+### `gmux worktree current`
+
+Show the worktree containing the current directory. `--json` emits its path,
+branch, HEAD, and Git state as an object.
+
+### `gmux worktree ps [selector]`
+
+List checkouts in the current repository and group their live local gmux
+sessions by actual cwd. Use `--json` for automation. Select one checkout with
+`current`, `branch:<branch>`, `path:<path>`, `name:<directory>`, or a unique bare
+branch/path/name.
+
+```bash
+gmux worktree ps
+gmux worktree ps branch:fix/login --json
+```
+
+### `gmux worktree create <name>`
+
+Create a new branch and linked worktree, optionally launching a registered gmux
+agent there and typing its initial prompt.
+
+```bash
+gmux worktree create fix-login \
+  --base origin/main \
+  --agent pi \
+  --prompt "Implement the login fix and run focused tests" \
+  --json
+```
+
+Options:
+
+- `--repo PATH` — source repository; defaults to the current checkout.
+- `--base REF` — creation ref; defaults to `HEAD`.
+- `--path PATH` — destination; defaults to `../<repo>-wt/<name>`.
+- `--agent LAUNCHER` — an available gmux launcher such as `pi`, `claude`, or `codex`.
+- `--prompt TEXT` — initial PTY input; requires `--agent`.
+- `--json` — emit the created worktree and optional session id.
+
+Existing branches and paths are rejected. If agent startup or prompt delivery
+fails, gmux preserves the checkout and reports its path; a lost daemon response
+may be ambiguous, so inspect `gmux ls` before relaunching. There is intentionally
+no worktree removal command yet—review and integrate work before cleaning it up
+with Git.
+
 ## UI, pairing, and the daemon
 
 ### `gmux open`

@@ -1,0 +1,107 @@
+---
+name: gmux-worktree
+description: Create and inspect isolated Git worktrees that run coding agents through gmux. Use when parallel implementation or review tasks need separate branches and working directories, or when the user asks to launch a gmux agent in a worktree.
+compatibility: Requires git, gmux, gmuxd, and an available gmux coding-agent launcher such as pi, Claude Code, or Codex.
+---
+
+# gmux worktree
+
+When this skill is loaded, **MUST use `gmux worktree create`** for creation and
+agent launch. Do not substitute raw `git worktree add` plus `cd` plus `gmux`; use
+that only as an explicitly reported fallback when the installed gmux lacks the
+worktree namespace. Never use the removed bare `gmux <command>` form—normal
+session launches require `gmux -- <command>`.
+
+Commands are local-only: never interpret a peer's path on this machine.
+
+## Reuse before create
+
+Before every create, **MUST run `gmux worktree ps --json`** in the target
+repository and compare the requested task with existing branch, path, and live
+sessions.
+
+- Reuse an existing matching worktree/session instead of creating another one.
+- Create at most one worktree per logical task. Substeps, retries, and follow-up
+  prompts stay in the same session via `gmux send` and `gmux wait`.
+- Never call `gmux worktree create` twice for one task unless the first command
+  failed before creation and a fresh `worktree ps` confirms that no checkout was
+  created.
+- Multiple worktrees are allowed only for explicitly separate parallel tasks;
+  keep a task → branch → path → session-id table and create one row per task.
+- When launching Hermes through `--agent hermes`, do not also pass Hermes's own
+  `--worktree` flag: gmux already created and selected the checkout.
+
+## Inspect
+
+```bash
+gmux worktree current
+gmux worktree current --json
+gmux worktree ps
+gmux worktree ps branch:fix/login --json
+```
+
+Selectors are `current`, `branch:<branch>`, `path:<path>`, and
+`name:<worktree-directory>`. A unique bare branch, path, or directory name also
+works. `ps` reports live local gmux sessions grouped by their actual checkout cwd.
+
+## Create and launch
+
+First inspect and reuse:
+
+```bash
+gmux worktree ps --json
+```
+
+Only when no matching checkout exists:
+
+```bash
+result=$(gmux worktree create fix-login \
+  --base origin/main \
+  --agent pi \
+  --prompt "Implement the login fix, run focused tests, and report changed files." \
+  --json)
+id=$(printf '%s' "$result" | jq -r '.session_id')
+path=$(printf '%s' "$result" | jq -r '.path')
+```
+
+Defaults:
+
+- repository: the enclosing Git checkout
+- base: `HEAD`
+- destination: `../<repo>-wt/<name>`; slashes in the branch become dashes in the path
+- no agent session unless `--agent` is supplied
+
+Use `--repo <path>` and `--path <path>` when defaults are inappropriate. gmux
+rejects existing branches and destination paths rather than silently reusing them.
+A prompt requires an agent.
+
+The initial prompt is typed into the registered PTY. On a machine where an agent
+has a first-run trust, login, or update dialog, create without `--prompt`, inspect
+with `gmux tail`/the browser, then send the prompt explicitly once ready.
+
+## Track and harvest
+
+```bash
+gmux wait "$id" --timeout 900
+gmux tail "$id" -n 200
+git -C "$path" status --short
+git -C "$path" diff --stat
+```
+
+For parallel work, keep an explicit task → session id → path → branch table. Create
+all worktrees first, then wait and review each result. `gmux wait` is for agent
+sessions, not arbitrary shell commands.
+
+## Safety
+
+- Uncommitted changes in the source checkout are not included when creating from
+  `HEAD`; choose and verify the base ref deliberately.
+- If launch or prompt delivery fails, gmux preserves the new checkout and reports
+  its path. A lost daemon response can be ambiguous, so inspect `gmux ls` before
+  deciding whether to relaunch or clean up.
+- Session failure or timeout never proves a worktree is disposable.
+- gmux intentionally has no `worktree rm` command yet. Review status, commits, and
+  integration before manually running `git worktree remove`; do not force removal
+  by default.
+- Worktrees isolate tracked files, not shared databases, ports, caches, credentials,
+  or external services.

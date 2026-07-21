@@ -485,6 +485,12 @@ body {
   background: var(--bg-hover);
 }
 
+/* The compact close button is absolutely positioned. Reserve its column so
+   the repository marker remains visible instead of sliding underneath it. */
+.session-item.has-close {
+  padding-right: 2.35em;
+}
+
 .session-item.selected {
   background: var(--bg-selected);
 }
@@ -603,6 +609,27 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1px;
+}
+
+.session-git-layout-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  opacity: 0.58;
+}
+.session-git-layout-icon.worktree {
+  opacity: 0.68;
+}
+.session-item > .session-git-layout-icon {
+  width: 13px;
+  height: 13px;
+}
+.session-item:hover .session-git-layout-icon,
+.session-row:hover .session-git-layout-icon,
+.session-item.selected .session-git-layout-icon,
+.session-row.selected .session-git-layout-icon {
+  opacity: 0.9;
 }
 
 .session-title-row {
@@ -770,6 +797,9 @@ body {
 .mock-mode .session-row-close {
   display: none;
 }
+.mock-mode .session-item.has-close {
+  padding-right: 0.3571em;
+}
 
 /* Session drag-to-reorder */
 .session-item.session-dragging {
@@ -853,6 +883,13 @@ body {
 .session-dup-warning {
   color: var(--warning, #d08770);
   font-weight: 500;
+}
+
+.session-row-trailing {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .session-row-close {
@@ -2316,6 +2353,23 @@ body {
    Uses pointer:coarse so tablets in landscape still get touch controls,
    while a desktop user with a narrow window keeps the sidebar visible. */
 @media (pointer: coarse) {
+  .session-item {
+    min-height: 44px;
+  }
+  .session-item.has-close {
+    padding-right: 3.25em;
+  }
+  .session-close-btn,
+  .session-row-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .session-close-btn {
+    right: 0;
+    width: 44px;
+    height: 44px;
+  }
+
   .sidebar {
     position: fixed;
     left: 0;

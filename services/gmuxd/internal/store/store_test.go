@@ -1048,6 +1048,7 @@ func fullyPopulatedSession() Session {
 		Cwd:            "/tmp/work",
 		Kind:           "pi",
 		WorkspaceRoot:  "/tmp/work",
+		GitLayout:      "worktree",
 		Remotes:        map[string]string{"origin": "github.com/x/y"},
 		Alive:          true,
 		Pid:            42,

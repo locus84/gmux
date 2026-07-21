@@ -104,6 +104,13 @@ describe('toUISession project stamp passthrough', () => {
     expect(ui.project_slug).toBeUndefined()
   })
 
+  it('preserves git_layout from the owning runner', () => {
+    const ui = toUISession({
+      id: 'sess-1', alive: true, git_layout: 'worktree',
+    } as any)
+    expect(ui.git_layout).toBe('worktree')
+  })
+
   it('passes last_activity_at through from the wire', () => {
     // The owning daemon stamps this; the UI uses it for the home
     // dashboard's Recent section sort. Pure passthrough at the
