@@ -156,6 +156,7 @@ type Server struct {
 	sockPath string
 	listener net.Listener
 	screen   *vt.Emulator // virtual terminal for replay snapshots (guarded by mu)
+	replay   rawReplay    // image-capable raw reconnect checkpoint (guarded by mu)
 	adapter  adapter.Adapter
 	state    *session.State
 
@@ -187,6 +188,32 @@ func (c *wsClient) write(typ websocket.MessageType, data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.Write(c.ctx, typ, data)
+}
+
+const replayMessageLimit = 1 << 20
+
+func (c *wsClient) writeRawReplay(checkpoint, suffix []byte) error {
+	// Keep the checkpoint's final ESU in one message so the browser replay
+	// buffer can detect it without cross-message marker state. Individual
+	// messages stay below gmuxd/peer WebSocket read limits.
+	offset := 0
+	for len(checkpoint)-offset > replayMessageLimit+len(replayESU) {
+		if err := c.write(websocket.MessageBinary, checkpoint[offset:offset+replayMessageLimit]); err != nil {
+			return err
+		}
+		offset += replayMessageLimit
+	}
+	if err := c.write(websocket.MessageBinary, checkpoint[offset:]); err != nil {
+		return err
+	}
+	for len(suffix) > 0 {
+		n := min(len(suffix), replayMessageLimit)
+		if err := c.write(websocket.MessageBinary, suffix[:n]); err != nil {
+			return err
+		}
+		suffix = suffix[n:]
+	}
+	return nil
 }
 
 // Config for creating a new PTY server.
@@ -806,6 +833,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) lockReplayBoundary(ctx context.Context) bool {
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		s.mu.Lock()
+		if s.replay.safeBoundary() {
+			return true // caller owns s.mu
+		}
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.ptyDone:
+			// No more bytes can complete the sequence. Discard raw replay and
+			// let the caller use the emulator snapshot at a synthetic boundary.
+			s.mu.Lock()
+			s.replay.abandonUnsafe()
+			return true // caller owns s.mu
+		case <-deadline.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // local Unix socket, no origin check needed
@@ -830,9 +886,17 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// text-only replay frame cannot reconstruct.
 	s.shrinkForReconnect()
 
-	// Replay screen state, then register for live data.
-	// All steps happen under s.mu so readPTY cannot send live data to
-	// this client before the snapshot frame.
+	// Replay screen state, then register for live data. A PTY flush can split
+	// an opaque Kitty/Sixel/IIP payload, so wait until the raw stream parser is
+	// at a legal boundary before taking the lock for replay + registration.
+	if !s.lockReplayBoundary(ctx) {
+		conn.Close(websocket.StatusTryAgainLater, "terminal output frame is incomplete")
+		cancel()
+		return
+	}
+
+	// All following steps happen under s.mu so readPTY cannot send live data to
+	// this client before the replay frame.
 	//
 	// Ordering guarantee: snapshot is always the first message the client
 	// receives, followed by any live data from subsequent readPTY cycles.
@@ -843,9 +907,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// sequences with style diffing.
 	//
 	// Sequence: BSU → reset → scrollback + screen → cursor → ESU
-	s.mu.Lock()
 	s.drainScreenLocked()
-	snapshot := renderScreen(s.screen)
+	checkpoint, suffix := s.replay.parts()
 	cursorSeq := "\x1b[?25h" // show cursor (default)
 	if s.cursorHidden {
 		cursorSeq = "\x1b[?25l" // hide cursor
@@ -856,12 +919,22 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	bsu := "\x1b[?2026h"                     // Begin Synchronized Update
 	resetSeq := "\x1b[r\x1b[H\x1b[2J\x1b[3J" // Reset scroll region + cursor home + erase display + erase scrollback
 	esu := "\x1b[?2026l"                     // End Synchronized Update
-	frame := []byte(bsu + resetSeq + snapshot + cursorPos + cursorSeq + esu)
-	if err := client.write(websocket.MessageBinary, frame); err != nil {
-		s.mu.Unlock()
-		conn.Close(websocket.StatusNormalClosure, "")
-		cancel()
-		return
+	if len(checkpoint) > 0 {
+		if err := client.writeRawReplay(checkpoint, suffix); err != nil {
+			s.mu.Unlock()
+			conn.Close(websocket.StatusNormalClosure, "")
+			cancel()
+			return
+		}
+	} else {
+		snapshot := renderScreen(s.screen)
+		frame := []byte(bsu + resetSeq + snapshot + cursorPos + cursorSeq + esu)
+		if err := client.write(websocket.MessageBinary, frame); err != nil {
+			s.mu.Unlock()
+			conn.Close(websocket.StatusNormalClosure, "")
+			cancel()
+			return
+		}
 	}
 	s.clients[client] = struct{}{}
 	s.lastClientLeft = time.Time{} // reset: we have an active viewer
@@ -1083,6 +1156,7 @@ func (s *Server) readPTY() {
 		// atomically so new clients always see their replay frame first.
 		s.mu.Lock()
 		s.screenPending = append(s.screenPending, data...)
+		s.replay.write(data)
 		localOut := s.localOut
 		clients := make([]*wsClient, 0, len(s.clients))
 		for c := range s.clients {

@@ -65,10 +65,19 @@ Three narrow exceptions remain:
   cache, so it follows a size chosen by another device instead of reclaiming
   ownership.
 
-The runner-side hidden reconnect shrink remains part of the runner protocol.
-The web client must acknowledge it with the freshly resolved reconnect resize
-above until that protocol is replaced and existing runner processes have been
-restarted.
+The runner owns durable image recovery. Alongside its text-only `x/vt`
+snapshot, it retains a bounded opaque replay checkpoint only after observing a
+complete synchronized full redraw (`BSU`, display/home/scrollback reset, then
+`ESU`). Subsequent bytes are retained in order only up to a strict cap and only
+at complete terminal-sequence boundaries. On attach, the runner sends that raw
+checkpoint and suffix so a fresh xterm receives the original Kitty/Sixel/IIP
+payloads; if no safe checkpoint exists, it falls back to the existing ANSI
+snapshot. gmuxd and peer proxies remain byte-transparent.
+
+The runner-side hidden reconnect shrink remains as a compatibility/fallback
+path. The web client must acknowledge it with the freshly resolved reconnect
+resize above for existing runners and sessions that have no valid raw
+checkpoint.
 
 ## Reapplication rule
 
@@ -90,11 +99,13 @@ separate product decision explicitly requires them.
   xterm's current image-layer and WebGL lifecycle semantics more closely.
 - Mobile devices receive the same addon defaults as desktop, so real-device
   observation is required for memory pressure and Safari compositing failures.
-- Reconnected or additional viewers may still be unable to reconstruct inline
-  image protocol state from replayed text. The authoritative reconnect resize
-  only completes the runner's existing hidden-shrink handshake; broader image
-  recovery still belongs at the stream/replay boundary rather than in canvas
-  or renderer tricks.
+- Reconnected and additional viewers recover inline images when the runner has
+  a complete bounded raw checkpoint. Oversized, incomplete, or plain streams
+  deterministically retain the ANSI snapshot fallback.
+- The authoritative reconnect resize still completes the runner's existing
+  hidden-shrink handshake for fallback and compatibility cases; image recovery
+  itself belongs at the stream/replay boundary rather than in canvas or
+  renderer tricks.
 - A target-device smoke test after deployment showed the upgraded inline image
   rendering correctly, so no downstream rendering workaround was reapplied.
 
@@ -106,3 +117,5 @@ separate product decision explicitly requires them.
   by this decision.
 - `d7a4749` — remove the downstream web rendering policies and deploy the
   upstream-default baseline.
+- `cli/gmux/internal/ptyserver/replay_checkpoint.go` — retain bounded,
+  protocol-safe raw redraw checkpoints for reconnect image recovery.
