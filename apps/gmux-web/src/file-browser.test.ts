@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { closeFileBrowserPath, fileApiPath, fileBrowserPath, formatBytes, parentPath, pasteFileBrowserPath, pathSegments, projectFileBrowserPath, tempFileApiPath } from './file-browser'
+import { closeFileBrowserPath, coverImageSize, fileApiPath, fileBrowserPath, formatBytes, parentPath, pasteFileBrowserPath, pathSegments, projectFileBrowserPath, tempFileApiPath } from './file-browser'
 
 describe('file browser helpers', () => {
   it('builds overlay route and session API URLs', () => {
@@ -31,6 +31,13 @@ describe('file browser helpers', () => {
       { name: 'app', path: 'src/app' },
       { name: 'main.ts', path: 'src/app/main.ts' },
     ])
+  })
+
+  it('sizes images to cover the viewport without changing aspect ratio', () => {
+    expect(coverImageSize(800, 400, 360, 600)).toEqual({ width: 1200, height: 600 })
+    expect(coverImageSize(400, 800, 360, 600)).toEqual({ width: 360, height: 720 })
+    expect(coverImageSize(600, 1000, 360, 600)).toEqual({ width: 360, height: 600 })
+    expect(coverImageSize(0, 400, 360, 600)).toBeNull()
   })
 
   it('formats byte counts', () => {

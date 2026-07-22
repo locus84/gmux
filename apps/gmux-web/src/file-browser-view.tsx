@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'preact/hooks'
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useLocation } from 'preact-iso'
 import {
   closeFileBrowserPath,
+  coverImageSize,
   fileApiPath,
   fileBrowserPath,
   projectFileBrowserPath,
@@ -123,6 +124,8 @@ export function FileBrowserView() {
   const [copied, setCopied] = useState<string | null>(null)
   const [imageMode, setImageModeState] = useState<ImageMode>(readImageMode)
   const [imageLoad, setImageLoad] = useState<ImageLoad>({ src: '', state: 'loading' })
+  const imageWrapRef = useRef<HTMLDivElement>(null)
+  const imageRef = useRef<HTMLImageElement>(null)
 
   const segments = useMemo(() => pathSegments(path), [path])
   const title = path ? path.split('/').filter(Boolean).at(-1) || 'Files' : 'Files'
@@ -168,6 +171,47 @@ export function FileBrowserView() {
     window.addEventListener('keydown', onKeyDown, true)
     return () => window.removeEventListener('keydown', onKeyDown, true)
   }, [loc.path, loc.url])
+
+  useEffect(() => {
+    const wrap = imageWrapRef.current
+    const image = imageRef.current
+    if (!wrap || !image) return
+
+    if (imageMode !== 'fill' || imageLoadState !== 'loaded') {
+      image.style.removeProperty('width')
+      image.style.removeProperty('height')
+      return
+    }
+
+    let centerFrame = 0
+    const layout = () => {
+      const style = getComputedStyle(wrap)
+      const horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight)
+      const verticalPadding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+      const size = coverImageSize(
+        image.naturalWidth,
+        image.naturalHeight,
+        wrap.clientWidth - horizontalPadding,
+        wrap.clientHeight - verticalPadding,
+      )
+      if (!size) return
+      image.style.width = `${size.width}px`
+      image.style.height = `${size.height}px`
+      cancelAnimationFrame(centerFrame)
+      centerFrame = requestAnimationFrame(() => {
+        wrap.scrollLeft = (wrap.scrollWidth - wrap.clientWidth) / 2
+        wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) / 2
+      })
+    }
+
+    layout()
+    const observer = new ResizeObserver(layout)
+    observer.observe(wrap)
+    return () => {
+      observer.disconnect()
+      cancelAnimationFrame(centerFrame)
+    }
+  }, [imageMode, imageSrc, imageLoadState])
 
   const setImageMode = (mode: ImageMode) => {
     setImageModeState(mode)
@@ -256,11 +300,12 @@ export function FileBrowserView() {
               <button class={imageMode === 'fill' ? 'active' : ''} onClick={() => setImageMode('fill')}>Fill</button>
             </div>
           </div>
-          <div class={`file-image-preview-wrap is-${imageMode}`}>
+          <div ref={imageWrapRef} class={`file-image-preview-wrap is-${imageMode}`}>
             {imageLoadState === 'loading' && <div class="state-subtitle">Loading image…</div>}
             {imageLoadState === 'error' && <div class="file-error"><div class="state-title">Could not load image</div></div>}
             <img
               key={imageSrc}
+              ref={imageRef}
               class={`file-image-preview is-${imageMode}`}
               src={imageSrc}
               alt={state.kind === 'content' ? state.data.name : path}

@@ -97,6 +97,17 @@ export function pathSegments(path: string): Array<{ name: string; path: string }
   })
 }
 
+export function coverImageSize(
+  naturalWidth: number,
+  naturalHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } | null {
+  if (naturalWidth <= 0 || naturalHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
+  const scale = Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
+  return { width: naturalWidth * scale, height: naturalHeight * scale }
+}
+
 export function formatBytes(bytes?: number): string {
   if (!bytes) return bytes === 0 ? '0 B' : ''
   const units = ['B', 'KB', 'MB', 'GB']

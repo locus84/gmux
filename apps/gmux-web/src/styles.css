@@ -3272,27 +3272,31 @@ body {
   background: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
   overscroll-behavior: none;
 }
-.file-image-preview-wrap.is-actual {
+.file-image-preview-wrap.is-actual,
+.file-image-preview-wrap.is-fill {
   display: block;
+}
+.file-image-preview-wrap.is-fill {
+  touch-action: pan-x pan-y;
+  -webkit-overflow-scrolling: touch;
 }
 .file-image-preview {
   display: block;
   user-select: none;
   -webkit-user-select: none;
 }
-.file-image-preview.is-fit,
-.file-image-preview.is-fill {
+.file-image-preview.is-fit {
   width: 100%;
   height: 100%;
   max-width: none;
   max-height: none;
   border-radius: 10px;
-}
-.file-image-preview.is-fit {
   object-fit: contain;
 }
 .file-image-preview.is-fill {
-  object-fit: cover;
+  max-width: none;
+  max-height: none;
+  border-radius: 10px;
 }
 .file-image-preview.is-actual {
   width: auto;
