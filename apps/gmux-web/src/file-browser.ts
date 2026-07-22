@@ -97,15 +97,43 @@ export function pathSegments(path: string): Array<{ name: string; path: string }
   })
 }
 
-export function coverImageSize(
+export type ImageSizingMode = 'fit' | 'actual' | 'fill'
+
+export const imageZoomMin = 0.25
+export const imageZoomMax = 5
+export const imageWheelZoomStep = 0.05
+
+export function imageSizeForMode(
+  mode: ImageSizingMode,
   naturalWidth: number,
   naturalHeight: number,
   viewportWidth: number,
   viewportHeight: number,
 ): { width: number; height: number } | null {
   if (naturalWidth <= 0 || naturalHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
-  const scale = Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
-  return { width: naturalWidth * scale, height: naturalHeight * scale }
+  if (mode === 'actual') return { width: naturalWidth, height: naturalHeight }
+  const ratio = mode === 'fill'
+    ? Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
+    : Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
+  return { width: naturalWidth * ratio, height: naturalHeight * ratio }
+}
+
+export function coverImageSize(
+  naturalWidth: number,
+  naturalHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } | null {
+  return imageSizeForMode('fill', naturalWidth, naturalHeight, viewportWidth, viewportHeight)
+}
+
+export function clampImageZoom(zoom: number): number {
+  return Math.min(imageZoomMax, Math.max(imageZoomMin, zoom))
+}
+
+export function wheelImageZoom(zoom: number, deltaY: number): number {
+  if (deltaY === 0) return clampImageZoom(zoom)
+  return clampImageZoom(zoom + (deltaY < 0 ? imageWheelZoomStep : -imageWheelZoomStep))
 }
 
 export function formatBytes(bytes?: number): string {

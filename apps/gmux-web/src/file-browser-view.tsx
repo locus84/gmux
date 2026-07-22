@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useLocation } from 'preact-iso'
 import {
+  clampImageZoom,
   closeFileBrowserPath,
-  coverImageSize,
   fileApiPath,
   fileBrowserPath,
   projectFileBrowserPath,
   formatBytes,
+  imageSizeForMode,
   parentPath,
   pathSegments,
   tempFileApiPath,
   type FileContentData,
   type FileEntry,
   type FileListData,
+  type ImageSizingMode,
+  wheelImageZoom,
 } from './file-browser'
 
 interface ApiEnvelope<T> {
@@ -32,7 +35,7 @@ function displayPath(root: string, path: string): string {
 }
 
 type FileTarget = { kind: 'session'; id: string } | { kind: 'project'; slug: string } | { kind: 'paste'; id: string }
-type ImageMode = 'fit' | 'actual' | 'fill'
+type ImageMode = ImageSizingMode
 type ImageLoadState = 'loading' | 'loaded' | 'error'
 type ImageLoad = { src: string; state: ImageLoadState }
 
@@ -125,7 +128,10 @@ export function FileBrowserView() {
   const [imageMode, setImageModeState] = useState<ImageMode>(readImageMode)
   const [imageLoad, setImageLoad] = useState<ImageLoad>({ src: '', state: 'loading' })
   const imageWrapRef = useRef<HTMLDivElement>(null)
+  const imageStageRef = useRef<HTMLDivElement>(null)
   const imageRef = useRef<HTMLImageElement>(null)
+  const imageZoomRef = useRef(1)
+  const imageZoomLabelRef = useRef<HTMLSpanElement>(null)
 
   const segments = useMemo(() => pathSegments(path), [path])
   const title = path ? path.split('/').filter(Boolean).at(-1) || 'Files' : 'Files'
@@ -174,42 +180,122 @@ export function FileBrowserView() {
 
   useEffect(() => {
     const wrap = imageWrapRef.current
+    const stage = imageStageRef.current
     const image = imageRef.current
-    if (!wrap || !image) return
+    if (!wrap || !stage || !image || imageLoadState !== 'loaded') return
 
-    if (imageMode !== 'fill' || imageLoadState !== 'loaded') {
-      image.style.removeProperty('width')
-      image.style.removeProperty('height')
-      return
+    imageZoomRef.current = 1
+    let centerFrame = 0
+    let pinch: { x: number; y: number; distance: number } | null = null
+    let wheelDelta = 0
+
+    const touchMetrics = (touches: TouchList) => {
+      const first = touches[0]
+      const second = touches[1]
+      return {
+        x: (first.clientX + second.clientX) / 2,
+        y: (first.clientY + second.clientY) / 2,
+        distance: Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY),
+      }
     }
 
-    let centerFrame = 0
-    const layout = () => {
-      const style = getComputedStyle(wrap)
-      const horizontalPadding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight)
-      const verticalPadding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
-      const size = coverImageSize(
+    const layout = (requestedZoom: number, focal?: { fromX: number; fromY: number; toX: number; toY: number }, center = false) => {
+      const stageStyle = getComputedStyle(stage)
+      const horizontalPadding = parseFloat(stageStyle.paddingLeft) + parseFloat(stageStyle.paddingRight)
+      const verticalPadding = parseFloat(stageStyle.paddingTop) + parseFloat(stageStyle.paddingBottom)
+      const base = imageSizeForMode(
+        imageMode,
         image.naturalWidth,
         image.naturalHeight,
         wrap.clientWidth - horizontalPadding,
         wrap.clientHeight - verticalPadding,
       )
-      if (!size) return
-      image.style.width = `${size.width}px`
-      image.style.height = `${size.height}px`
-      cancelAnimationFrame(centerFrame)
-      centerFrame = requestAnimationFrame(() => {
-        wrap.scrollLeft = (wrap.scrollWidth - wrap.clientWidth) / 2
-        wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) / 2
-      })
+      if (!base) return
+
+      const oldRect = focal ? image.getBoundingClientRect() : null
+      const anchorX = oldRect && oldRect.width ? (focal!.fromX - oldRect.left) / oldRect.width : 0.5
+      const anchorY = oldRect && oldRect.height ? (focal!.fromY - oldRect.top) / oldRect.height : 0.5
+      const zoom = clampImageZoom(requestedZoom)
+      const width = base.width * zoom
+      const height = base.height * zoom
+      imageZoomRef.current = zoom
+      image.style.width = `${width}px`
+      image.style.height = `${height}px`
+      stage.style.width = `${Math.max(wrap.clientWidth, width + horizontalPadding)}px`
+      stage.style.height = `${Math.max(wrap.clientHeight, height + verticalPadding)}px`
+      if (imageZoomLabelRef.current) imageZoomLabelRef.current.textContent = `${Math.round(zoom * 100)}%`
+
+      if (focal) {
+        const newRect = image.getBoundingClientRect()
+        wrap.scrollLeft += newRect.left + anchorX * newRect.width - focal.toX
+        wrap.scrollTop += newRect.top + anchorY * newRect.height - focal.toY
+      } else if (center) {
+        cancelAnimationFrame(centerFrame)
+        centerFrame = requestAnimationFrame(() => {
+          wrap.scrollLeft = (wrap.scrollWidth - wrap.clientWidth) / 2
+          wrap.scrollTop = (wrap.scrollHeight - wrap.clientHeight) / 2
+        })
+      }
     }
 
-    layout()
-    const observer = new ResizeObserver(layout)
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault()
+      const delta = event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? event.deltaY * 16
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? event.deltaY * wrap.clientHeight : event.deltaY
+      wheelDelta += delta
+      if (Math.abs(wheelDelta) < 40) return
+      const direction = wheelDelta
+      wheelDelta = 0
+      layout(wheelImageZoom(imageZoomRef.current, direction), {
+        fromX: event.clientX,
+        fromY: event.clientY,
+        toX: event.clientX,
+        toY: event.clientY,
+      })
+    }
+    const onTouchStart = (event: TouchEvent) => {
+      if (event.touches.length !== 2) return
+      event.preventDefault()
+      pinch = touchMetrics(event.touches)
+    }
+    const onTouchMove = (event: TouchEvent) => {
+      if (event.touches.length !== 2 || !pinch) return
+      event.preventDefault()
+      const next = touchMetrics(event.touches)
+      layout(imageZoomRef.current * next.distance / pinch.distance, {
+        fromX: pinch.x,
+        fromY: pinch.y,
+        toX: next.x,
+        toY: next.y,
+      })
+      pinch = next
+    }
+    const endPinch = (event: TouchEvent) => {
+      if (event.touches.length < 2) pinch = null
+    }
+
+    layout(1, undefined, true)
+    const observer = new ResizeObserver(() => {
+      const rect = wrap.getBoundingClientRect()
+      const x = rect.left + rect.width / 2
+      const y = rect.top + rect.height / 2
+      layout(imageZoomRef.current, { fromX: x, fromY: y, toX: x, toY: y })
+    })
     observer.observe(wrap)
+    wrap.addEventListener('wheel', onWheel, { passive: false })
+    wrap.addEventListener('touchstart', onTouchStart, { passive: false })
+    wrap.addEventListener('touchmove', onTouchMove, { passive: false })
+    wrap.addEventListener('touchend', endPinch)
+    wrap.addEventListener('touchcancel', endPinch)
     return () => {
       observer.disconnect()
       cancelAnimationFrame(centerFrame)
+      wrap.removeEventListener('wheel', onWheel)
+      wrap.removeEventListener('touchstart', onTouchStart)
+      wrap.removeEventListener('touchmove', onTouchMove)
+      wrap.removeEventListener('touchend', endPinch)
+      wrap.removeEventListener('touchcancel', endPinch)
     }
   }, [imageMode, imageSrc, imageLoadState])
 
@@ -294,6 +380,7 @@ export function FileBrowserView() {
             <span>{state.kind === 'content'
               ? `${formatBytes(state.data.size)}${state.data.mime ? ` · ${state.data.mime}` : ''}`
               : 'Loading image…'}</span>
+            <span ref={imageZoomLabelRef} class="file-image-zoom-level">100%</span>
             <div class="file-image-mode" role="group" aria-label="Image sizing">
               <button class={imageMode === 'fit' ? 'active' : ''} onClick={() => setImageMode('fit')}>Fit</button>
               <button class={imageMode === 'actual' ? 'active' : ''} onClick={() => setImageMode('actual')}>100%</button>
@@ -303,16 +390,18 @@ export function FileBrowserView() {
           <div ref={imageWrapRef} class={`file-image-preview-wrap is-${imageMode}`}>
             {imageLoadState === 'loading' && <div class="state-subtitle">Loading image…</div>}
             {imageLoadState === 'error' && <div class="file-error"><div class="state-title">Could not load image</div></div>}
-            <img
-              key={imageSrc}
-              ref={imageRef}
-              class={`file-image-preview is-${imageMode}`}
-              src={imageSrc}
-              alt={state.kind === 'content' ? state.data.name : path}
-              draggable={false}
-              onLoad={() => setImageLoad({ src: imageSrc, state: 'loaded' })}
-              onError={() => setImageLoad({ src: imageSrc, state: 'error' })}
-            />
+            <div ref={imageStageRef} class="file-image-stage">
+              <img
+                key={imageSrc}
+                ref={imageRef}
+                class={`file-image-preview is-${imageMode}`}
+                src={imageSrc}
+                alt={state.kind === 'content' ? state.data.name : path}
+                draggable={false}
+                onLoad={() => setImageLoad({ src: imageSrc, state: 'loaded' })}
+                onError={() => setImageLoad({ src: imageSrc, state: 'error' })}
+              />
+            </div>
           </div>
         </div>
       )}

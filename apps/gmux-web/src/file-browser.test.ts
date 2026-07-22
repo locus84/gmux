@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { closeFileBrowserPath, coverImageSize, fileApiPath, fileBrowserPath, formatBytes, parentPath, pasteFileBrowserPath, pathSegments, projectFileBrowserPath, tempFileApiPath } from './file-browser'
+import { clampImageZoom, closeFileBrowserPath, coverImageSize, fileApiPath, fileBrowserPath, formatBytes, imageSizeForMode, parentPath, pasteFileBrowserPath, pathSegments, projectFileBrowserPath, tempFileApiPath, wheelImageZoom } from './file-browser'
 
 describe('file browser helpers', () => {
   it('builds overlay route and session API URLs', () => {
@@ -33,11 +33,22 @@ describe('file browser helpers', () => {
     ])
   })
 
-  it('sizes images to cover the viewport without changing aspect ratio', () => {
+  it('sizes each image mode without changing aspect ratio', () => {
+    expect(imageSizeForMode('fit', 800, 400, 360, 600)).toEqual({ width: 360, height: 180 })
+    expect(imageSizeForMode('actual', 800, 400, 360, 600)).toEqual({ width: 800, height: 400 })
     expect(coverImageSize(800, 400, 360, 600)).toEqual({ width: 1200, height: 600 })
     expect(coverImageSize(400, 800, 360, 600)).toEqual({ width: 360, height: 720 })
     expect(coverImageSize(600, 1000, 360, 600)).toEqual({ width: 360, height: 600 })
-    expect(coverImageSize(0, 400, 360, 600)).toBeNull()
+    expect(imageSizeForMode('fit', 0, 400, 360, 600)).toBeNull()
+  })
+
+  it('clamps image zoom and changes wheel zoom by exactly five percent', () => {
+    expect(wheelImageZoom(1, -1)).toBe(1.05)
+    expect(wheelImageZoom(1.05, 500)).toBe(1)
+    expect(wheelImageZoom(1.033, -1) - 1.033).toBeCloseTo(0.05, 12)
+    expect(wheelImageZoom(1, 0)).toBe(1)
+    expect(clampImageZoom(0.01)).toBe(0.25)
+    expect(clampImageZoom(9)).toBe(5)
   })
 
   it('formats byte counts', () => {
