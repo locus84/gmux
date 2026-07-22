@@ -38,10 +38,15 @@ export function projectFileBrowserPath(projectSlug: string, path = '', currentPa
   return fileBrowserTargetPath('projectFiles', projectSlug, path, currentPath, currentSearch)
 }
 
-function fileBrowserTargetPath(key: 'files' | 'projectFiles', value: string, path: string, currentPath: string, currentSearch: string): string {
+export function pasteFileBrowserPath(sessionId: string, name: string, currentPath = location.pathname, currentSearch = location.search): string {
+  return fileBrowserTargetPath('pasteFile', sessionId, name, currentPath, currentSearch)
+}
+
+function fileBrowserTargetPath(key: 'files' | 'projectFiles' | 'pasteFile', value: string, path: string, currentPath: string, currentSearch: string): string {
   const params = new URLSearchParams(currentSearch)
   params.delete('files')
   params.delete('projectFiles')
+  params.delete('pasteFile')
   params.set(key, value)
   if (path) params.set('filePath', path)
   else params.delete('filePath')
@@ -52,6 +57,7 @@ export function closeFileBrowserPath(currentPath = location.pathname, currentSea
   const params = new URLSearchParams(currentSearch)
   params.delete('files')
   params.delete('projectFiles')
+  params.delete('pasteFile')
   params.delete('filePath')
   const qs = params.toString()
   return qs ? `${currentPath}?${qs}` : currentPath
@@ -67,6 +73,12 @@ export function fileApiPath(kind: 'list' | 'content' | 'raw', target: { sessionI
     ? `/v1/sessions/${encodeURIComponent(target.sessionId)}/${endpoint}`
     : `/v1/projects/${encodeURIComponent(target.projectSlug)}/${endpoint}`
   return `${base}${qs ? `?${qs}` : ''}`
+}
+
+export function tempFileApiPath(kind: 'content' | 'raw', sessionId: string, name: string): string {
+  const params = new URLSearchParams({ name })
+  if (kind === 'raw') params.set('raw', '1')
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/temp-file?${params.toString()}`
 }
 
 export function parentPath(path: string): string {

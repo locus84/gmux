@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { closeFileBrowserPath, fileApiPath, fileBrowserPath, formatBytes, parentPath, pathSegments, projectFileBrowserPath } from './file-browser'
+import { closeFileBrowserPath, fileApiPath, fileBrowserPath, formatBytes, parentPath, pasteFileBrowserPath, pathSegments, projectFileBrowserPath, tempFileApiPath } from './file-browser'
 
 describe('file browser helpers', () => {
   it('builds overlay route and session API URLs', () => {
@@ -7,7 +7,9 @@ describe('file browser helpers', () => {
       .toBe('/gmux?settings=projects&files=sess-1&filePath=src%2Fmain.ts')
     expect(projectFileBrowserPath('gd-idle', '', '/gd-idle', '?files=sess-1'))
       .toBe('/gd-idle?projectFiles=gd-idle')
-    expect(closeFileBrowserPath('/gmux', '?settings=projects&files=sess-1&projectFiles=gd-idle&filePath=src'))
+    expect(pasteFileBrowserPath('sess/peer', 'paste-37.jpg', '/gd-idle', '?files=sess-1'))
+      .toBe('/gd-idle?pasteFile=sess%2Fpeer&filePath=paste-37.jpg')
+    expect(closeFileBrowserPath('/gmux', '?settings=projects&files=sess-1&projectFiles=gd-idle&pasteFile=sess-2&filePath=src'))
       .toBe('/gmux?settings=projects')
     expect(fileApiPath('list', { sessionId: 'sess 1' }, ''))
       .toBe('/v1/sessions/sess%201/files')
@@ -17,6 +19,8 @@ describe('file browser helpers', () => {
       .toBe('/v1/sessions/sess%2F1/file?path=assets%2Fcat.png&raw=1')
     expect(fileApiPath('list', { projectSlug: 'gd-idle' }, ''))
       .toBe('/v1/projects/gd-idle/files')
+    expect(tempFileApiPath('raw', 'sess/peer', 'paste-37.jpg'))
+      .toBe('/v1/sessions/sess%2Fpeer/temp-file?name=paste-37.jpg&raw=1')
   })
 
   it('handles breadcrumbs and parents', () => {

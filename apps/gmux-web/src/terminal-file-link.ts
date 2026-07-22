@@ -13,8 +13,9 @@ export interface TerminalFileMatch {
   text: string
   /** Zero-based start column in the translated buffer line. */
   start: number
-  /** Session-root-relative path accepted by the file API. */
+  /** Session-root-relative path, or a validated paste-image basename. */
   path: string
+  pasteImage?: boolean
 }
 
 const leadingPunctuation = new Set(['(', '[', '{', '"', "'", '`', '*'])
@@ -99,6 +100,20 @@ export function resolveTerminalFilePath(text: string, context: TerminalFileLinkC
   return resolved.join('/')
 }
 
+const pasteImageNameRe = /^paste-[1-9][0-9]*\.(?:png|jpe?g|gif|webp|avif|bmp)$/i
+
+/** Recognize this session's canonical gmux clipboard path without exposing its directory. */
+export function resolveTerminalPasteImageName(text: string, context?: TerminalFileLinkContext): string | null {
+  if (!text.startsWith('/') || cleanAbsolute(text) !== text) return null
+  const parts = text.split('/').filter(Boolean)
+  const name = parts.at(-1) ?? ''
+  const owner = parts.at(-2) ?? ''
+  const marker = parts.at(-3) ?? ''
+  const sessionId = context?.sessionId.split('@').slice(0, -1).join('@') || context?.sessionId
+  if (marker !== 'gmux-pastes' || (sessionId && owner !== sessionId)) return null
+  return pasteImageNameRe.test(name) ? name : null
+}
+
 /** Find conservative, whitespace-delimited path candidates on one buffer line. */
 export function findTerminalFileMatches(line: string, context: TerminalFileLinkContext): TerminalFileMatch[] {
   const matches: TerminalFileMatch[] = []
@@ -106,12 +121,14 @@ export function findTerminalFileMatches(line: string, context: TerminalFileLinkC
     const raw = token[0]
     const cleaned = cleanCandidate(raw)
     if (!cleaned) continue
-    const path = resolveTerminalFilePath(cleaned.text, context)
+    const pasteImageName = resolveTerminalPasteImageName(cleaned.text, context)
+    const path = pasteImageName ?? resolveTerminalFilePath(cleaned.text, context)
     if (!path) continue
     matches.push({
       text: cleaned.text,
       start: (token.index ?? 0) + cleaned.offset,
       path,
+      ...(pasteImageName ? { pasteImage: true } : {}),
     })
   }
   return matches
@@ -151,7 +168,28 @@ function readBufferLine(line: IBufferLine, y: number): { text: string; cells: Bu
   return { text: trimmed, cells: cells.slice(0, trimmed.length) }
 }
 
-function readWrappedBufferLine(term: Terminal, bufferLineNumber: number): { text: string; cells: BufferTextCell[] } | null {
+interface BufferTextRange {
+  text: string
+  cells: BufferTextCell[]
+  start: number
+  end: number
+}
+
+export interface TerminalFileTarget {
+  sessionId: string
+  path: string
+  pasteImage: boolean
+  text: string
+}
+
+const visualPathFragmentRe = /^[A-Za-z0-9._~+%:@=/-]+$/
+const manualWrapExtensions = [
+  'avif', 'bmp', 'gif', 'jpeg', 'jpg', 'png', 'svg', 'webp',
+  'css', 'go', 'html', 'js', 'json', 'jsx', 'md', 'mjs', 'py', 'rs', 'sh', 'toml', 'ts', 'tsx', 'txt', 'yaml', 'yml',
+]
+const maxManualWrapRows = 3
+
+function readNativeBufferRange(term: Terminal, bufferLineNumber: number): BufferTextRange | null {
   const buffer = term.buffer.active
   let start = bufferLineNumber - 1
   let line = buffer.getLine(start)
@@ -165,6 +203,7 @@ function readWrappedBufferLine(term: Terminal, bufferLineNumber: number): { text
   }
 
   let text = ''
+  let end = start
   const cells: BufferTextCell[] = []
   for (let y = start; text.length < 2048; y++) {
     const current = buffer.getLine(y)
@@ -172,10 +211,139 @@ function readWrappedBufferLine(term: Terminal, bufferLineNumber: number): { text
     const translated = readBufferLine(current, y)
     text += translated.text
     cells.push(...translated.cells)
-    const next = buffer.getLine(y + 1)
-    if (!next?.isWrapped) break
+    end = y
+    if (!buffer.getLine(y + 1)?.isWrapped) break
   }
-  return { text, cells }
+  return { text, cells, start, end }
+}
+
+function manualExtensionContinuation(previousToken: string, nextToken: string): boolean {
+  const extension = previousToken.match(/\.([A-Za-z0-9]{1,12})$/u)?.[1]?.toLowerCase()
+  if (!extension) return false
+  const continued = `${extension}${nextToken.toLowerCase()}`
+  return manualWrapExtensions.some(candidate => candidate.startsWith(continued))
+}
+
+function isManualContinuation(previous: { text: string; cells: BufferTextCell[] }, nextText: string, cols: number): boolean {
+  const previousToken = previous.text.trimEnd().match(/\S+$/)?.[0] ?? ''
+  const nextToken = nextText.trimStart().match(/^\S+/)?.[0] ?? ''
+  const visualEnd = previous.cells.at(-1)?.endX ?? previous.text.length
+  const hasExtension = /\.[A-Za-z0-9]{1,12}$/u.test(previousToken)
+  const continuesExtension = manualExtensionContinuation(previousToken, nextToken)
+  return cols > 0
+    && (visualEnd >= cols - 1 || continuesExtension)
+    && nextText.length > nextText.trimStart().length
+    && !!nextToken
+    && visualPathFragmentRe.test(nextToken)
+    && (!hasExtension || continuesExtension)
+}
+
+function combineManualRows(term: Terminal, start: number, end: number): BufferTextRange | null {
+  const buffer = term.buffer.active
+  let text = ''
+  const cells: BufferTextCell[] = []
+  for (let y = start; y <= end; y++) {
+    const line = buffer.getLine(y)
+    if (!line) return null
+    const translated = readBufferLine(line, y)
+    const offset = y === start ? 0 : translated.text.length - translated.text.trimStart().length
+    text += translated.text.slice(offset)
+    cells.push(...translated.cells.slice(offset))
+  }
+  return { text, cells, start, end }
+}
+
+function matchSpansRows(range: BufferTextRange, match: TerminalFileMatch): boolean {
+  const first = range.cells[match.start]
+  const last = range.cells[match.start + match.text.length - 1]
+  return !!first && !!last && first.y !== last.y
+}
+
+function looksLikeCompleteManuallyWrappedFile(match: TerminalFileMatch): boolean {
+  return match.pasteImage === true || /\.[A-Za-z0-9]{1,12}$/u.test(match.text)
+}
+
+/**
+ * Read native xterm wraps first. For cursor-positioned TUI wraps, inspect at
+ * most three rows and keep the join only when it forms a validated path that
+ * actually crosses a row boundary. False negatives are safer than linking
+ * unrelated terminal/input rows.
+ */
+function readBufferRange(term: Terminal, bufferLineNumber: number, context: TerminalFileLinkContext): BufferTextRange | null {
+  const native = readNativeBufferRange(term, bufferLineNumber)
+  if (!native) return null
+  const buffer = term.buffer.active
+  let start = native.start
+  let end = native.end
+
+  while (start > 0 && end - start + 1 < maxManualWrapRows) {
+    const current = buffer.getLine(start)
+    const previous = buffer.getLine(start - 1)
+    if (!current || !previous || current.isWrapped) break
+    const previousText = readBufferLine(previous, start - 1)
+    const currentText = readBufferLine(current, start).text
+    if (!isManualContinuation(previousText, currentText, term.cols)) break
+    start--
+  }
+  while (end - start + 1 < maxManualWrapRows) {
+    const current = buffer.getLine(end)
+    const next = buffer.getLine(end + 1)
+    if (!current || !next || next.isWrapped) break
+    const currentText = readBufferLine(current, end)
+    const nextText = readBufferLine(next, end + 1).text
+    if (!isManualContinuation(currentText, nextText, term.cols)) break
+    end++
+  }
+
+  if (start === native.start && end === native.end) return native
+  const combined = combineManualRows(term, start, end)
+  if (!combined) return native
+  return findTerminalFileMatches(combined.text, context).some(match => (
+    matchSpansRows(combined, match) && looksLikeCompleteManuallyWrappedFile(match)
+  )) ? combined : null
+}
+
+function cursorIntersectsRange(term: Terminal, range: BufferTextRange): boolean {
+  const buffer = term.buffer.active
+  const cursorLine = buffer.baseY + buffer.cursorY
+  return Number.isFinite(cursorLine) && cursorLine >= range.start && cursorLine <= range.end
+}
+
+function matchContainsCell(range: BufferTextRange, match: TerminalFileMatch, x: number, y: number): boolean {
+  const first = range.cells[match.start]
+  const last = range.cells[match.start + match.text.length - 1]
+  if (!first || !last || y < first.y || y > last.y) return false
+  if (first.y === last.y) return y === first.y && x >= first.startX && x < last.endX
+  if (y === first.y) return x >= first.startX
+  if (y === last.y) return x < last.endX
+  return true
+}
+
+/** Resolve a mobile point without consulting xterm's private Linkifier cache. */
+export function terminalFileTargetAtPoint(
+  term: Terminal,
+  context: TerminalFileLinkContext,
+  clientX: number,
+  clientY: number,
+): TerminalFileTarget | null {
+  const screen = term.element?.querySelector('.xterm-screen')
+  const cell = term.dimensions?.css.cell
+  if (!screen || typeof (screen as Element).getBoundingClientRect !== 'function' || !cell?.width || !cell.height) return null
+  const rect = (screen as Element).getBoundingClientRect()
+  const x = Math.floor((clientX - rect.left) / cell.width)
+  const viewportRow = Math.floor((clientY - rect.top) / cell.height)
+  if (x < 0 || x >= term.cols || viewportRow < 0 || viewportRow >= term.rows) return null
+
+  const y = term.buffer.active.viewportY + viewportRow
+  const range = readBufferRange(term, y + 1, context)
+  if (!range || cursorIntersectsRange(term, range)) return null
+  const match = findTerminalFileMatches(range.text, context).find(candidate => matchContainsCell(range, candidate, x, y))
+  return match ? {
+    sessionId: context.sessionId,
+    path: match.path,
+    pasteImage: !!match.pasteImage,
+    text: match.text,
+  } : null
 }
 
 /**
@@ -186,18 +354,23 @@ function readWrappedBufferLine(term: Terminal, bufferLineNumber: number): { text
 export function createTerminalFileLinkProvider(
   term: Terminal,
   getContext: () => TerminalFileLinkContext,
-  fileHref: (sessionId: string, path: string) => string,
-  openFile: (sessionId: string, path: string) => void,
+  fileHref: (sessionId: string, path: string, pasteImage: boolean) => string,
+  openFile: (sessionId: string, path: string, pasteImage: boolean) => void,
 ): ILinkProvider {
   return {
     provideLinks(bufferLineNumber, callback) {
-      const translated = readWrappedBufferLine(term, bufferLineNumber)
+      const context = getContext()
+      const translated = readBufferRange(term, bufferLineNumber, context)
       if (!translated) {
         callback(undefined)
         return
       }
 
-      const context = getContext()
+      if (cursorIntersectsRange(term, translated)) {
+        callback(undefined)
+        return
+      }
+
       const matches = findTerminalFileMatches(translated.text, context)
       if (matches.length === 0) {
         callback(undefined)
@@ -212,13 +385,13 @@ export function createTerminalFileLinkProvider(
           // xterm displays the buffer range, not this value. Keeping the
           // generated viewer URL here lets the existing mobile long-press
           // sheet inspect/copy/open a durable target without agent knowledge.
-          text: fileHref(context.sessionId, match.path),
+          text: fileHref(context.sessionId, match.path, !!match.pasteImage),
           gmuxFile: true,
           range: {
             start: { x: startCell.startX + 1, y: startCell.y + 1 },
             end: { x: endCell.endX, y: endCell.y + 1 },
           },
-          activate: () => openFile(context.sessionId, match.path),
+          activate: () => openFile(context.sessionId, match.path, !!match.pasteImage),
         }]
       })
       callback(links)

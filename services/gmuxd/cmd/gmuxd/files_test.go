@@ -168,6 +168,117 @@ func TestWorkspaceFilesPreviewImageAndServeRaw(t *testing.T) {
 	}
 }
 
+func TestValidSessionTempImageID(t *testing.T) {
+	for _, id := range []string{"sess-123", "019f8275-596e-798b-afb6-c7d74e9c7ecf", "session_test.v1"} {
+		if !validSessionTempImageID(id) {
+			t.Errorf("validSessionTempImageID(%q) = false", id)
+		}
+	}
+	for _, id := range []string{"", ".", "..", "../sess-1", "sess/1", "sess@peer", "세션"} {
+		if validSessionTempImageID(id) {
+			t.Errorf("validSessionTempImageID(%q) = true", id)
+		}
+	}
+}
+
+func TestSessionTempImageContent(t *testing.T) {
+	tempRoot := t.TempDir()
+	tempDir := sessionTempImageDir(tempRoot, "sess-files")
+	if err := os.MkdirAll(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	png := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0}
+	if err := os.WriteFile(filepath.Join(tempDir, "paste-37.png"), png, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	large, err := os.Create(filepath.Join(tempDir, "paste-38.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := large.Write(png); err != nil {
+		t.Fatal(err)
+	}
+	if err := large.Truncate(workspaceImagePreviewLimit + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := large.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sessions := testSessionStore(root)
+
+	for _, raw := range []bool{false, true} {
+		path := "/v1/sessions/sess-files/temp-file?name=paste-37.png"
+		if raw {
+			path += "&raw=1"
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		sessionTempImageContentHandler(rr, req, "sess-files", sessions, tempRoot)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("raw=%v status = %d body=%s", raw, rr.Code, rr.Body.String())
+		}
+		if raw && rr.Header().Get("Content-Type") != "image/png" {
+			t.Fatalf("raw content-type = %q", rr.Header().Get("Content-Type"))
+		}
+		if !raw && !strings.Contains(rr.Body.String(), `"kind":"image"`) {
+			t.Fatalf("metadata missing image kind: %s", rr.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-files/temp-file?name=paste-38.png", nil)
+	rr := httptest.NewRecorder()
+	sessionTempImageContentHandler(rr, req, "sess-files", sessions, tempRoot)
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("large image status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	sessions.Upsert(store.Session{ID: "sess-other", Cwd: root, WorkspaceRoot: root, Alive: true})
+	req = httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-other/temp-file?name=paste-37.png", nil)
+	rr = httptest.NewRecorder()
+	sessionTempImageContentHandler(rr, req, "sess-other", sessions, tempRoot)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("cross-session image status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionTempImageRejectsUnsafeFiles(t *testing.T) {
+	tempRoot := t.TempDir()
+	tempDir := sessionTempImageDir(tempRoot, "sess-files")
+	if err := os.MkdirAll(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	sessions := testSessionStore(root)
+	if err := os.WriteFile(filepath.Join(tempDir, "paste-1.png"), []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(tempDir, "paste-2.png"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tempDir, "paste-1.png"), filepath.Join(tempDir, "paste-3.png")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	cases := map[string]int{
+		"../paste-1.png": http.StatusBadRequest,
+		"paste-0.png":    http.StatusBadRequest,
+		"paste-1.txt":    http.StatusBadRequest,
+		"paste-1.png":    http.StatusUnsupportedMediaType,
+		"paste-2.png":    http.StatusForbidden,
+		"paste-3.png":    http.StatusForbidden,
+		"paste-99.png":   http.StatusNotFound,
+	}
+	for name, want := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-files/temp-file?name="+name, nil)
+		rr := httptest.NewRecorder()
+		sessionTempImageContentHandler(rr, req, "sess-files", sessions, tempRoot)
+		if rr.Code != want {
+			t.Errorf("%s status = %d want %d body=%s", name, rr.Code, want, rr.Body.String())
+		}
+	}
+}
+
 func TestWorkspaceFilesRejectBinaryAndTooLarge(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "bin.dat"), []byte{'a', 0, 'b'}, 0o644); err != nil {

@@ -15,8 +15,8 @@ import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
-import { createTerminalFileLinkProvider } from './terminal-file-link'
-import { fileBrowserPath } from './file-browser'
+import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext, type TerminalFileTarget } from './terminal-file-link'
+import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
 import { createLongPressRecognizer } from './long-press'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 import { LinkActionSheet } from './link-action-sheet'
@@ -265,14 +265,21 @@ export function TerminalView({
   const altArmedRef = useRef(altArmed)
   const termIoRef = useRef<ReturnType<typeof createTerminalIO> | null>(null)
   const termEpochRef = useRef(0)
-  const fileHrefRef = useRef<(sessionId: string, path: string) => string>(() => '')
-  const openFileRef = useRef<(sessionId: string, path: string) => void>(() => {})
+  const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const fileOverlayOpenRef = useRef(false)
   const webLinkHrefRef = useRef<(uri: string) => string>(uri => uri)
-  fileHrefRef.current = (sessionId, path) => {
+  fileOverlayOpenRef.current = !!(loc.query.files || loc.query.projectFiles || loc.query.pasteFile)
+  fileHrefRef.current = (sessionId, path, pasteImage) => {
     const search = loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''
-    return fileBrowserPath(sessionId, path, loc.path, search)
+    return pasteImage
+      ? pasteFileBrowserPath(sessionId, path, loc.path, search)
+      : fileBrowserPath(sessionId, path, loc.path, search)
   }
-  openFileRef.current = (sessionId, path) => loc.route(fileHrefRef.current(sessionId, path))
+  openFileRef.current = (sessionId, path, pasteImage) => {
+    termRef.current?.textarea?.blur()
+    loc.route(fileHrefRef.current(sessionId, path, pasteImage))
+  }
   webLinkHrefRef.current = (uri) => resolveTerminalWebUrl(
     uri,
     vsCodeServerUrl.value,
@@ -513,21 +520,22 @@ export function TerminalView({
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.loadAddon(new ImageAddon())
+    const getFileLinkContext = (): TerminalFileLinkContext => {
+      const current = sessionRef.current
+      return {
+        sessionId: current.id,
+        root: current.workspace_root?.trim() || current.cwd.trim(),
+        cwd: current.cwd.trim(),
+      }
+    }
     // Detect workspace paths using the live session context. Register this
     // before WebLinksAddon; path candidates explicitly reject URL schemes, so
     // normal web and OSC 8 links retain their existing providers/handlers.
     term.registerLinkProvider(createTerminalFileLinkProvider(
       term,
-      () => {
-        const current = sessionRef.current
-        return {
-          sessionId: current.id,
-          root: current.workspace_root?.trim() || current.cwd.trim(),
-          cwd: current.cwd.trim(),
-        }
-      },
-      (sessionId, path) => fileHrefRef.current(sessionId, path),
-      (sessionId, path) => openFileRef.current(sessionId, path),
+      getFileLinkContext,
+      (sessionId, path, pasteImage) => fileHrefRef.current(sessionId, path, pasteImage),
+      (sessionId, path, pasteImage) => openFileRef.current(sessionId, path, pasteImage),
     ))
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon((_event, uri) => {
@@ -678,6 +686,7 @@ export function TerminalView({
       const tag = (ev.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (containerRef.current?.contains(ev.target as Node)) return
+      if (fileOverlayOpenRef.current) return
       term.focus()
     }
     window.addEventListener('keydown', handleGlobalKeydown, true)
@@ -693,7 +702,10 @@ export function TerminalView({
     // intent from a tap: even when nothing is under the finger, the
     // release must not open a link or toggle the keyboard.
     const longPress = createLongPressRecognizer((x, y) => {
-      const link = linkAtPoint(term, x, y)
+      const fileTarget = touchPanState.fileTarget
+      const link = fileTarget
+        ? { uri: fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage), label: fileTarget.text }
+        : linkAtPoint(term, x, y)
       try { navigator.vibrate?.(10) } catch { /* unsupported */ }
       // On a link: offer open/copy. On empty space: open the text sheet —
       // the buffer as natively-selectable text, scrolled to the pressed
@@ -713,6 +725,7 @@ export function TerminalView({
       momentumFrame: number | null
       dragScrollFrame: number | null
       pendingDragRows: number
+      fileTarget: TerminalFileTarget | null
       start: TerminalTouchSnapshot
     } = {
       active: false,
@@ -724,6 +737,7 @@ export function TerminalView({
       momentumFrame: null,
       dragScrollFrame: null,
       pendingDragRows: 0,
+      fileTarget: null,
       start: { x: 0, y: 0, scrollLeft: 0, scrollTop: 0, viewportY: 0 },
     }
 
@@ -759,6 +773,7 @@ export function TerminalView({
       touchPanState.moved = false
       touchPanState.rowRemainder = 0
       touchPanState.velocityRowsPerMs = 0
+      touchPanState.fileTarget = null
     }
 
     const startScrollMomentum = () => {
@@ -820,6 +835,7 @@ export function TerminalView({
         scrollTop: host.scrollTop,
         viewportY: term.buffer.active.viewportY,
       }
+      touchPanState.fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), touch.clientX, touch.clientY)
       longPress.start(touchPanState.start.x, touchPanState.start.y)
     }
 
@@ -933,6 +949,15 @@ export function TerminalView({
         // so the link can't be activated twice. When a link opens, skip
         // the keyboard focus/scroll — the tap was navigation, not input
         // intent.
+        const fileTarget = touchPanState.fileTarget
+        if (fileTarget) {
+          ev.preventDefault()
+          cancelDragScroll(true)
+          cancelScrollMomentum()
+          openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          resetTouchPan()
+          return
+        }
         if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
           ev.preventDefault()
           cancelDragScroll(true)

@@ -1815,18 +1815,25 @@ func serve(stderr io.Writer) int {
 		case "file", "files/content":
 			workspaceSessionFilesContentHandler(w, r, sessionID, sessions)
 
+		case "temp-file":
+			sessionTempImageContentHandler(w, r, sessionID, sessions, os.TempDir())
+
 		case "clipboard":
-			// Materialize a clipboard binary payload as a file in this
-			// gmuxd's os.TempDir() and return the absolute path. For
+			// Materialize a clipboard binary payload in this session's
+			// directory under the owning gmuxd's os.TempDir(). For
 			// devcontainer/peer sessions, the request was already
 			// forwarded above to the gmuxd that owns the session, so
 			// reaching this branch always means "write locally". The
 			// session must exist; we don't otherwise need fields from it.
+			if !validSessionTempImageID(sessionID) {
+				writeError(w, http.StatusBadRequest, "bad_request", "invalid session ID")
+				return
+			}
 			if _, ok := sessions.Get(sessionID); !ok {
 				writeError(w, http.StatusNotFound, "not_found", "session not found")
 				return
 			}
-			clipboardHandler(clipfile.NewLocalWriter(os.TempDir())).ServeHTTP(w, r)
+			clipboardHandler(clipfile.NewLocalWriter(sessionTempImageDir(os.TempDir(), sessionID))).ServeHTTP(w, r)
 
 		case "dismiss":
 			if r.Method != http.MethodPost {

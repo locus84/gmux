@@ -463,7 +463,9 @@ function App() {
   // collapsed entry doesn't reopen on a subsequent back.
   const settingsOpen = loc.query.settings !== undefined
   const settingsTab = loc.query.settings ?? 'projects'
-  const filesOpen = loc.query.files !== undefined || loc.query.projectFiles !== undefined
+  const filesOpen = loc.query.files !== undefined
+    || loc.query.projectFiles !== undefined
+    || loc.query.pasteFile !== undefined
   const openSettings = useCallback((tab = 'projects', replace = false) => {
     const params = new URLSearchParams(location.search)
     // Replace (don't push) when the requested tab is already active,

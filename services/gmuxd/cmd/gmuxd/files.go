@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gmuxapp/gmux/packages/paths"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/clipfile"
 	projectspkg "github.com/gmuxapp/gmux/services/gmuxd/internal/projects"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
@@ -80,6 +81,95 @@ func workspaceSessionFilesContentHandler(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	serveWorkspaceFilesContent(w, r, root)
+}
+
+func validSessionTempImageID(sessionID string) bool {
+	if sessionID == "" || filepath.Base(sessionID) != sessionID || sessionID == "." || sessionID == ".." {
+		return false
+	}
+	for _, r := range sessionID {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func sessionTempImageDir(tempRoot, sessionID string) string {
+	return filepath.Join(tempRoot, "gmux-pastes", sessionID)
+}
+
+// sessionTempImageContentHandler serves only gmux-generated clipboard image
+// basenames from this session's directory on the owning daemon. It deliberately
+// has no list endpoint and never accepts a caller-supplied directory or path.
+func sessionTempImageContentHandler(w http.ResponseWriter, r *http.Request, sessionID string, sessions *store.Store, tempRoot string) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+		return
+	}
+	if !validSessionTempImageID(sessionID) {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid session ID")
+		return
+	}
+	if _, ok := sessions.Get(sessionID); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "session not found")
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	if filepath.Base(name) != name || !clipfile.IsPasteFilename(name) || !isWorkspaceImageMime(workspaceMimeType(name, nil)) {
+		writeError(w, http.StatusBadRequest, "bad_attachment", "invalid temporary image name")
+		return
+	}
+
+	tempDir := sessionTempImageDir(tempRoot, sessionID)
+	abs := filepath.Join(tempDir, name)
+	before, err := os.Lstat(abs)
+	if err != nil {
+		writeWorkspaceStatError(w, err)
+		return
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		writeError(w, http.StatusForbidden, "forbidden", "temporary image must be a regular file")
+		return
+	}
+
+	f, err := os.Open(abs)
+	if err != nil {
+		writeWorkspaceStatError(w, err)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(before, info) {
+		writeError(w, http.StatusForbidden, "forbidden", "temporary image changed while opening")
+		return
+	}
+	if info.Size() > workspaceImagePreviewLimit {
+		writeError(w, http.StatusRequestEntityTooLarge, "too_large", fmt.Sprintf("file exceeds %d byte preview limit", workspaceImagePreviewLimit))
+		return
+	}
+
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(f, head)
+	mimeType := workspaceMimeType(abs, head[:n])
+	if !isWorkspaceImageMime(mimeType) {
+		writeError(w, http.StatusUnsupportedMediaType, "binary", "temporary file is not a supported image")
+		return
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "failed to read temporary image")
+		return
+	}
+	if r.URL.Query().Get("raw") == "1" {
+		w.Header().Set("Content-Type", mimeType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		http.ServeContent(w, r, name, info.ModTime(), io.NewSectionReader(f, 0, info.Size()))
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "data": workspaceFileContent{
+		Root: tempDir, Path: name, AbsPath: abs, Name: name, Size: info.Size(),
+		ModTime: formatModTime(info.ModTime()), Mime: mimeType, Kind: "image", Content: "",
+	}})
 }
 
 func workspaceProjectFilesListHandler(w http.ResponseWriter, r *http.Request, slug string, projectMgr *projectspkg.Manager, sessions *store.Store) {
