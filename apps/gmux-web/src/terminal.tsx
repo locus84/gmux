@@ -985,6 +985,21 @@ export function TerminalView({
       resetTouchPan()
     }
 
+    // File links also bypass xterm's hover cache on desktop. Linkifier may
+    // retain the provider result for a screen row after a TUI redraw, so a
+    // visually current path can otherwise ignore a click until the pointer
+    // leaves and re-enters the row. Resolve the public buffer cell at click
+    // time and reserve xterm's normal link path for web/OSC-8 links.
+    const handleMouseClickCapture = (ev: MouseEvent) => {
+      if (ev.button !== 0 || isInteractiveTarget(ev.target)) return
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), ev.clientX, ev.clientY)
+      if (!fileTarget) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+    }
+
+    shell?.addEventListener('click', handleMouseClickCapture, true)
     shell?.addEventListener('touchstart', handleTouchStartCapture, { capture: true, passive: false })
     shell?.addEventListener('touchmove', handleTouchMoveCapture, { capture: true, passive: false })
     shell?.addEventListener('touchend', handleTouchEndCapture, { capture: true, passive: false })
@@ -1095,6 +1110,7 @@ export function TerminalView({
         vv.removeEventListener('resize', onVisualViewportResize)
         vv.removeEventListener('resizeend', onVisualViewportResizeEnd)
       }
+      shell?.removeEventListener('click', handleMouseClickCapture, true)
       shell?.removeEventListener('touchstart', handleTouchStartCapture, true)
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)
