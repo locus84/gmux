@@ -34,3 +34,54 @@ export function buildVSCodeServerUrl(
     return null
   }
 }
+
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  return host === 'localhost'
+    || host.endsWith('.localhost')
+    || host === '0.0.0.0'
+    || host === '[::1]'
+    || /^127(?:\.\d{1,3}){3}$/.test(host)
+}
+
+/**
+ * Convert a loopback (or common wildcard-bind) HTTP URL emitted by a local
+ * terminal into code-server's generic same-host port proxy. Returns null when
+ * no safe rewrite applies.
+ */
+export function buildVSCodeLoopbackProxyUrl(
+  baseUrl: string | null | undefined,
+  rawUrl: string,
+): string | null {
+  const baseText = baseUrl?.trim()
+  if (!baseText) return null
+
+  try {
+    const source = new URL(rawUrl)
+    const base = new URL(baseText)
+    if (source.protocol !== 'http:'
+      || !isLoopbackHostname(source.hostname)
+      || source.username
+      || source.password
+      || (base.protocol !== 'https:' && base.protocol !== 'http:')) return null
+
+    const port = source.port || '80'
+    const basePath = base.pathname.endsWith('/') ? base.pathname : `${base.pathname}/`
+    base.pathname = `${basePath}proxy/${port}${source.pathname}`
+    base.search = source.search
+    base.hash = source.hash
+    return base.toString()
+  } catch {
+    return null
+  }
+}
+
+/** Resolve a terminal URL without sending a peer's loopback to this host. */
+export function resolveTerminalWebUrl(
+  rawUrl: string,
+  baseUrl: string | null | undefined,
+  peer?: string,
+): string {
+  if (peer) return rawUrl
+  return buildVSCodeLoopbackProxyUrl(baseUrl, rawUrl) ?? rawUrl
+}

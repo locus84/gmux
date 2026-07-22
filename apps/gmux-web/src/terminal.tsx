@@ -25,7 +25,8 @@ import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import { fetchAuthoritativeReconnectSize, shouldHandleTerminalSocketClose } from './terminal-connection'
 import { decideViewportResize, sameSize } from './terminal-resize'
-import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
+import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
+import { resolveTerminalWebUrl } from './vscode-server'
 import { MOCK_BY_ID } from './mock-data/index'
 import type { Session } from './types'
 
@@ -266,11 +267,17 @@ export function TerminalView({
   const termEpochRef = useRef(0)
   const fileHrefRef = useRef<(sessionId: string, path: string) => string>(() => '')
   const openFileRef = useRef<(sessionId: string, path: string) => void>(() => {})
+  const webLinkHrefRef = useRef<(uri: string) => string>(uri => uri)
   fileHrefRef.current = (sessionId, path) => {
     const search = loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''
     return fileBrowserPath(sessionId, path, loc.path, search)
   }
   openFileRef.current = (sessionId, path) => loc.route(fileHrefRef.current(sessionId, path))
+  webLinkHrefRef.current = (uri) => resolveTerminalWebUrl(
+    uri,
+    vsCodeServerUrl.value,
+    sessionRef.current.peer,
+  )
 
   // True once the terminal's font is downloaded; gates xterm mount.
   // See the preload effect below for why this matters.
@@ -499,7 +506,7 @@ export function TerminalView({
       ...terminalOptions,
       linkHandler: {
         activate(_event, text) {
-          window.open(text, '_blank', 'noopener')
+          window.open(webLinkHrefRef.current(text), '_blank', 'noopener')
         },
       },
     })
@@ -523,7 +530,9 @@ export function TerminalView({
       (sessionId, path) => openFileRef.current(sessionId, path),
     ))
     // Detect plain-text URLs in terminal output and make them clickable.
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(new WebLinksAddon((_event, uri) => {
+      window.open(webLinkHrefRef.current(uri), '_blank', 'noopener')
+    }))
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
     loadWebglRenderer(term)
