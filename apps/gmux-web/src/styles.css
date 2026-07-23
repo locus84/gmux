@@ -381,7 +381,9 @@ body {
   min-width: 12.8571em;
   z-index: 1000;
   padding: 0.2857em;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .launch-target-line {

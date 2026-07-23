@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { launchersForPeer, resolveTarget, formatTarget } from './launcher'
+import { launchersForPeer, launcherMenuPosition, resolveTarget, formatTarget } from './launcher'
 import type { Session, LauncherDef, PeerInfo } from './types'
 
 const localLaunchers: LauncherDef[] = [
@@ -122,6 +122,41 @@ describe('resolveTarget', () => {
     ]
     const target = resolveTarget(sessions, null, '/fallback')
     expect(target).toEqual({ cwd: '/fallback' })
+  })
+})
+
+describe('launcherMenuPosition', () => {
+  test('keeps default-item alignment when the menu fits', () => {
+    expect(launcherMenuPosition(
+      { left: 280, top: 100, right: 300 },
+      { width: 200, height: 160 },
+      { left: 0, top: 0, width: 800, height: 600 },
+      32,
+    )).toEqual({ left: 100, top: 64, maxWidth: 784, maxHeight: 584 })
+  })
+
+  test('flips above a bottom-edge launcher and clamps horizontally', () => {
+    expect(launcherMenuPosition(
+      { left: 760, top: 570, right: 780 },
+      { width: 200, height: 180 },
+      { left: 0, top: 0, width: 800, height: 600 },
+      32,
+    )).toEqual({ left: 580, top: 386, maxWidth: 784, maxHeight: 584 })
+  })
+
+  test('clamps oversized menus inside small and offset visual viewports', () => {
+    expect(launcherMenuPosition(
+      { left: 270, top: 30, right: 290 },
+      { width: 500, height: 400 },
+      { left: 0, top: 0, width: 300, height: 300 },
+      0,
+    )).toEqual({ left: 8, top: 8, maxWidth: 284, maxHeight: 284 })
+    expect(launcherMenuPosition(
+      { left: 320, top: 450, right: 340 },
+      { width: 200, height: 180 },
+      { left: 50, top: 100, width: 300, height: 400 },
+      32,
+    )).toEqual({ left: 140, top: 266, maxWidth: 284, maxHeight: 384 })
   })
 })
 
