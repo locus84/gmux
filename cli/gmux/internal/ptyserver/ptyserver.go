@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/vt"
@@ -31,7 +33,11 @@ import (
 
 // maxScrollback is the number of lines kept in the virtual terminal's
 // scrollback buffer. Lines older than this are discarded.
-const maxScrollback = 2000
+const (
+	maxScrollback                = 2000
+	maxExplicitTitleBytes        = 1024
+	maxExplicitTitleRequestBytes = maxExplicitTitleBytes*6 + 256
+)
 
 // ErrSocketInUse is returned by BindSocket when the requested socket
 // path is already owned by a live listener (a probe at that path got
@@ -495,6 +501,7 @@ func (s *Server) serve() {
 	mux.HandleFunc("POST /hook/event", s.handleHookEvent)
 	mux.HandleFunc("POST /input", s.handleInput)
 	mux.HandleFunc("PUT /status", s.handlePutStatus)
+	mux.HandleFunc("PUT /title", s.handlePutTitle)
 	mux.HandleFunc("PUT /slug", s.handlePutSlug)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("POST /kill", s.handleKill)
@@ -539,7 +546,8 @@ const maxInputBytes = 1 << 20 // 1 MiB
 // per-adapter assumptions. The agent reports facts about itself; the runner
 // maps them to sidebar state:
 //
-//	op "session"          — the bound conversation file, id, name (on bind)
+//	op "session"          — the bound conversation file and id (on bind)
+//	op "title"            — an explicit name chosen inside the child agent
 //	op "turn" phase start — the agent loop began (→ working)
 //	op "turn" phase end   — the loop ended with Outcome + title
 //
@@ -553,13 +561,14 @@ type hookEvent struct {
 	Path string `json:"path"`
 	Pid  int    `json:"pid"`
 
-	ID      string `json:"id,omitempty"`
-	Slug    string `json:"slug,omitempty"` // explicit URL-safe slug; preferred over Slugify(ID)
-	Name    string `json:"name,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Title   string `json:"title,omitempty"`
-	Phase   string `json:"phase,omitempty"`   // "start" | "end" (op "turn")
-	Outcome string `json:"outcome,omitempty"` // "completed" | "aborted" | "error"
+	ID         string  `json:"id,omitempty"`
+	Slug       string  `json:"slug,omitempty"` // explicit URL-safe slug; preferred over Slugify(ID)
+	Name       string  `json:"name,omitempty"`
+	AgentTitle *string `json:"agent_title,omitempty"`
+	Reason     string  `json:"reason,omitempty"`
+	Title      string  `json:"title,omitempty"`
+	Phase      string  `json:"phase,omitempty"`   // "start" | "end" (op "turn")
+	Outcome    string  `json:"outcome,omitempty"` // "completed" | "aborted" | "error"
 }
 
 // handleHookEvent applies the authoritative session state an agent's gmux hook
@@ -579,25 +588,49 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 	case "session":
 		// Authoritative bind (e.g. pi's session_start): the file the
 		// agent holds, named and slugged.
+		if ev.AgentTitle != nil {
+			title, err := normalizeExplicitTitle(*ev.AgentTitle)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.state.SetAgentTitle(title)
+		}
 		if ev.Path != "" {
 			s.state.SetSessionFile(ev.Path)
 		}
-		if title, slug := s.resolveHookTitle(ev.Name, ev.Path); title != "" {
+		title, derivedSlug := s.resolveHookTitle(ev.Name, ev.Path)
+		// A bind is authoritative for the adapter fallback too: clearing it
+		// prevents the previous conversation's generated title leaking across
+		// /new or /resume when the new conversation has no useful title yet.
+		// An activity re-announcement is only a reconciliation hint, so a
+		// transient parse miss must not erase the current fallback.
+		if title != "" || ev.Reason != "activity" {
 			s.state.SetAdapterTitle(title)
-			if slug != "" {
-				s.state.SetSlug(slug)
-			}
+		}
+		// Activity re-announcements may observe a later explicit /name in the
+		// session file. That name belongs to ExplicitTitle and must not mutate
+		// stable routing. A real bind may establish the new conversation slug.
+		if derivedSlug != "" && (ev.Reason != "activity" || s.state.SlugSnapshot() == "") {
+			s.state.SetSlug(derivedSlug)
 		}
 		// Slug source, in order of preference: an explicit slug the agent
 		// reports (e.g. codex, whose session id is a UUID that slugifies badly,
 		// sends a title-derived slug), else the identity to slugify.
-		// A title-derived slug from resolveHookTitle is stronger than the id
-		// fallback, so don't replace it unless the hook provided an explicit slug.
+		// A title-derived slug from the authoritative bind is stronger than the
+		// id fallback, so don't replace it unless the hook provided an explicit slug.
 		if ev.Slug != "" {
 			s.state.SetSlug(adapter.Slugify(ev.Slug))
 		} else if ev.ID != "" && s.state.SlugSnapshot() == "" {
 			s.state.SetSlug(adapter.Slugify(ev.ID))
 		}
+	case "title":
+		title, err := normalizeExplicitTitle(ev.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.state.SetAgentTitle(title)
 	case "turn":
 		// Agent-loop transition. The extension reports phase + outcome; the
 		// sidebar policy (what an outcome means) lives here, in testable Go.
@@ -627,7 +660,13 @@ func (s *Server) resolveHookTitle(rawTitle, path string) (title, slug string) {
 	if !ok || path == "" {
 		return "", ""
 	}
-	info, err := filer.ParseSessionFile(path)
+	var info *adapter.SessionFileInfo
+	var err error
+	if fallback, ok := s.adapter.(adapter.SessionFallbackFiler); ok {
+		info, err = fallback.ParseSessionFallback(path)
+	} else {
+		info, err = filer.ParseSessionFile(path)
+	}
 	if err != nil || info == nil {
 		return "", ""
 	}
@@ -691,6 +730,52 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write pty: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type titleRequest struct {
+	Title *string `json:"title"`
+}
+
+func normalizeExplicitTitle(raw string) (string, error) {
+	title := strings.TrimSpace(raw)
+	if !utf8.ValidString(title) {
+		return "", errors.New("title must be valid UTF-8")
+	}
+	if len(title) > maxExplicitTitleBytes {
+		return "", fmt.Errorf("title exceeds %d bytes", maxExplicitTitleBytes)
+	}
+	for _, r := range title {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return "", errors.New("title must be a single line without control characters")
+		}
+	}
+	return title, nil
+}
+
+func (s *Server) handlePutTitle(w http.ResponseWriter, r *http.Request) {
+	var req titleRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxExplicitTitleRequestBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		http.Error(w, "invalid JSON: trailing content", http.StatusBadRequest)
+		return
+	}
+	if req.Title == nil {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+	title, err := normalizeExplicitTitle(*req.Title)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.state.SetExplicitTitle(title)
 	w.WriteHeader(http.StatusNoContent)
 }
 

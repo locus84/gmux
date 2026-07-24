@@ -176,6 +176,19 @@ session marked dead — the same path as the UI's kill button.
 gmux kill a3f20187
 ```
 
+### `gmux session rename <id> <name>`
+
+Set a mux-owned session name. It takes precedence over application-controlled
+OSC titles and adapter-generated fallbacks, without changing the session slug
+or URL identity. Use `--clear` to reveal the application/fallback title again.
+Live and dead sessions are supported, including explicitly addressed peers.
+
+```bash
+gmux session rename a3f20187 "auth refactor"
+gmux session rename a3f20187@desktop "remote build"
+gmux session rename a3f20187 --clear
+```
+
 ## Managing workspaces
 
 ### `gmux workspace add <path>`

@@ -23,6 +23,12 @@ func TestPathMaterializesReadableExtension(t *testing.T) {
 	if !strings.Contains(string(data), "session_start") {
 		t.Error("materialized extension missing session_start handler")
 	}
+	if !strings.Contains(string(data), "session_info_changed") {
+		t.Error("materialized extension missing explicit-name handler")
+	}
+	if !strings.Contains(string(data), "agent_title") || !strings.Contains(string(data), "postQueue") {
+		t.Error("materialized extension missing atomic bind title or ordered transport")
+	}
 
 	// Idempotent: a second call returns the same path.
 	p2, err := Path()

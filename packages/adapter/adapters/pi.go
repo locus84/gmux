@@ -181,6 +181,18 @@ func (p *Pi) SessionDir(cwd string) string {
 // ParseSessionFile reads a pi JSONL session file and returns display metadata.
 // Title priority: session_info.name > first user message > "(new)".
 func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
+	return p.parseSessionFile(path, true)
+}
+
+// ParseSessionFallback returns the generated conversation title while ignoring
+// session_info.name. The live runner stores pi's explicit /name separately as
+// AgentTitle, so using it as AdapterTitle too would make clearing the explicit
+// layer reveal the same value instead of the first-message fallback.
+func (p *Pi) ParseSessionFallback(path string) (*adapter.SessionFileInfo, error) {
+	return p.parseSessionFile(path, false)
+}
+
+func (p *Pi) parseSessionFile(path string, preferName bool) (*adapter.SessionFileInfo, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -244,7 +256,7 @@ func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
 	}
 
 	switch {
-	case name != "":
+	case preferName && name != "":
 		info.Title = name
 	case firstUserMsg != "":
 		info.Title = truncateTitle(firstUserMsg, 80)

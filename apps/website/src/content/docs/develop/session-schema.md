@@ -23,14 +23,14 @@ Session data flows through three boundaries. Not every field crosses every bound
 
 Two paths: the runner's `GET /meta` endpoint (polled by discovery) and its SSE `/events` stream (subscribed for live updates).
 
-**GET /meta** returns the full session state including internal title inputs (`shell_title`, `adapter_title`) and build identity (`binary_hash`). gmuxd deserializes this into `store.Session`.
+**GET /meta** returns the full session state including internal title inputs (`explicit_title`, `agent_title`, `shell_title`, `adapter_title`) and build identity (`binary_hash`). gmuxd deserializes this into `store.Session`.
 
 **SSE events** carry incremental updates:
 
 | Event | Fields |
 |-------|--------|
 | `status` | `label`, `working`, `error` |
-| `meta` | `title`, `shell_title`, `adapter_title`, `subtitle`, `unread` |
+| `meta` | `title`, `explicit_title`, `agent_title`, `shell_title`, `adapter_title`, `subtitle`, `unread` |
 | `exit` | `exit_code` |
 | `terminal_resize` | `cols`, `rows` |
 | `activity` | (no fields, signal only) |
@@ -74,6 +74,8 @@ gmuxd exposes the aggregated store via `GET /v1/sessions` and `session-upsert` /
 | **Build identity** |
 | `stale` | — | ✓ derived | ✓ | ✓ "outdated" badge |
 | **Internal (not in API)** |
+| `explicit_title` | ✓ | ✓ | — | — |
+| `agent_title` | ✓ | ✓ | — | — |
 | `shell_title` | ✓ | ✓ | — | — |
 | `adapter_title` | ✓ | ✓ | — | — |
 | `resume_key` | — | ✓ | ✓ | ✓ project membership |
@@ -85,7 +87,7 @@ Internal fields are inputs to derived fields. The API only exposes the derived o
 
 | Internal input | Derived output |
 |---|---|
-| `shell_title`, `adapter_title` | `title` (via `resolveTitle`) |
+| `explicit_title`, `agent_title`, `shell_title`, `adapter_title` | `title` (via `resolveTitle`) |
 | `binary_hash` | `stale` (via `markStale`) |
 
 `resume_key` is both an input to `resumable` and directly API-visible (the frontend needs it for project session array membership to identify dead sessions).
@@ -133,7 +135,7 @@ All dead sessions with a command are resumable.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `title` | string | Primary display name. Resolved by gmuxd: adapter title > shell title > CommandTitler > adapter kind. |
+| `title` | string | Primary display name. Resolved by gmuxd: gmux explicit name > agent-native explicit name > application OSC title > adapter fallback > CommandTitler > adapter kind. |
 | `subtitle` | string? | Secondary context line. |
 | `status` | Status? | Application-reported status (see below). |
 | `unread` | boolean | Whether this session has unseen activity. |
@@ -203,8 +205,10 @@ As served by `GET /meta` on a runner's Unix socket (runner → gmuxd):
   "alive": true,
   "pid": 12345,
   "started_at": "2026-03-14T10:00:01Z",
-  "title": "fix auth bug",
-  "shell_title": "user@host:~/dev/gmux",
+  "title": "auth refactor",
+  "explicit_title": "auth refactor",
+  "agent_title": "pi auth work",
+  "shell_title": "π - auth refactor - gmux",
   "adapter_title": "fix auth bug",
   "status": { "label": "thinking", "working": true },
   "unread": false,
@@ -225,7 +229,7 @@ As served by `GET /v1/sessions` (gmuxd → frontend):
   "alive": true,
   "pid": 12345,
   "started_at": "2026-03-14T10:00:01Z",
-  "title": "fix auth bug",
+  "title": "auth refactor",
   "status": { "label": "thinking", "working": true },
   "unread": false,
   "socket_path": "/tmp/gmux-sessions/sess-abc123.sock",
@@ -235,7 +239,7 @@ As served by `GET /v1/sessions` (gmuxd → frontend):
 }
 ```
 
-Note the differences: `shell_title`, `adapter_title`, and `binary_hash` are absent from the API response. `title` is the resolved value. `stale` is derived from `binary_hash`. `slug` is auto-derived. `resume_key` is passed through for project membership matching.
+Note the differences: `explicit_title`, `agent_title`, `shell_title`, `adapter_title`, and `binary_hash` are absent from the API response. `title` is the resolved value. `stale` is derived from `binary_hash`. `slug` is auto-derived. `resume_key` is passed through for project membership matching.
 
 ## What's NOT in This Schema
 

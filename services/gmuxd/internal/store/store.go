@@ -86,9 +86,19 @@ type Session struct {
 	// ── Internal fields (excluded from API via MarshalJSON) ──
 
 	// Title inputs: resolveTitle merges these by precedence into Title
-	// on every Upsert/Update.
-	ShellTitle   string `json:"shell_title,omitempty"`
-	AdapterTitle string `json:"adapter_title,omitempty"`
+	// on every Upsert/Update. ExplicitTitle is mux-owned; AgentTitle is an
+	// explicit name chosen inside an agent; ShellTitle comes from application
+	// OSC; AdapterTitle is a generated fallback.
+	ExplicitTitle string `json:"explicit_title,omitempty"`
+	AgentTitle    string `json:"agent_title,omitempty"`
+
+	// Presence flags are set only while decoding runner /meta. They let a new
+	// daemon distinguish a new runner's authoritative empty value from an old
+	// runner that does not implement the field.
+	ExplicitTitleKnown bool   `json:"-"`
+	AgentTitleKnown    bool   `json:"-"`
+	ShellTitle         string `json:"shell_title,omitempty"`
+	AdapterTitle       string `json:"adapter_title,omitempty"`
 
 	// Project assignment stamps populated by the project Reconcile
 	// step on the origin host. ProjectSlug is the slug of the project
@@ -113,7 +123,7 @@ type Session struct {
 }
 
 // MarshalJSON serializes a Session for the frontend API, excluding internal
-// fields (ShellTitle, AdapterTitle) that are resolved into Title before sending.
+// title inputs that are resolved into Title before sending.
 func (s Session) MarshalJSON() ([]byte, error) {
 	type wire struct {
 		ID            string            `json:"id"`
@@ -239,8 +249,15 @@ func (s *Store) HasLocalSlug(kind, slug string) bool {
 	return false
 }
 
-// resolveTitle picks the best title: terminal > adapter > command fallback.
+// resolveTitle picks the best title:
+// explicit mux name > agent-native explicit name > terminal > adapter > command.
 func (s *Store) resolveTitle(sess Session) string {
+	if sess.ExplicitTitle != "" {
+		return sess.ExplicitTitle
+	}
+	if sess.AgentTitle != "" {
+		return sess.AgentTitle
+	}
 	if sess.ShellTitle != "" {
 		return sess.ShellTitle
 	}
@@ -268,8 +285,8 @@ func (s *Store) Upsert(sess Session) {
 // peer (spoke). Unlike Upsert it does NOT recompute Title or
 // Resumable: those fields are authoritatively set on the spoke and
 // arriving in the SSE payload already. The spoke intentionally keeps
-// its internal ShellTitle/AdapterTitle fields off the wire, so the
-// hub never has enough information to re-resolve correctly and would
+// its internal ExplicitTitle/AgentTitle/ShellTitle/AdapterTitle fields off the wire, so
+// the hub never has enough information to re-resolve correctly and would
 // otherwise overwrite a correct Title with the adapter Kind fallback.
 //
 // Canonicalization, duplicate-slug handling, unique-slug

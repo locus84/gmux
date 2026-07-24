@@ -218,8 +218,8 @@ func probeSocket(socketPath string) bool {
 //     daemon-restart-with-surviving-runner both land here. The
 //     existing record is mutated in place: runtime fields (alive,
 //     pid, socket, status, started/exit times, binary hash, runner
-//     version, command, terminal size) take their values from the
-//     fresh /meta payload, while everything else — slug,
+//     version, command, explicit/application titles, terminal size) take
+//     their values from the fresh /meta payload, while everything else — slug,
 //     created_at, attribution-derived adapter title and subtitle,
 //     workspace root, remotes — carries across the seam. The
 //     adapter's OnRegister hook is intentionally skipped: its
@@ -265,6 +265,13 @@ func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, 
 		existing.BinaryHash = newSess.BinaryHash
 		existing.RunnerVersion = newSess.RunnerVersion
 		existing.Command = newSess.Command
+		if newSess.ExplicitTitleKnown {
+			existing.ExplicitTitle = newSess.ExplicitTitle
+		}
+		if newSess.AgentTitleKnown {
+			existing.AgentTitle = newSess.AgentTitle
+		}
+		existing.ShellTitle = newSess.ShellTitle
 		existing.TerminalCols = newSess.TerminalCols
 		existing.TerminalRows = newSess.TerminalRows
 		// Resumable is a derived attribute of dead sessions; a
@@ -316,6 +323,15 @@ func queryMeta(socketPath string) (*store.Session, error) {
 	if err := json.Unmarshal(body, &sess); err != nil {
 		return nil, err
 	}
+	// Old runners omit title layers they do not understand. New runners emit
+	// these keys even when empty, making clear authoritative across daemon
+	// restart without treating mixed-version absence as a clear.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	_, sess.ExplicitTitleKnown = fields["explicit_title"]
+	_, sess.AgentTitleKnown = fields["agent_title"]
 
 	// Ensure socket_path is set (runner might not include it)
 	if sess.SocketPath == "" {
@@ -334,6 +350,26 @@ func KillSession(socketPath string) error {
 		return err
 	}
 	resp.Body.Close()
+	return nil
+}
+
+// SetExplicitTitle updates the mux-owned session name in the live runner.
+// The runner emits the resulting metadata event back to gmuxd; callers may
+// also update their local cache optimistically after this request succeeds.
+func SetExplicitTitle(ctx context.Context, socketPath, title string) error {
+	body, err := json.Marshal(map[string]string{"title": title})
+	if err != nil {
+		return err
+	}
+	resp, err := runnerRequest(ctx, socketPath, http.MethodPut, "/title", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("runner /title: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
 	return nil
 }
 

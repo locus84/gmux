@@ -163,6 +163,19 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "session rename", args: []string{"session", "rename", "abc@laptop", "작업 이름"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.sessionSub != "rename" || c.ref != "abc@laptop" || c.sessionTitle != "작업 이름" || c.clearTitle {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+		{name: "session rename clear", args: []string{"session", "rename", "abc", "--clear"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || !c.clearTitle || c.sessionTitle != "" {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
 		{name: "daemon status", args: []string{"daemon", "status"}, wantMode: modeDaemon,
 			check: func(t *testing.T, c *command) {
 				if c.daemonSub != "status" {
@@ -172,10 +185,10 @@ func TestParseCLI(t *testing.T) {
 		{name: "auth", args: []string{"auth"}, wantMode: modeAuth},
 		{name: "remote", args: []string{"remote"}, wantMode: modeRemote},
 
-		{name: "internal __run with directives", args: []string{"__run", "--resume-id=sess-1", "--initial-cols=80", "--", "pi"}, wantMode: modeRun,
+		{name: "internal __run with directives", args: []string{"__run", "--resume-id=sess-1", "--initial-cols=80", "--initial-title=작업 이름", "--initial-agent-title=Pi 이름", "--", "pi"}, wantMode: modeRun,
 			check: func(t *testing.T, c *command) {
-				if c.resumeID != "sess-1" || c.initialCols != 80 {
-					t.Errorf("resumeID=%q cols=%d", c.resumeID, c.initialCols)
+				if c.resumeID != "sess-1" || c.initialCols != 80 || c.initialTitle != "작업 이름" || c.initialAgentTitle != "Pi 이름" {
+					t.Errorf("resumeID=%q cols=%d title=%q agentTitle=%q", c.resumeID, c.initialCols, c.initialTitle, c.initialAgentTitle)
 				}
 				if strings.Join(c.runArgs, " ") != "pi" {
 					t.Errorf("runArgs = %v", c.runArgs)
@@ -202,6 +215,13 @@ func TestParseCLI(t *testing.T) {
 
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
+		{"session"},
+		{"session", "unknown"},
+		{"session", "rename"},
+		{"session", "rename", "abc"},
+		{"session", "rename", "abc", ""},
+		{"session", "rename", "abc", "name", "extra"},
+		{"session", "rename", "abc", "name", "--clear"},
 		{"workspace"},
 		{"workspace", "unknown"},
 		{"workspace", "add"},

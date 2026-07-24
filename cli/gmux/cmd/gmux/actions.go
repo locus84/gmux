@@ -358,6 +358,45 @@ func cmdKill(ref string) int {
 	return 0
 }
 
+func cmdSession(c *command) int {
+	if c.sessionSub != "rename" {
+		fmt.Fprintln(os.Stderr, "gmux: unsupported session command")
+		return 2
+	}
+	return cmdSessionRename(c.ref, c.sessionTitle)
+}
+
+func cmdSessionRename(ref, title string) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	payload, err := json.Marshal(map[string]string{"title": title})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/rename"
+	resp, err := gmuxdClient().Post(url, "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		fmt.Fprintf(os.Stderr, "gmux: rename failed: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
+		return 1
+	}
+	if title == "" {
+		fmt.Printf("cleared session name for %s\n", displayID(sess))
+	} else {
+		fmt.Printf("renamed %s to %s\n", displayID(sess), strings.TrimSpace(title))
+	}
+	return 0
+}
+
 // cmdTail implements `gmux tail <id> [-n N] [--raw]`.
 //
 // Routes through gmuxd's scrollback broker rather than the per-session

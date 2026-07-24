@@ -24,20 +24,25 @@ to guess.
 ## Event schema
 
 One JSON object per event, discriminated by `op`. Unknown ops/values are ignored
-(forward-compatible); zero-value fields are no-ops.
+(forward-compatible). An empty explicit `title` name is meaningful and clears
+the mux-owned name; other zero-value fields remain no-ops.
 
 ```jsonc
 // op "session" — authoritative bind. Sent on startup and on every rebind
 // (switch/new/resume/fork).
 {
   "op":     "session",
-  "path":   "/abs/path/to/conversation-file",  // required
+  "path":   "/abs/path/to/conversation-file",  // may be empty until a new file exists
   "id":     "session-id",                       // optional; slugified for the URL if no slug
   "slug":   "human-title",                      // optional; explicit URL-safe slug, preferred over id
-  "name":   "human title",                      // optional; sets the adapter title
+  "name":   "generated fallback",                // optional; sets the adapter title
+  "agent_title": "user-chosen agent name",       // optional; empty clears it on rebind
   "cwd":    "/project/dir",                      // optional; accepted, not yet applied
   "reason": "startup|new|resume|fork|activity"  // optional; informational
 }
+
+// op "title" — explicit user-authored session name. Empty clears it.
+{ "op": "title", "name": "human title" }
 
 // op "turn" — agent loop boundary.
 { "op": "turn", "phase": "start" }                            // → working
@@ -49,15 +54,23 @@ One JSON object per event, discriminated by `op`. Unknown ops/values are ignored
 
 | Field     | Op       | Meaning |
 |-----------|----------|---------|
-| `path`    | session  | Absolute path of the held conversation file. |
+| `path`    | session  | Absolute path of the held conversation file; may be empty on a brand-new bind. |
 | `id`      | session  | Session identity; slugified into the URL when no `slug`. |
 | `slug`    | session  | Explicit URL-safe slug; preferred over `id` (e.g. codex's UUID slugifies badly). |
-| `name`    | session  | Display title at bind time. |
+| `name`        | session | Adapter-generated fallback title at bind time. |
+| `agent_title` | session | Agent-native explicit name, applied atomically with a bind; empty clears it. |
+| `name`        | title   | Agent-native explicit name; an empty string clears it. |
 | `cwd`     | session  | Project dir. Accepted for forward-compat but not applied — the runner knows the launch cwd. |
 | `reason`  | session  | Why the bind happened; informational. |
 | `phase`   | turn     | `"start"` or `"end"`. |
 | `outcome` | turn end | Normalized terminal state — see below. |
-| `title`   | turn end | Display title at turn end. |
+| `title`   | turn end | Adapter-generated fallback title at turn end. |
+
+The runner keeps these sources separate and resolves them as:
+`gmux explicit title > agent-native explicit title > application OSC title > adapter fallback > command`.
+An agent should only send `op: "title"` for a name explicitly chosen inside the
+agent, not for an inferred title or decorated terminal title. A name set with
+`gmux session rename` remains the higher-priority multiplexer override.
 
 ### Outcome vocabulary
 
@@ -83,7 +96,9 @@ but `/events` replay.
    (below). Both are ephemeral, scoped to the launch, and no-op without
    `GMUX_SESSION_SOCK`.
 2. Report a `session` event on every bind.
-3. Report `turn` start/end, normalizing to the outcome vocabulary.
+3. If the agent supports explicit user naming, report `title` immediately when
+   it changes and clear it when switching to an unnamed session.
+4. Report `turn` start/end, normalizing to the outcome vocabulary.
 
 ### Injection seams
 

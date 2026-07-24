@@ -627,7 +627,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	cmd := []string{"claude", "--continue", "-p", "hi"}
 
 	t.Run("fresh launch: __run then -- then command verbatim", func(t *testing.T) {
-		got := buildLaunchArgs("", 0, 0, cmd)
+		got := buildLaunchArgs("", "", "", 0, 0, cmd)
 		want := append([]string{"__run", "--"}, cmd...)
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -635,10 +635,12 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("restart: directives precede --, then the command", func(t *testing.T) {
-		got := buildLaunchArgs("sess-abc", 142, 47, cmd)
+		got := buildLaunchArgs("sess-abc", "named session", "agent name", 142, 47, cmd)
 		want := []string{
 			"__run",
 			"--resume-id=sess-abc",
+			"--initial-title=named session",
+			"--initial-agent-title=agent name",
 			"--initial-cols=142",
 			"--initial-rows=47",
 			"--",
@@ -650,7 +652,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("zero dims omit the size flags", func(t *testing.T) {
-		got := buildLaunchArgs("sess-1", 0, 0, cmd)
+		got := buildLaunchArgs("sess-1", "", "", 0, 0, cmd)
 		want := append([]string{"__run", "--resume-id=sess-1", "--"}, cmd...)
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -660,7 +662,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	t.Run("command flags survive intact (-- terminator)", func(t *testing.T) {
 		// The `--` terminator delivers the command verbatim even when its
 		// own args look like directive flags.
-		got := buildLaunchArgs("sess-1", 80, 24, []string{"weirdcli", "--resume-id=evil"})
+		got := buildLaunchArgs("sess-1", "", "", 80, 24, []string{"weirdcli", "--resume-id=evil"})
 		want := []string{
 			"__run",
 			"--resume-id=sess-1",
@@ -725,7 +727,7 @@ eval "printf 'sess-fake\\n' >&$GMUX_HANDSHAKE_FD"
 		t.Fatal(err)
 	}
 
-	pid, id, err := launchGmux(bin, []string{"pi"}, dir, "sess-requested", 120, 40)
+	pid, id, err := launchGmux(bin, []string{"pi"}, dir, "sess-requested", "named session", "agent name", 120, 40)
 	if err != nil {
 		t.Fatalf("launchGmux error: %v", err)
 	}

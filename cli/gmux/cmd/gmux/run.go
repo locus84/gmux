@@ -42,12 +42,13 @@ const handshakeTimeout = 5 * time.Second
 const ptyDrainTimeout = 250 * time.Millisecond
 
 // runDirectives carries daemon→runner overrides for a /v1/launch,
-// /v1/resume, or /v1/restart. End-user invocations leave all three
-// fields zero. See the flag declarations in cli.go for semantics.
+// /v1/resume, or /v1/restart. End-user invocations leave all fields zero. See the flag declarations in cli.go for semantics.
 type runDirectives struct {
-	ResumeID    string
-	InitialCols int
-	InitialRows int
+	ResumeID          string
+	InitialCols       int
+	InitialRows       int
+	InitialTitle      string
+	InitialAgentTitle string
 }
 
 // runSession launches a new managed session for the given command.
@@ -161,6 +162,8 @@ func runSession(args []string, attach bool, dir runDirectives) {
 		SocketPath:    sockPath,
 		BinaryHash:    binhash.Self(),
 		RunnerVersion: version,
+		ExplicitTitle: dir.InitialTitle,
+		AgentTitle:    dir.InitialAgentTitle,
 	})
 
 	// Common env vars — set for every child, per ADR-0005

@@ -260,6 +260,14 @@ func TestParseSessionFileNameOverrides(t *testing.T) {
 	if info.Slug != "auth-refactor" {
 		t.Errorf("expected slug from session name, got %q", info.Slug)
 	}
+
+	fallback, err := NewPi().ParseSessionFallback(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Title != "Fix the auth bug" || fallback.Slug != "fix-the-auth-bug" {
+		t.Errorf("fallback = title %q slug %q, want first-message metadata", fallback.Title, fallback.Slug)
+	}
 }
 
 func TestParseSessionFileNoMessages(t *testing.T) {

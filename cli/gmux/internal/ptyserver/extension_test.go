@@ -311,6 +311,121 @@ func TestHookGenericPiTitleFallsBackToSessionFile(t *testing.T) {
 	}
 }
 
+func TestPutExplicitTitleValidatesAndClears(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "shell", Command: []string{"bash"}})
+	st.SetShellTitle("application title")
+	srv := &Server{state: st}
+
+	req := httptest.NewRequest(http.MethodPut, "/title", strings.NewReader(`{"title":"  사용자 이름  "}`))
+	rr := httptest.NewRecorder()
+	srv.handlePutTitle(rr, req)
+	if rr.Code != http.StatusNoContent || st.Title() != "사용자 이름" {
+		t.Fatalf("status=%d title=%q", rr.Code, st.Title())
+	}
+
+	for _, body := range []string{
+		`{"title":"bad\nname"}`,
+		"{\"title\":\"bad\u2028name\"}",
+		`{"title":"ok"} {}`,
+	} {
+		req = httptest.NewRequest(http.MethodPut, "/title", strings.NewReader(body))
+		rr = httptest.NewRecorder()
+		srv.handlePutTitle(rr, req)
+		if rr.Code != http.StatusBadRequest || st.Title() != "사용자 이름" {
+			t.Fatalf("body=%q invalid title status=%d title=%q", body, rr.Code, st.Title())
+		}
+	}
+
+	req = httptest.NewRequest(http.MethodPut, "/title", strings.NewReader(`{"title":""}`))
+	rr = httptest.NewRecorder()
+	srv.handlePutTitle(rr, req)
+	if rr.Code != http.StatusNoContent || st.Title() != "application title" {
+		t.Fatalf("clear status=%d title=%q", rr.Code, st.Title())
+	}
+}
+
+func TestHookAgentTitleOverridesOSCWithoutChangingSlug(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	st.SetAdapterTitle("adapter fallback")
+	st.SetShellTitle("π - decorated - gmux")
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(`{"op":"title","name":"  작업 이름  "}`))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := st.Title(); got != "작업 이름" {
+		t.Fatalf("title = %q, want explicit title", got)
+	}
+	if got := st.SlugSnapshot(); got != "" {
+		t.Fatalf("explicit rename changed slug to %q", got)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(`{"op":"title","name":""}`))
+	rr = httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+	if got := st.Title(); got != "π - decorated - gmux" {
+		t.Fatalf("clearing explicit title revealed %q, want OSC title", got)
+	}
+}
+
+func TestMuxTitleOverridesAndOutlivesAgentTitle(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}, ExplicitTitle: "gmux name"})
+	st.SetShellTitle("application title")
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+
+	for _, body := range []string{`{"op":"title","name":"pi name"}`, `{"op":"title","name":""}`} {
+		req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.handleHookEvent(rr, req)
+		if rr.Code != http.StatusNoContent || st.Title() != "gmux name" {
+			t.Fatalf("body=%s status=%d title=%q", body, rr.Code, st.Title())
+		}
+	}
+}
+
+func TestActivityParseMissPreservesAdapterFallback(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	st.SetAdapterTitle("existing fallback")
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(`{"op":"session","path":"/missing/session.jsonl","reason":"activity"}`))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+	if rr.Code != http.StatusNoContent || st.Title() != "existing fallback" {
+		t.Fatalf("status=%d title=%q", rr.Code, st.Title())
+	}
+}
+
+func TestActivityTitleRefreshDoesNotRenameExistingSlug(t *testing.T) {
+	dir := t.TempDir()
+	sessFile := filepath.Join(dir, "named.jsonl")
+	if err := os.WriteFile(sessFile, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"abc-123","timestamp":"2026-06-23T10:00:00Z","cwd":"/tmp/test"}`,
+		`{"type":"message","id":"u1","message":{"role":"user","content":[{"type":"text","text":"initial prompt"}]}}`,
+		`{"type":"session_info","name":"later explicit name"}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
+	st.SetSlug("stable-slug")
+	srv := &Server{state: st, adapter: adapters.NewPi()}
+	body := `{"op":"session","path":` + strconv.Quote(sessFile) + `,"id":"abc-123","reason":"activity"}`
+	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.handleHookEvent(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := st.SlugSnapshot(); got != "stable-slug" {
+		t.Fatalf("activity refresh changed slug to %q", got)
+	}
+}
+
 func TestHookUsefulPiNameDerivesSlug(t *testing.T) {
 	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
 	srv := &Server{state: st, adapter: adapters.NewPi()}
@@ -330,7 +445,7 @@ func TestHookUsefulPiNameDerivesSlug(t *testing.T) {
 	}
 }
 
-func TestHookSessionGenericPiNameDoesNotReplaceParsedTitle(t *testing.T) {
+func TestHookSessionSeparatesPiAgentNameFromGeneratedFallback(t *testing.T) {
 	dir := t.TempDir()
 	sessFile := filepath.Join(dir, "2026-06-23_sess-name.jsonl")
 	if err := os.WriteFile(sessFile, []byte(strings.Join([]string{
@@ -344,7 +459,7 @@ func TestHookSessionGenericPiNameDoesNotReplaceParsedTitle(t *testing.T) {
 	st := session.New(session.Config{ID: "s1", Kind: "pi", Command: []string{"pi"}})
 	srv := &Server{state: st, adapter: adapters.NewPi()}
 
-	body := `{"op":"session","path":` + strconv.Quote(sessFile) + `,"id":"abc-123","name":"π - gmux"}`
+	body := `{"op":"session","path":` + strconv.Quote(sessFile) + `,"id":"abc-123","name":"π - gmux","agent_title":"Useful custom title"}`
 	req := httptest.NewRequest(http.MethodPost, "/hook/event", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 	srv.handleHookEvent(rr, req)
@@ -355,8 +470,11 @@ func TestHookSessionGenericPiNameDoesNotReplaceParsedTitle(t *testing.T) {
 	if got := st.Title(); got != "Useful custom title" {
 		t.Fatalf("title = %q, want parsed custom title", got)
 	}
-	if got := st.SlugSnapshot(); got != "useful-custom-title" {
-		t.Fatalf("slug = %q, want custom-title slug", got)
+	if st.AdapterTitle != "Investigate gmux title updates" {
+		t.Fatalf("adapter fallback = %q, want first-message title", st.AdapterTitle)
+	}
+	if got := st.SlugSnapshot(); got != "investigate-gmux-title-updates" {
+		t.Fatalf("slug = %q, want fallback-title slug", got)
 	}
 }
 

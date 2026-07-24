@@ -2,8 +2,9 @@
 // helper the runner uses to materialize it.
 //
 // pi reports its active session, title, and status authoritatively via its
-// own lifecycle events (session_start on every bind; agent_start/agent_end
-// for turn status); this extension forwards them to the runner. It is loaded
+// own lifecycle events (session_start on every bind, session_info_changed for
+// explicit names, and agent_start/agent_end for turn status); this extension
+// forwards them to the runner. It is loaded
 // via `pi -e <path>`; see pi-ext.mjs for the design comment.
 //
 // The .mjs source is embedded and materialized to a stable, content-addressed

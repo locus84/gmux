@@ -13,7 +13,7 @@ The sidebar shows when pi is actively working. gmux loads a small extension into
 
 ### Session titles from conversations
 
-Instead of showing "pi" for every session, the extension reports pi's session name — which pi auto-generates from the conversation (and you can change with pi's `/name` command):
+Instead of showing "pi" for every session, gmux derives a fallback from the conversation. A name explicitly chosen with pi's `/name` command or `--name` is kept separately and takes precedence:
 
 ```
 ▼ ~/dev/myapp
@@ -22,7 +22,10 @@ Instead of showing "pi" for every session, the extension reports pi's session na
   ○ Refactor database layer
 ```
 
-Renaming with pi's `/name` command updates the sidebar live.
+Renaming with pi's `/name` command updates the sidebar immediately, without
+waiting for the next agent turn. gmux keeps that agent-native name separate, so
+pi's decorated OSC title (`π - name - project`) cannot replace it. A deliberate
+`gmux session rename` remains the higher-priority multiplexer override.
 
 ### Resumable sessions
 
@@ -75,7 +78,8 @@ gmuxd indexes these files for conversation search and history. Live session stat
 
 When gmux owns the launch, it injects the gmux session extension into pi (`pi -e <materialized-extension>`; extensions accumulate, so it coexists with your own). The extension subscribes to pi's own lifecycle and reports state to the runner authoritatively — no inference:
 
-- **`session_start`** (fires on startup *and* on every `/new`, `/resume`, and `/fork`) reports the active conversation file, id, and name. This is what binds a session to its file, and it's the only signal that survives selecting an already-loaded session from pi's `/resume` picker — pi serves that from memory without touching disk, so there is nothing for an external heuristic to observe. (This replaces the old scrollback content-matching; see ADR 0011.)
+- **`session_start`** (fires on startup *and* on every `/new`, `/resume`, and `/fork`) reports the active conversation file and id, and establishes or clears that conversation's explicit name. This is what binds a session to its file, and it's the only signal that survives selecting an already-loaded session from pi's `/resume` picker — pi serves that from memory without touching disk, so there is nothing for an external heuristic to observe. (This replaces the old scrollback content-matching; see ADR 0011.)
+- **`session_info_changed`** reports `/name`, `--name`, and extension-driven name changes immediately as explicit names rather than terminal titles.
 - **`agent_start` / `agent_end`** report each turn, so gmux drives status without watching the file.
 
 ### Status
@@ -93,5 +97,5 @@ If a pi release ever breaks the extension, set `GMUX_NO_AGENT_HOOK=1` to launch 
 
 ## Limitations
 
-- **Title appears after the first turn.** Pi generates the session name once the first response completes, so a brand-new session shows a generic title until then.
+- **Inferred fallback titles appear after the first turn.** A brand-new unnamed session shows pi's application title or a generic fallback until enough conversation content exists. Explicit `/name` and `--name` values appear immediately.
 - **The extension only loads when gmux controls the launch.** A shell-wrapped invocation (e.g. `bash -lc "pi …"`) doesn't receive the `-e` flag, so that session won't report hook-driven state.

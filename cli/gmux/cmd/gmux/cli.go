@@ -23,6 +23,7 @@ const (
 	modeSend                   // gmux send <id> <text> [keys...]
 	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
 	modeWait                   // gmux wait <id>
+	modeSession                // gmux session rename <id> <name>|--clear
 	modeWorktree               // gmux worktree <current|ps|create>
 	modeWorkspace              // gmux workspace add <path>
 	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path>
@@ -40,11 +41,13 @@ type command struct {
 	mode mode
 
 	// run (modeRun / internal __run)
-	detach      bool
-	runArgs     []string // the wrapped command, verbatim
-	resumeID    string   // internal: reuse this session id
-	initialCols int      // internal: pre-size PTY width
-	initialRows int      // internal: pre-size PTY height
+	detach            bool
+	runArgs           []string // the wrapped command, verbatim
+	resumeID          string   // internal: reuse this session id
+	initialCols       int      // internal: pre-size PTY width
+	initialRows       int      // internal: pre-size PTY height
+	initialTitle      string   // internal: preserve mux-owned name across resume/restart
+	initialAgentTitle string   // internal: preserve agent-native name across resume/restart
 
 	// session-addressing verbs (attach/tail/kill/send/send-keys/wait)
 	ref string // session reference; may carry an @peer suffix
@@ -67,6 +70,11 @@ type command struct {
 
 	// wait
 	timeout int // --timeout seconds (0 = none)
+
+	// session
+	sessionSub   string
+	sessionTitle string
+	clearTitle   bool
 
 	// workspace
 	workspaceSub  string
@@ -95,7 +103,7 @@ type command struct {
 // command in the error-only migration shim.
 var reservedVerbs = []string{
 	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "worktree", "workspace", "daemon", "auth", "remote", "version", "help",
+	"wait", "session", "worktree", "workspace", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -177,6 +185,8 @@ func parseCLI(args []string) (*command, error) {
 		return parseSendKeys(rest)
 	case "wait":
 		return parseWait(rest)
+	case "session":
+		return parseSession(rest)
 	case "worktree":
 		return parseWorktree(rest)
 	case "workspace":
@@ -380,6 +390,35 @@ func parseWorkspace(args []string) (*command, error) {
 	return &command{mode: modeWorkspace, workspaceSub: "add", workspacePath: args[1]}, nil
 }
 
+func parseSession(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("session requires one of: rename")
+	}
+	if args[0] != "rename" {
+		return nil, fmt.Errorf("unknown session command %q", args[0])
+	}
+	c := &command{mode: modeSession, sessionSub: "rename"}
+	fs := newFlagSet("session rename")
+	fs.BoolVar(&c.clearTitle, "clear", false, "clear the explicit session name")
+	pos, err := parseInterspersed(fs, args[1:])
+	if err != nil {
+		return nil, err
+	}
+	if c.clearTitle {
+		if len(pos) != 1 {
+			return nil, errors.New("session rename --clear requires exactly one session id")
+		}
+		c.ref = pos[0]
+		return c, nil
+	}
+	if len(pos) != 2 || strings.TrimSpace(pos[1]) == "" {
+		return nil, errors.New("session rename requires a session id and non-empty name")
+	}
+	c.ref = pos[0]
+	c.sessionTitle = pos[1]
+	return c, nil
+}
+
 func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
@@ -418,6 +457,8 @@ func parseInternalRun(args []string) (*command, error) {
 	fs.StringVar(&c.resumeID, "resume-id", "", "reuse this session id")
 	fs.IntVar(&c.initialCols, "initial-cols", 0, "pre-size PTY width")
 	fs.IntVar(&c.initialRows, "initial-rows", 0, "pre-size PTY height")
+	fs.StringVar(&c.initialTitle, "initial-title", "", "preserve the mux-owned session name")
+	fs.StringVar(&c.initialAgentTitle, "initial-agent-title", "", "preserve the agent-native session name")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -529,6 +570,8 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
   gmux wait <id> [--timeout N]      block until an agent session is idle
   gmux kill <id>                    terminate a session
+  gmux session rename <id> <name>   set the explicit session name
+  gmux session rename <id> --clear  reveal the application/fallback title
 
 Workspaces (local only):
   gmux workspace add <path>         add a directory to the workspace list

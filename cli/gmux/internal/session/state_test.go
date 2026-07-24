@@ -27,6 +27,24 @@ func TestNewState(t *testing.T) {
 	}
 }
 
+func TestMetaAlwaysIncludesAuthoritativeExplicitLayers(t *testing.T) {
+	s := New(Config{ID: "s", Kind: "shell"})
+	data, err := s.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := got["explicit_title"]; !ok || value != "" {
+		t.Fatalf("explicit_title = %#v, present=%v", value, ok)
+	}
+	if value, ok := got["agent_title"]; !ok || value != "" {
+		t.Fatalf("agent_title = %#v, present=%v", value, ok)
+	}
+}
+
 func TestNewStateIncludesGitLayout(t *testing.T) {
 	s := New(Config{ID: "s", Kind: "shell", GitLayout: "worktree"})
 	data, err := s.MarshalJSON()
@@ -39,6 +57,17 @@ func TestNewStateIncludesGitLayout(t *testing.T) {
 	}
 	if got["git_layout"] != "worktree" {
 		t.Fatalf("git_layout = %v, want worktree", got["git_layout"])
+	}
+}
+
+func TestNewStateRestoresInitialTitleLayers(t *testing.T) {
+	s := New(Config{ID: "s", Command: []string{"pi"}, ExplicitTitle: "restored name", AgentTitle: "pi name"})
+	if s.Title() != "restored name" {
+		t.Fatalf("title = %q, want restored name", s.Title())
+	}
+	s.SetExplicitTitle("")
+	if s.Title() != "pi name" {
+		t.Fatalf("title = %q, want restored agent name", s.Title())
 	}
 }
 
@@ -64,14 +93,38 @@ func TestTerminalTitleOverridesAdapterTitle(t *testing.T) {
 	}
 }
 
-func TestClearTerminalTitleRevealsAdapterTitle(t *testing.T) {
+func TestExplicitTitlePrecedenceAndClearing(t *testing.T) {
 	s := New(Config{ID: "s", Command: []string{"pi"}, Kind: "pi"})
 
-	s.SetAdapterTitle("named task")
+	s.SetAdapterTitle("adapter fallback")
 	s.SetShellTitle("application pane title")
+	s.SetAgentTitle("에이전트 이름")
+	s.SetExplicitTitle("사용자 이름")
+	if s.Title() != "사용자 이름" {
+		t.Fatalf("expected explicit title to win, got %q", s.Title())
+	}
+
+	s.SetShellTitle("changed application title")
+	s.SetAdapterTitle("changed adapter fallback")
+	if s.Title() != "사용자 이름" {
+		t.Fatalf("lower-priority title replaced explicit title: %q", s.Title())
+	}
+
+	s.SetExplicitTitle("")
+	if s.Title() != "에이전트 이름" {
+		t.Fatalf("expected agent title after clearing explicit title, got %q", s.Title())
+	}
+	s.SetAgentTitle("")
+	if s.Title() != "changed application title" {
+		t.Fatalf("expected terminal title after clearing agent title, got %q", s.Title())
+	}
 	s.SetShellTitle("")
-	if s.Title() != "named task" {
+	if s.Title() != "changed adapter fallback" {
 		t.Fatalf("expected adapter title after clearing terminal title, got %q", s.Title())
+	}
+	s.SetAdapterTitle("")
+	if s.Title() != "pi" {
+		t.Fatalf("expected command fallback after clearing adapter title, got %q", s.Title())
 	}
 }
 
@@ -117,6 +170,8 @@ func TestJSONIncludesComputedTitle(t *testing.T) {
 		Kind:    "pi",
 	})
 	s.SetShellTitle("~/dev/gmux")
+	s.SetAgentTitle("agent named session")
+	s.SetExplicitTitle("named session")
 
 	data, err := s.MarshalJSON()
 	if err != nil {
@@ -128,8 +183,14 @@ func TestJSONIncludesComputedTitle(t *testing.T) {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 
-	if parsed["title"] != "~/dev/gmux" {
-		t.Fatalf("expected computed title '~/dev/gmux', got %v", parsed["title"])
+	if parsed["title"] != "named session" {
+		t.Fatalf("expected computed explicit title, got %v", parsed["title"])
+	}
+	if parsed["explicit_title"] != "named session" {
+		t.Fatalf("expected explicit_title, got %v", parsed["explicit_title"])
+	}
+	if parsed["agent_title"] != "agent named session" {
+		t.Fatalf("expected agent_title, got %v", parsed["agent_title"])
 	}
 	if parsed["shell_title"] != "~/dev/gmux" {
 		t.Fatalf("expected shell_title, got %v", parsed["shell_title"])

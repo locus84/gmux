@@ -173,7 +173,8 @@ func launcherStates(ls []adapter.Launcher) []string {
 // session's id so identity (and the scrollback directory on disk)
 // carry across the seam. See ADR 0003.
 //
-// initialCols / initialRows, when non-zero, are passed via
+// initialTitle and initialAgentTitle preserve title layers when a dead session
+// is resumed or restarted. initialCols / initialRows, when non-zero, are passed via
 // --initial-cols / --initial-rows so the PTY starts at the right
 // size instead of the 80x24 default. Without this, /resume and
 // /restart momentarily expose the child process to a
@@ -186,8 +187,8 @@ func launcherStates(ls []adapter.Launcher) []string {
 // contract is greppable and shows up in `ps`. The runner still
 // honours the legacy GMUX_RESUME_ID env var as a fallback for
 // rolling upgrades, but this code path no longer sets it.
-func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, string, error) {
-	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialCols, initialRows, command)...)
+func launchGmux(gmuxBin string, command []string, cwd, resumeID, initialTitle, initialAgentTitle string, initialCols, initialRows uint16) (int, string, error) {
+	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialTitle, initialAgentTitle, initialCols, initialRows, command)...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
@@ -278,11 +279,17 @@ func resumableRunnerID(sessionID string) string {
 // __run verb, any non-empty daemon→runner directive flags, then a `--`
 // terminator and the user command verbatim. The `--` delivers the
 // command intact even when its own arguments look like flags.
-func buildLaunchArgs(resumeID string, initialCols, initialRows uint16, command []string) []string {
-	args := make([]string, 0, len(command)+5)
+func buildLaunchArgs(resumeID, initialTitle, initialAgentTitle string, initialCols, initialRows uint16, command []string) []string {
+	args := make([]string, 0, len(command)+7)
 	args = append(args, "__run")
 	if resumeID != "" {
 		args = append(args, "--resume-id="+resumeID)
+	}
+	if initialTitle != "" {
+		args = append(args, "--initial-title="+initialTitle)
+	}
+	if initialAgentTitle != "" {
+		args = append(args, "--initial-agent-title="+initialAgentTitle)
 	}
 	if initialCols > 0 {
 		args = append(args, fmt.Sprintf("--initial-cols=%d", initialCols))
@@ -584,6 +591,7 @@ func serve(stderr io.Writer) int {
 	subs := discovery.NewSubscriptions(sessions)
 	subs.OnDead = persistDead
 	var resumeMu sync.Mutex
+	var renameMu sync.Mutex
 
 	// Start file monitor — watches adapter session directories with inotify
 	// to extract title and working status from JSONL files.
@@ -1509,7 +1517,7 @@ func serve(stderr io.Writer) int {
 		// added; fixing /launch requires a protocol change to
 		// carry cols/rows in the launch request and is left as a
 		// follow-up.
-		pid, registeredID, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
+		pid, registeredID, err := launchGmux(gmuxBin, req.Command, cwd, "", "", "", 0, 0)
 		if err != nil {
 			log.Printf("launch: failed to start gmux: %v", err)
 			writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1611,7 +1619,7 @@ func serve(stderr io.Writer) int {
 			if requestedID == "" {
 				log.Printf("resume: %s is not a runner-owned session id; launching replacement session", sessionID)
 			}
-			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, requestedID, sess.TerminalCols, sess.TerminalRows)
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, requestedID, sess.ExplicitTitle, sess.AgentTitle, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("resume: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1703,7 +1711,7 @@ func serve(stderr io.Writer) int {
 			if requestedID == "" {
 				log.Printf("restart: %s is not a runner-owned session id; launching replacement session", sessionID)
 			}
-			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, requestedID, sess.TerminalCols, sess.TerminalRows)
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, requestedID, sess.ExplicitTitle, sess.AgentTitle, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("restart: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1752,6 +1760,14 @@ func serve(stderr io.Writer) int {
 				}
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{}})
+
+		case "rename":
+			// Keep runner and cache updates in one order. Without serialization,
+			// two concurrent responses can complete cache writes in the opposite
+			// order from the runner's title writes.
+			renameMu.Lock()
+			defer renameMu.Unlock()
+			handleSessionRename(w, r, sessionID, sessions, discovery.SetExplicitTitle, persistDead)
 
 		case "read":
 			if r.Method != http.MethodPost {

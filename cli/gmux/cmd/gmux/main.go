@@ -34,9 +34,11 @@ func main() {
 		openUI()
 	case modeRun:
 		runSession(cmd.runArgs, !cmd.detach, runDirectives{
-			ResumeID:    cmd.resumeID,
-			InitialCols: cmd.initialCols,
-			InitialRows: cmd.initialRows,
+			ResumeID:          cmd.resumeID,
+			InitialCols:       cmd.initialCols,
+			InitialRows:       cmd.initialRows,
+			InitialTitle:      cmd.initialTitle,
+			InitialAgentTitle: cmd.initialAgentTitle,
 		})
 	case modeList:
 		os.Exit(cmdList(cmd.all, cmd.json))
@@ -52,6 +54,8 @@ func main() {
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
 		os.Exit(cmdWait(cmd.ref, cmd.timeout))
+	case modeSession:
+		os.Exit(cmdSession(cmd))
 	case modeWorktree:
 		os.Exit(cmdWorktree(cmd))
 	case modeWorkspace:
