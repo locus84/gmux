@@ -54,6 +54,8 @@ func main() {
 		os.Exit(cmdWait(cmd.ref, cmd.timeout))
 	case modeWorktree:
 		os.Exit(cmdWorktree(cmd))
+	case modeWorkspace:
+		os.Exit(cmdWorkspace(cmd))
 	case modeDaemon:
 		os.Exit(execGmuxd(cmd.daemonSub))
 	case modeAuth:

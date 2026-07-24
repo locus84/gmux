@@ -176,6 +176,25 @@ session marked dead — the same path as the UI's kill button.
 gmux kill a3f20187
 ```
 
+## Managing workspaces
+
+### `gmux workspace add <path>`
+
+Add a local directory to gmux's workspace list, the same as entering an
+absolute path in the web UI's **Manage projects** screen. Relative paths are
+resolved from the shell's current directory, so the common form is:
+
+```bash
+mkdir my-project
+cd my-project
+gmux workspace add .
+```
+
+The path must already exist and be a directory. gmux resolves symlinks, sends
+the resulting absolute path to the local gmuxd, and prints the server-assigned
+workspace slug and canonical path. Duplicate paths are rejected. This command
+never adds a workspace on a network peer implicitly.
+
 ## Git worktrees
 
 Worktree commands are local-only. They read Git metadata on this machine and

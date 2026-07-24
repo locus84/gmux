@@ -24,6 +24,7 @@ const (
 	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
 	modeWait                   // gmux wait <id>
 	modeWorktree               // gmux worktree <current|ps|create>
+	modeWorkspace              // gmux workspace add <path>
 	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path>
 	modeAuth                   // gmux auth
 	modeRemote                 // gmux remote
@@ -67,6 +68,10 @@ type command struct {
 	// wait
 	timeout int // --timeout seconds (0 = none)
 
+	// workspace
+	workspaceSub  string
+	workspacePath string
+
 	// worktree
 	worktreeSub      string
 	worktreeSelector string
@@ -90,7 +95,7 @@ type command struct {
 // command in the error-only migration shim.
 var reservedVerbs = []string{
 	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "worktree", "daemon", "auth", "remote", "version", "help",
+	"wait", "worktree", "workspace", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -174,6 +179,8 @@ func parseCLI(args []string) (*command, error) {
 		return parseWait(rest)
 	case "worktree":
 		return parseWorktree(rest)
+	case "workspace":
+		return parseWorkspace(rest)
 	case "daemon":
 		return parseDaemon(rest)
 	case "auth":
@@ -360,6 +367,19 @@ func parseWorktree(args []string) (*command, error) {
 	return c, nil
 }
 
+func parseWorkspace(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("workspace requires one of: add")
+	}
+	if args[0] != "add" {
+		return nil, fmt.Errorf("unknown workspace command %q", args[0])
+	}
+	if len(args) != 2 || args[1] == "" {
+		return nil, errors.New("workspace add requires exactly one path")
+	}
+	return &command{mode: modeWorkspace, workspaceSub: "add", workspacePath: args[1]}, nil
+}
+
 func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
@@ -509,6 +529,9 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
   gmux wait <id> [--timeout N]      block until an agent session is idle
   gmux kill <id>                    terminate a session
+
+Workspaces (local only):
+  gmux workspace add <path>         add a directory to the workspace list
 
 Git worktrees (local only):
   gmux worktree current [--json]    show the enclosing worktree

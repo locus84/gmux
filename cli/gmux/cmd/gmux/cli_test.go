@@ -59,6 +59,13 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "workspace add", args: []string{"workspace", "add", "."}, wantMode: modeWorkspace,
+			check: func(t *testing.T, c *command) {
+				if c.workspaceSub != "add" || c.workspacePath != "." {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
 		{name: "worktree current json", args: []string{"worktree", "current", "--json"}, wantMode: modeWorktree,
 			check: func(t *testing.T, c *command) {
 				if c.worktreeSub != "current" || !c.json {
@@ -195,6 +202,11 @@ func TestParseCLI(t *testing.T) {
 
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
+		{"workspace"},
+		{"workspace", "unknown"},
+		{"workspace", "add"},
+		{"workspace", "add", ""},
+		{"workspace", "add", ".", "extra"},
 		{"worktree"},
 		{"worktree", "unknown"},
 		{"worktree", "current", "extra"},
