@@ -1137,7 +1137,9 @@ func (s *Server) readPTY() {
 		accum = nil
 
 		// Process adapter/title hooks on the accumulated chunk.
-		if title := adapters.ParseOSCTitle(data); title != "" && s.isUsefulTitle(title) {
+		if title := adapters.ParseOSCTitle(data); strings.TrimSpace(title) != "" {
+			// OSC 0/2 is the application's explicit terminal title; adapter title
+			// heuristics apply only to adapter metadata, not terminal protocol.
 			s.state.SetShellTitle(title)
 		}
 		if s.adapter != nil {

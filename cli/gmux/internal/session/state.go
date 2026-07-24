@@ -33,7 +33,7 @@ type State struct {
 	StartedAt string `json:"started_at"`
 	ExitedAt  string `json:"exited_at,omitempty"`
 
-	// Title sources. Display title is resolved: adapter > shell > command basename.
+	// Title sources. Display title is resolved: terminal > adapter > command basename.
 	ShellTitle   string `json:"shell_title,omitempty"`
 	AdapterTitle string `json:"adapter_title,omitempty"`
 
@@ -107,7 +107,7 @@ func New(cfg Config) *State {
 	}
 }
 
-// Title returns the resolved display title: adapter > shell > command basename.
+// Title returns the resolved display title: terminal > adapter > command basename.
 func (s *State) Title() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -115,11 +115,11 @@ func (s *State) Title() string {
 }
 
 func (s *State) titleLocked() string {
-	if s.AdapterTitle != "" {
-		return s.AdapterTitle
-	}
 	if s.ShellTitle != "" {
 		return s.ShellTitle
+	}
+	if s.AdapterTitle != "" {
+		return s.AdapterTitle
 	}
 	return commandBasename(s.Command)
 }
@@ -202,7 +202,7 @@ func (s *State) SetAdapterTitle(title string) {
 	s.emitMetaLocked()
 }
 
-// SetShellTitle sets the terminal/OSC title, used when no adapter title is set.
+// SetShellTitle sets the application-controlled terminal/OSC title.
 func (s *State) SetShellTitle(title string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

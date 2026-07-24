@@ -49,37 +49,29 @@ func TestTitleFallsBackToCommandBasename(t *testing.T) {
 	}
 }
 
-func TestShellTitleBeforeAdapterTitle(t *testing.T) {
+func TestTerminalTitleOverridesAdapterTitle(t *testing.T) {
 	s := New(Config{ID: "s", Command: []string{"pi"}, Kind: "pi"})
 
-	s.SetShellTitle("~/dev/project")
-	if s.Title() != "~/dev/project" {
-		t.Fatalf("expected shell title, got %q", s.Title())
+	s.SetAdapterTitle("adapter fallback")
+	s.SetShellTitle("π - renamed pane - project")
+	if s.Title() != "π - renamed pane - project" {
+		t.Fatalf("expected terminal title to win, got %q", s.Title())
 	}
 
-	s.SetAdapterTitle("fix auth bug")
-	if s.Title() != "fix auth bug" {
-		t.Fatalf("expected adapter title to win, got %q", s.Title())
-	}
-
-	s.SetShellTitle("~/dev/other")
-	if s.Title() != "fix auth bug" {
-		t.Fatalf("adapter title should keep winning, got %q", s.Title())
+	s.SetAdapterTitle("updated fallback")
+	if s.Title() != "π - renamed pane - project" {
+		t.Fatalf("adapter title hid terminal title: %q", s.Title())
 	}
 }
 
-func TestClearAdapterTitleRevealsShellTitle(t *testing.T) {
+func TestClearTerminalTitleRevealsAdapterTitle(t *testing.T) {
 	s := New(Config{ID: "s", Command: []string{"pi"}, Kind: "pi"})
 
-	s.SetShellTitle("~/dev/project")
 	s.SetAdapterTitle("named task")
+	s.SetShellTitle("application pane title")
+	s.SetShellTitle("")
 	if s.Title() != "named task" {
-		t.Fatalf("expected adapter title, got %q", s.Title())
-	}
-
-	s.SetAdapterTitle("")
-	if s.Title() != "~/dev/project" {
-		t.Fatalf("expected shell title after clearing adapter, got %q", s.Title())
+		t.Fatalf("expected adapter title after clearing terminal title, got %q", s.Title())
 	}
 }
 

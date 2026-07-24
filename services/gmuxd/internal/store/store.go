@@ -239,13 +239,13 @@ func (s *Store) HasLocalSlug(kind, slug string) bool {
 	return false
 }
 
-// resolveTitle picks the best title: adapter > shell > command fallback.
+// resolveTitle picks the best title: terminal > adapter > command fallback.
 func (s *Store) resolveTitle(sess Session) string {
-	if sess.AdapterTitle != "" {
-		return sess.AdapterTitle
-	}
 	if sess.ShellTitle != "" {
 		return sess.ShellTitle
+	}
+	if sess.AdapterTitle != "" {
+		return sess.AdapterTitle
 	}
 	// Ask the adapter for a command title if it implements CommandTitler.
 	if fn := s.commandTitlers[sess.Kind]; fn != nil && len(sess.Command) > 0 {

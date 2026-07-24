@@ -36,6 +36,21 @@ func TestUpsertAndGet(t *testing.T) {
 	}
 }
 
+func TestTerminalTitleOverridesAdapterTitle(t *testing.T) {
+	s := New()
+	s.Upsert(Session{
+		ID:           "s1",
+		Kind:         "pi",
+		ShellTitle:   "π - renamed pane - project",
+		AdapterTitle: "adapter fallback",
+	})
+
+	got, _ := s.Get("s1")
+	if got.Title != "π - renamed pane - project" {
+		t.Fatalf("expected terminal title to win, got %q", got.Title)
+	}
+}
+
 func TestUpsertOverwrite(t *testing.T) {
 	s := New()
 	s.Upsert(Session{ID: "s1", Kind: "pi", AdapterTitle: "v1"})
