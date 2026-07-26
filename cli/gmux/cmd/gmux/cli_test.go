@@ -175,6 +175,12 @@ func TestParseCLI(t *testing.T) {
 					t.Errorf("command = %#v", c)
 				}
 			}},
+		{name: "session dismiss", args: []string{"session", "dismiss", "abc@laptop"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.sessionSub != "dismiss" || c.ref != "abc@laptop" {
+					t.Errorf("command = %#v", c)
+				}
+			}},
 
 		{name: "daemon status", args: []string{"daemon", "status"}, wantMode: modeDaemon,
 			check: func(t *testing.T, c *command) {
@@ -222,6 +228,9 @@ func TestParseCLIErrors(t *testing.T) {
 		{"session", "rename", "abc", ""},
 		{"session", "rename", "abc", "name", "extra"},
 		{"session", "rename", "abc", "name", "--clear"},
+		{"session", "dismiss"},
+		{"session", "dismiss", ""},
+		{"session", "dismiss", "abc", "extra"},
 		{"workspace"},
 		{"workspace", "unknown"},
 		{"workspace", "add"},

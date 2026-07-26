@@ -176,6 +176,19 @@ session marked dead — the same path as the UI's kill button.
 gmux kill a3f20187
 ```
 
+### `gmux session dismiss <id>`
+
+Terminate a live session if needed and remove it from gmux instead of keeping a
+dead, resumable entry. Dead sessions can also be dismissed. Explicitly addressed
+peer sessions are supported.
+
+```bash
+gmux session dismiss a3f20187
+gmux session dismiss a3f20187@desktop
+```
+
+Use `gmux kill <id>` when you want the session to remain available for resume.
+
 ### `gmux session rename <id> <name>`
 
 Set a mux-owned session name. It takes precedence over application-controlled

@@ -23,7 +23,7 @@ const (
 	modeSend                   // gmux send <id> <text> [keys...]
 	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
 	modeWait                   // gmux wait <id>
-	modeSession                // gmux session rename <id> <name>|--clear
+	modeSession                // gmux session rename|dismiss ...
 	modeWorktree               // gmux worktree <current|ps|create>
 	modeWorkspace              // gmux workspace add <path>
 	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path>
@@ -392,31 +392,38 @@ func parseWorkspace(args []string) (*command, error) {
 
 func parseSession(args []string) (*command, error) {
 	if len(args) == 0 {
-		return nil, errors.New("session requires one of: rename")
+		return nil, errors.New("session requires one of: rename, dismiss")
 	}
-	if args[0] != "rename" {
-		return nil, fmt.Errorf("unknown session command %q", args[0])
-	}
-	c := &command{mode: modeSession, sessionSub: "rename"}
-	fs := newFlagSet("session rename")
-	fs.BoolVar(&c.clearTitle, "clear", false, "clear the explicit session name")
-	pos, err := parseInterspersed(fs, args[1:])
-	if err != nil {
-		return nil, err
-	}
-	if c.clearTitle {
-		if len(pos) != 1 {
-			return nil, errors.New("session rename --clear requires exactly one session id")
+	switch args[0] {
+	case "dismiss":
+		if len(args) != 2 || args[1] == "" {
+			return nil, errors.New("session dismiss requires exactly one session id")
+		}
+		return &command{mode: modeSession, sessionSub: "dismiss", ref: args[1]}, nil
+	case "rename":
+		c := &command{mode: modeSession, sessionSub: "rename"}
+		fs := newFlagSet("session rename")
+		fs.BoolVar(&c.clearTitle, "clear", false, "clear the explicit session name")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if c.clearTitle {
+			if len(pos) != 1 {
+				return nil, errors.New("session rename --clear requires exactly one session id")
+			}
+			c.ref = pos[0]
+			return c, nil
+		}
+		if len(pos) != 2 || strings.TrimSpace(pos[1]) == "" {
+			return nil, errors.New("session rename requires a session id and non-empty name")
 		}
 		c.ref = pos[0]
+		c.sessionTitle = pos[1]
 		return c, nil
+	default:
+		return nil, fmt.Errorf("unknown session command %q", args[0])
 	}
-	if len(pos) != 2 || strings.TrimSpace(pos[1]) == "" {
-		return nil, errors.New("session rename requires a session id and non-empty name")
-	}
-	c.ref = pos[0]
-	c.sessionTitle = pos[1]
-	return c, nil
 }
 
 func parseWait(args []string) (*command, error) {
@@ -572,6 +579,7 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux kill <id>                    terminate a session
   gmux session rename <id> <name>   set the explicit session name
   gmux session rename <id> --clear  reveal the application/fallback title
+  gmux session dismiss <id>         terminate and remove without keeping resume state
 
 Workspaces (local only):
   gmux workspace add <path>         add a directory to the workspace list

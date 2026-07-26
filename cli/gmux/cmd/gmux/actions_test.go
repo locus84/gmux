@@ -1,10 +1,68 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func startActionsTestDaemon(t *testing.T, handler http.Handler) {
+	t.Helper()
+	stateDir, err := os.MkdirTemp("/tmp", "gmux-actions-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(stateDir) })
+	sockDir := filepath.Join(stateDir, "gmux")
+	t.Setenv("XDG_STATE_HOME", stateDir)
+	t.Setenv("GMUX_STATE_DIR", sockDir)
+	if err := os.MkdirAll(sockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(sockDir, "gmuxd.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		ln.Close()
+	})
+}
+
+func TestSessionDismissPostsResolvedPeerSession(t *testing.T) {
+	posted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true,
+			"data": []map[string]any{{
+				"id": "sess-abc@laptop", "peer": "laptop", "alive": true,
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/sessions/sess-abc@laptop/dismiss", func(w http.ResponseWriter, r *http.Request) {
+		posted = true
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	startActionsTestDaemon(t, mux)
+
+	if code := cmdSessionDismiss("abc@laptop"); code != 0 {
+		t.Fatalf("cmdSessionDismiss exit = %d", code)
+	}
+	if !posted {
+		t.Fatal("dismiss endpoint was not called")
+	}
+}
 
 // TestMatchSession covers the reference-resolution rules the CLI
 // documents: short form (as shown by --list), full ID, slug, and

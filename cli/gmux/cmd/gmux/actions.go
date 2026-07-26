@@ -359,11 +359,39 @@ func cmdKill(ref string) int {
 }
 
 func cmdSession(c *command) int {
-	if c.sessionSub != "rename" {
+	switch c.sessionSub {
+	case "rename":
+		return cmdSessionRename(c.ref, c.sessionTitle)
+	case "dismiss":
+		return cmdSessionDismiss(c.ref)
+	default:
 		fmt.Fprintln(os.Stderr, "gmux: unsupported session command")
 		return 2
 	}
-	return cmdSessionRename(c.ref, c.sessionTitle)
+}
+
+// cmdSessionDismiss terminates the runner if needed and permanently removes
+// the session from gmux's list instead of leaving a resumable dead entry.
+func cmdSessionDismiss(ref string) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/dismiss"
+	resp, err := gmuxdClient().Post(url, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		fmt.Fprintf(os.Stderr, "gmux: dismiss failed: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
+		return 1
+	}
+	fmt.Printf("dismissed %s\n", displayID(sess))
+	return 0
 }
 
 func cmdSessionRename(ref, title string) int {
