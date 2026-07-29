@@ -1,3 +1,4 @@
+import { effect } from '@preact/signals'
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import {
   sessions, sessionsLoaded, worldLoaded, projects, upsertSession, removeSession,
@@ -5,7 +6,7 @@ import {
   handleActivity, isSessionActive, isSessionFading, activityMap,
   sessionStaleness, peers, peerAppearance, peerStatusByName,
   isSessionUnavailable, urlPath, urlSearch, filteredSessions, selectedId,
-  navigateToSession, setNavigate,
+  navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
   view, duplicateSessionFiles,
@@ -223,6 +224,53 @@ describe('upsertSession', () => {
     // URL should be unchanged.
     expect(urlPath.value).toBe('/myproject/pi/fix-auth')
     expect(selectedId.value).toBe('sess-1')
+  })
+})
+
+describe('full session snapshot slug transition', () => {
+  it('keeps an ID-routed selected session active when attribution assigns a slug', () => {
+    const navigateMock = vi.fn()
+    setNavigate(navigateMock)
+    _setRawWorld({
+      projects: [{ slug: 'cosplay-frontier', match: [{ path: '/work/cosplay-frontier' }] }],
+    })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    _rawSessions.value = [
+      makeSession({
+        id: 'sess-f5bf2142',
+        cwd: '/work/cosplay-frontier',
+        kind: 'pi',
+        project_slug: 'cosplay-frontier',
+      }),
+    ]
+    urlPath.value = '/cosplay-frontier/pi/sess-f5b'
+    expect(selectedId.value).toBe('sess-f5bf2142')
+
+    // Observe the reactive selection, not just its final value: without
+    // batching the roster and URL writes, this records a transient null and
+    // xterm unmounts even though the session is selected again afterward.
+    const observedSelections: (string | null)[] = []
+    const dispose = effect(() => {
+      observedSelections.push(selectedId.value)
+    })
+
+    replaceSessionSnapshot([
+      makeSession({
+        id: 'sess-f5bf2142',
+        cwd: '/work/cosplay-frontier',
+        kind: 'pi',
+        slug: 'skill-name-resource-curator-location-use',
+        project_slug: 'cosplay-frontier',
+      }),
+    ])
+
+    const canonical = '/cosplay-frontier/pi/skill-name-resource-curator-location-use'
+    expect(urlPath.value).toBe(canonical)
+    expect(selectedId.value).toBe('sess-f5bf2142')
+    expect(observedSelections).toEqual(['sess-f5bf2142'])
+    expect(navigateMock).toHaveBeenCalledWith(canonical, true)
+    dispose()
   })
 })
 

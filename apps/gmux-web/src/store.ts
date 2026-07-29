@@ -964,6 +964,48 @@ export function sessionStaleness(
   return null
 }
 
+/**
+ * Replace the full session roster from a snapshot.
+ *
+ * If the selected session's slug changed, move its URL in the same signal
+ * batch as the roster. Otherwise the new roster briefly resolves the old
+ * slug URL to the project hub, unmounting the terminal before URL
+ * normalization can recover.
+ *
+ * Returns IDs that were absent from the previous snapshot.
+ */
+export function replaceSessionSnapshot(list: Session[]): string[] {
+  const prev = _rawSessions.value
+  const prevIds = new Set(prev.map(s => s.id))
+  const newIds = list.filter(s => !prevIds.has(s.id)).map(s => s.id)
+
+  const selectedSessionId = selectedId.value
+  const oldSelected = selectedSessionId
+    ? prev.find(s => s.id === selectedSessionId)
+    : undefined
+  const newSelected = selectedSessionId
+    ? list.find(s => s.id === selectedSessionId)
+    : undefined
+  const newUrl = selectedSessionId
+    && oldSelected
+    && newSelected
+    && oldSelected.slug !== newSelected.slug
+    ? viewToPath(
+        { kind: 'session', sessionId: selectedSessionId },
+        projects.value,
+        list,
+      )
+    : null
+
+  batch(() => {
+    _rawSessions.value = list
+    if (newUrl) urlPath.value = newUrl
+  })
+
+  if (newUrl) navigate(newUrl, true)
+  return newIds
+}
+
 /** Upsert a session from SSE. Returns true if the session was new. */
 export function upsertSession(raw: ProtocolSession): boolean {
   const updated = toUISession(raw)
@@ -1422,16 +1464,11 @@ export function initStore(): () => void {
       const envelope = JSON.parse(e.data) as { sessions?: ProtocolSession[] }
       const list = (envelope.sessions ?? []).map(toUISession)
 
-      // Detect newly-arrived IDs vs the previous snapshot so a
-      // pending launch (just-POSTed /v1/launch awaiting an id) can
-      // navigate to its session as soon as the daemon publishes it.
-      // Done before we commit the new array so consumers see the
-      // navigation against the new state.
-      const prevIds = new Set(_rawSessions.value.map(s => s.id))
-      const newIds = list.filter(s => !prevIds.has(s.id)).map(s => s.id)
+      // Detect newly-arrived IDs while replacing the roster. The helper
+      // also keeps a selected session's URL atomic with any slug change.
+      const newIds = replaceSessionSnapshot(list)
 
       batch(() => {
-        _rawSessions.value = list
         sessionsLoaded.value = true
         connState.value = 'connected'
       })
