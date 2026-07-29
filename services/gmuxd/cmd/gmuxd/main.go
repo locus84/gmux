@@ -960,6 +960,9 @@ func serve(stderr io.Writer) int {
 			},
 		})
 	})
+	mux.HandleFunc("PATCH /v1/frontend-config", func(w http.ResponseWriter, r *http.Request) {
+		handleFrontendConfigPatch(w, r, config.UpdateSettings)
+	})
 
 	// ── Web Push ──
 

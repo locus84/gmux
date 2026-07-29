@@ -1,5 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { buildVSCodeLoopbackProxyUrl, buildVSCodeServerUrl, expandVSCodeWorkspacePath, resolveTerminalWebUrl } from './vscode-server'
+import { buildVSCodeLoopbackProxyUrl, buildVSCodeServerUrl, expandVSCodeWorkspacePath, resolveTerminalWebUrl, validateVSCodeServerConfig } from './vscode-server'
+
+describe('validateVSCodeServerConfig', () => {
+  it('trims valid optional values', () => {
+    expect(validateVSCodeServerConfig(' https://code.example.test/base/ ', ' /home/rhee ')).toEqual({
+      values: { vsCodeServerUrl: 'https://code.example.test/base/', vsCodeServerHomeDir: '/home/rhee' },
+      errors: {},
+    })
+    expect(validateVSCodeServerConfig('', '')).toEqual({
+      values: { vsCodeServerUrl: '', vsCodeServerHomeDir: '' },
+      errors: {},
+    })
+  })
+
+  it('rejects unsafe URLs and non-absolute home directories', () => {
+    for (const value of ['code.example.test', 'file:///tmp/code', 'https://user:pass@example.test']) {
+      expect(validateVSCodeServerConfig(value, '').errors.vsCodeServerUrl).toBeTruthy()
+    }
+    expect(validateVSCodeServerConfig('https://code.example.test', '~/repo').errors.vsCodeServerHomeDir).toBeTruthy()
+    expect(validateVSCodeServerConfig('https://code.example.test', 'home/rhee').errors.vsCodeServerHomeDir).toBeTruthy()
+  })
+})
 
 describe('buildVSCodeServerUrl', () => {
   it('adds the workspace path as a folder query parameter', () => {

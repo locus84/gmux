@@ -1,3 +1,43 @@
+export interface VSCodeServerConfigValidation {
+  values: { vsCodeServerUrl: string; vsCodeServerHomeDir: string }
+  errors: { vsCodeServerUrl?: string; vsCodeServerHomeDir?: string }
+}
+
+export function validateVSCodeServerConfig(serverUrl: string, homeDir: string): VSCodeServerConfigValidation {
+  const vsCodeServerUrl = serverUrl.trim()
+  const vsCodeServerHomeDir = homeDir.trim()
+  const errors: VSCodeServerConfigValidation['errors'] = {}
+
+  if (vsCodeServerUrl.length > 2048) {
+    errors.vsCodeServerUrl = 'The URL must be 2048 characters or fewer.'
+  } else if (vsCodeServerUrl) {
+    try {
+      const parsed = new URL(vsCodeServerUrl)
+      if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.host || parsed.username || parsed.password) {
+        errors.vsCodeServerUrl = 'Enter an absolute HTTP(S) URL without credentials.'
+      }
+    } catch {
+      errors.vsCodeServerUrl = 'Enter an absolute HTTP(S) URL without credentials.'
+    }
+  }
+  if (vsCodeServerHomeDir.length > 4096) {
+    errors.vsCodeServerHomeDir = 'The path must be 4096 characters or fewer.'
+  } else if (vsCodeServerHomeDir && !vsCodeServerHomeDir.startsWith('/')) {
+    errors.vsCodeServerHomeDir = 'Enter an absolute server path beginning with /.'
+  }
+  if (/\p{Cc}|\u2028|\u2029/u.test(vsCodeServerUrl)) {
+    errors.vsCodeServerUrl = 'The URL contains unsupported control characters.'
+  }
+  if (/\p{Cc}|\u2028|\u2029/u.test(vsCodeServerHomeDir)) {
+    errors.vsCodeServerHomeDir = 'The path contains unsupported control characters.'
+  }
+
+  return {
+    values: { vsCodeServerUrl, vsCodeServerHomeDir },
+    errors,
+  }
+}
+
 export function expandVSCodeWorkspacePath(workspacePath: string, homeDir?: string): string {
   const path = workspacePath.trim()
   const home = homeDir?.trim().replace(/\/$/, '')

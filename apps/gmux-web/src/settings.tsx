@@ -23,6 +23,7 @@ import {
   unresolvedHosts, removeReferences,
   UI_SCALE_MIN, UI_SCALE_MAX, uiScaleDefault, uiScaleOverride, uiScaleEffective,
   setBrowserUiScale, resetBrowserUiScale,
+  vsCodeServerUrl, vsCodeServerHomeDir,
 } from './store'
 import { HostSuffix } from './host-suffix'
 import { hostStatus } from './host-status'
@@ -39,8 +40,10 @@ import {
 } from './push-subscriptions'
 import type { ProjectItem, DiscoveredProject, Folder, PeerInfo } from './types'
 import type { UnresolvedHost } from './references'
+import { saveVSCodeServerConfig } from './config'
+import { validateVSCodeServerConfig } from './vscode-server'
 
-type SettingsTab = 'projects' | 'hosts' | 'appearance'
+type SettingsTab = 'projects' | 'hosts' | 'appearance' | 'integrations'
 
 // ── SettingsModal ──
 
@@ -57,7 +60,7 @@ export function SettingsModal({
 }) {
   // Normalize the raw `?settings` value: anything unknown falls back to
   // the projects tab (covers bare `?settings`).
-  const activeTab: SettingsTab = tab === 'hosts' || tab === 'appearance' ? tab : 'projects'
+  const activeTab: SettingsTab = tab === 'hosts' || tab === 'appearance' || tab === 'integrations' ? tab : 'projects'
   const [discoveredQuery, setDiscoveredQuery] = useState('')
   const [pathDraft, setPathDraft] = useState('')
   const [pathError, setPathError] = useState('')
@@ -183,11 +186,17 @@ export function SettingsModal({
             aria-selected={activeTab === 'appearance'}
             onClick={() => onSelectTab('appearance')}
           >Appearance</button>
+          <button
+            class={`settings-tab${activeTab === 'integrations' ? ' active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'integrations'}
+            onClick={() => onSelectTab('integrations')}
+          >Integrations</button>
         </nav>
 
         <div class="settings-main">
           <div class="settings-main-header">
-            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : activeTab === 'appearance' ? 'Appearance' : 'Projects'}</span>
+            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : activeTab === 'appearance' ? 'Appearance' : activeTab === 'integrations' ? 'Integrations' : 'Projects'}</span>
             {activeTab === 'projects' && (
               <a
                 class="mp-docs-link"
@@ -206,6 +215,10 @@ export function SettingsModal({
         ) : activeTab === 'appearance' ? (
           <div class="modal-body">
             <AppearanceTab />
+          </div>
+        ) : activeTab === 'integrations' ? (
+          <div class="modal-body">
+            <IntegrationsTab />
           </div>
         ) : (
         <div class="modal-body">
@@ -284,6 +297,148 @@ export function SettingsModal({
         </div>
       </div>
     </div>
+  )
+}
+
+// ── Integrations tab (host-shared preferences) ──
+
+function IntegrationsTab() {
+  const loadedURL = vsCodeServerUrl.value
+  const loadedHomeDir = vsCodeServerHomeDir.value
+  const [urlDraft, setUrlDraft] = useState(loadedURL)
+  const [homeDraft, setHomeDraft] = useState(loadedHomeDir)
+  const urlDraftRef = useRef(loadedURL)
+  const homeDraftRef = useRef(loadedHomeDir)
+  const urlTouchedRef = useRef(false)
+  const homeTouchedRef = useRef(false)
+  const urlRevisionRef = useRef(0)
+  const homeRevisionRef = useRef(0)
+  const [fieldErrors, setFieldErrors] = useState<{ vsCodeServerUrl?: string; vsCodeServerHomeDir?: string }>({})
+  const [saveError, setSaveError] = useState('')
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!urlTouchedRef.current) {
+      urlDraftRef.current = loadedURL
+      setUrlDraft(loadedURL)
+    }
+    if (!homeTouchedRef.current) {
+      homeDraftRef.current = loadedHomeDir
+      setHomeDraft(loadedHomeDir)
+    }
+  }, [loadedURL, loadedHomeDir])
+
+  const changed = urlDraft.trim() !== loadedURL
+    || homeDraft.trim() !== loadedHomeDir
+
+  const updateURLDraft = (value: string) => {
+    urlDraftRef.current = value
+    urlTouchedRef.current = true
+    urlRevisionRef.current++
+    setUrlDraft(value)
+    setFieldErrors(errors => ({ ...errors, vsCodeServerUrl: undefined }))
+    setSaveError('')
+    setSaved(false)
+  }
+  const updateHomeDraft = (value: string) => {
+    homeDraftRef.current = value
+    homeTouchedRef.current = true
+    homeRevisionRef.current++
+    setHomeDraft(value)
+    setFieldErrors(errors => ({ ...errors, vsCodeServerHomeDir: undefined }))
+    setSaveError('')
+    setSaved(false)
+  }
+
+  const handleSave = async (event: SubmitEvent) => {
+    event.preventDefault()
+    const validation = validateVSCodeServerConfig(urlDraft, homeDraft)
+    setFieldErrors(validation.errors)
+    if (Object.keys(validation.errors).length > 0) return
+
+    setSaving(true)
+    setSaveError('')
+    setSaved(false)
+    try {
+      const submitted = validation.values
+      const submittedURLRevision = urlRevisionRef.current
+      const submittedHomeRevision = homeRevisionRef.current
+      const patch = {
+        ...(submitted.vsCodeServerUrl !== loadedURL ? { vsCodeServerUrl: submitted.vsCodeServerUrl } : {}),
+        ...(submitted.vsCodeServerHomeDir !== loadedHomeDir ? { vsCodeServerHomeDir: submitted.vsCodeServerHomeDir } : {}),
+      }
+      const config = await saveVSCodeServerConfig(patch)
+      const urlUnchanged = urlRevisionRef.current === submittedURLRevision
+      const homeUnchanged = homeRevisionRef.current === submittedHomeRevision
+      if (urlUnchanged) {
+        urlTouchedRef.current = false
+        urlDraftRef.current = config.vsCodeServerUrl
+        setUrlDraft(config.vsCodeServerUrl)
+      }
+      if (homeUnchanged) {
+        homeTouchedRef.current = false
+        homeDraftRef.current = config.vsCodeServerHomeDir
+        setHomeDraft(config.vsCodeServerHomeDir)
+      }
+      vsCodeServerUrl.value = config.vsCodeServerUrl
+      vsCodeServerHomeDir.value = config.vsCodeServerHomeDir
+      setSaved(urlUnchanged && homeUnchanged)
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : 'Could not save VS Code Server settings.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section class="mp-section integration-settings-section">
+      <div class="mp-section-label">VS Code Server</div>
+      <div class="mp-path-hint integration-settings-help">
+        Shared by every browser connected to this gmux host. These values update this host's settings.jsonc; peer-host settings are not changed.
+      </div>
+      <form class="integration-settings-form" onSubmit={handleSave}>
+        <label class="integration-settings-field">
+          <span>Server URL</span>
+          <input
+            id="vscode-server-url"
+            class={`mp-filter-input${fieldErrors.vsCodeServerUrl ? ' field-invalid' : ''}`}
+            type="url"
+            inputMode="url"
+            autocomplete="url"
+            placeholder="https://code.example.com"
+            value={urlDraft}
+            aria-invalid={!!fieldErrors.vsCodeServerUrl}
+            aria-describedby={fieldErrors.vsCodeServerUrl ? 'vscode-server-url-error' : undefined}
+            onInput={(event) => updateURLDraft((event.currentTarget as HTMLInputElement).value)}
+          />
+          {fieldErrors.vsCodeServerUrl && <span id="vscode-server-url-error" class="integration-settings-error">{fieldErrors.vsCodeServerUrl}</span>}
+        </label>
+        <label class="integration-settings-field">
+          <span>Server home directory</span>
+          <input
+            id="vscode-server-home-dir"
+            class={`mp-filter-input${fieldErrors.vsCodeServerHomeDir ? ' field-invalid' : ''}`}
+            type="text"
+            placeholder="/home/me"
+            value={homeDraft}
+            aria-invalid={!!fieldErrors.vsCodeServerHomeDir}
+            aria-describedby={`vscode-server-home-help${fieldErrors.vsCodeServerHomeDir ? ' vscode-server-home-error' : ''}`}
+            autocapitalize="off"
+            autocomplete="off"
+            spellcheck={false}
+            onInput={(event) => updateHomeDraft((event.currentTarget as HTMLInputElement).value)}
+          />
+          <span id="vscode-server-home-help" class="mp-path-hint">Expands project paths such as ~/repo for the VS Code Server host.</span>
+          {fieldErrors.vsCodeServerHomeDir && <span id="vscode-server-home-error" class="integration-settings-error">{fieldErrors.vsCodeServerHomeDir}</span>}
+        </label>
+        {saveError && <div class="mp-manual-error" role="alert">{saveError}</div>}
+        {saved && <div class="integration-settings-saved" role="status">Saved for this gmux host.</div>}
+        <button class="mp-manual-btn integration-settings-save" type="submit" disabled={saving || !changed}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+      </form>
+    </section>
   )
 }
 

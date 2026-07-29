@@ -1134,6 +1134,52 @@ body {
   color: var(--text);
 }
 
+.integration-settings-help {
+  margin-bottom: 14px;
+}
+
+.integration-settings-form,
+.integration-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.integration-settings-form {
+  gap: 16px;
+}
+
+.integration-settings-field > span:first-child {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.integration-settings-field .mp-filter-input {
+  width: 100%;
+  min-height: 44px;
+}
+
+.integration-settings-field .field-invalid {
+  border-color: var(--status-error);
+}
+
+.integration-settings-error {
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.integration-settings-saved {
+  color: var(--status-connected);
+  font-size: 12px;
+}
+
+.integration-settings-save {
+  align-self: flex-start;
+  min-width: 120px;
+  min-height: 44px;
+}
+
 .ui-scale-help {
   margin-bottom: 12px;
 }
@@ -1197,11 +1243,18 @@ body {
   .settings-rail-title { display: none; }
   .settings-tab {
     width: auto;
+    min-height: 44px;
     flex-shrink: 0;
+    padding: 10px 6px;
+    font-size: 12px;
   }
   /* On mobile the top tab strip already shows the current page, so the
      title row is redundant — drop it entirely. */
   .settings-main-header { display: none; }
+  .integration-settings-save {
+    align-self: stretch;
+    width: 100%;
+  }
 }
 
 /* Hosts roster (read-only). */

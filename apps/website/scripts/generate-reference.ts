@@ -355,6 +355,10 @@ function generateSettingsPage(): string {
   lines.push('Missing fields use the defaults shown below. Numeric values are clamped to')
   lines.push('their valid range (not rejected). Unknown keys produce a console warning.')
   lines.push('')
+  lines.push('The VS Code Server fields can also be edited under **Settings → Integrations** in gmux web.')
+  lines.push('Web edits are shared by every browser connected to that gmux host and safely preserve')
+  lines.push('comments and unrelated values in `settings.jsonc`. Peer-host settings are not changed.')
+  lines.push('')
   lines.push(SETTINGS_EXAMPLE)
 
   lines.push('## Fields')
