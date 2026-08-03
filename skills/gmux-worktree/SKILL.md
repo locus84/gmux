@@ -86,11 +86,16 @@ gmux wait "$id" --timeout 900
 gmux tail "$id" -n 200
 git -C "$path" status --short
 git -C "$path" diff --stat
+# After recording the final report and verification evidence:
+gmux session dismiss "$id"
 ```
 
 For parallel work, keep an explicit task → session id → path → branch table. Create
 all worktrees first, then wait and review each result. `gmux wait` is for agent
-sessions, not arbitrary shell commands.
+sessions, not arbitrary shell commands. One-shot orchestrators must dismiss only
+the session IDs they created after harvesting output; dismissal leaves the worktree,
+commits, and files intact. Keep user-opened interactive sessions unless the user asks
+to dismiss them.
 
 ## Safety
 
@@ -99,7 +104,9 @@ sessions, not arbitrary shell commands.
 - If launch or prompt delivery fails, gmux preserves the new checkout and reports
   its path. A lost daemon response can be ambiguous, so inspect `gmux ls` before
   deciding whether to relaunch or clean up.
-- Session failure or timeout never proves a worktree is disposable.
+- Session failure or timeout never proves a worktree is disposable. Harvest any
+  available output, dismiss the owned worker session, and preserve the worktree for
+  recovery.
 - gmux intentionally has no `worktree rm` command yet. Review status, commits, and
   integration before manually running `git worktree remove`; do not force removal
   by default.

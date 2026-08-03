@@ -20,7 +20,8 @@ gmux send <id> C-c           # send a control key (interrupt), no text
 gmux wait <id>               # block until the agent finishes its turn
 gmux tail <id> [-n N]        # last N lines of output (ANSI stripped; default 100)
 gmux ls [--json]             # list sessions (--json for machine parsing)
-gmux kill <id>               # SIGTERM the runner
+gmux kill <id>               # SIGTERM the runner but retain its session record
+gmux session dismiss <id>    # terminate if needed and permanently remove the record
 ```
 
 `ls` IDs are 8-character prefixes; pass them directly to
@@ -57,6 +58,7 @@ gmux send $id "$(cat review.txt)" Enter
 gmux wait $id
 
 gmux tail $id -n 100
+gmux session dismiss $id
 ```
 
 ## Parallel orchestration
@@ -78,6 +80,7 @@ done
 for id in "${ids[@]}"; do
   echo "=== $id ==="
   gmux tail "$id" -n 100
+  gmux session dismiss "$id"
 done
 ```
 
@@ -95,6 +98,15 @@ those blocking instead: `gmux -- make build < /dev/null` exits with the
 command's own status. (Waiting on arbitrary output — "until this text
 appears" — is planned as a server-side condition; until then, poll `gmux tail`
 yourself if you must.)
+
+## Worker cleanup
+
+Hermes and other one-shot orchestrators own the IDs they launch. After an owned
+worker reaches idle or exits, harvest its final output and repository/test evidence,
+then run `gmux session dismiss <id>`. Dismiss only tracked worker IDs; never sweep
+all sessions for a project. `dismiss` removes the session record but does not remove
+its Git worktree. Keep user-opened interactive sessions resumable unless the user
+asks to dismiss them.
 
 ## Other agents have one-shot modes
 
