@@ -5,9 +5,9 @@
  * callbacks and the mobile open/close toggle are passed as props.
  */
 
-import { useState, useCallback } from 'preact/hooks'
+import { useState, useEffect } from 'preact/hooks'
 import { sessionPath } from './routing'
-import { reorderKeysForFolder } from './projects'
+import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { LaunchButton } from './launcher'
 import { useArrivalPulse } from './use-arrival-pulse'
 import {
@@ -17,10 +17,10 @@ import {
   peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
   unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
   vsCodeServerUrl, vsCodeServerHomeDir,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
-import { GitLayoutIcon } from './git-layout-icon'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
 import type { Session, Folder } from './types'
@@ -253,7 +253,6 @@ function SessionItem({
           </div>
         )}
       </div>
-      <GitLayoutIcon layout={session.git_layout} />
       {onClose && (
         <button
           class="session-close-btn"
@@ -265,6 +264,69 @@ function SessionItem({
         </button>
       )}
     </a>
+  )
+}
+
+function CheckoutSection({
+  group,
+  folder,
+  selId,
+  resumingId,
+  am,
+  peerStatus,
+  mixedHosts,
+  onCloseSession,
+  onClick,
+  onReorder,
+}: {
+  group: CheckoutGroup
+  folder: Folder
+  selId: string | null
+  resumingId: string | null
+  am: ReadonlyMap<string, 'active' | 'fading'>
+  peerStatus: ReadonlyMap<string, string>
+  mixedHosts: boolean
+  onCloseSession: (session: Session) => void
+  onClick?: () => void
+  onReorder: (from: number, to: number) => void
+}) {
+  const [drag, setDrag] = useState<DragState | null>(null)
+  const displayItems = drag ? reorder(group.sessions, drag.from, drag.over) : group.sessions
+  const handleDragEnd = () => {
+    if (drag && drag.from !== drag.over) onReorder(drag.from, drag.over)
+    setDrag(null)
+  }
+
+  return (
+    <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
+      <div class="checkout-header" title={group.path || group.label}>
+        <span class="checkout-tree-mark" aria-hidden="true">↳</span>
+        <span class="checkout-name">{group.label}</span>
+        {group.primary && <span class="checkout-primary-label">default</span>}
+        {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
+      </div>
+      <div class="checkout-sessions">
+        {displayItems.map((s, i) => (
+          <SessionItem
+            key={s.id}
+            session={s}
+            href={sessionPath(folder.slug, s, folder.peer)}
+            selected={selId === s.id}
+            resuming={resumingId === s.id}
+            dotState={sessionDotState(s, am)}
+            unavailable={isSessionUnavailable(s, peerStatus)}
+            showHostMarker={mixedHosts}
+            dragging={drag !== null && s.id === group.sessions[drag.from]?.id}
+            dropTarget={drag !== null && drag.over === i && drag.from !== i}
+            onClose={() => onCloseSession(s)}
+            onClick={onClick}
+            onDragStart={() => setDrag({ from: i, over: i })}
+            onDragOver={() => setDrag(prev => prev ? { ...prev, over: i } : null)}
+            onDragEnd={handleDragEnd}
+          />
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -287,52 +349,49 @@ function FolderGroup({
   onCloseSession: (session: Session) => void
   onClick?: () => void
 }) {
-  const [drag, setDrag] = useState<DragState | null>(null)
-
-  const handleDragStart = useCallback((idx: number) => {
-    setDrag({ from: idx, over: idx })
-  }, [])
-
-  const handleDragOver = useCallback((idx: number) => {
-    setDrag(prev => prev ? { ...prev, over: idx } : null)
-  }, [])
-
-  const handleDragEnd = useCallback((visible: Session[]) => {
-    if (!drag || drag.from === drag.over) {
-      setDrag(null)
-      return
+  const ownerStatus = folder.peer ? peerStatus.get(folder.peer) : 'local'
+  useEffect(() => {
+    if (!folder.unresolved && !folder.missing && (ownerStatus === 'local' || ownerStatus === 'connected')) {
+      void ensureProjectWorktrees(folder.slug, folder.peer)
     }
-    const reordered = reorder(visible, drag.from, drag.over)
-    // reorderKeysForFolder partitions sessions by the folder owner's
-    // identity and keys them appropriately for the owning daemon's
-    // projects.json (namespaced ids for Local-peer sessions inside a
-    // parent's local folder, plain ids for everything else). See its
-    // docstring for the full routing matrix.
+  }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
+
+  const inventoryKey = projectWorktreeInventoryKey(folder.slug, folder.peer)
+  const inventory = projectWorktreeInventories.value[inventoryKey]
+  const checkoutGroups: CheckoutGroup[] = inventory?.error
+    ? [{
+        key: 'inventory-unavailable',
+        path: folder.launchCwd ?? '',
+        label: 'Sessions',
+        primary: false,
+        sessions: folder.sessions.filter(s => s.alive || s.resumable),
+        fallback: true,
+      }]
+    : groupSessionsByCheckout(folder, inventory?.data?.worktrees, inventory?.data?.primary_path)
+  const visible = checkoutGroups.flatMap(group => group.sessions)
+  const isCurrent = currentKey === folder.key
+  const href = folder.peer ? `/@${folder.peer}/${folder.slug}` : `/${folder.slug}`
+  // Folder spans multiple hosts iff its sessions don't all share the
+  // same .peer value. In practice this is the devcontainer case.
+  const folderPeers = new Set(visible.map(s => s.peer ?? ''))
+  const mixedHosts = folderPeers.size > 1
+  const workspacePath = folderWorkspacePath(folder, visible)
+  const codeHref = buildVSCodeServerUrl(vsCodeServerUrl.value, workspacePath, vsCodeServerHomeDir.value)
+  const fileSession = visible.find(s => s.workspace_root?.trim() || s.cwd?.trim())
+
+  const handleCheckoutReorder = (group: CheckoutGroup, from: number, to: number) => {
+    const reordered = reorder(group.sessions, from, to)
+    const allVisible = checkoutGroups.flatMap(item => item.key === group.key ? reordered : item.sessions)
     const visibleKeys = reorderKeysForFolder(
-      reordered,
+      allVisible,
       folder.peer,
       (name) => localPeerNames.value.has(name),
     )
     if (visibleKeys.length > 0) {
       reorderSessions(folder.slug, visibleKeys, folder.peer)
     }
-    setDrag(null)
-  }, [drag, folder.slug, folder.peer])
+  }
 
-  const visible = folder.sessions.filter(s => s.alive || s.resumable)
-  const displayItems = drag ? reorder(visible, drag.from, drag.over) : visible
-  const isCurrent = currentKey === folder.key
-  const href = folder.peer ? `/@${folder.peer}/${folder.slug}` : `/${folder.slug}`
-  // Folder spans multiple hosts iff its sessions don't all share the
-  // same .peer value. In practice this is the devcontainer case: a
-  // local project's folder containing both parent-local sessions
-  // (peer=undefined) and Local-peer container sessions. When all
-  // sessions agree, per-row markers are noise.
-  const folderPeers = new Set(visible.map(s => s.peer ?? ''))
-  const mixedHosts = folderPeers.size > 1
-  const workspacePath = folderWorkspacePath(folder, visible)
-  const codeHref = buildVSCodeServerUrl(vsCodeServerUrl.value, workspacePath, vsCodeServerHomeDir.value)
-  const fileSession = visible.find(s => s.workspace_root?.trim() || s.cwd?.trim())
   return (
     <div class="folder">
       <div class="folder-header">
@@ -367,24 +426,30 @@ function FolderGroup({
           </div>
         )}
       </div>
-      <div class="folder-sessions">
-        {displayItems.map((s, i) => (
-          <SessionItem
-            key={s.id}
-            session={s}
-            href={sessionPath(folder.slug, s, folder.peer)}
-            selected={selId === s.id}
-            resuming={resumingId === s.id}
-            dotState={sessionDotState(s, am)}
-            unavailable={isSessionUnavailable(s, peerStatus)}
-            showHostMarker={mixedHosts}
-            dragging={drag !== null && s.id === visible[drag.from]?.id}
-            dropTarget={drag !== null && drag.over === i && drag.from !== i}
-            onClose={() => onCloseSession(s)}
+      <div class="folder-checkouts" aria-busy={inventory?.loading || undefined}>
+        {inventory?.error && (
+          <button
+            type="button"
+            class="checkout-inventory-error"
+            title={inventory.error}
+            onClick={() => void ensureProjectWorktrees(folder.slug, folder.peer, true)}
+          >
+            Worktrees unavailable · Retry
+          </button>
+        )}
+        {checkoutGroups.map(group => (
+          <CheckoutSection
+            key={group.key}
+            group={group}
+            folder={folder}
+            selId={selId}
+            resumingId={resumingId}
+            am={am}
+            peerStatus={peerStatus}
+            mixedHosts={mixedHosts}
+            onCloseSession={onCloseSession}
             onClick={onClick}
-            onDragStart={() => handleDragStart(i)}
-            onDragOver={() => handleDragOver(i)}
-            onDragEnd={() => handleDragEnd(visible)}
+            onReorder={(from, to) => handleCheckoutReorder(group, from, to)}
           />
         ))}
       </div>

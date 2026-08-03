@@ -1208,6 +1208,10 @@ func serve(stderr io.Writer) int {
 		workspaceProjectFilesContentHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
 	})
 
+	mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreesHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+
 	mux.HandleFunc("PATCH /v1/projects/{slug}/sessions", func(w http.ResponseWriter, r *http.Request) {
 		slug := r.PathValue("slug")
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
@@ -2680,15 +2684,23 @@ func shouldForwardActivity(asPeer bool, sessionID string, isLocalPeer func(strin
 }
 
 // isAllowedPeerProxyPath gates the generic /v1/peers/{peer}/...
-// proxy. We deliberately allowlist a small surface, scoped to writes
-// the frontend actually issues for peer-owned state today, rather
-// than blanket-forwarding every method+path. New peer-write features
-// extend this function explicitly.
+// proxy. We deliberately allowlist a small surface, scoped to operations
+// the frontend actually issues for peer-owned state today, rather than
+// blanket-forwarding every method+path. New peer features extend this
+// function explicitly.
 //
 // `sub` is the path relative to the peer's API root, with no leading
 // slash (e.g. "v1/projects/gmux/sessions").
 func isAllowedPeerProxyPath(method, sub string) bool {
 	parts := strings.Split(sub, "/")
+	// Project worktree inventory: GET v1/projects/<slug>/worktrees.
+	// Git must run on the daemon that owns the project's filesystem.
+	if method == http.MethodGet &&
+		len(parts) == 4 &&
+		parts[0] == "v1" && parts[1] == "projects" &&
+		parts[2] != "" && parts[3] == "worktrees" {
+		return true
+	}
 	// Project session reorder: PATCH v1/projects/<slug>/sessions.
 	// The frontend uses this to push a new session order into a
 	// peer's projects.json. The peer applies the change atomically

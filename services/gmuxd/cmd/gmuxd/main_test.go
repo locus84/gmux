@@ -589,12 +589,16 @@ func TestIsAllowedPeerProxyPath(t *testing.T) {
 		sub    string
 		want   bool
 	}{
+		// Allowed: read worktrees on the daemon that owns the project filesystem.
+		{"worktrees allowed", http.MethodGet, "v1/projects/gmux/worktrees", true},
+		{"worktrees wrong method denied", http.MethodPost, "v1/projects/gmux/worktrees", false},
+
 		// Allowed: project session reorder.
 		{"reorder allowed", http.MethodPatch, "v1/projects/gmux/sessions", true},
 		{"reorder allowed weird slug", http.MethodPatch, "v1/projects/with-dash/sessions", true},
 
 		// Method must be PATCH.
-		{"GET denied", http.MethodGet, "v1/projects/gmux/sessions", false},
+		{"GET sessions denied", http.MethodGet, "v1/projects/gmux/sessions", false},
 		{"POST denied", http.MethodPost, "v1/projects/gmux/sessions", false},
 		{"DELETE denied", http.MethodDelete, "v1/projects/gmux/sessions", false},
 

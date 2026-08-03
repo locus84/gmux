@@ -4,6 +4,7 @@
 // Builds sidebar folders and project hub topology. Pure functions with
 // no side effects or signal dependencies.
 
+import type { Worktree } from '@gmux/protocol'
 import type { Session, Folder, ProjectItem, PeerInfo, DiscoveredProject } from './types'
 
 // --- Remote normalization (mirrors Go NormalizeRemote) ---
@@ -418,6 +419,150 @@ export function buildProjectFolders(
   }
 
   return folders
+}
+
+export interface CheckoutGroup {
+  key: string
+  path: string
+  label: string
+  primary: boolean
+  sessions: Session[]
+  worktree?: Worktree
+  fallback?: boolean
+}
+
+/**
+ * Group the sidebar's existing visible sessions under Git checkout roots.
+ * The worktree inventory is fetched from the owning daemon; session
+ * association stays derived from cwd so it follows live snapshots without
+ * persisting a second relationship.
+ */
+export function groupSessionsByCheckout(
+  folder: Folder,
+  worktrees?: readonly Worktree[],
+  primaryPath?: string,
+): CheckoutGroup[] {
+  const visible = folder.sessions.filter(s => s.alive || s.resumable === true)
+  const inventory = worktrees && worktrees.length > 0
+    ? worktrees
+    : primaryPath
+      ? [{ path: primaryPath, primary: true, detached: false, bare: false, locked: false, prunable: false }]
+      : []
+  const listed = [...inventory].sort((a, b) => {
+    if (a.primary !== b.primary) return a.primary ? -1 : 1
+    return checkoutLabel(a).localeCompare(checkoutLabel(b)) || a.path.localeCompare(b.path)
+  })
+
+  if (listed.length === 0) {
+    return approximateCheckoutGroups(folder, visible)
+  }
+
+  const groups: CheckoutGroup[] = listed.map(wt => ({
+    key: `checkout:${wt.path}`,
+    path: wt.path,
+    label: checkoutLabel(wt),
+    primary: wt.primary,
+    sessions: [],
+    worktree: wt,
+  }))
+  const unmatched = new Map<string, CheckoutGroup>()
+  for (const session of visible) {
+    // A local project folder may also contain Local-peer/devcontainer
+    // sessions. Their cwd lives in a different filesystem namespace, so
+    // never match it against the parent daemon's checkout inventory.
+    const sameFilesystemOwner = (folder.peer ?? '') === (session.peer ?? '')
+    const match = sameFilesystemOwner ? deepestCheckout(groups, session.cwd) : undefined
+    if (match) {
+      match.sessions.push(session)
+      continue
+    }
+    const path = session.cwd || folder.launchCwd || ''
+    const owner = session.peer ?? ''
+    const key = `fallback:${owner}:${path || session.id}`
+    let group = unmatched.get(key)
+    if (!group) {
+      group = {
+        key,
+        path,
+        label: `${checkoutPathLabel(path) || 'Other checkout'}${owner ? ` · ${owner}` : ''}`,
+        primary: false,
+        sessions: [],
+        fallback: true,
+      }
+      unmatched.set(key, group)
+    }
+    group.sessions.push(session)
+  }
+  return [...groups, ...[...unmatched.values()].sort((a, b) => a.label.localeCompare(b.label) || a.path.localeCompare(b.path))]
+}
+
+function approximateCheckoutGroups(folder: Folder, sessions: Session[]): CheckoutGroup[] {
+  const primaryPath = folder.launchCwd ?? ''
+  const primary: CheckoutGroup = {
+    key: `primary:${primaryPath}`,
+    path: primaryPath,
+    label: checkoutPathLabel(primaryPath) || 'Primary checkout',
+    primary: true,
+    sessions: [],
+    fallback: true,
+  }
+  const linked = new Map<string, CheckoutGroup>()
+  for (const session of sessions) {
+    if (session.git_layout !== 'worktree') {
+      primary.sessions.push(session)
+      continue
+    }
+    const path = session.cwd || ''
+    let group = linked.get(path)
+    if (!group) {
+      group = {
+        key: `approx:${path || session.id}`,
+        path,
+        label: checkoutPathLabel(path) || 'Linked worktree',
+        primary: false,
+        sessions: [],
+        fallback: true,
+      }
+      linked.set(path, group)
+    }
+    group.sessions.push(session)
+  }
+  return [primary, ...[...linked.values()].sort((a, b) => a.label.localeCompare(b.label) || a.path.localeCompare(b.path))]
+}
+
+function deepestCheckout(groups: CheckoutGroup[], cwd: string): CheckoutGroup | undefined {
+  let best: CheckoutGroup | undefined
+  for (const group of groups) {
+    if (checkoutPathContains(group.path, cwd) && (!best || normalizeCheckoutPath(group.path).length > normalizeCheckoutPath(best.path).length)) {
+      best = group
+    }
+  }
+  return best
+}
+
+export function checkoutPathContains(root: string, candidate: string): boolean {
+  root = normalizeCheckoutPath(root)
+  candidate = normalizeCheckoutPath(candidate)
+  if (!root || !candidate) return false
+  return candidate === root || candidate.startsWith(root.endsWith('/') ? root : `${root}/`)
+}
+
+function normalizeCheckoutPath(path: string): string {
+  if (!path) return ''
+  path = path.replaceAll('\\', '/').replace(/\/{2,}/g, '/')
+  if (path.length > 1) path = path.replace(/\/$/, '')
+  if (/^[A-Za-z]:\//.test(path)) return path.toLowerCase()
+  return path
+}
+
+function checkoutLabel(worktree: Worktree): string {
+  return worktree.branch || (worktree.detached ? `detached ${worktree.head?.slice(0, 7) || ''}`.trim() : checkoutPathLabel(worktree.path)) || 'checkout'
+}
+
+function checkoutPathLabel(path: string): string {
+  const normalized = normalizeCheckoutPath(path)
+  if (!normalized || normalized === '/') return normalized
+  return normalized.slice(normalized.lastIndexOf('/') + 1)
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   SessionSchema,
   successEnvelope,
   SessionStatusSchema,
+  ProjectWorktreesResponseSchema,
 } from './index.js'
 
 describe('protocol schemas', () => {
@@ -76,5 +77,25 @@ describe('protocol schemas', () => {
     const Schema = successEnvelope(SessionStatusSchema)
     const parsed = Schema.parse({ ok: true, data: { label: 'test', working: false } })
     expect(parsed.data.label).toBe('test')
+  })
+
+  it('parses project worktree inventories', () => {
+    const parsed = ProjectWorktreesResponseSchema.parse({
+      ok: true,
+      data: {
+        project_slug: 'gmux',
+        primary_path: '~/src/gmux',
+        worktrees: [
+          { path: '~/src/gmux', branch: 'main', head: 'abc', primary: true },
+          { path: '~/.local/share/gmux/worktrees/fix', branch: 'fix/auth', head: 'def', primary: false, locked: true },
+        ],
+      },
+    })
+    expect(parsed.ok).toBe(true)
+    if (parsed.ok) {
+      expect(parsed.data.worktrees[0].primary).toBe(true)
+      expect(parsed.data.worktrees[1].locked).toBe(true)
+      expect(parsed.data.worktrees[1].detached).toBe(false)
+    }
   })
 })

@@ -24,7 +24,11 @@ import { resolveReferences, removeReferenceItems, removeHostReferenceItems, refK
 import { fetchFrontendConfig, buildTerminalOptions, resolveUiScale, resolveKeybinds, type ResolvedKeybind } from './config'
 import { MOCK_SESSIONS, MOCK_PROJECTS, MOCK_PEERS, MOCK_HEALTH } from './mock-data/index'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import type { Session as ProtocolSession } from '@gmux/protocol'
+import {
+  ProjectWorktreesResponseSchema,
+  type ProjectWorktrees,
+  type Session as ProtocolSession,
+} from '@gmux/protocol'
 
 // ── HealthData type (used by both raw signal and consumers) ─────────────────
 
@@ -88,6 +92,51 @@ export const _rawWorld = signal<RawWorld>({
   peerProjects: {},
   peerDiscovered: {},
 })
+
+export interface ProjectWorktreeInventoryState {
+  data?: ProjectWorktrees
+  loading: boolean
+  error?: string
+}
+
+/** On-demand Git checkout inventories keyed by the owning host + project. */
+export const projectWorktreeInventories = signal<Record<string, ProjectWorktreeInventoryState>>({})
+
+export function projectWorktreeInventoryKey(slug: string, peer?: string): string {
+  return `${peer ?? ''}::${slug}`
+}
+
+/** Fetch the checkout inventory from the daemon that owns the project filesystem. */
+export async function ensureProjectWorktrees(slug: string, peer?: string, force = false): Promise<void> {
+  const key = projectWorktreeInventoryKey(slug, peer)
+  const current = projectWorktreeInventories.value[key]
+  if (!force && (current?.loading || current?.data)) return
+
+  projectWorktreeInventories.value = {
+    ...projectWorktreeInventories.value,
+    [key]: { ...current, loading: true, error: undefined },
+  }
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  try {
+    const resp = await fetch(url)
+    const body = await resp.json()
+    if (!resp.ok) {
+      throw new Error(body?.error?.message || `request failed (${resp.status})`)
+    }
+    const parsed = ProjectWorktreesResponseSchema.parse(body)
+    if (!parsed.ok) throw new Error(parsed.error.message)
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: parsed.data, loading: false },
+    }
+  } catch (err) {
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: current?.data, loading: false, error: err instanceof Error ? err.message : String(err) },
+    }
+  }
+}
 
 /** Merge a partial world update into `_rawWorld`. Used by SSE handlers,
  * bulk-fetch responses, and tests; callers don't have to spread the

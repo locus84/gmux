@@ -9,7 +9,7 @@ import {
   navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
-  view, duplicateSessionFiles,
+  view, duplicateSessionFiles, ensureProjectWorktrees, projectWorktreeInventories,
 } from './store'
 import { SessionSchema } from '@gmux/protocol'
 import type { PendingMutation } from './store'
@@ -43,6 +43,7 @@ beforeEach(() => {
   _rawSessions.value = []
   _setRawWorld({ projects: [], peers: [] })
   _pendingMutations.value = []
+  projectWorktreeInventories.value = {}
   sessionsLoaded.value = false
   worldLoaded.value = false
   urlPath.value = '/'
@@ -1008,5 +1009,47 @@ describe('session_file (duplicate-open warning)', () => {
     const dups = duplicateSessionFiles.value
     expect(dups.has('/conv.jsonl')).toBe(true)
     expect(dups.has('/other.jsonl')).toBe(false)
+  })
+})
+
+describe('ensureProjectWorktrees', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('fetches local and peer-owned inventories from the owning daemon', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: {
+          project_slug: 'gmux',
+          primary_path: '~/src/gmux',
+          worktrees: [{ path: '~/src/gmux', branch: 'main', primary: true }],
+        },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await ensureProjectWorktrees('gmux', 'tower')
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/peers/tower/v1/projects/gmux/worktrees')
+    expect(projectWorktreeInventories.value['tower::gmux'].data?.worktrees[0].branch).toBe('main')
+  })
+
+  it('deduplicates a fetched inventory until force refresh', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [] },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux', undefined, true)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenLastCalledWith('/v1/projects/gmux/worktrees')
   })
 })

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -64,7 +65,12 @@ func ParseWorktreePorcelainZ(data []byte) ([]Worktree, error) {
 
 // ListWorktrees asks Git for every checkout belonging to dir's repository.
 func ListWorktrees(dir string) ([]Worktree, error) {
-	cmd := exec.Command("git", "-C", dir, "worktree", "list", "--porcelain", "-z")
+	return ListWorktreesContext(context.Background(), dir)
+}
+
+// ListWorktreesContext is ListWorktrees with caller-controlled cancellation.
+func ListWorktreesContext(ctx context.Context, dir string) ([]Worktree, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain", "-z")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
