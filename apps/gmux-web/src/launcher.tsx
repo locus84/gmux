@@ -141,6 +141,8 @@ function visibleViewport(): LauncherMenuViewport {
 interface LaunchButtonProps {
   className?: string
   onLaunch?: () => void
+  /** Optional infrequent action rendered below the launcher list and a divider. */
+  footerAction?: { label: string; onSelect: () => void; triggerKey?: string }
   /** Async action to run before the launch request (e.g. seed a project). */
   beforeLaunch?: () => Promise<void>
   /** Explicit target: working directory for the new session. */
@@ -157,7 +159,7 @@ interface LaunchButtonProps {
   fallbackCwd?: string
 }
 
-export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, sessions, selectedId, fallbackCwd }: LaunchButtonProps) {
+export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, cwd, peer, sessions, selectedId, fallbackCwd }: LaunchButtonProps) {
   // Resolve the target: context-aware mode (sessions provided) derives
   // a smart cwd, while an explicit `peer` prop is always authoritative
   // (the caller knows the folder's owner; ADR 0002). This matters for
@@ -181,7 +183,8 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
 
   // Read launcher config from the store (populated by /v1/health).
   const hasLaunchers = launchersSignal.value.length > 0
-  const isOpen = state === 'open' && hasLaunchers
+  const hasMenuItems = hasLaunchers || !!footerAction
+  const isOpen = state === 'open' && hasMenuItems
 
   // The target line and divider sit above the default launcher item.
   const targetOffset = showTarget ? 32 : 0
@@ -252,7 +255,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
       viewport?.removeEventListener('resize', reposition)
       viewport?.removeEventListener('scroll', reposition)
     }
-  }, [isOpen, targetOffset, target.peer, launchersSignal.value.length])
+  }, [isOpen, targetOffset, target.peer, launchersSignal.value.length, !!footerAction])
 
   // Close on outside press. The menu is portaled to <body> so it can
   // escape transformed/clipped ancestors such as the mobile sidebar; treat
@@ -323,6 +326,21 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
           {l.label}
         </button>
       ))}
+      {footerAction && (
+        <>
+          {(defLauncher || others.length > 0) && <div class="launch-inline-divider" />}
+          <button
+            class="launch-inline-item launch-inline-footer"
+            onClick={(e) => {
+              e.stopPropagation()
+              setState('idle')
+              footerAction.onSelect()
+            }}
+          >
+            {footerAction.label}
+          </button>
+        </>
+      )}
     </div>
   ) : null
 
@@ -331,6 +349,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
       <button
         ref={btnRef}
         class={`launch-btn ${isLoading ? 'loading' : ''}`}
+        data-new-worktree-key={footerAction?.triggerKey}
         title={target.cwd
           ? target.peer ? `New session on ${target.peer} in ${target.cwd}` : `New session in ${target.cwd}`
           : 'New session'}

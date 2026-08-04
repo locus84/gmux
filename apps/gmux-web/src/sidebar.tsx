@@ -664,6 +664,11 @@ function FolderGroup({
               fallbackCwd={folder.launchCwd ?? ''}
               peer={folder.peer}
               className="folder-launch-btn"
+              footerAction={canCreateWorktree ? {
+                label: 'New worktree',
+                onSelect: onNewWorktree,
+                triggerKey: folder.key,
+              } : undefined}
             />
           </div>
         )}
@@ -694,17 +699,6 @@ function FolderGroup({
             onReorder={(from, to) => handleCheckoutReorder(group, from, to)}
           />
         ))}
-        {canCreateWorktree && (
-          <button
-            type="button"
-            class="checkout-new-worktree-btn"
-            data-new-worktree-key={folder.key}
-            onClick={onNewWorktree}
-          >
-            <span aria-hidden="true">＋</span>
-            New worktree
-          </button>
-        )}
       </div>
     </div>
   )

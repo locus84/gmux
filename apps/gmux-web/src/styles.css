@@ -603,26 +603,8 @@ body {
   padding-left: 1.65em;
 }
 
-.checkout-new-worktree-btn {
-  width: calc(100% - 2em);
-  min-height: 36px;
-  margin: 2px 1em 5px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  font: 12px 'Instrument Sans', sans-serif;
-}
-
-.checkout-new-worktree-btn:hover,
-.checkout-new-worktree-btn:focus-visible {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--bg-hover);
+.launch-inline-footer {
+  color: var(--text-secondary);
 }
 
 .worktree-remove-sheet,
@@ -756,7 +738,7 @@ body {
 }
 
 @media (pointer: coarse) {
-  .checkout-new-worktree-btn {
+  .launch-inline-footer {
     min-height: 44px;
   }
 
