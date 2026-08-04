@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	projectspkg "github.com/gmuxapp/gmux/services/gmuxd/internal/projects"
@@ -47,6 +49,96 @@ func TestProjectWorktreesHandlerListsPrimaryAndLinked(t *testing.T) {
 	}
 }
 
+func TestProjectWorktreeDeleteHandlerRemovesCheckoutAndPreservesBranch(t *testing.T) {
+	repo := initProjectWorktreeRepo(t)
+	linked := filepath.Join(t.TempDir(), "feature")
+	runProjectGit(t, repo, "worktree", "add", "-b", "feature", linked)
+	mgr := projectManagerForRoot(t, repo)
+
+	rr := deleteProjectWorktree(t, mgr, store.New(), linked)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(linked); !os.IsNotExist(err) {
+		t.Fatalf("linked checkout still exists: %v", err)
+	}
+	cmd := exec.Command("git", "-C", repo, "branch", "--list", "feature")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "feature") {
+		t.Fatalf("branch missing: err=%v out=%s", err, out)
+	}
+}
+
+func TestProjectWorktreeDeleteHandlerRejectsUnsafeTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, linked string, sessions *store.Store)
+		path  func(repo, linked string) string
+		want  string
+	}{
+		{
+			name: "primary",
+			path: func(repo, linked string) string { return repo },
+			want: "primary checkout",
+		},
+		{
+			name: "dirty",
+			setup: func(t *testing.T, linked string, sessions *store.Store) {
+				if err := os.WriteFile(filepath.Join(linked, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "uncommitted, untracked, or ignored",
+		},
+		{
+			name: "session",
+			setup: func(t *testing.T, linked string, sessions *store.Store) {
+				cwd := filepath.Join(linked, "src")
+				if err := os.Mkdir(cwd, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				sessions.Upsert(store.Session{ID: "sess-worktree", Kind: "shell", Cwd: cwd, Alive: true})
+			},
+			want: "live or resumable session",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := initProjectWorktreeRepo(t)
+			linked := filepath.Join(t.TempDir(), "feature")
+			runProjectGit(t, repo, "worktree", "add", "-b", "feature", linked)
+			sessions := store.New()
+			if tc.setup != nil {
+				tc.setup(t, linked, sessions)
+			}
+			target := linked
+			if tc.path != nil {
+				target = tc.path(repo, linked)
+			}
+			rr := deleteProjectWorktree(t, projectManagerForRoot(t, repo), sessions, target)
+			if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), tc.want) {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+			if _, err := os.Stat(linked); err != nil {
+				t.Fatalf("linked checkout removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestProjectWorktreeDeleteHandlerRejectsConfiguredLinkedCheckout(t *testing.T) {
+	repo := initProjectWorktreeRepo(t)
+	linked := filepath.Join(t.TempDir(), "configured")
+	runProjectGit(t, repo, "worktree", "add", "-b", "configured", linked)
+
+	rr := deleteProjectWorktree(t, projectManagerForRoot(t, linked), store.New(), linked)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "configured project checkout") {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(linked); err != nil {
+		t.Fatalf("configured checkout removed: %v", err)
+	}
+}
+
 func TestProjectWorktreesHandlerReturnsPrimaryForNonGitProject(t *testing.T) {
 	root := t.TempDir()
 	mgr := projectspkg.NewManager(t.TempDir())
@@ -81,6 +173,27 @@ func TestProjectWorktreesHandlerRejectsMultipleProjectRoots(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
+}
+
+func projectManagerForRoot(t *testing.T, root string) *projectspkg.Manager {
+	t.Helper()
+	mgr := projectspkg.NewManager(t.TempDir())
+	if _, err := mgr.AddProject("gmux", []projectspkg.MatchRule{{Path: root}}); err != nil {
+		t.Fatal(err)
+	}
+	return mgr
+}
+
+func deleteProjectWorktree(t *testing.T, mgr *projectspkg.Manager, sessions *store.Store, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"path": path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/v1/projects/gmux/worktrees", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	projectWorktreeDeleteHandler(rr, req, "gmux", mgr, sessions)
+	return rr
 }
 
 func initProjectWorktreeRepo(t *testing.T) string {

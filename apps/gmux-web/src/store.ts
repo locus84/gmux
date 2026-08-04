@@ -26,6 +26,7 @@ import { MOCK_SESSIONS, MOCK_PROJECTS, MOCK_PEERS, MOCK_HEALTH } from './mock-da
 import type { ResolvedTerminalOptions } from './settings-schema'
 import {
   ProjectWorktreesResponseSchema,
+  RemoveProjectWorktreeResponseSchema,
   type ProjectWorktrees,
   type Session as ProtocolSession,
 } from '@gmux/protocol'
@@ -101,6 +102,7 @@ export interface ProjectWorktreeInventoryState {
 
 /** On-demand Git checkout inventories keyed by the owning host + project. */
 export const projectWorktreeInventories = signal<Record<string, ProjectWorktreeInventoryState>>({})
+const projectWorktreeInventoryRequests = new Map<string, number>()
 
 export function projectWorktreeInventoryKey(slug: string, peer?: string): string {
   return `${peer ?? ''}::${slug}`
@@ -111,6 +113,8 @@ export async function ensureProjectWorktrees(slug: string, peer?: string, force 
   const key = projectWorktreeInventoryKey(slug, peer)
   const current = projectWorktreeInventories.value[key]
   if (!force && (current?.loading || current?.data)) return
+  const requestId = (projectWorktreeInventoryRequests.get(key) ?? 0) + 1
+  projectWorktreeInventoryRequests.set(key, requestId)
 
   projectWorktreeInventories.value = {
     ...projectWorktreeInventories.value,
@@ -126,16 +130,41 @@ export async function ensureProjectWorktrees(slug: string, peer?: string, force 
     }
     const parsed = ProjectWorktreesResponseSchema.parse(body)
     if (!parsed.ok) throw new Error(parsed.error.message)
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
     projectWorktreeInventories.value = {
       ...projectWorktreeInventories.value,
       [key]: { data: parsed.data, loading: false },
     }
   } catch (err) {
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
     projectWorktreeInventories.value = {
       ...projectWorktreeInventories.value,
       [key]: { data: current?.data, loading: false, error: err instanceof Error ? err.message : String(err) },
     }
   }
+}
+
+/** Safely remove a linked worktree on its filesystem-owning daemon. */
+export async function removeProjectWorktree(slug: string, path: string, peer?: string): Promise<void> {
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  const resp = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) {
+    if (resp.status === 404) {
+      await ensureProjectWorktrees(slug, peer, true)
+      const refreshed = projectWorktreeInventories.value[projectWorktreeInventoryKey(slug, peer)]
+      if (refreshed?.data && !refreshed.data.worktrees.some(worktree => worktree.path === path)) return
+    }
+    throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  }
+  const parsed = RemoveProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
 }
 
 /** Merge a partial world update into `_rawWorld`. Used by SSE handlers,

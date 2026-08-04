@@ -61,6 +61,55 @@ func TestListWorktreesAndResolveCurrent(t *testing.T) {
 	}
 }
 
+func TestWorktreeDirtyAndRemove(t *testing.T) {
+	repo := initGitRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored.secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".gitignore")
+	runGit(t, repo, "commit", "-m", "ignore generated secret")
+	wt := filepath.Join(t.TempDir(), "feature")
+	runGit(t, repo, "worktree", "add", "-b", "feature", wt, "HEAD")
+
+	dirty, err := WorktreeDirtyContext(t.Context(), wt)
+	if err != nil || dirty {
+		t.Fatalf("clean dirty=%v err=%v", dirty, err)
+	}
+	ignored := filepath.Join(wt, "ignored.secret")
+	if err := os.WriteFile(ignored, []byte("valuable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err = WorktreeDirtyContext(t.Context(), wt)
+	if err != nil || !dirty {
+		t.Fatalf("ignored dirty=%v err=%v", dirty, err)
+	}
+	if err := os.Remove(ignored); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "new.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err = WorktreeDirtyContext(t.Context(), wt)
+	if err != nil || !dirty {
+		t.Fatalf("changed dirty=%v err=%v", dirty, err)
+	}
+	if err := RemoveWorktreeContext(t.Context(), repo, wt); err == nil {
+		t.Fatal("expected non-force removal to reject dirty worktree")
+	}
+	if err := os.Remove(filepath.Join(wt, "new.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveWorktreeContext(t.Context(), repo, wt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree still exists: %v", err)
+	}
+	if got := runGit(t, repo, "branch", "--list", "feature"); !strings.Contains(got, "feature") {
+		t.Fatalf("branch was removed: %q", got)
+	}
+}
+
 func TestResolveWorktreeSelectors(t *testing.T) {
 	cwd := t.TempDir()
 	items := []Worktree{

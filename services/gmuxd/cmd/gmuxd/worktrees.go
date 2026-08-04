@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/paths"
@@ -13,6 +17,13 @@ import (
 )
 
 const projectWorktreeTimeout = 5 * time.Second
+const projectWorktreeRemoveTimeout = 30 * time.Second
+const projectWorktreeRequestLimit = 16 * 1024
+
+// worktreeLifecycleMu prevents local launch/resume registration from racing a
+// worktree safety check and removal. Peer launches are guarded by their owning
+// daemon after forwarding.
+var worktreeLifecycleMu sync.RWMutex
 
 type projectWorktree struct {
 	workspace.Worktree
@@ -80,6 +91,133 @@ func projectWorktreesHandler(w http.ResponseWriter, r *http.Request, slug string
 	}
 
 	writeProjectWorktrees(w, slug, primaryPath, result)
+}
+
+func projectWorktreeDeleteHandler(w http.ResponseWriter, r *http.Request, slug string, projectMgr *projectspkg.Manager, sessions *store.Store) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, projectWorktreeRequestLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "path is required")
+		return
+	}
+
+	worktreeLifecycleMu.Lock()
+	defer worktreeLifecycleMu.Unlock()
+
+	root, err := projectWorktreeRoot(slug, projectMgr, sessions)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	root = paths.NormalizePath(strings.TrimSpace(root))
+	target := canonicalFilesystemPath(strings.TrimSpace(req.Path))
+
+	ctx, cancel := context.WithTimeout(r.Context(), projectWorktreeTimeout)
+	defer cancel()
+	items, err := workspace.ListWorktreesContext(ctx, root)
+	if err != nil {
+		writeProjectWorktreeCommandError(w, ctx, err)
+		return
+	}
+
+	primaryPath := canonicalFilesystemPath(root)
+	if detected := workspace.Detect(root); detected.Root != "" {
+		primaryPath = canonicalFilesystemPath(detected.Root)
+	}
+	primaryListed := false
+	var selected *workspace.Worktree
+	for i := range items {
+		itemPath := canonicalFilesystemPath(items[i].Path)
+		if itemPath == primaryPath {
+			primaryListed = true
+		}
+		if itemPath == target {
+			selected = &items[i]
+		}
+	}
+	if !primaryListed && len(items) > 0 {
+		primaryPath = canonicalFilesystemPath(items[0].Path)
+	}
+	if selected == nil {
+		writeError(w, http.StatusNotFound, "not_found", "worktree is not listed for this project")
+		return
+	}
+	if target == primaryPath || target == canonicalFilesystemPath(root) {
+		writeError(w, http.StatusConflict, "conflict", "the primary checkout or configured project checkout cannot be removed")
+		return
+	}
+	if selected.Bare || selected.Detached {
+		writeError(w, http.StatusConflict, "conflict", "bare or detached worktrees cannot be removed from gmux")
+		return
+	}
+	if selected.Locked {
+		message := "worktree is locked"
+		if selected.LockReason != "" {
+			message += ": " + selected.LockReason
+		}
+		writeError(w, http.StatusConflict, "conflict", message)
+		return
+	}
+	if selected.Prunable {
+		writeError(w, http.StatusConflict, "conflict", "worktree metadata is prunable; repair it with Git first")
+		return
+	}
+	for _, session := range sessions.List() {
+		if session.Peer != "" || (!session.Alive && !session.Resumable) {
+			continue
+		}
+		if pathInsideWorktree(target, paths.NormalizePath(session.Cwd)) ||
+			pathInsideWorktree(target, paths.NormalizePath(session.WorkspaceRoot)) {
+			writeError(w, http.StatusConflict, "conflict", "worktree has a live or resumable session; dismiss it first")
+			return
+		}
+	}
+	dirty, err := workspace.WorktreeDirtyContext(ctx, target)
+	if err != nil {
+		writeProjectWorktreeCommandError(w, ctx, err)
+		return
+	}
+	if dirty {
+		writeError(w, http.StatusConflict, "conflict", "worktree has uncommitted, untracked, or ignored files")
+		return
+	}
+	// Once Git starts removing files, finish independently of a browser
+	// disconnect so a mobile navigation cannot leave a half-removed checkout.
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), projectWorktreeRemoveTimeout)
+	defer removeCancel()
+	if err := workspace.RemoveWorktreeContext(removeCtx, root, target); err != nil {
+		writeProjectWorktreeCommandError(w, removeCtx, err)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "data": map[string]string{
+		"project_slug": slug,
+		"removed_path": paths.CanonicalizePath(target),
+	}})
+}
+
+func writeProjectWorktreeCommandError(w http.ResponseWriter, ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		writeError(w, http.StatusGatewayTimeout, "unavailable", "worktree operation timed out")
+		return
+	}
+	writeError(w, http.StatusConflict, "conflict", err.Error())
+}
+
+func pathInsideWorktree(root, candidate string) bool {
+	if root == "" || candidate == "" {
+		return false
+	}
+	root = canonicalFilesystemPath(root)
+	candidate = canonicalFilesystemPath(candidate)
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func canonicalFilesystemPath(path string) string {
+	return paths.NormalizePath(paths.CanonicalizePath(paths.NormalizePath(path)))
 }
 
 func projectWorktreeRoot(slug string, projectMgr *projectspkg.Manager, sessions *store.Store) (string, error) {

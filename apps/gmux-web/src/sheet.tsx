@@ -39,7 +39,8 @@
  *    the sheets only exist on touch devices; no keyboard-activation path to
  *    lose.
  *
- * Opening a sheet also closes the on-screen keyboard (see effect below).
+ * Opening a long-press sheet also closes the on-screen keyboard by default;
+ * keyboard-accessible dialogs can opt out so their autofocus is preserved.
  *
  * The panel (with its role/aria-label) is passed as children.
  */
@@ -67,9 +68,11 @@ function dismissAfterGesture(fn: () => void): void {
   setTimeout(fn, 0)
 }
 
-export function SheetBackdrop({ onClose, children }: {
+export function SheetBackdrop({ onClose, children, blurActiveElement = true }: {
   onClose: () => void
   children: ComponentChildren
+  /** Long-press sheets close the soft keyboard; keyboard dialogs opt out so autofocus survives. */
+  blurActiveElement?: boolean
 }) {
   // Close the keyboard when a sheet opens by blurring the terminal's
   // focused hidden textarea. While it holds focus iOS locks selection to
@@ -77,8 +80,8 @@ export function SheetBackdrop({ onClose, children }: {
   // over everything; blurring releases both. You don't need the keyboard
   // to copy/paste, and dropping it gives the sheet more room.
   useEffect(() => {
-    (document.activeElement as HTMLElement | null)?.blur()
-  }, [])
+    if (blurActiveElement) (document.activeElement as HTMLElement | null)?.blur()
+  }, [blurActiveElement])
 
   return createPortal(
     <div

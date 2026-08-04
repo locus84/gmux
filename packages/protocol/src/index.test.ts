@@ -5,6 +5,8 @@ import {
   successEnvelope,
   SessionStatusSchema,
   ProjectWorktreesResponseSchema,
+  RemoveProjectWorktreeRequestSchema,
+  RemoveProjectWorktreeResponseSchema,
 } from './index.js'
 
 describe('protocol schemas', () => {
@@ -77,6 +79,16 @@ describe('protocol schemas', () => {
     const Schema = successEnvelope(SessionStatusSchema)
     const parsed = Schema.parse({ ok: true, data: { label: 'test', working: false } })
     expect(parsed.data.label).toBe('test')
+  })
+
+  it('parses safe project worktree removal payloads', () => {
+    expect(RemoveProjectWorktreeRequestSchema.parse({ path: '~/src/gmux-feature' })).toEqual({ path: '~/src/gmux-feature' })
+    expect(() => RemoveProjectWorktreeRequestSchema.parse({ path: '', force: true })).toThrow()
+    const parsed = RemoveProjectWorktreeResponseSchema.parse({
+      ok: true,
+      data: { project_slug: 'gmux', removed_path: '~/src/gmux-feature' },
+    })
+    expect(parsed.ok && parsed.data.removed_path).toBe('~/src/gmux-feature')
   })
 
   it('parses project worktree inventories', () => {

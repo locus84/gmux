@@ -73,17 +73,47 @@ func ListWorktreesContext(ctx context.Context, dir string) ([]Worktree, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "worktree", "list", "--porcelain", "-z")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return nil, fmt.Errorf("list git worktrees: %s", msg)
+		return nil, gitCommandError("list git worktrees", out, err)
 	}
 	items, err := ParseWorktreePorcelainZ(out)
 	if err != nil {
 		return nil, err
 	}
 	return items, nil
+}
+
+// WorktreeDirtyContext reports whether path has tracked, staged, untracked,
+// ignored, conflicted, or submodule files. Ignored files are included because
+// git worktree remove would otherwise silently delete them without --force.
+// Callers should still use non-force Git removal because the worktree may
+// change after this check.
+func WorktreeDirtyContext(ctx context.Context, path string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, gitCommandError("inspect git worktree", out, err)
+	}
+	return len(out) > 0, nil
+}
+
+// RemoveWorktreeContext removes an exact linked checkout without --force.
+// Git remains the final safety guard against changes racing this operation.
+// Removing a worktree does not delete its branch.
+func RemoveWorktreeContext(ctx context.Context, repositoryRoot, path string) error {
+	cmd := exec.CommandContext(ctx, "git", "-C", repositoryRoot, "worktree", "remove", "--", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return gitCommandError("remove git worktree", out, err)
+	}
+	return nil
+}
+
+func gitCommandError(action string, out []byte, err error) error {
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		msg = err.Error()
+	}
+	return fmt.Errorf("%s: %s", action, msg)
 }
 
 // CurrentWorktree returns the deepest checkout containing cwd.

@@ -188,6 +188,9 @@ func launcherStates(ls []adapter.Launcher) []string {
 // honours the legacy GMUX_RESUME_ID env var as a fallback for
 // rolling upgrades, but this code path no longer sets it.
 func launchGmux(gmuxBin string, command []string, cwd, resumeID, initialTitle, initialAgentTitle string, initialCols, initialRows uint16) (int, string, error) {
+	worktreeLifecycleMu.RLock()
+	defer worktreeLifecycleMu.RUnlock()
+
 	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialTitle, initialAgentTitle, initialCols, initialRows, command)...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -1210,6 +1213,9 @@ func serve(stderr io.Writer) int {
 
 	mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
 		projectWorktreesHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+	mux.HandleFunc("DELETE /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreeDeleteHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
 	})
 
 	mux.HandleFunc("PATCH /v1/projects/{slug}/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -2693,9 +2699,9 @@ func shouldForwardActivity(asPeer bool, sessionID string, isLocalPeer func(strin
 // slash (e.g. "v1/projects/gmux/sessions").
 func isAllowedPeerProxyPath(method, sub string) bool {
 	parts := strings.Split(sub, "/")
-	// Project worktree inventory: GET v1/projects/<slug>/worktrees.
-	// Git must run on the daemon that owns the project's filesystem.
-	if method == http.MethodGet &&
+	// Project worktree inventory and safe removal. Git must run on the
+	// daemon that owns the project's filesystem.
+	if (method == http.MethodGet || method == http.MethodDelete) &&
 		len(parts) == 4 &&
 		parts[0] == "v1" && parts[1] == "projects" &&
 		parts[2] != "" && parts[3] == "worktrees" {

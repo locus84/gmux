@@ -5,7 +5,7 @@
  * callbacks and the mobile open/close toggle are passed as props.
  */
 
-import { useState, useEffect } from 'preact/hooks'
+import { useState, useEffect, useRef } from 'preact/hooks'
 import { sessionPath } from './routing'
 import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { LaunchButton } from './launcher'
@@ -17,12 +17,13 @@ import {
   peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
   unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
   vsCodeServerUrl, vsCodeServerHomeDir,
-  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, removeProjectWorktree,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
+import { SheetBackdrop } from './sheet'
 import type { Session, Folder } from './types'
 
 // ── Types ──
@@ -291,41 +292,146 @@ function CheckoutSection({
   onReorder: (from: number, to: number) => void
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
+  const [expanded, setExpanded] = useState(true)
+  const [removeOpen, setRemoveOpen] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState('')
+  const removeTriggerRef = useRef<HTMLButtonElement>(null)
+  const removeDialogRef = useRef<HTMLDivElement>(null)
   const displayItems = drag ? reorder(group.sessions, drag.from, drag.over) : group.sessions
+  const canLaunch = !group.fallback && group.path !== ''
+  const canRemove = !!group.worktree && !group.primary && !group.fallback
   const handleDragEnd = () => {
     if (drag && drag.from !== drag.over) onReorder(drag.from, drag.over)
     setDrag(null)
   }
+  const closeRemove = () => {
+    if (removing) return
+    setRemoveOpen(false)
+    setRemoveError('')
+    queueMicrotask(() => removeTriggerRef.current?.focus())
+  }
+  const confirmRemove = async () => {
+    setRemoving(true)
+    setRemoveError('')
+    try {
+      await removeProjectWorktree(folder.slug, group.path, folder.peer)
+      setRemoveOpen(false)
+    } catch (err) {
+      setRemoveError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  useEffect(() => {
+    if (selId && group.sessions.some(session => session.id === selId)) setExpanded(true)
+  }, [selId, group.key])
+
+  useEffect(() => {
+    if (!removeOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeRemove()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusable = [...(removeDialogRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex="-1"])') ?? [])]
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [removeOpen, removing])
 
   return (
     <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
       <div class="checkout-header" title={group.path || group.label}>
-        <span class="checkout-tree-mark" aria-hidden="true">↳</span>
-        <span class="checkout-name">{group.label}</span>
-        {group.primary && <span class="checkout-primary-label">default</span>}
-        {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
+        <button
+          type="button"
+          class="checkout-fold-btn"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}`}
+          onClick={() => setExpanded(value => !value)}
+        >
+          <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
+          <span class="checkout-tree-mark" aria-hidden="true">↳</span>
+          <span class="checkout-name">{group.label}</span>
+          {group.primary && <span class="checkout-primary-label">default</span>}
+          {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
+          {!expanded && group.sessions.length > 0 && <span class="checkout-session-count">{group.sessions.length}</span>}
+        </button>
+        <div class="checkout-actions">
+          {canLaunch && (
+            <LaunchButton
+              cwd={group.path}
+              peer={folder.peer}
+              className="checkout-launch-btn"
+            />
+          )}
+          {canRemove && (
+            <button
+              type="button"
+              ref={removeTriggerRef}
+              class="checkout-remove-btn"
+              aria-label={`Remove worktree ${group.label}`}
+              title="Remove worktree"
+              onClick={() => { setRemoveError(''); setRemoveOpen(true) }}
+            >
+              <span aria-hidden="true">×</span>
+            </button>
+          )}
+        </div>
       </div>
-      <div class="checkout-sessions">
-        {displayItems.map((s, i) => (
-          <SessionItem
-            key={s.id}
-            session={s}
-            href={sessionPath(folder.slug, s, folder.peer)}
-            selected={selId === s.id}
-            resuming={resumingId === s.id}
-            dotState={sessionDotState(s, am)}
-            unavailable={isSessionUnavailable(s, peerStatus)}
-            showHostMarker={mixedHosts}
-            dragging={drag !== null && s.id === group.sessions[drag.from]?.id}
-            dropTarget={drag !== null && drag.over === i && drag.from !== i}
-            onClose={() => onCloseSession(s)}
-            onClick={onClick}
-            onDragStart={() => setDrag({ from: i, over: i })}
-            onDragOver={() => setDrag(prev => prev ? { ...prev, over: i } : null)}
-            onDragEnd={handleDragEnd}
-          />
-        ))}
-      </div>
+      {expanded && (
+        <div class="checkout-sessions">
+          {displayItems.map((s, i) => (
+            <SessionItem
+              key={s.id}
+              session={s}
+              href={sessionPath(folder.slug, s, folder.peer)}
+              selected={selId === s.id}
+              resuming={resumingId === s.id}
+              dotState={sessionDotState(s, am)}
+              unavailable={isSessionUnavailable(s, peerStatus)}
+              showHostMarker={mixedHosts}
+              dragging={drag !== null && s.id === group.sessions[drag.from]?.id}
+              dropTarget={drag !== null && drag.over === i && drag.from !== i}
+              onClose={() => onCloseSession(s)}
+              onClick={onClick}
+              onDragStart={() => setDrag({ from: i, over: i })}
+              onDragOver={() => setDrag(prev => prev ? { ...prev, over: i } : null)}
+              onDragEnd={handleDragEnd}
+            />
+          ))}
+        </div>
+      )}
+      {removeOpen && (
+        <SheetBackdrop onClose={closeRemove} blurActiveElement={false}>
+          <div ref={removeDialogRef} class="modal-panel worktree-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="worktree-remove-title">
+            <h2 id="worktree-remove-title">Remove worktree?</h2>
+            <p><strong>{group.label}</strong></p>
+            <code>{group.path}</code>
+            <p>The checkout directory will be removed. Its Git branch will remain.</p>
+            <p class="worktree-remove-safety">Removal is blocked if it has changes or ignored files, is locked, or has a live or resumable session.</p>
+            {removeError && <div class="worktree-remove-error" role="alert">{removeError}</div>}
+            <div class="worktree-remove-buttons">
+              <button type="button" class="sheet-btn sheet-btn-quiet" aria-disabled={removing} autoFocus onClick={closeRemove}>Cancel</button>
+              <button type="button" class="sheet-btn worktree-remove-confirm" disabled={removing} onClick={() => void confirmRemove()}>
+                {removing ? 'Removing…' : 'Remove worktree'}
+              </button>
+            </div>
+          </div>
+        </SheetBackdrop>
+      )}
     </div>
   )
 }

@@ -466,13 +466,81 @@ body {
 .checkout-header {
   min-width: 0;
   display: flex;
-  align-items: center;
-  gap: 0.35em;
-  padding: 0.2em 1em 0.15em 1.15em;
+  align-items: stretch;
   color: var(--text-muted);
   font-size: 0.75em;
   line-height: 1.5;
   font-family: 'Fira Code', monospace;
+}
+
+.checkout-fold-btn {
+  min-width: 0;
+  min-height: 32px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.35em 0.15em 1em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.checkout-fold-btn:hover,
+.checkout-fold-btn:focus-visible,
+.checkout-actions button:hover,
+.checkout-actions button:focus-visible {
+  background: var(--bg-hover);
+}
+
+.checkout-chevron {
+  flex: none;
+  font-family: sans-serif;
+  font-size: 1.35em;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 0.12s ease;
+}
+
+.checkout-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.checkout-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding-right: 0.65em;
+}
+
+.checkout-actions .launch-btn,
+.checkout-remove-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.checkout-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.checkout-remove-btn:hover,
+.checkout-remove-btn:focus-visible {
+  color: var(--status-error);
 }
 
 .checkout-tree-mark {
@@ -488,7 +556,8 @@ body {
 }
 
 .checkout-primary-label,
-.checkout-state-label {
+.checkout-state-label,
+.checkout-session-count {
   flex: none;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -500,6 +569,11 @@ body {
 
 .checkout-state-label {
   color: var(--status-warning);
+}
+
+.checkout-session-count {
+  min-width: 1.5em;
+  text-align: center;
 }
 
 .checkout-inventory-error {
@@ -527,6 +601,77 @@ body {
 
 .checkout-sessions .session-item {
   padding-left: 1.65em;
+}
+
+.worktree-remove-sheet {
+  width: 380px;
+  padding: 18px;
+  gap: 10px;
+}
+
+.worktree-remove-sheet h2,
+.worktree-remove-sheet p {
+  margin: 0;
+}
+
+.worktree-remove-sheet code {
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.worktree-remove-safety {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.worktree-remove-error {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 55%, var(--border));
+  border-radius: 7px;
+  color: var(--status-error);
+  font-size: 13px;
+}
+
+.worktree-remove-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.worktree-remove-buttons .sheet-btn {
+  min-height: 44px;
+}
+
+.worktree-remove-confirm {
+  border-color: var(--status-error);
+  background: var(--status-error);
+  color: var(--bg);
+}
+
+.worktree-remove-buttons button:disabled,
+.worktree-remove-buttons button[aria-disabled="true"] {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+@media (pointer: coarse) {
+  .checkout-fold-btn,
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn {
+    min-height: 44px;
+    height: 44px;
+  }
+
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn {
+    min-width: 44px;
+    width: 44px;
+  }
 }
 
 /* ── Host suffix (project headers) ── */

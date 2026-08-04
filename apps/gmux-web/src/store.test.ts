@@ -9,7 +9,7 @@ import {
   navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
-  view, duplicateSessionFiles, ensureProjectWorktrees, projectWorktreeInventories,
+  view, duplicateSessionFiles, ensureProjectWorktrees, removeProjectWorktree, projectWorktreeInventories,
 } from './store'
 import { SessionSchema } from '@gmux/protocol'
 import type { PendingMutation } from './store'
@@ -1033,6 +1033,79 @@ describe('ensureProjectWorktrees', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/peers/tower/v1/projects/gmux/worktrees')
     expect(projectWorktreeInventories.value['tower::gmux'].data?.worktrees[0].branch).toBe('main')
+  })
+
+  it('removes a peer worktree then force-refreshes its inventory', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: { project_slug: 'gmux', removed_path: '~/wt/fix' } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [] },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await removeProjectWorktree('gmux', '~/wt/fix', 'tower')
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/v1/peers/tower/v1/projects/gmux/worktrees', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '~/wt/fix' }),
+    })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/v1/peers/tower/v1/projects/gmux/worktrees')
+  })
+
+  it('surfaces a safe-removal conflict without refreshing', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ ok: false, error: { code: 'conflict', message: 'worktree has changes' } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(removeProjectWorktree('gmux', '~/wt/fix')).rejects.toThrow('worktree has changes')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let an older inventory response overwrite a force refresh', async () => {
+    let resolveOld!: (value: any) => void
+    const oldResponse = new Promise(resolve => { resolveOld = resolve })
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(oldResponse)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: {
+            project_slug: 'gmux',
+            primary_path: '~/src/gmux',
+            worktrees: [{ path: '~/src/gmux', branch: 'new', primary: true }],
+          },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const oldFetch = ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux', undefined, true)
+    resolveOld({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: {
+          project_slug: 'gmux',
+          primary_path: '~/src/gmux',
+          worktrees: [{ path: '~/src/gmux', branch: 'old', primary: true }],
+        },
+      }),
+    })
+    await oldFetch
+
+    expect(projectWorktreeInventories.value['::gmux'].data?.worktrees[0].branch).toBe('new')
   })
 
   it('deduplicates a fetched inventory until force refresh', async () => {
