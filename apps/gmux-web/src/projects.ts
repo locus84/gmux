@@ -431,6 +431,11 @@ export interface CheckoutGroup {
   fallback?: boolean
 }
 
+/** A project can create managed linked worktrees only after Git inventory succeeds. */
+export function canCreateManagedWorktree(worktrees: readonly Worktree[] | undefined): boolean {
+  return !!worktrees?.some(worktree => !!worktree.head && !worktree.bare)
+}
+
 /**
  * Group the sidebar's existing visible sessions under Git checkout roots.
  * The worktree inventory is fetched from the owning daemon; session

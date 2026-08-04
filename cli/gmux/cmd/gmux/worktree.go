@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -91,47 +92,11 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 	if err != nil {
 		return worktreeCreateResult{}, fmt.Errorf("resolve repository: %w", err)
 	}
-	repo = cleanWorktreePath(repo)
+	// Keep cheap branch validation ahead of launcher probing so malformed input
+	// never contacts gmuxd. CreateWorktreeContext performs the authoritative
+	// validation again immediately before the Git operation.
 	if _, err := gitOutput(repo, "check-ref-format", "--branch", req.Name); err != nil {
 		return worktreeCreateResult{}, fmt.Errorf("invalid worktree branch %q: %w", req.Name, err)
-	}
-	baseHead, err := gitOutput(repo, "rev-parse", "--verify", req.Base+"^{commit}")
-	if err != nil {
-		return worktreeCreateResult{}, fmt.Errorf("resolve base %q: %w", req.Base, err)
-	}
-	if gitOK(repo, "show-ref", "--verify", "--quiet", "refs/heads/"+req.Name) {
-		return worktreeCreateResult{}, fmt.Errorf("branch %q already exists", req.Name)
-	}
-	items, err := workspace.ListWorktrees(repo)
-	if err != nil {
-		return worktreeCreateResult{}, fmt.Errorf("list repository worktrees: %w", err)
-	}
-	if len(items) == 0 {
-		return worktreeCreateResult{}, fmt.Errorf("list repository worktrees: Git returned no worktrees")
-	}
-	path := req.Path
-	if path == "" {
-		repoPath, err := mirroredWorktreeRepoPath(items[0].Path)
-		if err != nil {
-			return worktreeCreateResult{}, fmt.Errorf("resolve managed worktree path: %w", err)
-		}
-		path = filepath.Join(paths.WorktreesDir(), repoPath, worktreePathName(req.Name))
-	} else if !filepath.IsAbs(path) {
-		path, err = filepath.Abs(path)
-		if err != nil {
-			return worktreeCreateResult{}, fmt.Errorf("resolve destination: %w", err)
-		}
-	}
-	path = cleanWorktreePath(path)
-	for _, existing := range items {
-		if containsPath(existing.Path, path) {
-			return worktreeCreateResult{}, fmt.Errorf("destination must be outside existing worktrees: %s", path)
-		}
-	}
-	if _, err := os.Lstat(path); err == nil {
-		return worktreeCreateResult{}, fmt.Errorf("destination already exists: %s", path)
-	} else if !os.IsNotExist(err) {
-		return worktreeCreateResult{}, fmt.Errorf("inspect destination: %w", err)
 	}
 	if req.Prompt != "" && req.Agent == "" {
 		return worktreeCreateResult{}, fmt.Errorf("prompt requires an agent")
@@ -147,10 +112,15 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 			return worktreeCreateResult{}, err
 		}
 	}
-	if _, err := gitOutput(repo, "worktree", "add", "-b", req.Name, "--", path, req.Base); err != nil {
-		return worktreeCreateResult{}, fmt.Errorf("create worktree: %w", err)
+	created, err := workspace.CreateWorktreeContext(context.Background(), workspace.CreateWorktreeOptions{
+		Repository: repo, Branch: req.Name, Base: req.Base,
+		Destination: req.Path, ManagedRoot: paths.WorktreesDir(),
+	})
+	if err != nil {
+		return worktreeCreateResult{}, err
 	}
-	result := worktreeCreateResult{Worktree: workspace.Worktree{Path: path, Branch: req.Name, Head: baseHead}}
+	path := created.Path
+	result := worktreeCreateResult{Worktree: created}
 	if req.Agent == "" {
 		return result, nil
 	}

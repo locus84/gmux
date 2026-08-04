@@ -18,6 +18,7 @@ import (
 
 const projectWorktreeTimeout = 5 * time.Second
 const projectWorktreeRemoveTimeout = 30 * time.Second
+const projectWorktreeCreateTimeout = 60 * time.Second
 const projectWorktreeRequestLimit = 16 * 1024
 
 // worktreeLifecycleMu prevents local launch/resume registration from racing a
@@ -91,6 +92,72 @@ func projectWorktreesHandler(w http.ResponseWriter, r *http.Request, slug string
 	}
 
 	writeProjectWorktrees(w, slug, primaryPath, result)
+}
+
+func projectWorktreeCreateHandler(w http.ResponseWriter, r *http.Request, slug string, projectMgr *projectspkg.Manager, sessions *store.Store) {
+	var req struct {
+		Branch string `json:"branch"`
+		Base   string `json:"base,omitempty"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, projectWorktreeRequestLimit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid worktree request")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "bad_request", "request must contain one JSON object")
+		return
+	}
+	req.Branch = strings.TrimSpace(req.Branch)
+	req.Base = strings.TrimSpace(req.Base)
+	if req.Branch == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "branch is required")
+		return
+	}
+	if len(req.Branch) > 255 || len(req.Base) > 1024 {
+		writeError(w, http.StatusBadRequest, "bad_request", "branch or base is too long")
+		return
+	}
+
+	worktreeLifecycleMu.Lock()
+	defer worktreeLifecycleMu.Unlock()
+	root, err := projectWorktreeRoot(slug, projectMgr, sessions)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	root = paths.NormalizePath(strings.TrimSpace(root))
+	if detected := workspace.Detect(root); detected.Root == "" || detected.GitLayout == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "project is not a Git repository")
+		return
+	}
+
+	// Once creation begins, finish independently of a browser disconnect. A
+	// lost response can then be recovered by refreshing the inventory.
+	ctx, cancel := context.WithTimeout(context.Background(), projectWorktreeCreateTimeout)
+	defer cancel()
+	created, err := workspace.CreateWorktreeContext(ctx, workspace.CreateWorktreeOptions{
+		Repository:  root,
+		Branch:      req.Branch,
+		Base:        req.Base,
+		ManagedRoot: paths.WorktreesDir(),
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			writeError(w, http.StatusGatewayTimeout, "unavailable", "worktree creation timed out; refresh before retrying")
+			return
+		}
+		writeProjectWorktreeCreateError(w, err)
+		return
+	}
+	created.Path = paths.CanonicalizePath(created.Path)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]any{"ok": true, "data": map[string]any{
+		"project_slug": slug,
+		"worktree":     projectWorktree{Worktree: created, Primary: false},
+	}})
 }
 
 func projectWorktreeDeleteHandler(w http.ResponseWriter, r *http.Request, slug string, projectMgr *projectspkg.Manager, sessions *store.Store) {
@@ -196,6 +263,22 @@ func projectWorktreeDeleteHandler(w http.ResponseWriter, r *http.Request, slug s
 		"project_slug": slug,
 		"removed_path": paths.CanonicalizePath(target),
 	}})
+}
+
+func writeProjectWorktreeCreateError(w http.ResponseWriter, err error) {
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "invalid worktree branch"):
+		writeError(w, http.StatusBadRequest, "bad_request", message)
+	case strings.Contains(message, "resolve base"):
+		writeError(w, http.StatusBadRequest, "bad_request", message)
+	case strings.Contains(message, "branch \"") && strings.Contains(message, "already exists"):
+		writeError(w, http.StatusConflict, "conflict", message)
+	case strings.Contains(message, "destination already exists") || strings.Contains(message, "destination must be outside"):
+		writeError(w, http.StatusConflict, "conflict", message)
+	default:
+		writeError(w, http.StatusInternalServerError, "internal", "failed to create worktree")
+	}
 }
 
 func writeProjectWorktreeCommandError(w http.ResponseWriter, ctx context.Context, err error) {

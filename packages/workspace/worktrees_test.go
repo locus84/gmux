@@ -61,6 +61,60 @@ func TestListWorktreesAndResolveCurrent(t *testing.T) {
 	}
 }
 
+func TestCreateWorktreeContextManagedPathAndResolvedBase(t *testing.T) {
+	repo := initGitRepo(t)
+	base := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(repo, "local-only.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	managed := t.TempDir()
+	created, err := CreateWorktreeContext(t.Context(), CreateWorktreeOptions{
+		Repository: repo, Branch: "fix/login", Base: "HEAD", ManagedRoot: managed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Branch != "fix/login" || created.Head != base || !pathContains(managed, created.Path) || filepath.Base(created.Path) != "fix-login" {
+		t.Fatalf("created = %#v", created)
+	}
+	if _, err := os.Stat(filepath.Join(created.Path, "local-only.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty source file was copied: %v", err)
+	}
+	if got := strings.TrimSpace(runGit(t, created.Path, "rev-parse", "HEAD")); got != base {
+		t.Fatalf("HEAD = %q, want %q", got, base)
+	}
+	if _, err := CreateWorktreeContext(t.Context(), CreateWorktreeOptions{
+		Repository: repo, Branch: "fix/login", ManagedRoot: managed,
+	}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("duplicate error = %v", err)
+	}
+}
+
+func TestCreateWorktreeContextRejectsUnsafeInput(t *testing.T) {
+	repo := initGitRepo(t)
+	managed := t.TempDir()
+	if _, err := CreateWorktreeContext(t.Context(), CreateWorktreeOptions{
+		Repository: repo, Branch: "-bad", ManagedRoot: managed,
+	}); err == nil || !strings.Contains(err.Error(), "invalid worktree branch") {
+		t.Fatalf("invalid branch error = %v", err)
+	}
+	if _, err := CreateWorktreeContext(t.Context(), CreateWorktreeOptions{
+		Repository: repo, Branch: "bad-base", Base: "--not-a-ref", ManagedRoot: managed,
+	}); err == nil || !strings.Contains(err.Error(), "resolve base") {
+		t.Fatalf("invalid base error = %v", err)
+	}
+	parent := t.TempDir()
+	link := filepath.Join(parent, "repo-link")
+	if err := os.Symlink(repo, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateWorktreeContext(t.Context(), CreateWorktreeOptions{
+		Repository: repo, Branch: "nested", Destination: filepath.Join(link, "nested"), ManagedRoot: managed,
+	}); err == nil || !strings.Contains(err.Error(), "outside existing worktrees") {
+		t.Fatalf("symlinked destination error = %v", err)
+	}
+}
+
 func TestWorktreeDirtyAndRemove(t *testing.T) {
 	repo := initGitRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored.secret\n"), 0o644); err != nil {

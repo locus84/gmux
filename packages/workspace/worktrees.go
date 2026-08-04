@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -80,6 +81,124 @@ func ListWorktreesContext(ctx context.Context, dir string) ([]Worktree, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+// CreateWorktreeOptions describes a branch-backed linked checkout. Destination
+// may be explicit for CLI compatibility; otherwise ManagedRoot is required and
+// the destination is derived from the repository and branch.
+type CreateWorktreeOptions struct {
+	Repository  string
+	Branch      string
+	Base        string
+	Destination string
+	ManagedRoot string
+}
+
+// CreateWorktreeContext creates a new local branch and linked checkout without
+// copying uncommitted, untracked, or ignored files from the source checkout.
+func CreateWorktreeContext(ctx context.Context, opts CreateWorktreeOptions) (Worktree, error) {
+	if strings.TrimSpace(opts.Repository) == "" {
+		return Worktree{}, errors.New("repository path is required")
+	}
+	if opts.Base == "" {
+		opts.Base = "HEAD"
+	}
+	repo, err := gitOutputContext(ctx, opts.Repository, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return Worktree{}, fmt.Errorf("resolve repository: %w", err)
+	}
+	repo = canonicalPath(repo)
+	if _, err := gitOutputContext(ctx, repo, "check-ref-format", "--branch", opts.Branch); err != nil {
+		return Worktree{}, fmt.Errorf("invalid worktree branch %q: %w", opts.Branch, err)
+	}
+	baseHead, err := gitOutputContext(ctx, repo, "rev-parse", "--verify", "--end-of-options", opts.Base+"^{commit}")
+	if err != nil {
+		return Worktree{}, fmt.Errorf("resolve base %q: %w", opts.Base, err)
+	}
+	if gitOKContext(ctx, repo, "show-ref", "--verify", "--quiet", "refs/heads/"+opts.Branch) {
+		return Worktree{}, fmt.Errorf("branch %q already exists", opts.Branch)
+	}
+	items, err := ListWorktreesContext(ctx, repo)
+	if err != nil {
+		return Worktree{}, fmt.Errorf("list repository worktrees: %w", err)
+	}
+	if len(items) == 0 {
+		return Worktree{}, errors.New("list repository worktrees: Git returned no worktrees")
+	}
+
+	destination := opts.Destination
+	if destination == "" {
+		if strings.TrimSpace(opts.ManagedRoot) == "" {
+			return Worktree{}, errors.New("managed worktree root is required")
+		}
+		repoPath, err := mirroredRepositoryPath(items[0].Path)
+		if err != nil {
+			return Worktree{}, fmt.Errorf("resolve managed worktree path: %w", err)
+		}
+		destination = filepath.Join(opts.ManagedRoot, repoPath, worktreePathName(opts.Branch))
+	}
+	destination = canonicalNewPath(destination)
+	for _, existing := range items {
+		if pathContains(existing.Path, destination) {
+			return Worktree{}, fmt.Errorf("destination must be outside existing worktrees: %s", destination)
+		}
+	}
+	if _, err := os.Lstat(destination); err == nil {
+		return Worktree{}, fmt.Errorf("destination already exists: %s", destination)
+	} else if !os.IsNotExist(err) {
+		return Worktree{}, fmt.Errorf("inspect destination: %w", err)
+	}
+
+	// Use the already-resolved commit so a moving base ref cannot change which
+	// commit is checked out between validation and creation.
+	if _, err := gitOutputContext(ctx, repo, "worktree", "add", "-b", opts.Branch, "--", destination, baseHead); err != nil {
+		return Worktree{}, fmt.Errorf("create worktree: %w", err)
+	}
+	return Worktree{Path: destination, Branch: opts.Branch, Head: baseHead}, nil
+}
+
+func gitOutputContext(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", gitCommandError("git "+strings.Join(args, " "), out, err)
+	}
+	return strings.TrimRight(string(out), "\r\n"), nil
+}
+
+func gitOKContext(ctx context.Context, dir string, args ...string) bool {
+	return exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...).Run() == nil
+}
+
+func worktreePathName(branch string) string {
+	replacer := strings.NewReplacer("/", "-", "\\", "-", string(filepath.Separator), "-")
+	return replacer.Replace(branch)
+}
+
+func mirroredRepositoryPath(repo string) (string, error) {
+	repo = canonicalPath(repo)
+	volume := filepath.VolumeName(repo)
+	rel := strings.TrimLeft(strings.TrimPrefix(repo, volume), "/\\")
+	if volume != "" {
+		volume = strings.TrimPrefix(strings.TrimPrefix(volume, `\\?\`), `\\.\`)
+		if len(volume) >= 4 && strings.EqualFold(volume[:4], `UNC\`) {
+			volume = volume[4:]
+		}
+		volume = strings.Trim(volume, "/\\")
+		volume = strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(volume, ":", ""), "\\", string(filepath.Separator)), "/", string(filepath.Separator))
+		rel = filepath.Join(volume, rel)
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		if filepath.IsAbs(repo) {
+			return "_root", nil
+		}
+		return "", fmt.Errorf("repository path %q cannot be mirrored safely", repo)
+	}
+	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("repository path %q cannot be mirrored safely", repo)
+	}
+	return rel, nil
 }
 
 // WorktreeDirtyContext reports whether path has tracked, staged, untracked,
@@ -203,8 +322,7 @@ func ResolveWorktree(items []Worktree, selector, cwd string) (Worktree, error) {
 }
 
 func canonicalPath(path string) string {
-	abs, err := filepath.Abs(path)
-	if err == nil {
+	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
 	path = filepath.Clean(path)
@@ -212,6 +330,28 @@ func canonicalPath(path string) string {
 		return resolved
 	}
 	return path
+}
+
+// canonicalNewPath resolves the nearest existing ancestor so a destination
+// below a symlink cannot bypass containment checks before it exists.
+func canonicalNewPath(path string) string {
+	path = canonicalPath(path)
+	probe := path
+	var suffix []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(probe); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return path
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
 }
 
 func pathContains(root, path string) bool {

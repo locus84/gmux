@@ -49,6 +49,63 @@ func TestProjectWorktreesHandlerListsPrimaryAndLinked(t *testing.T) {
 	}
 }
 
+func TestProjectWorktreeCreateHandlerCreatesManagedCheckout(t *testing.T) {
+	repo := initProjectWorktreeRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "local-only.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	mgr := projectManagerForRoot(t, repo)
+	rr := createProjectWorktree(t, mgr, map[string]string{"branch": "fix/auth", "base": "HEAD"})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Data struct {
+			ProjectSlug string          `json:"project_slug"`
+			Worktree    projectWorktree `json:"worktree"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Data.ProjectSlug != "gmux" || body.Data.Worktree.Branch != "fix/auth" || body.Data.Worktree.Primary {
+		t.Fatalf("unexpected response: %#v", body)
+	}
+	if _, err := os.Stat(filepath.Join(body.Data.Worktree.Path, "local-only.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty source file was copied: %v", err)
+	}
+	if duplicate := createProjectWorktree(t, mgr, map[string]string{"branch": "fix/auth"}); duplicate.Code != http.StatusConflict {
+		t.Fatalf("duplicate status = %d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+}
+
+func TestProjectWorktreeCreateHandlerRejectsInvalidRequests(t *testing.T) {
+	repo := initProjectWorktreeRepo(t)
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	mgr := projectManagerForRoot(t, repo)
+	for _, tc := range []struct {
+		name string
+		body map[string]string
+	}{
+		{name: "missing branch", body: map[string]string{}},
+		{name: "invalid branch", body: map[string]string{"branch": "-bad"}},
+		{name: "invalid base", body: map[string]string{"branch": "bad-base", "base": "--missing"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := createProjectWorktree(t, mgr, tc.body)
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	plain := projectManagerForRoot(t, t.TempDir())
+	if rr := createProjectWorktree(t, plain, map[string]string{"branch": "feature"}); rr.Code != http.StatusBadRequest {
+		t.Fatalf("non-Git status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestProjectWorktreeDeleteHandlerRemovesCheckoutAndPreservesBranch(t *testing.T) {
 	repo := initProjectWorktreeRepo(t)
 	linked := filepath.Join(t.TempDir(), "feature")
@@ -182,6 +239,18 @@ func projectManagerForRoot(t *testing.T, root string) *projectspkg.Manager {
 		t.Fatal(err)
 	}
 	return mgr
+}
+
+func createProjectWorktree(t *testing.T, mgr *projectspkg.Manager, body map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/gmux/worktrees", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	projectWorktreeCreateHandler(rr, req, "gmux", mgr, store.New())
+	return rr
 }
 
 func deleteProjectWorktree(t *testing.T, mgr *projectspkg.Manager, sessions *store.Store, path string) *httptest.ResponseRecorder {

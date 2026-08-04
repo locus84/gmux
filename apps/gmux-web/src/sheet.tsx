@@ -83,6 +83,22 @@ export function SheetBackdrop({ onClose, children, blurActiveElement = true }: {
     if (blurActiveElement) (document.activeElement as HTMLElement | null)?.blur()
   }, [blurActiveElement])
 
+  // The portal is a true modal surface. Keep the application behind it out
+  // of both keyboard focus order and the accessibility tree until dismissal.
+  useEffect(() => {
+    const app = document.getElementById('app')
+    if (!app) return
+    const previousInert = app.inert
+    const previousAriaHidden = app.getAttribute('aria-hidden')
+    app.inert = true
+    app.setAttribute('aria-hidden', 'true')
+    return () => {
+      app.inert = previousInert
+      if (previousAriaHidden === null) app.removeAttribute('aria-hidden')
+      else app.setAttribute('aria-hidden', previousAriaHidden)
+    }
+  }, [])
+
   return createPortal(
     <div
       class="modal-backdrop action-sheet-backdrop"

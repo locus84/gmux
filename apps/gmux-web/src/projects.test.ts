@@ -16,6 +16,7 @@ import {
   countUnmatchedActive,
   projectAvailability,
   checkoutPathContains,
+  canCreateManagedWorktree,
   groupSessionsByCheckout,
 } from './projects'
 import { makeSession } from './test-helpers'
@@ -1071,6 +1072,15 @@ describe('projectAvailability', () => {
     // disconnected roster entry surfaces as unresolved — the actionable
     // state — not offline.
     expect(projectAvailability({ peer: 'bespin', unresolved: true }, connected)).toBe('unresolved')
+  })
+})
+
+describe('canCreateManagedWorktree', () => {
+  it('allows Git inventories and rejects non-Git or bare inventories', () => {
+    expect(canCreateManagedWorktree([{ path: '/repo', head: 'abc', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false }])).toBe(true)
+    expect(canCreateManagedWorktree([])).toBe(false)
+    expect(canCreateManagedWorktree([{ path: '/repo', primary: true, detached: false, bare: true, locked: false, prunable: false }])).toBe(false)
+    expect(canCreateManagedWorktree(undefined)).toBe(false)
   })
 })
 

@@ -466,6 +466,7 @@ function App() {
   const filesOpen = loc.query.files !== undefined
     || loc.query.projectFiles !== undefined
     || loc.query.pasteFile !== undefined
+  const newWorktreeKey = typeof loc.query.newWorktree === 'string' ? loc.query.newWorktree : undefined
   const openSettings = useCallback((tab = 'projects', replace = false) => {
     const params = new URLSearchParams(location.search)
     // Replace (don't push) when the requested tab is already active,
@@ -478,6 +479,17 @@ function App() {
   const closeSettings = useCallback(() => {
     const params = new URLSearchParams(location.search)
     params.delete('settings')
+    const qs = params.toString()
+    loc.route(qs ? `${loc.path}?${qs}` : loc.path, true)
+  }, [loc])
+  const openNewWorktree = useCallback((key: string) => {
+    const params = new URLSearchParams(location.search)
+    params.set('newWorktree', key)
+    loc.route(`${loc.path}?${params.toString()}`)
+  }, [loc])
+  const closeNewWorktree = useCallback(() => {
+    const params = new URLSearchParams(location.search)
+    params.delete('newWorktree')
     const qs = params.toString()
     loc.route(qs ? `${loc.path}?${qs}` : loc.path, true)
   }, [loc])
@@ -604,6 +616,9 @@ function App() {
         resumingId={resumingId}
         onCloseSession={handleCloseSession}
         onOpenSettings={() => { setSidebarOpen(false); openSettings() }}
+        newWorktreeKey={newWorktreeKey}
+        onOpenNewWorktree={openNewWorktree}
+        onCloseNewWorktree={closeNewWorktree}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
       />

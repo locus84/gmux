@@ -1214,6 +1214,9 @@ func serve(stderr io.Writer) int {
 	mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
 		projectWorktreesHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
 	})
+	mux.HandleFunc("POST /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreeCreateHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
 	mux.HandleFunc("DELETE /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
 		projectWorktreeDeleteHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
 	})
@@ -2701,7 +2704,7 @@ func isAllowedPeerProxyPath(method, sub string) bool {
 	parts := strings.Split(sub, "/")
 	// Project worktree inventory and safe removal. Git must run on the
 	// daemon that owns the project's filesystem.
-	if (method == http.MethodGet || method == http.MethodDelete) &&
+	if (method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete) &&
 		len(parts) == 4 &&
 		parts[0] == "v1" && parts[1] == "projects" &&
 		parts[2] != "" && parts[3] == "worktrees" {

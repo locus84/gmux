@@ -21,6 +21,18 @@ export const ProjectWorktreesSchema = z.object({
 
 export const ProjectWorktreesResponseSchema = responseEnvelope(ProjectWorktreesSchema)
 
+export const CreateProjectWorktreeRequestSchema = z.object({
+  branch: z.string().trim().min(1).max(255),
+  base: z.string().trim().min(1).max(1024).optional(),
+}).strict()
+
+export const CreatedProjectWorktreeSchema = z.object({
+  project_slug: z.string().min(1),
+  worktree: WorktreeSchema,
+})
+
+export const CreateProjectWorktreeResponseSchema = responseEnvelope(CreatedProjectWorktreeSchema)
+
 export const RemoveProjectWorktreeRequestSchema = z.object({
   path: z.string().min(1),
 }).strict()
@@ -35,6 +47,9 @@ export const RemoveProjectWorktreeResponseSchema = responseEnvelope(RemovedProje
 export type Worktree = z.infer<typeof WorktreeSchema>
 export type ProjectWorktrees = z.infer<typeof ProjectWorktreesSchema>
 export type ProjectWorktreesResponse = z.infer<typeof ProjectWorktreesResponseSchema>
+export type CreateProjectWorktreeRequest = z.infer<typeof CreateProjectWorktreeRequestSchema>
+export type CreatedProjectWorktree = z.infer<typeof CreatedProjectWorktreeSchema>
+export type CreateProjectWorktreeResponse = z.infer<typeof CreateProjectWorktreeResponseSchema>
 export type RemoveProjectWorktreeRequest = z.infer<typeof RemoveProjectWorktreeRequestSchema>
 export type RemovedProjectWorktree = z.infer<typeof RemovedProjectWorktreeSchema>
 export type RemoveProjectWorktreeResponse = z.infer<typeof RemoveProjectWorktreeResponseSchema>

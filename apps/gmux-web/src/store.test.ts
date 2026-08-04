@@ -9,7 +9,7 @@ import {
   navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
-  view, duplicateSessionFiles, ensureProjectWorktrees, removeProjectWorktree, projectWorktreeInventories,
+  view, duplicateSessionFiles, ensureProjectWorktrees, createProjectWorktree, removeProjectWorktree, projectWorktreeInventories,
 } from './store'
 import { SessionSchema } from '@gmux/protocol'
 import type { PendingMutation } from './store'
@@ -1033,6 +1033,31 @@ describe('ensureProjectWorktrees', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/peers/tower/v1/projects/gmux/worktrees')
     expect(projectWorktreeInventories.value['tower::gmux'].data?.worktrees[0].branch).toBe('main')
+  })
+
+  it('creates a peer worktree then force-refreshes its inventory', async () => {
+    const created = { path: '~/wt/fix-auth', branch: 'fix/auth', head: 'abc', primary: false }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: { project_slug: 'gmux', worktree: created } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [created] },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createProjectWorktree('gmux', 'fix/auth', 'origin/main', 'tower')).resolves.toMatchObject({ branch: 'fix/auth' })
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/v1/peers/tower/v1/projects/gmux/worktrees', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch: 'fix/auth', base: 'origin/main' }),
+    })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/v1/peers/tower/v1/projects/gmux/worktrees')
   })
 
   it('removes a peer worktree then force-refreshes its inventory', async () => {

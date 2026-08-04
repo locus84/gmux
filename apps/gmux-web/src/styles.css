@@ -603,10 +603,106 @@ body {
   padding-left: 1.65em;
 }
 
-.worktree-remove-sheet {
+.checkout-new-worktree-btn {
+  width: calc(100% - 2em);
+  min-height: 36px;
+  margin: 2px 1em 5px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: 12px 'Instrument Sans', sans-serif;
+}
+
+.checkout-new-worktree-btn:hover,
+.checkout-new-worktree-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.worktree-remove-sheet,
+.worktree-create-sheet {
   width: 380px;
   padding: 18px;
   gap: 10px;
+}
+
+.worktree-create-sheet h2,
+.worktree-create-sheet p {
+  margin: 0;
+}
+
+.worktree-create-project,
+.worktree-create-help {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.worktree-create-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.worktree-create-field input {
+  width: 100%;
+  min-height: 44px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg-surface);
+  color: var(--text);
+  padding: 9px 10px;
+  font: 13px 'Fira Code', monospace;
+}
+
+.worktree-create-field input:focus {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in oklch, var(--accent) 30%, transparent);
+  outline-offset: 1px;
+}
+
+.worktree-create-advanced summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.worktree-create-advanced[open] summary {
+  margin-bottom: 6px;
+}
+
+.worktree-create-submit {
+  min-width: 132px;
+}
+
+@media (max-width: 640px) {
+  .worktree-create-sheet {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-width: none;
+    max-height: calc(var(--app-height, 100vh) - 16px);
+    padding: 18px 18px calc(18px + env(safe-area-inset-bottom));
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 14px 14px 0 0;
+    overflow-y: auto;
+  }
 }
 
 .worktree-remove-sheet h2,
@@ -660,6 +756,10 @@ body {
 }
 
 @media (pointer: coarse) {
+  .checkout-new-worktree-btn {
+    min-height: 44px;
+  }
+
   .checkout-fold-btn,
   .checkout-actions .launch-btn,
   .checkout-remove-btn {

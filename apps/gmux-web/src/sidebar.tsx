@@ -7,17 +7,17 @@
 
 import { useState, useEffect, useRef } from 'preact/hooks'
 import { sessionPath } from './routing'
-import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
+import { canCreateManagedWorktree, groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { LaunchButton } from './launcher'
 import { useArrivalPulse } from './use-arrival-pulse'
 import {
   folders, selectedId, currentProjectKey,
-  activityMap, projects, connState,
+  activityMap, projects, connState, worldLoaded,
   updateProjects, reorderSessions,
   peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
   unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
   vsCodeServerUrl, vsCodeServerHomeDir,
-  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, removeProjectWorktree,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, createProjectWorktree, removeProjectWorktree,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
@@ -436,6 +436,125 @@ function CheckoutSection({
   )
 }
 
+function NewWorktreeSheet({ folder, onClose, restoreTriggerFocus }: { folder: Folder; onClose: () => void; restoreTriggerFocus: boolean }) {
+  const [branch, setBranch] = useState('')
+  const [base, setBase] = useState('HEAD')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const panelRef = useRef<HTMLFormElement>(null)
+  const branchInputRef = useRef<HTMLInputElement>(null)
+
+  const close = () => {
+    if (!submitting) onClose()
+  }
+  const submit = async () => {
+    const normalizedBranch = branch.trim()
+    const normalizedBase = base.trim() || 'HEAD'
+    if (!normalizedBranch) {
+      setError('Branch name is required.')
+      branchInputRef.current?.focus()
+      return
+    }
+    setSubmitting(true)
+    setError('')
+    try {
+      await createProjectWorktree(folder.slug, normalizedBranch, normalizedBase, folder.peer)
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  useEffect(() => () => {
+    if (restoreTriggerFocus) {
+      queueMicrotask(() => [...document.querySelectorAll<HTMLElement>('[data-new-worktree-key]')].find(element => element.dataset.newWorktreeKey === folder.key)?.focus())
+    }
+  }, [folder.key, restoreTriggerFocus])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        close()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusable = [...(panelRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), summary, [tabindex]:not([tabindex="-1"])') ?? [])]
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [submitting])
+
+  return (
+    <SheetBackdrop onClose={close} blurActiveElement={false}>
+      <form
+        ref={panelRef}
+        class="modal-panel worktree-create-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="worktree-create-title"
+        aria-busy={submitting}
+        onSubmit={(event) => { event.preventDefault(); void submit() }}
+      >
+        <h2 id="worktree-create-title">New worktree</h2>
+        <p class="worktree-create-project">Create a linked checkout for <strong>{folder.name}</strong>.</p>
+        <label class="worktree-create-field">
+          <span>Branch</span>
+          <input
+            ref={branchInputRef}
+            value={branch}
+            disabled={submitting}
+            autoFocus
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellcheck={false}
+            placeholder="fix/login"
+            aria-invalid={!!error || undefined}
+            aria-describedby="worktree-create-help"
+            onInput={(event) => setBranch(event.currentTarget.value)}
+          />
+        </label>
+        <details class="worktree-create-advanced">
+          <summary>Advanced</summary>
+          <label class="worktree-create-field">
+            <span>Base</span>
+            <input
+              value={base}
+              disabled={submitting}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellcheck={false}
+              placeholder="HEAD"
+              onInput={(event) => setBase(event.currentTarget.value)}
+            />
+          </label>
+        </details>
+        <div id="worktree-create-help" class="worktree-create-help">
+          gmux chooses a managed path. Uncommitted and untracked files from the source checkout are not copied.
+        </div>
+        {error && <div class="worktree-remove-error" role="alert">{error}</div>}
+        <div class="worktree-remove-buttons">
+          <button type="button" class="sheet-btn sheet-btn-quiet" aria-disabled={submitting} onClick={close}>Cancel</button>
+          <button type="submit" class="sheet-btn sheet-btn-primary worktree-create-submit" disabled={submitting || !branch.trim()}>
+            {submitting ? 'Creating…' : 'Create worktree'}
+          </button>
+        </div>
+      </form>
+    </SheetBackdrop>
+  )
+}
+
 function FolderGroup({
   folder,
   selId,
@@ -445,6 +564,7 @@ function FolderGroup({
   peerStatus,
   onCloseSession,
   onClick,
+  onNewWorktree,
 }: {
   folder: Folder
   selId: string | null
@@ -454,16 +574,19 @@ function FolderGroup({
   peerStatus: ReadonlyMap<string, string>
   onCloseSession: (session: Session) => void
   onClick?: () => void
+  onNewWorktree: () => void
 }) {
   const ownerStatus = folder.peer ? peerStatus.get(folder.peer) : 'local'
   useEffect(() => {
     if (!folder.unresolved && !folder.missing && (ownerStatus === 'local' || ownerStatus === 'connected')) {
-      void ensureProjectWorktrees(folder.slug, folder.peer)
+      void ensureProjectWorktrees(folder.slug, folder.peer, ownerStatus === 'connected')
     }
   }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
 
   const inventoryKey = projectWorktreeInventoryKey(folder.slug, folder.peer)
   const inventory = projectWorktreeInventories.value[inventoryKey]
+  const ownerReachable = ownerStatus === 'local' || ownerStatus === 'connected'
+  const canCreateWorktree = ownerReachable && !folder.missing && !folder.unresolved && !inventory?.loading && !inventory?.error && canCreateManagedWorktree(inventory?.data?.worktrees)
   const checkoutGroups: CheckoutGroup[] = inventory?.error
     ? [{
         key: 'inventory-unavailable',
@@ -558,6 +681,17 @@ function FolderGroup({
             onReorder={(from, to) => handleCheckoutReorder(group, from, to)}
           />
         ))}
+        {canCreateWorktree && (
+          <button
+            type="button"
+            class="checkout-new-worktree-btn"
+            data-new-worktree-key={folder.key}
+            onClick={onNewWorktree}
+          >
+            <span aria-hidden="true">＋</span>
+            New worktree
+          </button>
+        )}
       </div>
     </div>
   )
@@ -567,12 +701,18 @@ export function Sidebar({
   resumingId,
   onCloseSession,
   onOpenSettings,
+  newWorktreeKey,
+  onOpenNewWorktree,
+  onCloseNewWorktree,
   open,
   onClose,
 }: {
   resumingId: string | null
   onCloseSession: (session: Session) => void
   onOpenSettings: () => void
+  newWorktreeKey?: string
+  onOpenNewWorktree: (key: string) => void
+  onCloseNewWorktree: () => void
   open: boolean
   onClose: () => void
 }) {
@@ -596,6 +736,32 @@ export function Sidebar({
   // removed): flag the gear so the user knows where the fix lives. (refs #270)
   const hasUnresolved = unresolvedHosts.value.length > 0
   const bgArrival = useArrivalPulse(waiting ? 'unread' : 'none', waitingCount)
+  const requestedWorktreeFolder = newWorktreeKey ? foldersVal.find(folder => folder.key === newWorktreeKey) : undefined
+  const requestedOwnerStatus = requestedWorktreeFolder?.peer ? peerStatus.get(requestedWorktreeFolder.peer) : 'local'
+  const requestedInventory = requestedWorktreeFolder
+    ? projectWorktreeInventories.value[projectWorktreeInventoryKey(requestedWorktreeFolder.slug, requestedWorktreeFolder.peer)]
+    : undefined
+  const requestedEligible = !!requestedWorktreeFolder
+    && !requestedWorktreeFolder.missing
+    && !requestedWorktreeFolder.unresolved
+    && (requestedOwnerStatus === 'local' || requestedOwnerStatus === 'connected')
+    && !requestedInventory?.error
+    && canCreateManagedWorktree(requestedInventory?.data?.worktrees)
+  const newWorktreeFolder = requestedEligible ? requestedWorktreeFolder : undefined
+
+  useEffect(() => {
+    if (!newWorktreeKey) return
+    if (!requestedWorktreeFolder) {
+      if (worldLoaded.value) onCloseNewWorktree()
+      return
+    }
+    const permanentlyInvalid = requestedWorktreeFolder.missing
+      || requestedWorktreeFolder.unresolved
+      || (requestedOwnerStatus !== 'local' && requestedOwnerStatus !== 'connected')
+      || !!requestedInventory?.error
+      || (!!requestedInventory?.data && !canCreateManagedWorktree(requestedInventory.data.worktrees))
+    if (permanentlyInvalid) onCloseNewWorktree()
+  }, [newWorktreeKey, requestedWorktreeFolder, requestedOwnerStatus, requestedInventory?.error, requestedInventory?.data, worldLoaded.value, onCloseNewWorktree])
 
   const totalVisible = foldersVal.reduce(
     (n, f) => n + f.sessions.filter(s => s.alive || s.resumable).length, 0,
@@ -652,6 +818,7 @@ export function Sidebar({
               peerStatus={peerStatus}
               onCloseSession={onCloseSession}
               onClick={onClose}
+              onNewWorktree={() => onOpenNewWorktree(f.key)}
             />
           ))}
           {connected && !hasProjects && (
@@ -677,6 +844,14 @@ export function Sidebar({
           )}
         </div>
       </aside>
+      {newWorktreeFolder && (
+        <NewWorktreeSheet
+          key={newWorktreeFolder.key}
+          folder={newWorktreeFolder}
+          onClose={onCloseNewWorktree}
+          restoreTriggerFocus={open || !matchMedia('(pointer: coarse)').matches}
+        />
+      )}
     </>
   )
 }

@@ -26,8 +26,10 @@ import { MOCK_SESSIONS, MOCK_PROJECTS, MOCK_PEERS, MOCK_HEALTH } from './mock-da
 import type { ResolvedTerminalOptions } from './settings-schema'
 import {
   ProjectWorktreesResponseSchema,
+  CreateProjectWorktreeResponseSchema,
   RemoveProjectWorktreeResponseSchema,
   type ProjectWorktrees,
+  type Worktree,
   type Session as ProtocolSession,
 } from '@gmux/protocol'
 
@@ -142,6 +144,23 @@ export async function ensureProjectWorktrees(slug: string, peer?: string, force 
       [key]: { data: current?.data, loading: false, error: err instanceof Error ? err.message : String(err) },
     }
   }
+}
+
+/** Create a branch-backed linked worktree on its filesystem-owning daemon. */
+export async function createProjectWorktree(slug: string, branch: string, base = 'HEAD', peer?: string): Promise<Worktree> {
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ branch, base }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  const parsed = CreateProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
+  return parsed.data.worktree
 }
 
 /** Safely remove a linked worktree on its filesystem-owning daemon. */
