@@ -5,7 +5,7 @@ import {
   markSessionRead, dismissSession, reorderSessions,
   handleActivity, isSessionActive, isSessionFading, activityMap,
   sessionStaleness, peers, peerAppearance, peerStatusByName,
-  isSessionUnavailable, urlPath, urlSearch, filteredSessions, selectedId,
+  isSessionUnavailable, aggregateSessionDotState, urlPath, urlSearch, filteredSessions, selectedId,
   navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
@@ -579,6 +579,37 @@ describe('peerAppearance', () => {
       { name: 'alpha', url: '', status: 'connected', session_count: 0 },
     ] })
     expect(peerAppearance.value.get('alpha')!.color).toBe(color1)
+  })
+})
+
+describe('aggregateSessionDotState', () => {
+  it('surfaces the highest-priority child dot for a collapsed group', () => {
+    const sessions = [
+      makeSession({ id: 'active' }),
+      makeSession({ id: 'done', unread: true }),
+      makeSession({ id: 'working', status: { label: 'Working', working: true } }),
+    ]
+    expect(aggregateSessionDotState(sessions, new Map([['active', 'active']]))).toBe('working')
+  })
+
+  it('keeps completed unread work visible unless that session is selected', () => {
+    const sessions = [makeSession({ id: 'done', unread: true })]
+    expect(aggregateSessionDotState(sessions, new Map())).toBe('unread')
+    expect(aggregateSessionDotState(sessions, new Map(), { selectedId: 'done' })).toBe('none')
+  })
+
+  it('uses working while a child session is resuming and none for an empty group', () => {
+    const sessions = [makeSession({ id: 'resume' })]
+    expect(aggregateSessionDotState(sessions, new Map(), { resumingId: 'resume' })).toBe('working')
+    expect(aggregateSessionDotState([], new Map())).toBe('none')
+  })
+
+  it('ignores sessions whose row uses an unavailable or sleeping icon', () => {
+    const sessions = [
+      makeSession({ id: 'remote', peer: 'tower', unread: true }),
+      makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true }),
+    ]
+    expect(aggregateSessionDotState(sessions, new Map(), { peerStatus: new Map([['tower', 'offline']]) })).toBe('none')
   })
 })
 

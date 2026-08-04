@@ -14,7 +14,7 @@ import {
   folders, selectedId, currentProjectKey,
   activityMap, projects, connState, worldLoaded,
   updateProjects, reorderSessions,
-  peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
+  peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState, aggregateSessionDotState,
   unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
   vsCodeServerUrl, vsCodeServerHomeDir,
   projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, createProjectWorktree, removeProjectWorktree,
@@ -299,6 +299,12 @@ function CheckoutSection({
   const removeTriggerRef = useRef<HTMLButtonElement>(null)
   const removeDialogRef = useRef<HTMLDivElement>(null)
   const displayItems = drag ? reorder(group.sessions, drag.from, drag.over) : group.sessions
+  const collapsedDot = aggregateSessionDotState(group.sessions, am, {
+    selectedId: selId,
+    resumingId,
+    peerStatus,
+  })
+  const collapsedArrival = useArrivalPulse(expanded ? 'none' : collapsedDot)
   const canLaunch = !group.fallback && group.path !== ''
   const canRemove = !!group.worktree && !group.primary && !group.fallback
   const handleDragEnd = () => {
@@ -359,7 +365,7 @@ function CheckoutSection({
           type="button"
           class="checkout-fold-btn"
           aria-expanded={expanded}
-          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}`}
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}${!expanded && collapsedDot !== 'none' ? ', session needs attention' : ''}`}
           onClick={() => setExpanded(value => !value)}
         >
           <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
@@ -368,6 +374,13 @@ function CheckoutSection({
           {group.primary && <span class="checkout-primary-label">default</span>}
           {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
           {!expanded && group.sessions.length > 0 && <span class="checkout-session-count">{group.sessions.length}</span>}
+          {!expanded && collapsedDot !== 'none' && (
+            <span
+              class={`session-dot-indicator ${collapsedDot}${collapsedArrival ? ` ${collapsedArrival}` : ''}`}
+              title="A session in this checkout needs attention"
+              aria-hidden="true"
+            />
+          )}
         </button>
         <div class="checkout-actions">
           {canLaunch && (

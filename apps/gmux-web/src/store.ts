@@ -463,6 +463,28 @@ export function sessionDotState(
   return 'none'
 }
 
+export function aggregateSessionDotState(
+  sessions: readonly Session[],
+  am: ReadonlyMap<string, 'active' | 'fading'>,
+  options: {
+    selectedId?: string | null
+    resumingId?: string | null
+    peerStatus?: ReadonlyMap<string, string>
+  } = {},
+): DotState {
+  const priority: Record<DotState, number> = { none: 0, fading: 1, active: 2, unread: 3, working: 4, error: 5 }
+  let aggregate: DotState = 'none'
+  for (const session of sessions) {
+    // Match the session row: unreachable and sleeping sessions render their
+    // own icon instead of an activity dot, so they do not contribute here.
+    if ((options.peerStatus && isSessionUnavailable(session, options.peerStatus)) || (!session.alive && session.resumable)) continue
+    let state = options.resumingId === session.id ? 'working' : sessionDotState(session, am)
+    if (options.selectedId === session.id && (state === 'error' || state === 'unread')) state = 'none'
+    if (priority[state] > priority[aggregate]) aggregate = state
+  }
+  return aggregate
+}
+
 export function isSessionUnavailable(
   session: { peer?: string },
   statusByName: ReadonlyMap<string, string>,
