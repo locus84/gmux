@@ -24,6 +24,7 @@ import { HostSuffix } from './host-suffix'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { fileBrowserPath, projectFileBrowserPath } from './file-browser'
 import { SheetBackdrop } from './sheet'
+import { readCheckoutExpanded, writeCheckoutExpanded } from './checkout-fold'
 import type { Session, Folder } from './types'
 
 // ── Types ──
@@ -292,7 +293,8 @@ function CheckoutSection({
   onReorder: (from: number, to: number) => void
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
-  const [expanded, setExpanded] = useState(true)
+  const foldIdentity = group.path || group.key
+  const [expanded, setExpanded] = useState(() => readCheckoutExpanded(folder.key, foldIdentity))
   const [removeOpen, setRemoveOpen] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [removeError, setRemoveError] = useState('')
@@ -366,7 +368,11 @@ function CheckoutSection({
           class="checkout-fold-btn"
           aria-expanded={expanded}
           aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}${!expanded && collapsedDot !== 'none' ? ', session needs attention' : ''}`}
-          onClick={() => setExpanded(value => !value)}
+          onClick={() => setExpanded(value => {
+            const next = !value
+            writeCheckoutExpanded(folder.key, foldIdentity, next)
+            return next
+          })}
         >
           <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
           <span class="checkout-tree-mark" aria-hidden="true">↳</span>
