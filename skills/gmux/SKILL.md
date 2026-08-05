@@ -15,12 +15,14 @@ the command begins.
 ```bash
 gmux -- <cmd> [args]         # run blocking; exits with the child's exit code
 gmux -d -- <cmd> [args]      # run detached; prints the session id on stdout
-gmux send <id> 'text' Enter  # type text and submit (Enter is explicit)
-gmux send <id> C-c           # send a control key (interrupt), no text
-gmux wait <id>               # block until the agent finishes its turn
+gmux send <id> 'text' Enter  # submit; Pi uses its injected extension, not PTY typing
+gmux send <id> C-c           # send a raw control key (interrupt)
+gmux wait <id>               # block until the agent truly settles
+gmux wait <id> --json        # for Pi, return the latest semantic result
 gmux tail <id> [-n N]        # last N lines of output (ANSI stripped; default 100)
 gmux ls [--json]             # list sessions (--json for machine parsing)
-gmux kill <id>               # SIGTERM the runner
+gmux kill <id>               # SIGTERM the runner but retain its session record
+gmux session dismiss <id>    # terminate if needed and permanently remove the record
 ```
 
 `ls` IDs are 8-character prefixes; pass them directly to
@@ -32,15 +34,21 @@ Because `gmux -- <cmd>` propagates the child's exit code, it composes:
 
 ## Sending input and keys
 
-`send` types literal text; any trailing token that is a key name is sent as a
-key. **Enter is not implicit** — add it to submit:
+`send` accepts literal text and trailing key names. **Enter is not implicit**.
+For Pi sessions, exactly `text + Enter` (including piped text + Enter) is routed
+through gmux's injected Pi extension via `sendUserMessage`; it does not touch the
+PTY. Draft text without Enter, control/navigation keys, `send-keys`, and non-Pi
+sessions remain raw terminal input:
 
 ```bash
 gmux send $id 'pytest -q' Enter   # type and run
 gmux send $id 'half a line'       # type without submitting
 gmux send $id C-c                 # interrupt (Ctrl-C)
 gmux send $id Escape              # send Escape
-echo "$body" | gmux send $id Enter  # pipe stdin, then submit (Enter optional)
+echo "$body" | gmux send $id Enter  # pipe stdin, then submit
+req="review-$(date +%s)-$$"
+gmux send --request-id "$req" --json $id 'review this' Enter
+gmux wait $id --request-id "$req" --json
 ```
 
 Key names follow tmux: `Enter`, `Tab`, `Escape`, `Up`/`Down`/`Left`/`Right`,
@@ -54,12 +62,17 @@ id=$(gmux -d -- pi "implement the feature")
 gmux wait $id
 
 gmux send $id "$(cat review.txt)" Enter
-gmux wait $id
-
-gmux tail $id -n 100
+result=$(gmux wait $id --json)
+printf '%s\n' "$result"
+# Independently verify the worktree before cleanup.
+gmux session dismiss $id
 ```
 
 ## Parallel orchestration
+
+For isolated branches and working directories, load the separate
+`gmux-worktree` skill and use `gmux worktree create` rather than manually
+combining Git worktree and session setup.
 
 ```bash
 ids=()
@@ -68,29 +81,44 @@ for ticket in fa-48 fa-49 fa-52; do
 done
 
 for id in "${ids[@]}"; do
-  gmux wait "$id" --timeout 600 || echo "$id failed: $?"
+  gmux wait "$id" --timeout 600 --json >"result-$id.json" || echo "$id failed: $?"
 done
 
 for id in "${ids[@]}"; do
-  echo "=== $id ==="
-  gmux tail "$id" -n 100
+  # Verify each worktree independently before dismissing its owned session.
+  gmux session dismiss "$id"
 done
 ```
 
 ## Waiting
 
-`gmux wait <id>` blocks until an **agent** session goes idle (turn finished) or
-the session exits, optionally bounded by `--timeout N`. Exit codes:
+`gmux wait <id>` blocks until an **agent** session goes idle or exits. For Pi it
+uses the extension's correlated semantic request and `agent_settled`, so retries,
+auto-compaction, and queued steering cannot create a false intermediate idle.
+`--json` returns the latest semantic Pi request's bounded final response. With
+multiple callers sharing one Pi session, provide the same stable
+`--request-id ID` to both `send` and `wait`; the default wait intentionally
+follows the session's latest semantic request. Exit codes:
 
 - `0` agent reached idle (or session exited)
 - `2` session died before going idle
 - `3` `--timeout` elapsed
+- `4` correlated Pi delivery/turn failed
 
 Plain **shell** commands don't emit an idle signal and are rejected, so run
 those blocking instead: `gmux -- make build < /dev/null` exits with the
-command's own status. (Waiting on arbitrary output — "until this text
-appears" — is planned as a server-side condition; until then, poll `gmux tail`
-yourself if you must.)
+command's own status. Never implement agent orchestration with repeated
+`tail`/`sleep`/resend loops: send once, wait once, consume the structured result,
+and treat `in_doubt` as requiring inspection rather than automatic retry.
+
+## Worker cleanup
+
+Hermes and other one-shot orchestrators own the IDs they launch. After an owned
+worker reaches idle or exits, harvest its final output and repository/test evidence,
+then run `gmux session dismiss <id>`. Dismiss only tracked worker IDs; never sweep
+all sessions for a project. `dismiss` removes the session record but does not remove
+its Git worktree. Keep user-opened interactive sessions resumable unless the user
+asks to dismiss them.
 
 ## Other agents have one-shot modes
 

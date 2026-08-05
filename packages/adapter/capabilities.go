@@ -53,6 +53,13 @@ type SessionFiler interface {
 	ParseSessionFile(path string) (*SessionFileInfo, error)
 }
 
+// SessionFallbackFiler is optionally implemented by hooked agents whose
+// session file stores both an explicit user name and a generated conversation
+// fallback. The runner uses this to keep those title sources separate.
+type SessionFallbackFiler interface {
+	ParseSessionFallback(path string) (*SessionFileInfo, error)
+}
+
 // FileMonitor is implemented by adapters that want to react to changes
 // in their attributed session file. gmuxd calls ParseNewLines when
 // inotify fires on an attributed file.

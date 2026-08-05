@@ -23,6 +23,7 @@ type State struct {
 	Cwd           string            `json:"cwd"`
 	Kind          string            `json:"kind"`
 	WorkspaceRoot string            `json:"workspace_root,omitempty"`
+	GitLayout     string            `json:"git_layout,omitempty"`
 	Remotes       map[string]string `json:"remotes,omitempty"`
 
 	// Process state (owned by runner)
@@ -32,9 +33,13 @@ type State struct {
 	StartedAt string `json:"started_at"`
 	ExitedAt  string `json:"exited_at,omitempty"`
 
-	// Title sources. Display title is resolved: adapter > shell > command basename.
-	ShellTitle   string `json:"shell_title,omitempty"`
-	AdapterTitle string `json:"adapter_title,omitempty"`
+	// Title sources. Display title is resolved:
+	// explicit mux name > agent-native explicit name > application terminal
+	// title > adapter fallback > command.
+	ExplicitTitle string `json:"explicit_title"`
+	AgentTitle    string `json:"agent_title"`
+	ShellTitle    string `json:"shell_title,omitempty"`
+	AdapterTitle  string `json:"adapter_title,omitempty"`
 
 	// Other display fields
 	Subtitle string          `json:"subtitle,omitempty"`
@@ -84,7 +89,10 @@ type Config struct {
 	BinaryHash    string
 	RunnerVersion string
 	WorkspaceRoot string
+	GitLayout     string
 	Remotes       map[string]string
+	ExplicitTitle string
+	AgentTitle    string
 }
 
 // New creates a new session state.
@@ -96,15 +104,19 @@ func New(cfg Config) *State {
 		Cwd:           cfg.Cwd,
 		Kind:          cfg.Kind,
 		WorkspaceRoot: cfg.WorkspaceRoot,
+		GitLayout:     cfg.GitLayout,
 		Remotes:       cfg.Remotes,
 		SocketPath:    cfg.SocketPath,
 		BinaryHash:    cfg.BinaryHash,
 		RunnerVersion: cfg.RunnerVersion,
+		ExplicitTitle: cfg.ExplicitTitle,
+		AgentTitle:    cfg.AgentTitle,
 		Alive:         false,
 	}
 }
 
-// Title returns the resolved display title: adapter > shell > command basename.
+// Title returns the resolved display title:
+// explicit mux name > agent-native explicit name > terminal > adapter > command.
 func (s *State) Title() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -112,11 +124,17 @@ func (s *State) Title() string {
 }
 
 func (s *State) titleLocked() string {
-	if s.AdapterTitle != "" {
-		return s.AdapterTitle
+	if s.ExplicitTitle != "" {
+		return s.ExplicitTitle
+	}
+	if s.AgentTitle != "" {
+		return s.AgentTitle
 	}
 	if s.ShellTitle != "" {
 		return s.ShellTitle
+	}
+	if s.AdapterTitle != "" {
+		return s.AdapterTitle
 	}
 	return commandBasename(s.Command)
 }
@@ -188,7 +206,29 @@ func (s *State) SetStatus(status *adapter.Status) {
 	s.emit(Event{Type: "status", Data: status})
 }
 
-// SetAdapterTitle sets the high-priority title from the adapter/file monitor.
+// SetExplicitTitle sets or clears the mux-owned session name.
+func (s *State) SetExplicitTitle(title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ExplicitTitle == title {
+		return
+	}
+	s.ExplicitTitle = title
+	s.emitMetaLocked()
+}
+
+// SetAgentTitle sets or clears an explicit name chosen inside the child agent.
+func (s *State) SetAgentTitle(title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.AgentTitle == title {
+		return
+	}
+	s.AgentTitle = title
+	s.emitMetaLocked()
+}
+
+// SetAdapterTitle sets the generated fallback title from the adapter/file monitor.
 func (s *State) SetAdapterTitle(title string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -199,7 +239,7 @@ func (s *State) SetAdapterTitle(title string) {
 	s.emitMetaLocked()
 }
 
-// SetShellTitle sets the terminal/OSC title, used when no adapter title is set.
+// SetShellTitle sets the application-controlled terminal/OSC title.
 func (s *State) SetShellTitle(title string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -291,12 +331,14 @@ func (s *State) SetTerminalSize(cols, rows uint16) {
 }
 
 func (s *State) emitMetaLocked() {
+	// Include every title input, including empty strings, so a reconnecting
+	// daemon can distinguish "clear this source" from "field absent".
 	data := map[string]string{
-		"title":       s.titleLocked(),
-		"shell_title": s.ShellTitle,
-	}
-	if s.AdapterTitle != "" {
-		data["adapter_title"] = s.AdapterTitle
+		"title":          s.titleLocked(),
+		"explicit_title": s.ExplicitTitle,
+		"agent_title":    s.AgentTitle,
+		"shell_title":    s.ShellTitle,
+		"adapter_title":  s.AdapterTitle,
 	}
 	if s.Subtitle != "" {
 		data["subtitle"] = s.Subtitle

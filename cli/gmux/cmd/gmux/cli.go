@@ -12,23 +12,26 @@ import (
 type mode int
 
 const (
-	modeHelp      mode = iota // print usage and exit
-	modeVersion               // print version and exit
-	modeOpen                  // open the web UI
-	modeRun                   // run a command in a new session (gmux -- <cmd>)
-	modeList                  // gmux ls
-	modeAttach                // gmux attach <id>
-	modeTail                  // gmux tail <id>
-	modeKill                  // gmux kill <id>
-	modeSend                  // gmux send <id> <text> [keys...]
-	modeSendKeys              // gmux send-keys -t <id> ... (tmux-compat)
-	modeWait                  // gmux wait <id>
-	modeDaemon                // gmux daemon <start|stop|restart|status|log-path>
-	modeAuth                  // gmux auth
-	modeRemote                // gmux remote
-	modeDumpEnv               // (internal) gmux __dump-env
-	modeCodexHook             // (internal) gmux __codex-hook <Event>
-	modeClaudeHook            // (internal) gmux __claude-hook
+	modeHelp       mode = iota // print usage and exit
+	modeVersion                // print version and exit
+	modeOpen                   // open the web UI
+	modeRun                    // run a command in a new session (gmux -- <cmd>)
+	modeList                   // gmux ls
+	modeAttach                 // gmux attach <id>
+	modeTail                   // gmux tail <id>
+	modeKill                   // gmux kill <id>
+	modeSend                   // gmux send <id> <text> [keys...]
+	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
+	modeWait                   // gmux wait <id>
+	modeSession                // gmux session rename|dismiss ...
+	modeWorktree               // gmux worktree <current|ps|create>
+	modeWorkspace              // gmux workspace add <path>
+	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path>
+	modeAuth                   // gmux auth
+	modeRemote                 // gmux remote
+	modeDumpEnv                // (internal) gmux __dump-env
+	modeCodexHook              // (internal) gmux __codex-hook <Event>
+	modeClaudeHook             // (internal) gmux __claude-hook
 )
 
 // command is the fully-parsed CLI invocation. One struct for every
@@ -38,11 +41,13 @@ type command struct {
 	mode mode
 
 	// run (modeRun / internal __run)
-	detach      bool
-	runArgs     []string // the wrapped command, verbatim
-	resumeID    string   // internal: reuse this session id
-	initialCols int      // internal: pre-size PTY width
-	initialRows int      // internal: pre-size PTY height
+	detach            bool
+	runArgs           []string // the wrapped command, verbatim
+	resumeID          string   // internal: reuse this session id
+	initialCols       int      // internal: pre-size PTY width
+	initialRows       int      // internal: pre-size PTY height
+	initialTitle      string   // internal: preserve mux-owned name across resume/restart
+	initialAgentTitle string   // internal: preserve agent-native name across resume/restart
 
 	// session-addressing verbs (attach/tail/kill/send/send-keys/wait)
 	ref string // session reference; may carry an @peer suffix
@@ -56,8 +61,9 @@ type command struct {
 	raw       bool
 
 	// send
-	sendText *string  // literal text to type (nil = none)
-	sendKeys []string // trailing key-name tokens (Enter, C-c, ...)
+	sendText  *string  // literal text to type (nil = none)
+	sendKeys  []string // trailing key-name tokens (Enter, C-c, ...)
+	requestID string   // semantic Pi request correlation (optional)
 
 	// send-keys (tmux-compat)
 	keysLiteral bool     // -l: treat args as literal text, not key names
@@ -65,6 +71,25 @@ type command struct {
 
 	// wait
 	timeout int // --timeout seconds (0 = none)
+
+	// session
+	sessionSub   string
+	sessionTitle string
+	clearTitle   bool
+
+	// workspace
+	workspaceSub  string
+	workspacePath string
+
+	// worktree
+	worktreeSub      string
+	worktreeSelector string
+	worktreeName     string
+	worktreeRepo     string
+	worktreeBase     string
+	worktreePath     string
+	worktreeAgent    string
+	worktreePrompt   string
 
 	// daemon
 	daemonSub string // start|stop|restart|status|log-path
@@ -79,7 +104,7 @@ type command struct {
 // command in the error-only migration shim.
 var reservedVerbs = []string{
 	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "daemon", "auth", "remote", "version", "help",
+	"wait", "session", "worktree", "workspace", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -161,6 +186,12 @@ func parseCLI(args []string) (*command, error) {
 		return parseSendKeys(rest)
 	case "wait":
 		return parseWait(rest)
+	case "session":
+		return parseSession(rest)
+	case "worktree":
+		return parseWorktree(rest)
+	case "workspace":
+		return parseWorkspace(rest)
 	case "daemon":
 		return parseDaemon(rest)
 	case "auth":
@@ -257,10 +288,29 @@ func parseTail(args []string) (*command, error) {
 // literal text; any further bare tokens are key-name tokens. With no
 // text and no keys, stdin supplies the text.
 func parseSend(args []string) (*command, error) {
+	c := &command{mode: modeSend}
+	// Send text is intentionally positional and may begin with a dash. Keep
+	// semantic-control flags explicit and before the session reference.
+	for len(args) > 0 {
+		switch args[0] {
+		case "--json":
+			c.json = true
+			args = args[1:]
+		case "--request-id":
+			if len(args) < 2 || args[1] == "" {
+				return nil, errors.New("--request-id requires a value")
+			}
+			c.requestID = args[1]
+			args = args[2:]
+		default:
+			goto parsedSendFlags
+		}
+	}
+parsedSendFlags:
 	if len(args) < 1 {
 		return nil, errors.New("send requires a session id")
 	}
-	c := &command{mode: modeSend, ref: args[0]}
+	c.ref = args[0]
 	rest := args[1:]
 	if len(rest) > 0 {
 		// Heuristic: the first non-key token is the literal text; the
@@ -296,10 +346,112 @@ func parseSendKeys(args []string) (*command, error) {
 	return c, nil
 }
 
+func parseWorktree(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("worktree requires one of: current, ps, create")
+	}
+	c := &command{mode: modeWorktree, worktreeSub: args[0], worktreeBase: "HEAD"}
+	fs := newFlagSet("worktree " + c.worktreeSub)
+	switch c.worktreeSub {
+	case "current":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return nil, err
+		}
+		if len(fs.Args()) != 0 {
+			return nil, errors.New("worktree current takes no arguments")
+		}
+	case "ps":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) > 1 {
+			return nil, errors.New("worktree ps takes at most one selector")
+		}
+		if len(pos) == 1 {
+			c.worktreeSelector = pos[0]
+		}
+	case "create":
+		fs.StringVar(&c.worktreeRepo, "repo", "", "repository path (default current directory)")
+		fs.StringVar(&c.worktreeBase, "base", "HEAD", "base ref")
+		fs.StringVar(&c.worktreePath, "path", "", "destination path (default: managed XDG data directory)")
+		fs.StringVar(&c.worktreeAgent, "agent", "", "gmux launcher id")
+		fs.StringVar(&c.worktreePrompt, "prompt", "", "initial agent prompt")
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) != 1 {
+			return nil, errors.New("worktree create requires exactly one name")
+		}
+		c.worktreeName = pos[0]
+		if c.worktreePrompt != "" && c.worktreeAgent == "" {
+			return nil, errors.New("--prompt requires --agent")
+		}
+	default:
+		return nil, fmt.Errorf("unknown worktree command %q", c.worktreeSub)
+	}
+	return c, nil
+}
+
+func parseWorkspace(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("workspace requires one of: add")
+	}
+	if args[0] != "add" {
+		return nil, fmt.Errorf("unknown workspace command %q", args[0])
+	}
+	if len(args) != 2 || args[1] == "" {
+		return nil, errors.New("workspace add requires exactly one path")
+	}
+	return &command{mode: modeWorkspace, workspaceSub: "add", workspacePath: args[1]}, nil
+}
+
+func parseSession(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("session requires one of: rename, dismiss")
+	}
+	switch args[0] {
+	case "dismiss":
+		if len(args) != 2 || args[1] == "" {
+			return nil, errors.New("session dismiss requires exactly one session id")
+		}
+		return &command{mode: modeSession, sessionSub: "dismiss", ref: args[1]}, nil
+	case "rename":
+		c := &command{mode: modeSession, sessionSub: "rename"}
+		fs := newFlagSet("session rename")
+		fs.BoolVar(&c.clearTitle, "clear", false, "clear the explicit session name")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if c.clearTitle {
+			if len(pos) != 1 {
+				return nil, errors.New("session rename --clear requires exactly one session id")
+			}
+			c.ref = pos[0]
+			return c, nil
+		}
+		if len(pos) != 2 || strings.TrimSpace(pos[1]) == "" {
+			return nil, errors.New("session rename requires a session id and non-empty name")
+		}
+		c.ref = pos[0]
+		c.sessionTitle = pos[1]
+		return c, nil
+	default:
+		return nil, fmt.Errorf("unknown session command %q", args[0])
+	}
+}
+
 func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
 	fs.IntVar(&c.timeout, "timeout", 0, "fail after N seconds")
+	fs.BoolVar(&c.json, "json", false, "print the settled Pi result as JSON")
+	fs.StringVar(&c.requestID, "request-id", "", "wait for this semantic Pi request id")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, err
@@ -334,6 +486,8 @@ func parseInternalRun(args []string) (*command, error) {
 	fs.StringVar(&c.resumeID, "resume-id", "", "reuse this session id")
 	fs.IntVar(&c.initialCols, "initial-cols", 0, "pre-size PTY width")
 	fs.IntVar(&c.initialRows, "initial-rows", 0, "pre-size PTY height")
+	fs.StringVar(&c.initialTitle, "initial-title", "", "preserve the mux-owned session name")
+	fs.StringVar(&c.initialAgentTitle, "initial-agent-title", "", "preserve the agent-native session name")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -441,10 +595,22 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux ls [--all] [--json]          list sessions
   gmux attach <id>                  reattach to a session
   gmux tail <id> [-n N] [--raw]     print recent output (snapshot)
-  gmux send <id> <text> [Key...]    type text and/or send keys (e.g. Enter, C-c)
+  gmux send [--request-id ID] [--json] <id> <text> [Key...]
+                                      submit Pi text or send raw keys
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
-  gmux wait <id> [--timeout N]      block until an agent session is idle
+  gmux wait <id> [--timeout N] [--json]  wait for settled agent result
   gmux kill <id>                    terminate a session
+  gmux session rename <id> <name>   set the explicit session name
+  gmux session rename <id> --clear  reveal the application/fallback title
+  gmux session dismiss <id>         terminate and remove without keeping resume state
+
+Workspaces (local only):
+  gmux workspace add <path>         add a directory to the workspace list
+
+Git worktrees (local only):
+  gmux worktree current [--json]    show the enclosing worktree
+  gmux worktree ps [ref] [--json]   show worktrees and their live sessions
+  gmux worktree create <name> ...   create a worktree and optionally launch an agent
 
 UI & pairing:
   gmux open                         open the web UI

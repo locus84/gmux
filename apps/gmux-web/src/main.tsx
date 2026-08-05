@@ -16,6 +16,7 @@ import type { Session } from './types'
 import { SettingsModal } from './settings'
 import { ProjectHub } from './project-hub'
 import { Home } from './home'
+import { FileBrowserView } from './file-browser-view'
 import { installCopySession } from './mock-data/export-session'
 import { installVersionWatch } from './version-watch'
 
@@ -23,7 +24,7 @@ import {
   sessions, connState, selected, selectedId, view, health, peers,
   terminalOptions, keybinds, macCommandIsCtrl,
   unreadCount, keyboardOpen, terminalScrolledUp, terminalScrollToBottom,
-  urlPath, urlSearch,
+  urlPath, urlSearch, projects,
   initStore, setNavigate, navigateToSession,
   dismissSession, resumeSession, restartSession,
   sessionStaleness,
@@ -52,6 +53,17 @@ installCopySession()
 // Mock mode is offline-only and the daemon version is fixed, so the
 // watcher is pointless there and would risk masking real bugs.
 if (!USE_MOCK) installVersionWatch()
+
+// Register the minimal service worker so Chrome can offer the installed-app
+// flow. The worker intentionally does not cache or intercept responses, so it
+// is safe in dev too: Vite HMR and all API requests still go to the network.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => {
+      console.warn('service worker registration failed:', err)
+    })
+  })
+}
 
 // Disable pinch-to-zoom app-wide. This is a terminal, not a document;
 // page zoom only breaks the layout. iOS Safari ignores user-scalable=no
@@ -209,6 +221,8 @@ const IconWordLeft  = () => <svg viewBox="0 0 18 14" width="20" height="16" {...
 const IconWordRight = () => <svg viewBox="0 0 18 14" width="20" height="16" {...S}><line x1="14.5" y1="3" x2="14.5" y2="11"/><path d="M5 7h7m0 0-3-3m3 3-3 3"/></svg>
 const IconSend = () => <svg viewBox="0 0 14 14" width="16" height="16" fill="currentColor" stroke="none"><path d="M3 2.5l8 4.5-8 4.5V8.5L7.5 7 3 5.5z"/></svg>
 const IconEnd = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M7 2v7m0 0-3-3m3 3 3-3"/><path d="M3.5 12h7"/></svg>
+const IconPaste = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M5 3.5h4"/><path d="M5.5 2.5h3l.5 1H5z"/><path d="M4 4h-.5a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1H10"/><path d="M5 7h4M5 9.5h3"/></svg>
+const IconAttach = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M5 7.5 8.8 3.7a2 2 0 0 1 2.8 2.8l-5 5a3 3 0 0 1-4.2-4.2l5.2-5.2"/><path d="M9.5 5 4.3 10.2a1 1 0 0 1-1.4-1.4L7.7 4"/></svg>
 
 // Press-and-hold auto-repeat for the navigation keys: fire once on press,
 // then after a short delay repeat until release. Arrows repeat briskly;
@@ -250,6 +264,8 @@ function MobileTerminalBar({
   altArmed,
   onMenu,
   onSend,
+  onPaste,
+  onAttachFile,
   onToggleCtrl,
   onToggleAlt,
   onCtrlConsumed,
@@ -260,6 +276,8 @@ function MobileTerminalBar({
   altArmed: boolean
   onMenu: () => void
   onSend: (data: string) => void
+  onPaste: () => void
+  onAttachFile: (file: File) => void
   onToggleCtrl: () => void
   onToggleAlt: () => void
   onCtrlConsumed: () => void
@@ -270,6 +288,7 @@ function MobileTerminalBar({
   // deliberately omitted. unreadCount excludes the selected session and
   // its value re-fires the arrival pulse when another session starts
   // waiting.
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const waitingCount = unreadCount.value
   const waiting = waitingCount > 0
   const arrival = useArrivalPulse(waiting ? 'unread' : 'none', waitingCount)
@@ -307,14 +326,22 @@ function MobileTerminalBar({
 
   // The bar is a CSS grid laid out via named areas (.mk-* → grid-area), so the
   // DOM order below is only tab/reading order — the visual arrangement lives
-  // in styles.css. Narrow phones get a 7×2 grid (empty top-left corner;
+  // in styles.css. Narrow phones get a 7×2 grid (paste at top-left;
   // scroll-end or empty top-right). Wider viewports (landscape / tablets)
   // collapse to a single row, and the widest step folds the word-jumps back
   // in. Keys never relabel; ctrl/alt only arm + highlight.
   const armedClass = (armed: boolean) => `mobile-bottom-action${armed ? ' armed' : ''}`
+  const chooseFile = () => fileInputRef.current?.click()
+  const handleFileChange = (ev: Event) => {
+    const input = ev.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (file) onAttachFile(file)
+  }
 
   return (
-    <div class="mobile-bottom-bar" role="toolbar" aria-label="Terminal keys" onMouseDown={keepFocus}>
+    <div class="mobile-input-stack">
+      <div class="mobile-bottom-bar" role="toolbar" aria-label="Terminal keys" onMouseDown={keepFocus}>
       <button
         class={`mobile-bottom-action menu-btn mk-menu${waiting ? ' bg-waiting' : ''}${arrival ? ` bg-${arrival}` : ''}`}
         onClick={() => {
@@ -326,6 +353,7 @@ function MobileTerminalBar({
         }}
         title="Open sessions"
       ><span class="mkey-face">☰</span></button>
+      <button class="mobile-bottom-action mk-paste" disabled={!canSend} onClick={onPaste} title="Paste clipboard"><span class="mkey-face"><IconPaste /></span></button>
       <button class="mobile-bottom-action mk-esc" disabled={!canSend} onClick={() => sendKey('\x1b')} title="Escape"><span class="mkey-face">esc</span></button>
       <button class="mobile-bottom-action mk-tab" disabled={!canSend} onClick={() => sendKey('\t')} title="Tab"><span class="mkey-face">tab</span></button>
       <button class={`${armedClass(ctrlArmed)} mk-ctrl`} disabled={!canSend} aria-pressed={ctrlArmed} onClick={onToggleCtrl} title={ctrlArmed ? 'Ctrl armed for next key' : 'Arm Ctrl'}><span class="mkey-face">ctrl</span></button>
@@ -336,10 +364,14 @@ function MobileTerminalBar({
       <button class="mobile-bottom-action mk-au" disabled={!canSend} {...repeat(() => sendKey('\x1b[A'), ARROW_REPEAT_MS)} title="Up arrow"><span class="mkey-face"><IconUp /></span></button>
       <button class="mobile-bottom-action mk-ar" disabled={!canSend} {...repeat(() => sendKey('\x1b[C'), ARROW_REPEAT_MS)} title="Right arrow"><span class="mkey-face"><IconRight /></span></button>
       <button class="mobile-bottom-action mk-wr" disabled={!canSend} {...repeat(() => sendWord('\x1b[C'), WORD_REPEAT_MS)} title="Word right"><span class="mkey-face"><IconWordRight /></span></button>
-      {terminalScrolledUp.value && (
+      {terminalScrolledUp.value ? (
         <button class="mobile-bottom-action mk-end" onClick={() => terminalScrollToBottom.value?.()} title="Scroll to bottom"><span class="mkey-face"><IconEnd /></span></button>
+      ) : (
+        <button class="mobile-bottom-action mk-attach" disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
       )}
+      <input ref={fileInputRef} class="mobile-attach-input" type="file" onChange={handleFileChange} />
       <button class="mobile-bottom-action send-btn mk-send" disabled={!canSend} onClick={() => sendKey('\r')} title={altArmed ? 'Send Alt+Enter' : 'Send'}><span class="mkey-face"><IconSend /></span></button>
+      </div>
     </div>
   )
 }
@@ -431,6 +463,10 @@ function App() {
   // collapsed entry doesn't reopen on a subsequent back.
   const settingsOpen = loc.query.settings !== undefined
   const settingsTab = loc.query.settings ?? 'projects'
+  const filesOpen = loc.query.files !== undefined
+    || loc.query.projectFiles !== undefined
+    || loc.query.pasteFile !== undefined
+  const newWorktreeKey = typeof loc.query.newWorktree === 'string' ? loc.query.newWorktree : undefined
   const openSettings = useCallback((tab = 'projects', replace = false) => {
     const params = new URLSearchParams(location.search)
     // Replace (don't push) when the requested tab is already active,
@@ -446,6 +482,17 @@ function App() {
     const qs = params.toString()
     loc.route(qs ? `${loc.path}?${qs}` : loc.path, true)
   }, [loc])
+  const openNewWorktree = useCallback((key: string) => {
+    const params = new URLSearchParams(location.search)
+    params.set('newWorktree', key)
+    loc.route(`${loc.path}?${params.toString()}`)
+  }, [loc])
+  const closeNewWorktree = useCallback(() => {
+    const params = new URLSearchParams(location.search)
+    params.delete('newWorktree')
+    const qs = params.toString()
+    loc.route(qs ? `${loc.path}?${qs}` : loc.path, true)
+  }, [loc])
 
   // Initialize the store (SSE, data fetching, effects).
   useEffect(() => initStore(), [])
@@ -456,6 +503,8 @@ function App() {
   const [altArmed, setAltArmed] = useState(false)
 
   const terminalInputRef = useRef<((data: string) => void) | null>(null)
+  const terminalPasteRef = useRef<(() => void) | null>(null)
+  const terminalAttachFileRef = useRef<((file: File) => void) | null>(null)
   const terminalFocusRef = useRef<(() => void) | null>(null)
 
   // Read signals.
@@ -470,6 +519,14 @@ function App() {
 
   const { notifPermission, requestNotifPermission } = usePresence()
 
+  // Navigate a freshly opened PWA window from a Web Push notification once
+  // the session/project snapshot has loaded enough to build its canonical URL.
+  useEffect(() => {
+    const sessionId = loc.query.notificationSession
+    if (typeof sessionId !== 'string' || !sessionId) return
+    navigateToSession(sessionId, true)
+  }, [loc, sessionsVal, projects.value])
+
   // ── Resume ──
   const [resumingId, setResumingId] = useState<string | null>(null)
 
@@ -479,7 +536,10 @@ function App() {
 
   const handleResume = useCallback((id: string) => {
     setResumingId(id)
-    resumeSession(id).catch(err => {
+    resumeSession(id).then(result => {
+      const registeredId = result?.session_id
+      if (registeredId && registeredId !== id) setResumingId(registeredId)
+    }).catch(err => {
       console.error('resume failed:', err)
       setResumingId(prev => prev === id ? null : prev)
     })
@@ -524,6 +584,12 @@ function App() {
   const handleTerminalInputReady = useCallback((send: ((data: string) => void) | null) => {
     terminalInputRef.current = send
   }, [])
+  const handleTerminalPasteReady = useCallback((paste: (() => void) | null) => {
+    terminalPasteRef.current = paste
+  }, [])
+  const handleTerminalAttachFileReady = useCallback((attach: ((file: File) => void) | null) => {
+    terminalAttachFileRef.current = attach
+  }, [])
   const handleTerminalFocusReady = useCallback((focus: (() => void) | null) => {
     terminalFocusRef.current = focus
     // Auto-focus on mount only off-touch; on touch this would pop the
@@ -531,6 +597,8 @@ function App() {
     if (!isTouchDevice()) focus?.()
   }, [])
   const handleMobileInput = useCallback((data: string) => { terminalInputRef.current?.(data) }, [])
+  const handleMobilePaste = useCallback(() => { terminalPasteRef.current?.() }, [])
+  const handleMobileAttachFile = useCallback((file: File) => { terminalAttachFileRef.current?.(file) }, [])
   const handleToggleCtrl = useCallback(() => {
     if (!canAttach) return
     setCtrlArmed(armed => !armed)
@@ -548,6 +616,9 @@ function App() {
         resumingId={resumingId}
         onCloseSession={handleCloseSession}
         onOpenSettings={() => { setSidebarOpen(false); openSettings() }}
+        newWorktreeKey={newWorktreeKey}
+        onOpenNewWorktree={openNewWorktree}
+        onCloseNewWorktree={closeNewWorktree}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
       />
@@ -558,6 +629,8 @@ function App() {
         onClose={closeSettings}
         onSelectTab={(t) => openSettings(t, true)}
       />
+
+      {filesOpen && <FileBrowserView />}
 
       <div class="main-panel">
         {viewVal !== null && viewVal.kind !== 'project' && viewVal.kind !== 'home' && (
@@ -587,6 +660,7 @@ function App() {
             projectSlug={viewVal.projectSlug}
             projectPeer={viewVal.projectPeer}
             onCloseSession={handleCloseSession}
+            onOpenMenu={() => setSidebarOpen(true)}
           />
         ) : selectedVal && (canAttach || USE_MOCK) && termOpts && keybindsVal ? (
           <TerminalView
@@ -599,6 +673,8 @@ function App() {
             altArmed={altArmed}
             onAltConsumed={handleAltConsumed}
             onInputReady={handleTerminalInputReady}
+            onPasteReady={handleTerminalPasteReady}
+            onAttachFileReady={handleTerminalAttachFileReady}
             onFocusReady={handleTerminalFocusReady}
           />
         ) : selectedVal && !selectedVal.alive && termOpts && !USE_MOCK ? (
@@ -615,6 +691,7 @@ function App() {
         ) : (
           <Home
             onManageProjects={() => openSettings()}
+            onOpenMenu={() => setSidebarOpen(true)}
             notifPermission={notifPermission}
             onRequestNotifPermission={requestNotifPermission}
           />
@@ -627,6 +704,8 @@ function App() {
             altArmed={altArmed}
             onMenu={() => setSidebarOpen(true)}
             onSend={handleMobileInput}
+            onPaste={handleMobilePaste}
+            onAttachFile={handleMobileAttachFile}
             onToggleCtrl={handleToggleCtrl}
             onToggleAlt={handleToggleAlt}
             onCtrlConsumed={handleCtrlConsumed}

@@ -1,10 +1,142 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func startActionsTestDaemon(t *testing.T, handler http.Handler) {
+	t.Helper()
+	stateDir, err := os.MkdirTemp("/tmp", "gmux-actions-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(stateDir) })
+	sockDir := filepath.Join(stateDir, "gmux")
+	t.Setenv("XDG_STATE_HOME", stateDir)
+	t.Setenv("GMUX_STATE_DIR", sockDir)
+	if err := os.MkdirAll(sockDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", filepath.Join(sockDir, "gmuxd.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Management commands call ensureGmuxd before their action. The fixture
+	// must look healthy or the test process will spawn a detached real gmuxd
+	// against this temporary state directory (and may contend with the user's
+	// launchd service on TCP 8790).
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/health" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": map[string]any{"version": version}})
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+	srv := &http.Server{Handler: root}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		ln.Close()
+	})
+}
+
+func TestCmdSendUsesSemanticTransportOnlyForSubmittedPiText(t *testing.T) {
+	var semantic int
+	var rawBodies []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": []map[string]any{
+			{"id": "sess-pi", "kind": "pi", "alive": true},
+			{"id": "sess-claude", "kind": "claude", "alive": true},
+		}})
+	})
+	mux.HandleFunc("/v1/sessions/sess-pi/message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			semantic++
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["text"] != "do it" || body["request_id"] != "req&+#" {
+				t.Errorf("semantic body=%v", body)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": map[string]any{"request_id": body["request_id"], "state": "queued"}})
+			return
+		}
+		if got := r.URL.Query().Get("request_id"); got != "req&+#" {
+			t.Errorf("polled request id=%q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": map[string]any{"request_id": "req&+#", "state": "running"}})
+	})
+	rawHandler := func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		rawBodies = append(rawBodies, string(body))
+		w.WriteHeader(http.StatusNoContent)
+	}
+	mux.HandleFunc("/v1/sessions/sess-pi/input", rawHandler)
+	mux.HandleFunc("/v1/sessions/sess-claude/input", rawHandler)
+	startActionsTestDaemon(t, mux)
+
+	text := "do it"
+	if code := cmdSend("pi", &text, []string{"Enter"}, "req&+#", false); code != 0 {
+		t.Fatalf("semantic send exit=%d", code)
+	}
+	draft := "draft"
+	if code := cmdSend("pi", &draft, nil, "", false); code != 0 {
+		t.Fatalf("raw draft exit=%d", code)
+	}
+	mixed := "mixed"
+	if code := cmdSend("pi", &mixed, []string{"Enter", "Tab"}, "", false); code != 0 {
+		t.Fatalf("mixed-key send exit=%d", code)
+	}
+	claude := "claude"
+	if code := cmdSend("claude", &claude, []string{"Enter"}, "", false); code != 0 {
+		t.Fatalf("non-Pi send exit=%d", code)
+	}
+	if code := cmdSendKeys("pi", []string{"Enter"}, false); code != 0 {
+		t.Fatalf("send-keys exit=%d", code)
+	}
+	wantRaw := []string{"draft", "mixed\r\t", "claude\r", "\r"}
+	if semantic != 1 || !reflect.DeepEqual(rawBodies, wantRaw) {
+		t.Fatalf("semantic=%d raw=%q want=%q", semantic, rawBodies, wantRaw)
+	}
+}
+
+func TestSessionDismissPostsResolvedPeerSession(t *testing.T) {
+	posted := false
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true,
+			"data": []map[string]any{{
+				"id": "sess-abc@laptop", "peer": "laptop", "alive": true,
+			}},
+		})
+	})
+	mux.HandleFunc("/v1/sessions/sess-abc@laptop/dismiss", func(w http.ResponseWriter, r *http.Request) {
+		posted = true
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	startActionsTestDaemon(t, mux)
+
+	if code := cmdSessionDismiss("abc@laptop"); code != 0 {
+		t.Fatalf("cmdSessionDismiss exit = %d", code)
+	}
+	if !posted {
+		t.Fatal("dismiss endpoint was not called")
+	}
+}
 
 // TestMatchSession covers the reference-resolution rules the CLI
 // documents: short form (as shown by --list), full ID, slug, and
@@ -186,6 +318,24 @@ func TestBuildSendBody(t *testing.T) {
 				t.Errorf("body = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSemanticSendText(t *testing.T) {
+	inline := "hello\nworld"
+	got, ok, err := semanticSendText(&inline, nil)
+	if err != nil || !ok || got != inline {
+		t.Fatalf("inline got=%q ok=%v err=%v", got, ok, err)
+	}
+	got, ok, err = semanticSendText(nil, strings.NewReader("piped"))
+	if err != nil || !ok || got != "piped" {
+		t.Fatalf("piped got=%q ok=%v err=%v", got, ok, err)
+	}
+	if _, ok, err := semanticSendText(nil, nil); err != nil || ok {
+		t.Fatalf("empty ok=%v err=%v", ok, err)
+	}
+	if _, _, err := semanticSendText(nil, bytes.NewReader([]byte{0xff})); err == nil {
+		t.Fatal("invalid UTF-8 was accepted")
 	}
 }
 

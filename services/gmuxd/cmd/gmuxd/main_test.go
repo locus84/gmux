@@ -589,12 +589,18 @@ func TestIsAllowedPeerProxyPath(t *testing.T) {
 		sub    string
 		want   bool
 	}{
+		// Allowed: read worktrees on the daemon that owns the project filesystem.
+		{"worktrees list allowed", http.MethodGet, "v1/projects/gmux/worktrees", true},
+		{"worktrees create allowed", http.MethodPost, "v1/projects/gmux/worktrees", true},
+		{"worktrees delete allowed", http.MethodDelete, "v1/projects/gmux/worktrees", true},
+		{"worktrees wrong method denied", http.MethodPut, "v1/projects/gmux/worktrees", false},
+
 		// Allowed: project session reorder.
 		{"reorder allowed", http.MethodPatch, "v1/projects/gmux/sessions", true},
 		{"reorder allowed weird slug", http.MethodPatch, "v1/projects/with-dash/sessions", true},
 
 		// Method must be PATCH.
-		{"GET denied", http.MethodGet, "v1/projects/gmux/sessions", false},
+		{"GET sessions denied", http.MethodGet, "v1/projects/gmux/sessions", false},
 		{"POST denied", http.MethodPost, "v1/projects/gmux/sessions", false},
 		{"DELETE denied", http.MethodDelete, "v1/projects/gmux/sessions", false},
 
@@ -627,7 +633,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	cmd := []string{"claude", "--continue", "-p", "hi"}
 
 	t.Run("fresh launch: __run then -- then command verbatim", func(t *testing.T) {
-		got := buildLaunchArgs("", 0, 0, cmd)
+		got := buildLaunchArgs("", "", "", 0, 0, cmd)
 		want := append([]string{"__run", "--"}, cmd...)
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -635,10 +641,12 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("restart: directives precede --, then the command", func(t *testing.T) {
-		got := buildLaunchArgs("sess-abc", 142, 47, cmd)
+		got := buildLaunchArgs("sess-abc", "named session", "agent name", 142, 47, cmd)
 		want := []string{
 			"__run",
 			"--resume-id=sess-abc",
+			"--initial-title=named session",
+			"--initial-agent-title=agent name",
 			"--initial-cols=142",
 			"--initial-rows=47",
 			"--",
@@ -650,7 +658,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("zero dims omit the size flags", func(t *testing.T) {
-		got := buildLaunchArgs("sess-1", 0, 0, cmd)
+		got := buildLaunchArgs("sess-1", "", "", 0, 0, cmd)
 		want := append([]string{"__run", "--resume-id=sess-1", "--"}, cmd...)
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -660,7 +668,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	t.Run("command flags survive intact (-- terminator)", func(t *testing.T) {
 		// The `--` terminator delivers the command verbatim even when its
 		// own args look like directive flags.
-		got := buildLaunchArgs("sess-1", 80, 24, []string{"weirdcli", "--resume-id=evil"})
+		got := buildLaunchArgs("sess-1", "", "", 80, 24, []string{"weirdcli", "--resume-id=evil"})
 		want := []string{
 			"__run",
 			"--resume-id=sess-1",
@@ -673,4 +681,96 @@ func TestBuildLaunchArgs(t *testing.T) {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	})
+}
+
+func TestResumableRunnerID(t *testing.T) {
+	if got := resumableRunnerID("sess-abc123"); got != "sess-abc123" {
+		t.Fatalf("valid session id = %q", got)
+	}
+	for _, id := range []string{"019eedf4-f2ec-7fae-82b1-6283edb68e18", "../sess-bad", ""} {
+		if got := resumableRunnerID(id); got != "" {
+			t.Fatalf("resumableRunnerID(%q) = %q, want fresh id", id, got)
+		}
+	}
+}
+
+func TestBuildRunnerEnvPinsDaemonPaths(t *testing.T) {
+	t.Setenv("GMUX_STATE_DIR", "/daemon/state")
+	t.Setenv("GMUX_SOCKET_DIR", "/daemon/sockets")
+	env := buildRunnerEnv([]string{
+		"PATH=/usr/bin",
+		"XDG_STATE_HOME=/login/state",
+		"XDG_RUNTIME_DIR=/login/runtime",
+		"GMUX_STATE_DIR=/login/gmux-state",
+		"GMUX_SOCKET_DIR=/login/sockets",
+	})
+
+	if got := envValue(env, "GMUX_STATE_DIR"); got != "/daemon/state" {
+		t.Fatalf("GMUX_STATE_DIR = %q, want daemon state dir", got)
+	}
+	if got := envValue(env, "GMUX_SOCKET_DIR"); got != "/daemon/sockets" {
+		t.Fatalf("GMUX_SOCKET_DIR = %q, want daemon socket dir", got)
+	}
+	if got := envValue(env, "XDG_STATE_HOME"); got != "/login/state" {
+		t.Fatalf("XDG_STATE_HOME = %q, want login env preserved for child command", got)
+	}
+}
+
+func TestLaunchGmuxWaitsForHandshake(t *testing.T) {
+	t.Setenv("SHELL", "")
+	t.Setenv("GMUX_STATE_DIR", "/daemon/state")
+	t.Setenv("GMUX_SOCKET_DIR", "/daemon/sockets")
+
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "gmux")
+	script := `#!/bin/sh
+if [ "$GMUX_STATE_DIR" != "/daemon/state" ]; then exit 10; fi
+if [ "$GMUX_SOCKET_DIR" != "/daemon/sockets" ]; then exit 11; fi
+if [ "$GMUX_HANDSHAKE_FD" != "3" ]; then exit 12; fi
+eval "printf 'sess-fake\\n' >&$GMUX_HANDSHAKE_FD"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, id, err := launchGmux(bin, []string{"pi"}, dir, "sess-requested", "named session", "agent name", 120, 40)
+	if err != nil {
+		t.Fatalf("launchGmux error: %v", err)
+	}
+	if pid <= 0 {
+		t.Fatalf("pid = %d", pid)
+	}
+	if id != "sess-fake" {
+		t.Fatalf("registered id = %q", id)
+	}
+}
+
+func TestReadRunnerHandshake(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	go func() {
+		_, _ = w.WriteString("sess-registered\n")
+		_ = w.Close()
+	}()
+
+	id, err := readRunnerHandshake(r, time.Second)
+	if err != nil {
+		t.Fatalf("readRunnerHandshake error: %v", err)
+	}
+	if id != "sess-registered" {
+		t.Fatalf("id = %q", id)
+	}
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
 }

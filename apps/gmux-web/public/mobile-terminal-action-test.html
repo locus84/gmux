@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-visual" />
+  <title>gmux mobile terminal action probe</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: max(14px, env(safe-area-inset-top)) 14px max(24px, env(safe-area-inset-bottom));
+      background: #080d19;
+      color: #eef2ff;
+    }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p { margin: 8px 0; color: #aab3d1; line-height: 1.45; }
+    code { color: #b8c7ff; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+    button, a.button {
+      min-height: 44px;
+      border: 1px solid #394262;
+      border-radius: 11px;
+      background: #182038;
+      color: #eef2ff;
+      padding: 0 12px;
+      font: inherit;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      touch-action: manipulation;
+    }
+    button.primary, a.button.primary { background: #3653c9; border-color: #6880ff; }
+    button:active, a.button:active { background: #263250; }
+    .card { border: 1px solid #29324e; border-radius: 15px; background: #11182c; padding: 12px; margin: 12px 0; }
+    .terminal-wrap { position: relative; border: 1px solid #394262; border-radius: 14px; overflow: hidden; background: #030712; }
+    .terminal {
+      min-height: 190px;
+      padding: 12px;
+      overflow: auto;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .terminal .path { color: #9ecbff; text-decoration: underline; text-decoration-style: dotted; }
+    .hidden-ta {
+      position: absolute;
+      left: 9px;
+      top: 9px;
+      width: 2em;
+      height: 1.4em;
+      min-height: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: transparent;
+      caret-color: transparent;
+      opacity: .01;
+      resize: none;
+      font-size: 16px;
+    }
+    .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill {
+      border: 1px solid #3c4b75;
+      background: #0b1327;
+      border-radius: 999px;
+      min-height: 44px;
+      padding: 0 14px;
+      max-width: 100%;
+    }
+    .pill span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .metrics { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .metric { background: #050914; border: 1px solid #29324e; border-radius: 10px; padding: 8px; overflow-wrap: anywhere; }
+    .metric b { display: block; color: #a9c1ff; margin-bottom: 4px; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #050914; border: 1px solid #29324e; border-radius: 10px; padding: 10px; max-height: 36vh; overflow: auto; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .small { font-size: 13px; color: #9aa6c7; }
+    .sheet-backdrop { position: fixed; inset: 0; display: none; align-items: end; justify-content: center; padding: 16px; background: rgba(0,0,0,.45); z-index: 10; }
+    .sheet-backdrop.open { display: flex; }
+    .sheet { width: min(520px, 100%); border: 1px solid #3c4b75; border-radius: 18px; background: #10172a; padding: 14px; box-shadow: 0 16px 60px rgba(0,0,0,.45); }
+    .sheet .target { background: #050914; border: 1px solid #29324e; border-radius: 10px; padding: 10px; overflow-wrap: anywhere; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  </style>
+</head>
+<body>
+  <h1>gmux mobile terminal action probe</h1>
+  <p>목표: 모바일에서 <b>터미널 표면 탭 = 키보드</b>가 뜨는 현상을 기준으로, 파일 열기 행동을 터미널 안/밖 어디에 둬야 하는지 확인합니다.</p>
+
+  <div class="row">
+    <button id="clear">Clear log</button>
+    <button id="copy">Copy report</button>
+    <button id="blur">Blur active input</button>
+  </div>
+
+  <section class="card">
+    <b>1. Terminal-like surface</b>
+    <p class="small">이 박스는 현재 gmux 모바일 터미널처럼 탭하면 숨은 textarea에 focus합니다. 파란 파일 경로를 눌러도 기본적으로 키보드가 뜨는지 봅니다.</p>
+    <div id="terminalWrap" class="terminal-wrap">
+      <textarea id="hiddenTa" class="hidden-ta" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" inputmode="text"></textarea>
+      <div id="terminal" class="terminal" role="textbox" aria-label="terminal-like surface" tabindex="0">tap terminal text below:
+
+read image file:
+<span class="path" data-path=".pi/tmp/a.png">/Users/rhee/WorkSpace/gmux/.pi/tmp/a.png</span>
+
+longer path that may wrap/truncate in real terminal:
+<span class="path" data-path=".pi/tmp/gmux-mobile-link-test.png">/Users/rhee/WorkSpace/gmux/.pi/tmp/gmux-mobile-link-test.png</span>
+
+Tap anywhere in this terminal-like area. If the keyboard opens, terminal-text click targets are not a viable primary mobile UX.</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <b>2. Out-of-terminal actions</b>
+    <p class="small">터미널 밖 버튼입니다. 이걸 누를 때 키보드가 뜨지 않아야 합니다. 실제 제품에서는 “최근 파일/이미지” pill 또는 toolbar 버튼 후보입니다.</p>
+    <div class="pill-row">
+      <button id="openShort" class="pill primary"><span>Open .pi/tmp/a.png</span></button>
+      <button id="openLong" class="pill"><span>Open gmux-mobile-link-test.png</span></button>
+      <button id="sheetBtn" class="pill"><span>Show file action sheet</span></button>
+    </div>
+  </section>
+
+  <section class="card metrics">
+    <div class="metric"><b>Active element</b><span id="active">-</span></div>
+    <div class="metric"><b>Viewport</b><span id="viewport">-</span></div>
+    <div class="metric"><b>Last action</b><span id="last">-</span></div>
+    <div class="metric"><b>Generated file-browser URL</b><span id="targetUrl">-</span></div>
+  </section>
+
+  <section class="card">
+    <b>Event log</b>
+    <pre id="log"></pre>
+  </section>
+
+  <div id="sheetBackdrop" class="sheet-backdrop">
+    <div class="sheet" role="dialog" aria-label="File actions">
+      <p class="small">Action sheet outside terminal surface</p>
+      <div id="sheetTarget" class="target">.pi/tmp/a.png</div>
+      <div class="row">
+        <button id="sheetOpen" class="primary">Open in files</button>
+        <button id="sheetClose">Close</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const logEl = $('log');
+  const activeEl = $('active');
+  const viewportEl = $('viewport');
+  const lastEl = $('last');
+  const targetUrlEl = $('targetUrl');
+  const hiddenTa = $('hiddenTa');
+  const terminal = $('terminal');
+  const sheet = $('sheetBackdrop');
+  const started = performance.now();
+
+  const params = new URLSearchParams(location.search);
+  const sessionId = params.get('session') || params.get('files') || 'sess-2052addb';
+
+  function now() { return (performance.now() - started).toFixed(1).padStart(7); }
+  function activeName() {
+    const el = document.activeElement;
+    if (!el) return '-';
+    return `${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${el.className ? '.' + String(el.className).replace(/\s+/g, '.') : ''}`;
+  }
+  function viewportText() {
+    const vv = window.visualViewport;
+    return `inner=${innerWidth}x${innerHeight}` + (vv ? ` visual=${Math.round(vv.width)}x${Math.round(vv.height)} offset=${Math.round(vv.offsetLeft)},${Math.round(vv.offsetTop)}` : ' visual=-');
+  }
+  function log(msg) {
+    logEl.textContent += `${now()} ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+    updateMetrics();
+  }
+  function updateMetrics() {
+    activeEl.textContent = activeName();
+    viewportEl.textContent = viewportText();
+  }
+  function fileUrl(path) {
+    const qs = new URLSearchParams(location.search);
+    qs.set('files', sessionId);
+    qs.set('filePath', path);
+    qs.delete('session');
+    return `${location.pathname}?${qs.toString()}`;
+  }
+  function openFile(path, source) {
+    const url = fileUrl(path);
+    lastEl.textContent = `${source}: ${path}`;
+    targetUrlEl.textContent = url;
+    log(`OPEN source=${source} path=${path} activeBefore=${activeName()}`);
+    // Do not navigate automatically by default; this probe is about focus/keyboard.
+    // Use hash so the URL changes visibly without leaving the probe.
+    history.replaceState(null, '', `${location.pathname}${location.search}#open=${encodeURIComponent(path)}`);
+  }
+
+  terminal.addEventListener('touchstart', ev => log(`terminal touchstart target=${ev.target.tagName}.${ev.target.className || ''}`), { passive: true });
+  terminal.addEventListener('touchend', ev => log(`terminal touchend target=${ev.target.tagName}.${ev.target.className || ''}`), { passive: true });
+  terminal.addEventListener('click', ev => {
+    const pathEl = ev.target.closest?.('[data-path]');
+    log(`terminal click target=${ev.target.tagName}.${ev.target.className || ''} path=${pathEl?.dataset.path || '-'} -> focus hidden textarea`);
+    hiddenTa.focus();
+    if (pathEl) openFile(pathEl.dataset.path, 'terminal-text-click');
+  });
+  hiddenTa.addEventListener('focus', () => log('hidden textarea focus'));
+  hiddenTa.addEventListener('blur', () => log('hidden textarea blur'));
+  hiddenTa.addEventListener('input', () => log(`hidden textarea input value=${JSON.stringify(hiddenTa.value)}`));
+
+  $('openShort').onclick = () => openFile('.pi/tmp/a.png', 'outside-pill');
+  $('openLong').onclick = () => openFile('.pi/tmp/gmux-mobile-link-test.png', 'outside-pill');
+  $('sheetBtn').onclick = () => { log('open sheet button'); sheet.classList.add('open'); };
+  $('sheetOpen').onclick = () => { openFile('.pi/tmp/a.png', 'action-sheet'); sheet.classList.remove('open'); };
+  $('sheetClose').onclick = () => { log('close sheet'); sheet.classList.remove('open'); };
+  sheet.addEventListener('click', ev => { if (ev.target === sheet) { log('sheet backdrop close'); sheet.classList.remove('open'); } });
+
+  $('blur').onclick = () => { document.activeElement?.blur?.(); log('manual blur'); };
+  $('clear').onclick = () => { logEl.textContent = ''; lastEl.textContent = '-'; targetUrlEl.textContent = '-'; updateMetrics(); };
+  $('copy').onclick = async () => {
+    const report = [`UA: ${navigator.userAgent}`, `touch=${navigator.maxTouchPoints}`, viewportText(), '', logEl.textContent].join('\n');
+    await navigator.clipboard.writeText(report);
+    log('copied report');
+  };
+
+  for (const name of ['resize', 'scroll']) window.addEventListener(name, () => log(`window ${name}`), { passive: true });
+  window.visualViewport?.addEventListener('resize', () => log('visualViewport resize'), { passive: true });
+  window.visualViewport?.addEventListener('scroll', () => log('visualViewport scroll'), { passive: true });
+  document.addEventListener('focusin', ev => log(`focusin ${activeName()}`));
+  document.addEventListener('focusout', ev => log(`focusout ${ev.target.tagName.toLowerCase()}#${ev.target.id || ''}`));
+
+  log(`loaded UA=${navigator.userAgent}`);
+  log(`session=${sessionId}`);
+  updateMetrics();
+})();
+</script>
+</body>
+</html>

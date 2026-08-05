@@ -114,10 +114,11 @@ it in the browser.
 
 ### `gmux send <id> [text] [Key...]`
 
-Inject input into a running session as if typed at the keyboard. The text is
-sent literally; any trailing arguments that name keys (`Enter`, `C-c`,
-`Escape`, `Up`, …) are sent as those keys. **Submission is explicit** — add a
-trailing `Enter` to dispatch a line; omit it to leave the input unsent.
+Send input to a running session. For Pi, literal text followed by exactly
+`Enter` is delivered semantically through gmux's injected Pi extension, not
+through the PTY. Draft text without Enter, control/navigation keys,
+`send-keys`, and other agent kinds remain raw terminal input. **Submission is
+explicit** — add a trailing `Enter` to dispatch a line.
 
 ```bash
 gmux send a3f20187 'describe yourself' Enter   # type and submit
@@ -125,6 +126,8 @@ gmux send a3f20187 'half a thought'            # type, leave it unsent
 gmux send a3f20187 C-c                          # interrupt (Ctrl-C)
 gmux send a3f20187 Escape                       # send Escape
 echo "$body" | gmux send a3f20187 Enter         # pipe stdin, then submit
+gmux send --request-id review-42 --json a3f20187 'review' Enter
+gmux wait a3f20187 --request-id review-42 --json
 ```
 
 When no text is given and stdin is a pipe, gmux reads stdin until EOF (capped
@@ -135,21 +138,24 @@ For verbatim tmux compatibility there's also `gmux send-keys -t <id> <keys...>`
 (all arguments are key names by default; `-l` sends them as literal text).
 Use plain `send` for everyday use; `send-keys` only when porting tmux commands.
 
-**Access control.** `send` is powerful — anything you send lands in the
-session's PTY, indistinguishable from keyboard input. Access is gated by
-filesystem permissions on the session's Unix socket (owner-only), so only the
-user who started a session can send to it. Peer sessions are reached through
-gmuxd's authenticated proxy.
+**Access control.** Both semantic Pi messages and raw input are gated by the
+session's owner-only Unix socket. Peer sessions are reached through gmuxd's
+authenticated proxy.
 
 ### `gmux wait <id>`
 
-Block until an **agent** session finishes its current turn (its spinner stops),
-optionally bounded by `--timeout N`.
+Block until an **agent** session settles, optionally bounded by `--timeout N`.
+For Pi, waiting follows the latest semantic send and uses `agent_settled`,
+including automatic retries, compaction retries, and queued steering. Add
+`--json` to return the bounded final Pi response and outcome. When multiple
+callers share a session, pass the same stable `--request-id` to `send` and
+`wait` for exact caller correlation.
 
 ```bash
 gmux send a3f20187 'do the thing' Enter
 gmux wait a3f20187
 gmux wait a3f20187 --timeout 600   # or fail after 600s
+gmux wait a3f20187 --json          # latest semantic Pi result
 ```
 
 The idle signal is the same `Status.Working` flag the UI's spinner consumes,
@@ -159,6 +165,7 @@ so `wait` returns the moment the agent emits its closing message. Exit codes
 - `0` — the agent reached idle
 - `2` — the session exited before becoming idle
 - `3` — `--timeout` elapsed
+- `4` — correlated Pi delivery/turn failed
 
 Plain **shell** sessions have no idle signal and are rejected with a clear
 error; to wait for a shell command, run it through the blocking piped form
@@ -175,6 +182,104 @@ session marked dead — the same path as the UI's kill button.
 ```bash
 gmux kill a3f20187
 ```
+
+### `gmux session dismiss <id>`
+
+Terminate a live session if needed and remove it from gmux instead of keeping a
+dead, resumable entry. Dead sessions can also be dismissed. Explicitly addressed
+peer sessions are supported.
+
+```bash
+gmux session dismiss a3f20187
+gmux session dismiss a3f20187@desktop
+```
+
+Use `gmux kill <id>` when you want the session to remain available for resume.
+
+### `gmux session rename <id> <name>`
+
+Set a mux-owned session name. It takes precedence over application-controlled
+OSC titles and adapter-generated fallbacks, without changing the session slug
+or URL identity. Use `--clear` to reveal the application/fallback title again.
+Live and dead sessions are supported, including explicitly addressed peers.
+
+```bash
+gmux session rename a3f20187 "auth refactor"
+gmux session rename a3f20187@desktop "remote build"
+gmux session rename a3f20187 --clear
+```
+
+## Managing workspaces
+
+### `gmux workspace add <path>`
+
+Add a local directory to gmux's workspace list, the same as entering an
+absolute path in the web UI's **Manage projects** screen. Relative paths are
+resolved from the shell's current directory, so the common form is:
+
+```bash
+mkdir my-project
+cd my-project
+gmux workspace add .
+```
+
+The path must already exist and be a directory. gmux resolves symlinks, sends
+the resulting absolute path to the local gmuxd, and prints the server-assigned
+workspace slug and canonical path. Duplicate paths are rejected. This command
+never adds a workspace on a network peer implicitly.
+
+## Git worktrees
+
+Worktree commands are local-only. They read Git metadata on this machine and
+never interpret a peer session's filesystem path locally.
+
+### `gmux worktree current`
+
+Show the worktree containing the current directory. `--json` emits its path,
+branch, HEAD, and Git state as an object.
+
+### `gmux worktree ps [selector]`
+
+List checkouts in the current repository and group their live local gmux
+sessions by actual cwd. Use `--json` for automation. Select one checkout with
+`current`, `branch:<branch>`, `path:<path>`, `name:<directory>`, or a unique bare
+branch/path/name.
+
+```bash
+gmux worktree ps
+gmux worktree ps branch:fix/login --json
+```
+
+### `gmux worktree create <name>`
+
+Create a new branch and linked worktree, optionally launching a registered gmux
+agent there and typing its initial prompt.
+
+```bash
+gmux worktree create fix-login \
+  --base origin/main \
+  --agent pi \
+  --prompt "Implement the login fix and run focused tests" \
+  --json
+```
+
+Options:
+
+- `--repo PATH` — source repository; defaults to the current checkout.
+- `--base REF` — creation ref; defaults to `HEAD`.
+- `--path PATH` — destination; defaults to the mirrored canonical repository path under `$XDG_DATA_HOME/gmux/worktrees` (normally `~/.local/share/gmux/worktrees`). Branch slashes become dashes in the final directory name.
+- `--agent LAUNCHER` — an available gmux launcher such as `pi`, `claude`, or `codex`.
+- `--prompt TEXT` — initial PTY input; requires `--agent`.
+- `--json` — emit the created worktree and optional session id.
+
+For example, repository `/Users/me/src/app` and branch `fix/login` produce
+`~/.local/share/gmux/worktrees/Users/me/src/app/fix-login` by default.
+
+Existing branches and paths are rejected. If agent startup or prompt delivery
+fails, gmux preserves the checkout and reports its path; a lost daemon response
+may be ambiguous, so inspect `gmux ls` before relaunching. There is intentionally
+no worktree removal command yet—review and integrate work before cleaning it up
+with Git.
 
 ## UI, pairing, and the daemon
 

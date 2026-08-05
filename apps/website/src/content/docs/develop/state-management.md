@@ -19,7 +19,7 @@ Session state flows one way: runners and file monitors produce it, `gmuxd` aggre
 
 Sessions owned by a peer go through `store.UpsertRemote` instead of `store.Upsert`. The difference is that `UpsertRemote` does **not** re-run `resolveTitle` or re-derive `resumable`: those fields were already authoritatively resolved on the spoke and arrive in the SSE payload. Canonicalization, duplicate-resume-key handling, unique-resume-key numbering, and the broadcast all still run.
 
-This split exists because the spoke keeps `shell_title` and `adapter_title` as internal fields and drops them in `MarshalJSON`. If the hub called `Upsert` on a remote session it would see those fields empty, fall through to the `CommandTitler` or the bare `kind` string, and overwrite the correct spoke-resolved `title`. `UpsertRemote` trusts the spoke. The alternative, putting the internal title fields on the wire, was rejected: it widens the public API surface for a purely internal concern.
+This split exists because the spoke keeps `explicit_title`, `agent_title`, `shell_title`, and `adapter_title` as internal fields and drops them in `MarshalJSON`. If the hub called `Upsert` on a remote session it would see those fields empty, fall through to the `CommandTitler` or the bare `kind` string, and overwrite the correct spoke-resolved `title`. `UpsertRemote` trusts the spoke. The alternative, putting the internal title fields on the wire, was rejected: it widens the public API surface for a purely internal concern.
 
 ## Who writes what
 
@@ -88,13 +88,13 @@ These are computed in `Upsert()` and `Update()`, never set manually:
 
 | Field | Derivation |
 |---|---|
-| `title` | `adapter_title` > `shell_title` > `CommandTitler` > adapter kind |
+| `title` | `explicit_title` > `agent_title` > `shell_title` > `adapter_title` > `CommandTitler` > adapter kind |
 | `resumable` | `!alive && has command` |
 | `stale` | `binary_hash` differs from gmuxd's expected runner hash |
 
 All dead sessions with a command are resumable, regardless of adapter kind. Adapters with native resume (pi, claude, codex) provide tool-specific resume commands via the `Resumer` interface. Adapters without it (shell) keep the original launch command, so "resume" re-runs it in the same working directory.
 
-**Title priority:** `adapter_title` always wins over `shell_title`. An empty `adapter_title` from the runner never overwrites a non-empty one on the daemon, preserving titles across resume where the daemon knows the title from file attribution but the freshly-started runner doesn't yet. The next fallback is the adapter's `CommandTitler` interface (shell uses this to show `pytest -x`). The final fallback is the adapter kind name (e.g. "codex").
+**Title priority:** `explicit_title` is a gmux-owned, user-chosen name and always wins. `agent_title` records an explicit name chosen inside an integrated agent such as pi `/name`. Application-controlled OSC 0/2 updates `shell_title`, which wins over the adapter's generated `adapter_title` fallback. Clearing a source immediately reveals the next source. The next fallback is the adapter's `CommandTitler` interface (shell uses this to show `pytest -x`); the final fallback is the adapter kind name (e.g. "codex"). Internal title sources are resolved on the owning daemon, while peers receive only the resolved `title`.
 
 **Internal vs API-visible fields.** Several fields are internal to gmuxd and excluded from the API response via `MarshalJSON`. Their derived outputs are exposed instead. See the [field map](/develop/session-schema#field-map) for the full breakdown.
 

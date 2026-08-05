@@ -42,12 +42,13 @@ const handshakeTimeout = 5 * time.Second
 const ptyDrainTimeout = 250 * time.Millisecond
 
 // runDirectives carries daemon→runner overrides for a /v1/launch,
-// /v1/resume, or /v1/restart. End-user invocations leave all three
-// fields zero. See the flag declarations in cli.go for semantics.
+// /v1/resume, or /v1/restart. End-user invocations leave all fields zero. See the flag declarations in cli.go for semantics.
 type runDirectives struct {
-	ResumeID    string
-	InitialCols int
-	InitialRows int
+	ResumeID          string
+	InitialCols       int
+	InitialRows       int
+	InitialTitle      string
+	InitialAgentTitle string
 }
 
 // runSession launches a new managed session for the given command.
@@ -142,8 +143,11 @@ func runSession(args []string, attach bool, dir runDirectives) {
 		SocketPath: sockPath,
 	})
 
-	// Detect VCS workspace root and remotes for grouping related sessions.
-	wsRoot := workspace.DetectRoot(workDir)
+	// Detect VCS workspace metadata once at session start. GitLayout is
+	// intentionally immutable for the session; a later git init appears after
+	// the runner is restarted rather than adding filesystem-watch state.
+	workspaceInfo := workspace.Detect(workDir)
+	wsRoot := workspaceInfo.Root
 	remotes := workspace.DetectRemotes(wsRoot)
 
 	// Create in-memory session state
@@ -153,10 +157,13 @@ func runSession(args []string, attach bool, dir runDirectives) {
 		Cwd:           workDir,
 		Kind:          a.Name(),
 		WorkspaceRoot: wsRoot,
+		GitLayout:     string(workspaceInfo.GitLayout),
 		Remotes:       remotes,
 		SocketPath:    sockPath,
 		BinaryHash:    binhash.Self(),
 		RunnerVersion: version,
+		ExplicitTitle: dir.InitialTitle,
+		AgentTitle:    dir.InitialAgentTitle,
 	})
 
 	// Common env vars — set for every child, per ADR-0005

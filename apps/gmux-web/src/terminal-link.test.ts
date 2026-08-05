@@ -26,6 +26,7 @@ beforeAll(() => {
 
 interface InternalLinkShape {
   text: string
+  gmuxFile?: true
   range: { start: { x: number, y: number }, end: { x: number, y: number } }
 }
 
@@ -163,6 +164,23 @@ describe('linkAtPoint', () => {
     expect(linkAtPoint(term, 1, 1)).toEqual({
       uri: 'https://evil.example/payload',
       label: 'Click here',
+    })
+  })
+
+  test('marks gmux file routes for internal long-press navigation', () => {
+    const { term } = makeFakeTerm({
+      resolveLink: () => ({
+        text: '/gmux/pi/session?files=sess-1&filePath=src%2Fmain.ts',
+        gmuxFile: true,
+        range: { start: { x: 1, y: 1 }, end: { x: 11, y: 1 } },
+      }),
+      bufferRows: ['src/main.ts'],
+    })
+
+    expect(linkAtPoint(term, 1, 1)).toEqual({
+      uri: '/gmux/pi/session?files=sess-1&filePath=src%2Fmain.ts',
+      label: 'src/main.ts',
+      internalFile: true,
     })
   })
 

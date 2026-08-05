@@ -117,6 +117,35 @@ func TestSubscribeReplacesExistingForSameID(t *testing.T) {
 	}
 }
 
+func TestMetaEventCanSetAndClearTitleLayers(t *testing.T) {
+	sessions := store.New()
+	sessions.Upsert(store.Session{
+		ID:            "sess-title",
+		Kind:          "pi",
+		ExplicitTitle: "old explicit",
+		ShellTitle:    "application title",
+	})
+	subs := NewSubscriptions(sessions)
+
+	subs.handleEvent("sess-title", "", "meta", []byte(`{"explicit_title":"new explicit"}`))
+	got, _ := sessions.Get("sess-title")
+	if got.Title != "new explicit" || got.ExplicitTitle != "new explicit" {
+		t.Fatalf("set: title=%q explicit=%q", got.Title, got.ExplicitTitle)
+	}
+
+	subs.handleEvent("sess-title", "", "meta", []byte(`{"agent_title":"agent name","explicit_title":""}`))
+	got, _ = sessions.Get("sess-title")
+	if got.Title != "agent name" || got.ExplicitTitle != "" || got.AgentTitle != "agent name" {
+		t.Fatalf("agent fallback: title=%q explicit=%q agent=%q", got.Title, got.ExplicitTitle, got.AgentTitle)
+	}
+
+	subs.handleEvent("sess-title", "", "meta", []byte(`{"agent_title":""}`))
+	got, _ = sessions.Get("sess-title")
+	if got.Title != "application title" || got.AgentTitle != "" {
+		t.Fatalf("clear: title=%q agent=%q", got.Title, got.AgentTitle)
+	}
+}
+
 // TestSubscribeOldDeferDoesNotEvictNewEntry pins the load-bearing
 // pointer-identity check in runSubscription's cleanup defer.
 //
@@ -233,6 +262,40 @@ func TestExitEventDoesNotResurrectDismissedSession(t *testing.T) {
 
 	if got, ok := sessions.Get(id); ok {
 		t.Fatalf("dismissed session was resurrected by late exit event: %+v", got)
+	}
+}
+
+func TestExitEventPreservesConcurrentExplicitRename(t *testing.T) {
+	const id = "sess-exit-rename-race"
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: id, Kind: "shell", Alive: true, Command: []string{"bash"}})
+
+	subs := NewSubscriptions(sessions)
+	onExitStarted := make(chan struct{})
+	allowOnExit := make(chan struct{})
+	subs.OnExit = func(sess *store.Session) bool {
+		close(onExitStarted)
+		<-allowOnExit
+		sess.Command = []string{"bash", "-l"}
+		return true
+	}
+
+	exitDone := make(chan struct{})
+	go func() {
+		subs.handleEvent(id, "", "exit", []byte(`{"exit_code":0}`))
+		close(exitDone)
+	}()
+	<-onExitStarted
+	sessions.Update(id, func(sess *store.Session) { sess.ExplicitTitle = "concurrent rename" })
+	close(allowOnExit)
+	<-exitDone
+
+	got, _ := sessions.Get(id)
+	if got.ExplicitTitle != "concurrent rename" || got.Title != "concurrent rename" {
+		t.Fatalf("rename lost across exit: explicit=%q title=%q", got.ExplicitTitle, got.Title)
+	}
+	if got.Alive || len(got.Command) != 2 {
+		t.Fatalf("exit fields not applied: alive=%v command=%v", got.Alive, got.Command)
 	}
 }
 

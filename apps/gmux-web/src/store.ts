@@ -21,10 +21,17 @@ import { navigateWithReload } from './version-watch'
 import { buildProjectFolders, discoverProjects } from './projects'
 import { resolveReferences, removeReferenceItems, removeHostReferenceItems, refKey, type UnresolvedHost } from './references'
 
-import { fetchFrontendConfig, buildTerminalOptions, resolveKeybinds, type ResolvedKeybind } from './config'
+import { fetchFrontendConfig, buildTerminalOptions, resolveUiScale, resolveKeybinds, type ResolvedKeybind } from './config'
 import { MOCK_SESSIONS, MOCK_PROJECTS, MOCK_PEERS, MOCK_HEALTH } from './mock-data/index'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import type { Session as ProtocolSession } from '@gmux/protocol'
+import {
+  ProjectWorktreesResponseSchema,
+  CreateProjectWorktreeResponseSchema,
+  RemoveProjectWorktreeResponseSchema,
+  type ProjectWorktrees,
+  type Worktree,
+  type Session as ProtocolSession,
+} from '@gmux/protocol'
 
 // ── HealthData type (used by both raw signal and consumers) ─────────────────
 
@@ -88,6 +95,96 @@ export const _rawWorld = signal<RawWorld>({
   peerProjects: {},
   peerDiscovered: {},
 })
+
+export interface ProjectWorktreeInventoryState {
+  data?: ProjectWorktrees
+  loading: boolean
+  error?: string
+}
+
+/** On-demand Git checkout inventories keyed by the owning host + project. */
+export const projectWorktreeInventories = signal<Record<string, ProjectWorktreeInventoryState>>({})
+const projectWorktreeInventoryRequests = new Map<string, number>()
+
+export function projectWorktreeInventoryKey(slug: string, peer?: string): string {
+  return `${peer ?? ''}::${slug}`
+}
+
+/** Fetch the checkout inventory from the daemon that owns the project filesystem. */
+export async function ensureProjectWorktrees(slug: string, peer?: string, force = false): Promise<void> {
+  const key = projectWorktreeInventoryKey(slug, peer)
+  const current = projectWorktreeInventories.value[key]
+  if (!force && (current?.loading || current?.data)) return
+  const requestId = (projectWorktreeInventoryRequests.get(key) ?? 0) + 1
+  projectWorktreeInventoryRequests.set(key, requestId)
+
+  projectWorktreeInventories.value = {
+    ...projectWorktreeInventories.value,
+    [key]: { ...current, loading: true, error: undefined },
+  }
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  try {
+    const resp = await fetch(url)
+    const body = await resp.json()
+    if (!resp.ok) {
+      throw new Error(body?.error?.message || `request failed (${resp.status})`)
+    }
+    const parsed = ProjectWorktreesResponseSchema.parse(body)
+    if (!parsed.ok) throw new Error(parsed.error.message)
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: parsed.data, loading: false },
+    }
+  } catch (err) {
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: current?.data, loading: false, error: err instanceof Error ? err.message : String(err) },
+    }
+  }
+}
+
+/** Create a branch-backed linked worktree on its filesystem-owning daemon. */
+export async function createProjectWorktree(slug: string, branch: string, base = 'HEAD', peer?: string): Promise<Worktree> {
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ branch, base }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  const parsed = CreateProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
+  return parsed.data.worktree
+}
+
+/** Safely remove a linked worktree on its filesystem-owning daemon. */
+export async function removeProjectWorktree(slug: string, path: string, peer?: string): Promise<void> {
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  const url = `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+  const resp = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) {
+    if (resp.status === 404) {
+      await ensureProjectWorktrees(slug, peer, true)
+      const refreshed = projectWorktreeInventories.value[projectWorktreeInventoryKey(slug, peer)]
+      if (refreshed?.data && !refreshed.data.worktrees.some(worktree => worktree.path === path)) return
+    }
+    throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  }
+  const parsed = RemoveProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
+}
 
 /** Merge a partial world update into `_rawWorld`. Used by SSE handlers,
  * bulk-fetch responses, and tests; callers don't have to spread the
@@ -366,6 +463,28 @@ export function sessionDotState(
   return 'none'
 }
 
+export function aggregateSessionDotState(
+  sessions: readonly Session[],
+  am: ReadonlyMap<string, 'active' | 'fading'>,
+  options: {
+    selectedId?: string | null
+    resumingId?: string | null
+    peerStatus?: ReadonlyMap<string, string>
+  } = {},
+): DotState {
+  const priority: Record<DotState, number> = { none: 0, fading: 1, active: 2, unread: 3, working: 4, error: 5 }
+  let aggregate: DotState = 'none'
+  for (const session of sessions) {
+    // Match the session row: unreachable and sleeping sessions render their
+    // own icon instead of an activity dot, so they do not contribute here.
+    if ((options.peerStatus && isSessionUnavailable(session, options.peerStatus)) || (!session.alive && session.resumable)) continue
+    let state = options.resumingId === session.id ? 'working' : sessionDotState(session, am)
+    if (options.selectedId === session.id && (state === 'error' || state === 'unread')) state = 'none'
+    if (priority[state] > priority[aggregate]) aggregate = state
+  }
+  return aggregate
+}
+
 export function isSessionUnavailable(
   session: { peer?: string },
   statusByName: ReadonlyMap<string, string>,
@@ -391,9 +510,86 @@ export const peerAppearance = computed<ReadonlyMap<string, PeerAppearance>>(() =
   return map
 })
 
-export const terminalOptions = signal<ResolvedTerminalOptions | null>(null)
+const terminalOptionsBase = signal<ResolvedTerminalOptions | null>(null)
 export const keybinds = signal<ResolvedKeybind[] | null>(null)
 export const macCommandIsCtrl = signal(false)
+export const vsCodeServerUrl = signal('')
+export const vsCodeServerHomeDir = signal('')
+
+export const UI_SCALE_MIN = 0.7
+export const UI_SCALE_MAX = 2
+const UI_SCALE_STORAGE_KEY = 'gmux.uiScale'
+
+export const uiScaleDefault = signal(1)
+export const uiScaleOverride = signal<number | null>(null)
+export const uiScaleEffective = computed(() => uiScaleOverride.value ?? uiScaleDefault.value)
+export const terminalOptions = computed<ResolvedTerminalOptions | null>(() => {
+  const base = terminalOptionsBase.value
+  if (!base) return null
+  return {
+    ...base,
+    fontSize: base.fontSize * uiScaleEffective.value,
+  }
+})
+
+export function clampUiScale(scale: number): number {
+  if (!Number.isFinite(scale)) return 1
+  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale))
+}
+
+function readBrowserUiScale(): number | null {
+  if (typeof localStorage === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(UI_SCALE_STORAGE_KEY)
+    if (raw == null || raw.trim() === '') return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? clampUiScale(parsed) : null
+  } catch {
+    return null
+  }
+}
+
+function writeBrowserUiScale(scale: number | null) {
+  if (typeof localStorage === 'undefined') return
+  try {
+    if (scale == null) localStorage.removeItem(UI_SCALE_STORAGE_KEY)
+    else localStorage.setItem(UI_SCALE_STORAGE_KEY, String(scale))
+  } catch {
+    // Storage may be unavailable (private mode / locked-down browser). The
+    // in-memory signal still updates for this tab; persistence just fails.
+  }
+}
+
+function applyUiScale(scale: number) {
+  if (typeof document === 'undefined') return
+  const root = document.documentElement.style
+  root.setProperty('--ui-scale', String(scale))
+  root.setProperty('--ui-font-size', `${14 * scale}px`)
+  root.setProperty('--sidebar-width', `${272 * scale}px`)
+  root.setProperty('--header-height', `${44 * scale}px`)
+  root.setProperty('--radius', `${6 * scale}px`)
+}
+
+function applyConfiguredUiScale(defaultScale: number) {
+  const nextDefault = clampUiScale(defaultScale)
+  const nextOverride = readBrowserUiScale()
+  uiScaleDefault.value = nextDefault
+  uiScaleOverride.value = nextOverride
+  applyUiScale(nextOverride ?? nextDefault)
+}
+
+export function setBrowserUiScale(scale: number) {
+  const next = clampUiScale(scale)
+  writeBrowserUiScale(next)
+  uiScaleOverride.value = next
+  applyUiScale(next)
+}
+
+export function resetBrowserUiScale() {
+  writeBrowserUiScale(null)
+  uiScaleOverride.value = null
+  applyUiScale(uiScaleDefault.value)
+}
 
 /**
  * True while the on-screen keyboard is open, detected via visual-viewport
@@ -836,6 +1032,7 @@ export function toUISession(s: ProtocolSession): Session {
     command: s.command ?? [],
     cwd: s.cwd ?? '',
     workspace_root: s.workspace_root ?? undefined,
+    git_layout: s.git_layout ?? undefined,
     remotes: s.remotes ?? undefined,
     kind: s.kind ?? 'shell',
     alive: s.alive,
@@ -884,6 +1081,48 @@ export function sessionStaleness(
   if (session.runner_version !== h.version) return 'version'
   if (session.binary_hash && h.runner_hash && session.binary_hash !== h.runner_hash) return 'hash'
   return null
+}
+
+/**
+ * Replace the full session roster from a snapshot.
+ *
+ * If the selected session's slug changed, move its URL in the same signal
+ * batch as the roster. Otherwise the new roster briefly resolves the old
+ * slug URL to the project hub, unmounting the terminal before URL
+ * normalization can recover.
+ *
+ * Returns IDs that were absent from the previous snapshot.
+ */
+export function replaceSessionSnapshot(list: Session[]): string[] {
+  const prev = _rawSessions.value
+  const prevIds = new Set(prev.map(s => s.id))
+  const newIds = list.filter(s => !prevIds.has(s.id)).map(s => s.id)
+
+  const selectedSessionId = selectedId.value
+  const oldSelected = selectedSessionId
+    ? prev.find(s => s.id === selectedSessionId)
+    : undefined
+  const newSelected = selectedSessionId
+    ? list.find(s => s.id === selectedSessionId)
+    : undefined
+  const newUrl = selectedSessionId
+    && oldSelected
+    && newSelected
+    && oldSelected.slug !== newSelected.slug
+    ? viewToPath(
+        { kind: 'session', sessionId: selectedSessionId },
+        projects.value,
+        list,
+      )
+    : null
+
+  batch(() => {
+    _rawSessions.value = list
+    if (newUrl) urlPath.value = newUrl
+  })
+
+  if (newUrl) navigate(newUrl, true)
+  return newIds
 }
 
 /** Upsert a session from SSE. Returns true if the session was new. */
@@ -1145,19 +1384,20 @@ export async function reorderSessions(
 
 // ── Session actions ─────────────────────────────────────────────────────────
 
-async function postAction(endpoint: string, body?: Record<string, unknown>): Promise<void> {
-  try {
-    const resp = await fetch(endpoint, {
-      method: 'POST',
-      ...(body ? {
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      } : {}),
-    })
-    if (!resp.ok) console.warn(`${endpoint} failed:`, resp.status, await resp.text().catch(() => ''))
-  } catch (err) {
-    console.warn(`${endpoint} error:`, err)
+async function postAction<T = unknown>(endpoint: string, body?: Record<string, unknown>): Promise<T | undefined> {
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    ...(body ? {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    } : {}),
+  })
+  const text = typeof resp.text === 'function' ? await resp.text().catch(() => '') : ''
+  const parsed = text ? JSON.parse(text) as { ok?: boolean; data?: T; error?: { message?: string } } : null
+  if (!resp.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error?.message || text || `${endpoint} failed (${resp.status})`)
   }
+  return parsed?.data
 }
 
 export function killSession(sessionId: string): Promise<void> {
@@ -1173,12 +1413,17 @@ export function dismissSession(sessionId: string): Promise<void> {
   return postAction(`/v1/sessions/${sessionId}/dismiss`)
 }
 
-export function resumeSession(sessionId: string): Promise<void> {
-  return postAction(`/v1/sessions/${sessionId}/resume`)
+export interface SessionActionResult {
+  pid?: number
+  session_id?: string
 }
 
-export function restartSession(sessionId: string): Promise<void> {
-  return postAction(`/v1/sessions/${sessionId}/restart`)
+export function resumeSession(sessionId: string): Promise<SessionActionResult | undefined> {
+  return postAction<SessionActionResult>(`/v1/sessions/${sessionId}/resume`)
+}
+
+export function restartSession(sessionId: string): Promise<SessionActionResult | undefined> {
+  return postAction<SessionActionResult>(`/v1/sessions/${sessionId}/restart`)
 }
 
 // ── Launch ───────────────────────────────────────────────────────────────────
@@ -1252,6 +1497,20 @@ export function navigateToSession(sessionId: string, replace?: boolean): boolean
   return true
 }
 
+async function redirectToLoginIfUnauthorized() {
+  try {
+    const resp = await fetch('/v1/health', {
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+    if (resp.status === 401) location.replace('/auth/login')
+  } catch {
+    // Real network/daemon failures should keep showing the connection
+    // error state instead of bouncing to the login page.
+  }
+}
+
 /**
  * Start the store: connect SSE, fetch initial data, start timers.
  * Call once from the app root.
@@ -1270,8 +1529,11 @@ export function initStore(): () => void {
       sessionsLoaded.value = true
       worldLoaded.value = true
       connState.value = 'connected'
-      terminalOptions.value = buildTerminalOptions(null, null)
+      terminalOptionsBase.value = buildTerminalOptions(null, null)
+      applyConfiguredUiScale(resolveUiScale(null))
       keybinds.value = resolveKeybinds(null, false)
+      vsCodeServerUrl.value = ''
+      vsCodeServerHomeDir.value = ''
     })
     const activeIds = MOCK_SESSIONS.filter(s => s.mockActive).map(s => s.id)
     activeIds.forEach(id => { handleActivity(id) })
@@ -1288,9 +1550,12 @@ export function initStore(): () => void {
   fetchFrontendConfig().then(fc => {
     const macCtrl = fc.settings?.macCommandIsCtrl === true
     batch(() => {
-      terminalOptions.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      terminalOptionsBase.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      applyConfiguredUiScale(resolveUiScale(fc.settings))
       macCommandIsCtrl.value = macCtrl
       keybinds.value = resolveKeybinds(fc.settings?.keybinds ?? null, macCtrl)
+      vsCodeServerUrl.value = (fc.settings?.vsCodeServerUrl ?? '').trim()
+      vsCodeServerHomeDir.value = (fc.settings?.vsCodeServerHomeDir ?? '').trim()
     })
   })
 
@@ -1303,7 +1568,10 @@ export function initStore(): () => void {
     // Browser EventSource auto-reconnects; flag the UI as degraded
     // until the next snapshot arrives. `sessionsLoaded` stays true
     // once it has flipped, so reconnect doesn't blank the sidebar.
-    if (connState.value === 'connecting') connState.value = 'error'
+    if (connState.value === 'connecting') {
+      connState.value = 'error'
+      void redirectToLoginIfUnauthorized()
+    }
   })
 
   // Protocol 2 (ADR 0001). The server pushes two snapshot kinds plus
@@ -1315,16 +1583,11 @@ export function initStore(): () => void {
       const envelope = JSON.parse(e.data) as { sessions?: ProtocolSession[] }
       const list = (envelope.sessions ?? []).map(toUISession)
 
-      // Detect newly-arrived IDs vs the previous snapshot so a
-      // pending launch (just-POSTed /v1/launch awaiting an id) can
-      // navigate to its session as soon as the daemon publishes it.
-      // Done before we commit the new array so consumers see the
-      // navigation against the new state.
-      const prevIds = new Set(_rawSessions.value.map(s => s.id))
-      const newIds = list.filter(s => !prevIds.has(s.id)).map(s => s.id)
+      // Detect newly-arrived IDs while replacing the roster. The helper
+      // also keeps a selected session's URL atomic with any slug change.
+      const newIds = replaceSessionSnapshot(list)
 
       batch(() => {
-        _rawSessions.value = list
         sessionsLoaded.value = true
         connState.value = 'connected'
       })

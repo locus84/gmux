@@ -36,6 +36,58 @@ func TestUpsertAndGet(t *testing.T) {
 	}
 }
 
+func TestTerminalTitleOverridesAdapterTitle(t *testing.T) {
+	s := New()
+	s.Upsert(Session{
+		ID:           "s1",
+		Kind:         "pi",
+		ShellTitle:   "π - renamed pane - project",
+		AdapterTitle: "adapter fallback",
+	})
+
+	got, _ := s.Get("s1")
+	if got.Title != "π - renamed pane - project" {
+		t.Fatalf("expected terminal title to win, got %q", got.Title)
+	}
+}
+
+func TestExplicitTitlePrecedenceAndClearing(t *testing.T) {
+	s := New()
+	s.Upsert(Session{
+		ID:            "s1",
+		Kind:          "pi",
+		ExplicitTitle: "사용자 이름",
+		AgentTitle:    "에이전트 이름",
+		ShellTitle:    "application title",
+		AdapterTitle:  "adapter fallback",
+	})
+
+	got, _ := s.Get("s1")
+	if got.Title != "사용자 이름" {
+		t.Fatalf("expected explicit title to win, got %q", got.Title)
+	}
+
+	s.Update("s1", func(sess *Session) {
+		sess.ShellTitle = "changed application title"
+		sess.AdapterTitle = "changed adapter fallback"
+	})
+	got, _ = s.Get("s1")
+	if got.Title != "사용자 이름" {
+		t.Fatalf("lower-priority update replaced explicit title: %q", got.Title)
+	}
+
+	s.Update("s1", func(sess *Session) { sess.ExplicitTitle = "" })
+	got, _ = s.Get("s1")
+	if got.Title != "에이전트 이름" {
+		t.Fatalf("clear did not reveal agent title: %q", got.Title)
+	}
+	s.Update("s1", func(sess *Session) { sess.AgentTitle = "" })
+	got, _ = s.Get("s1")
+	if got.Title != "changed application title" {
+		t.Fatalf("clearing agent title did not reveal application title: %q", got.Title)
+	}
+}
+
 func TestUpsertOverwrite(t *testing.T) {
 	s := New()
 	s.Upsert(Session{ID: "s1", Kind: "pi", AdapterTitle: "v1"})
@@ -940,6 +992,8 @@ func TestSessionMarshalJSON_WireFormat(t *testing.T) {
 		Alive:         true,
 		RunnerVersion: "1.2.0",
 		BinaryHash:    "aabbccdd",
+		ExplicitTitle: "internal-only",
+		AgentTitle:    "internal-only",
 		ShellTitle:    "internal-only",
 		AdapterTitle:  "internal-only",
 		Slug:          "my-slug",
@@ -965,6 +1019,12 @@ func TestSessionMarshalJSON_WireFormat(t *testing.T) {
 	}
 
 	// Internal fields must not appear on the wire.
+	if _, ok := m["explicit_title"]; ok {
+		t.Error("explicit_title must not appear in wire JSON")
+	}
+	if _, ok := m["agent_title"]; ok {
+		t.Error("agent_title must not appear in wire JSON")
+	}
 	if _, ok := m["shell_title"]; ok {
 		t.Error("shell_title must not appear in wire JSON")
 	}
@@ -982,8 +1042,10 @@ func TestSessionMarshalJSON_WireFormat(t *testing.T) {
 // merging) but never sent to clients. Add a field here if and only
 // if you are deliberately keeping it server-side.
 var internalSessionFields = map[string]struct{}{
-	"ShellTitle":   {},
-	"AdapterTitle": {},
+	"ExplicitTitle": {},
+	"AgentTitle":    {},
+	"ShellTitle":    {},
+	"AdapterTitle":  {},
 }
 
 // TestSessionMarshalJSON_AllFieldsAppearOnWire is the gotcha-catcher
@@ -1048,6 +1110,7 @@ func fullyPopulatedSession() Session {
 		Cwd:            "/tmp/work",
 		Kind:           "pi",
 		WorkspaceRoot:  "/tmp/work",
+		GitLayout:      "worktree",
 		Remotes:        map[string]string{"origin": "github.com/x/y"},
 		Alive:          true,
 		Pid:            42,
@@ -1067,6 +1130,8 @@ func fullyPopulatedSession() Session {
 		SessionFile:    "/home/u/.pi/sess.jsonl",
 		RunnerVersion:  "v1",
 		BinaryHash:     "hash",
+		ExplicitTitle:  "explicit-internal",
+		AgentTitle:     "agent-internal",
 		ShellTitle:     "shell-internal",
 		AdapterTitle:   "adapter-internal",
 		ProjectSlug:    "proj",

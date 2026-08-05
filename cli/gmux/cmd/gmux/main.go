@@ -34,9 +34,11 @@ func main() {
 		openUI()
 	case modeRun:
 		runSession(cmd.runArgs, !cmd.detach, runDirectives{
-			ResumeID:    cmd.resumeID,
-			InitialCols: cmd.initialCols,
-			InitialRows: cmd.initialRows,
+			ResumeID:          cmd.resumeID,
+			InitialCols:       cmd.initialCols,
+			InitialRows:       cmd.initialRows,
+			InitialTitle:      cmd.initialTitle,
+			InitialAgentTitle: cmd.initialAgentTitle,
 		})
 	case modeList:
 		os.Exit(cmdList(cmd.all, cmd.json))
@@ -47,11 +49,17 @@ func main() {
 	case modeAttach:
 		os.Exit(cmdAttach(cmd.ref))
 	case modeSend:
-		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys))
+		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys, cmd.requestID, cmd.json))
 	case modeSendKeys:
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
-		os.Exit(cmdWait(cmd.ref, cmd.timeout))
+		os.Exit(cmdWait(cmd.ref, cmd.timeout, cmd.json, cmd.requestID))
+	case modeSession:
+		os.Exit(cmdSession(cmd))
+	case modeWorktree:
+		os.Exit(cmdWorktree(cmd))
+	case modeWorkspace:
+		os.Exit(cmdWorkspace(cmd))
 	case modeDaemon:
 		os.Exit(execGmuxd(cmd.daemonSub))
 	case modeAuth:

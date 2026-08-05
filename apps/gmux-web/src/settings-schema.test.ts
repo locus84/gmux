@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   buildTerminalOptions,
+  resolveUiScale,
   normalizeThemeColors,
   DEFAULT_THEME_COLORS,
 } from './settings-schema'
@@ -12,6 +13,7 @@ describe('buildTerminalOptions', () => {
     expect(opts.fontFamily).toBe("'Fira Code', 'Symbols Nerd Font Mono', monospace")
     expect(opts.cursorBlink).toBe(false)
     expect(opts.scrollback).toBe(5000)
+    expect(resolveUiScale(null)).toBe(1)
     expect(opts.theme).toEqual(DEFAULT_THEME_COLORS)
   })
 
@@ -61,6 +63,12 @@ describe('buildTerminalOptions', () => {
     expect(buildTerminalOptions({ fontSize: 100 }, null).fontSize).toBe(48)
   })
 
+  it('resolves and clamps uiScale to valid range', () => {
+    expect(resolveUiScale({ uiScale: 1.25 })).toBe(1.25)
+    expect(resolveUiScale({ uiScale: 0.1 })).toBe(0.7)
+    expect(resolveUiScale({ uiScale: 5 })).toBe(2)
+  })
+
   it('clamps scrollback to valid range', () => {
     expect(buildTerminalOptions({ scrollback: -10 }, null).scrollback).toBe(0)
     expect(buildTerminalOptions({ scrollback: 999999 }, null).scrollback).toBe(100_000)
@@ -97,20 +105,23 @@ describe('buildTerminalOptions', () => {
     spy.mockRestore()
   })
 
-  it('ignores keybinds and macCommandIsCtrl keys without warning', () => {
+  it('ignores non-terminal UI settings without warning', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {/* suppress console output in test */})
-    buildTerminalOptions({ keybinds: [], macCommandIsCtrl: true }, null)
+    buildTerminalOptions({ uiScale: 1.2, keybinds: [], macCommandIsCtrl: true, vsCodeServerUrl: 'https://code.example.test', vsCodeServerHomeDir: '/Users/rhee' }, null)
     expect(spy).not.toHaveBeenCalled()
     spy.mockRestore()
   })
 
-  it('does not leak keybinds or macCommandIsCtrl into terminal options', () => {
+  it('does not leak non-terminal UI settings into terminal options', () => {
     const opts = buildTerminalOptions(
-      { keybinds: [{ key: 'ctrl+c', action: 'none' }], macCommandIsCtrl: true },
+      { uiScale: 1.2, keybinds: [{ key: 'ctrl+c', action: 'none' }], macCommandIsCtrl: true, vsCodeServerUrl: 'https://code.example.test', vsCodeServerHomeDir: '/Users/rhee' },
       null,
     )
+    expect((opts as any).uiScale).toBeUndefined()
     expect((opts as any).keybinds).toBeUndefined()
     expect((opts as any).macCommandIsCtrl).toBeUndefined()
+    expect((opts as any).vsCodeServerUrl).toBeUndefined()
+    expect((opts as any).vsCodeServerHomeDir).toBeUndefined()
   })
 
   it('falls back to defaults for invalid settings', () => {

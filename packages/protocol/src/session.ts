@@ -15,6 +15,7 @@ export const SessionSchema = z.object({
   command: z.array(z.string()).optional(),
   cwd: z.string().optional(),
   workspace_root: z.string().optional(),
+  git_layout: z.enum(['repository', 'worktree']).optional(),
   remotes: z.record(z.string()).optional(),
   kind: z.string().default('shell'),
   alive: z.boolean(),

@@ -89,8 +89,7 @@ func (s *Store) SessionDir(id string) string {
 }
 
 // persistedSession aliases store.Session to bypass the API
-// MarshalJSON method, which strips internal fields like ShellTitle
-// and AdapterTitle. The default reflection-based marshaller
+// MarshalJSON method, which strips internal title-source fields. The default reflection-based marshaller
 // respects the json tags on the original struct — including the
 // ones for those internal fields — so no manual mirroring is
 // needed and adding a new field to store.Session automatically

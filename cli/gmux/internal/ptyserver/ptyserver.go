@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/vt"
@@ -31,7 +33,11 @@ import (
 
 // maxScrollback is the number of lines kept in the virtual terminal's
 // scrollback buffer. Lines older than this are discarded.
-const maxScrollback = 2000
+const (
+	maxScrollback                = 2000
+	maxExplicitTitleBytes        = 1024
+	maxExplicitTitleRequestBytes = maxExplicitTitleBytes*6 + 256
+)
 
 // ErrSocketInUse is returned by BindSocket when the requested socket
 // path is already owned by a live listener (a probe at that path got
@@ -151,23 +157,26 @@ type ResizeMsg struct {
 
 // Server holds a PTY and serves WebSocket connections.
 type Server struct {
-	cmd      *exec.Cmd
-	ptmx     *os.File
-	sockPath string
-	listener net.Listener
-	screen   *vt.Emulator // virtual terminal for replay snapshots (guarded by mu)
-	adapter  adapter.Adapter
-	state    *session.State
+	cmd           *exec.Cmd
+	ptmx          *os.File
+	sockPath      string
+	listener      net.Listener
+	screen        *vt.Emulator // virtual terminal for replay snapshots (guarded by mu)
+	replay        rawReplay    // image-capable raw reconnect checkpoint (guarded by mu)
+	adapter       adapter.Adapter
+	state         *session.State
+	agentMessages *agentMessageBroker
 
-	mu             sync.Mutex
-	clients        map[*wsClient]struct{}
-	localOut       io.Writer      // optional local terminal output sink
-	scrollback     io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
-	ptyCols        uint16         // last applied PTY cols (guarded by mu)
-	ptyRows        uint16         // last applied PTY rows (guarded by mu)
-	cursorHidden   bool           // tracks DECTCEM via callback (guarded by mu)
-	screenPending  []byte         // raw PTY data not yet fed to screen (guarded by mu)
-	lastClientLeft time.Time      // when the last WS client disconnected (guarded by mu)
+	mu                    sync.Mutex
+	clients               map[*wsClient]struct{}
+	localOut              io.Writer      // optional local terminal output sink
+	scrollback            io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
+	ptyCols               uint16         // last applied PTY cols (guarded by mu)
+	ptyRows               uint16         // last applied PTY rows (guarded by mu)
+	hiddenReconnectShrink bool           // true when ptyCols was internally shrunk for reconnect redraw (guarded by mu)
+	cursorHidden          bool           // tracks DECTCEM via callback (guarded by mu)
+	screenPending         []byte         // raw PTY data not yet fed to screen (guarded by mu)
+	lastClientLeft        time.Time      // when the last WS client disconnected (guarded by mu)
 
 	done    chan struct{} // closed when child exits
 	ptyDone chan struct{} // closed when readPTY finishes draining
@@ -186,6 +195,32 @@ func (c *wsClient) write(typ websocket.MessageType, data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.Write(c.ctx, typ, data)
+}
+
+const replayMessageLimit = 1 << 20
+
+func (c *wsClient) writeRawReplay(checkpoint, suffix []byte) error {
+	// Keep the checkpoint's final ESU in one message so the browser replay
+	// buffer can detect it without cross-message marker state. Individual
+	// messages stay below gmuxd/peer WebSocket read limits.
+	offset := 0
+	for len(checkpoint)-offset > replayMessageLimit+len(replayESU) {
+		if err := c.write(websocket.MessageBinary, checkpoint[offset:offset+replayMessageLimit]); err != nil {
+			return err
+		}
+		offset += replayMessageLimit
+	}
+	if err := c.write(websocket.MessageBinary, checkpoint[offset:]); err != nil {
+		return err
+	}
+	for len(suffix) > 0 {
+		n := min(len(suffix), replayMessageLimit)
+		if err := c.write(websocket.MessageBinary, suffix[:n]); err != nil {
+			return err
+		}
+		suffix = suffix[n:]
+	}
+	return nil
 }
 
 // Config for creating a new PTY server.
@@ -305,20 +340,21 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cmd:        cmd,
-		ptmx:       ptmx,
-		sockPath:   cfg.SocketPath,
-		listener:   listener,
-		screen:     nil, // set below after s is constructed
-		adapter:    cfg.Adapter,
-		state:      cfg.State,
-		clients:    make(map[*wsClient]struct{}),
-		localOut:   cfg.LocalOut,   // wired before readPTY starts so early output is never lost
-		scrollback: cfg.Scrollback, // same: wired pre-readPTY so fast-exit output is never lost
-		ptyCols:    cfg.Cols,
-		ptyRows:    cfg.Rows,
-		done:       make(chan struct{}),
-		ptyDone:    make(chan struct{}),
+		cmd:           cmd,
+		ptmx:          ptmx,
+		sockPath:      cfg.SocketPath,
+		listener:      listener,
+		screen:        nil, // set below after s is constructed
+		adapter:       cfg.Adapter,
+		state:         cfg.State,
+		agentMessages: newAgentMessageBroker(),
+		clients:       make(map[*wsClient]struct{}),
+		localOut:      cfg.LocalOut,   // wired before readPTY starts so early output is never lost
+		scrollback:    cfg.Scrollback, // same: wired pre-readPTY so fast-exit output is never lost
+		ptyCols:       cfg.Cols,
+		ptyRows:       cfg.Rows,
+		done:          make(chan struct{}),
+		ptyDone:       make(chan struct{}),
 	}
 
 	// The callback fires under s.mu (held during drainScreenLocked → screen.Write).
@@ -447,6 +483,7 @@ func (s *Server) Resize(cols, rows uint16) {
 
 // Shutdown closes the listener and all connections.
 func (s *Server) Shutdown() {
+	s.agentMessages.close()
 	s.listener.Close()
 	s.ptmx.Close()
 	os.Remove(s.sockPath)
@@ -465,8 +502,12 @@ func (s *Server) serve() {
 	// HTTP endpoints (checked first via explicit paths)
 	mux.HandleFunc("GET /meta", s.handleMeta)
 	mux.HandleFunc("POST /hook/event", s.handleHookEvent)
+	mux.HandleFunc("/agent/message", s.handleAgentMessage)
+	mux.HandleFunc("GET /hook/messages/next", s.handleAgentMessagesNext)
+	mux.HandleFunc("POST /hook/message-event", s.handleAgentMessageEvent)
 	mux.HandleFunc("POST /input", s.handleInput)
 	mux.HandleFunc("PUT /status", s.handlePutStatus)
+	mux.HandleFunc("PUT /title", s.handlePutTitle)
 	mux.HandleFunc("PUT /slug", s.handlePutSlug)
 	mux.HandleFunc("GET /events", s.handleEvents)
 	mux.HandleFunc("POST /kill", s.handleKill)
@@ -511,7 +552,8 @@ const maxInputBytes = 1 << 20 // 1 MiB
 // per-adapter assumptions. The agent reports facts about itself; the runner
 // maps them to sidebar state:
 //
-//	op "session"          — the bound conversation file, id, name (on bind)
+//	op "session"          — the bound conversation file and id (on bind)
+//	op "title"            — an explicit name chosen inside the child agent
 //	op "turn" phase start — the agent loop began (→ working)
 //	op "turn" phase end   — the loop ended with Outcome + title
 //
@@ -525,13 +567,15 @@ type hookEvent struct {
 	Path string `json:"path"`
 	Pid  int    `json:"pid"`
 
-	ID      string `json:"id,omitempty"`
-	Slug    string `json:"slug,omitempty"` // explicit URL-safe slug; preferred over Slugify(ID)
-	Name    string `json:"name,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Title   string `json:"title,omitempty"`
-	Phase   string `json:"phase,omitempty"`   // "start" | "end" (op "turn")
-	Outcome string `json:"outcome,omitempty"` // "completed" | "aborted" | "error"
+	ID         string  `json:"id,omitempty"`
+	Slug       string  `json:"slug,omitempty"` // explicit URL-safe slug; preferred over Slugify(ID)
+	Name       string  `json:"name,omitempty"`
+	AgentTitle *string `json:"agent_title,omitempty"`
+	Reason     string  `json:"reason,omitempty"`
+	Title      string  `json:"title,omitempty"`
+	Phase      string  `json:"phase,omitempty"`   // "start" | "end" (op "turn")
+	Outcome    string  `json:"outcome,omitempty"` // "completed" | "aborted" | "error"
+	Epoch      string  `json:"epoch,omitempty"`   // pi extension runtime epoch
 }
 
 // handleHookEvent applies the authoritative session state an agent's gmux hook
@@ -548,33 +592,139 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch ev.Op {
+	case "runtime":
+		if strings.TrimSpace(ev.Epoch) == "" {
+			http.Error(w, "runtime epoch is required", http.StatusBadRequest)
+			return
+		}
+		if s.agentMessages == nil {
+			http.Error(w, "semantic message broker unavailable", http.StatusNotImplemented)
+			return
+		}
+		if ev.Phase == "bind" {
+			s.agentMessages.bindRuntime(ev.Epoch)
+		} else if ev.Phase == "unbind" {
+			s.agentMessages.unbindRuntime(ev.Epoch)
+		} else {
+			http.Error(w, "invalid runtime phase", http.StatusBadRequest)
+			return
+		}
 	case "session":
 		// Authoritative bind (e.g. pi's session_start): the file the
 		// agent holds, named and slugged.
+		if ev.AgentTitle != nil {
+			title, err := normalizeExplicitTitle(*ev.AgentTitle)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			s.state.SetAgentTitle(title)
+		}
 		if ev.Path != "" {
 			s.state.SetSessionFile(ev.Path)
 		}
-		if ev.Name != "" {
-			s.state.SetAdapterTitle(ev.Name)
+		title, derivedSlug := s.resolveHookTitle(ev.Name, ev.Path)
+		// A bind is authoritative for the adapter fallback too: clearing it
+		// prevents the previous conversation's generated title leaking across
+		// /new or /resume when the new conversation has no useful title yet.
+		// An activity re-announcement is only a reconciliation hint, so a
+		// transient parse miss must not erase the current fallback.
+		if title != "" || ev.Reason != "activity" {
+			s.state.SetAdapterTitle(title)
+		}
+		// Activity re-announcements may observe a later explicit /name in the
+		// session file. That name belongs to ExplicitTitle and must not mutate
+		// stable routing. A real bind may establish the new conversation slug.
+		if derivedSlug != "" && (ev.Reason != "activity" || s.state.SlugSnapshot() == "") {
+			s.state.SetSlug(derivedSlug)
 		}
 		// Slug source, in order of preference: an explicit slug the agent
 		// reports (e.g. codex, whose session id is a UUID that slugifies badly,
 		// sends a title-derived slug), else the identity to slugify.
+		// A title-derived slug from the authoritative bind is stronger than the
+		// id fallback, so don't replace it unless the hook provided an explicit slug.
 		if ev.Slug != "" {
 			s.state.SetSlug(adapter.Slugify(ev.Slug))
-		} else if ev.ID != "" {
+		} else if ev.ID != "" && s.state.SlugSnapshot() == "" {
 			s.state.SetSlug(adapter.Slugify(ev.ID))
 		}
+	case "title":
+		title, err := normalizeExplicitTitle(ev.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.state.SetAgentTitle(title)
 	case "turn":
 		// Agent-loop transition. The extension reports phase + outcome; the
 		// sidebar policy (what an outcome means) lives here, in testable Go.
 		if ev.Phase == "start" {
+			if s.agentMessages != nil {
+				s.agentMessages.beginTurn()
+			}
 			s.state.SetStatus(&adapter.Status{Working: true})
 			break
 		}
-		s.applyTurnEnd(ev.Outcome, ev.Title)
+		title, slug := s.resolveHookTitle(ev.Title, "")
+		s.applyTurnEnd(ev.Outcome, title)
+		if slug != "" {
+			s.state.SetSlug(slug)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) resolveHookTitle(rawTitle, path string) (title, slug string) {
+	title = strings.TrimSpace(rawTitle)
+	if s.isUsefulTitle(title) {
+		return title, s.slugFromTitle(title)
+	}
+
+	if path == "" {
+		path = s.state.SessionFileSnapshot()
+	}
+	filer, ok := s.adapter.(adapter.SessionFiler)
+	if !ok || path == "" {
+		return "", ""
+	}
+	var info *adapter.SessionFileInfo
+	var err error
+	if fallback, ok := s.adapter.(adapter.SessionFallbackFiler); ok {
+		info, err = fallback.ParseSessionFallback(path)
+	} else {
+		info, err = filer.ParseSessionFile(path)
+	}
+	if err != nil || info == nil {
+		return "", ""
+	}
+	parsed := strings.TrimSpace(info.Title)
+	if !s.isUsefulTitle(parsed) {
+		return "", ""
+	}
+	return parsed, adapter.Slugify(info.Slug)
+}
+
+func (s *Server) slugFromTitle(title string) string {
+	if s.adapter != nil && s.adapter.Name() == "pi" {
+		return adapter.Slugify(title)
+	}
+	return ""
+}
+
+func (s *Server) isUsefulTitle(title string) bool {
+	title = strings.TrimSpace(title)
+	if title == "" || title == "(new)" {
+		return false
+	}
+	// pi's session manager reports a default window label like "π - gmux"
+	// before a conversation has a real first-message or /name title. Treat it
+	// as a placeholder so the parsed session file can supply the useful title.
+	if s.adapter != nil && s.adapter.Name() == "pi" {
+		if title == "pi" || strings.HasPrefix(title, "π - ") {
+			return false
+		}
+	}
+	return true
 }
 
 // applyTurnEnd maps a normalized turn outcome to sidebar state. This is the
@@ -607,6 +757,52 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "write pty: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type titleRequest struct {
+	Title *string `json:"title"`
+}
+
+func normalizeExplicitTitle(raw string) (string, error) {
+	title := strings.TrimSpace(raw)
+	if !utf8.ValidString(title) {
+		return "", errors.New("title must be valid UTF-8")
+	}
+	if len(title) > maxExplicitTitleBytes {
+		return "", fmt.Errorf("title exceeds %d bytes", maxExplicitTitleBytes)
+	}
+	for _, r := range title {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return "", errors.New("title must be a single line without control characters")
+		}
+	}
+	return title, nil
+}
+
+func (s *Server) handlePutTitle(w http.ResponseWriter, r *http.Request) {
+	var req titleRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxExplicitTitleRequestBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		http.Error(w, "invalid JSON: trailing content", http.StatusBadRequest)
+		return
+	}
+	if req.Title == nil {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+	title, err := normalizeExplicitTitle(*req.Title)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.state.SetExplicitTitle(title)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -749,6 +945,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) lockReplayBoundary(ctx context.Context) bool {
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		s.mu.Lock()
+		if s.replay.safeBoundary() {
+			return true // caller owns s.mu
+		}
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.ptyDone:
+			// No more bytes can complete the sequence. Discard raw replay and
+			// let the caller use the emulator snapshot at a synthetic boundary.
+			s.mu.Lock()
+			s.replay.abandonUnsafe()
+			return true // caller owns s.mu
+		case <-deadline.C:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // local Unix socket, no origin check needed
@@ -766,9 +991,24 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		cancel: cancel,
 	}
 
-	// Replay screen state, then register for live data.
-	// All steps happen under s.mu so readPTY cannot send live data to
-	// this client before the snapshot frame.
+	// If this is the first viewer after output already happened, apply the
+	// same hidden shrink normally done after the last disconnect. The browser's
+	// first/next real resize will then force a SIGWINCH redraw after it is
+	// connected, causing TUIs to re-emit inline image escape sequences that the
+	// text-only replay frame cannot reconstruct.
+	s.shrinkForReconnect()
+
+	// Replay screen state, then register for live data. A PTY flush can split
+	// an opaque Kitty/Sixel/IIP payload, so wait until the raw stream parser is
+	// at a legal boundary before taking the lock for replay + registration.
+	if !s.lockReplayBoundary(ctx) {
+		conn.Close(websocket.StatusTryAgainLater, "terminal output frame is incomplete")
+		cancel()
+		return
+	}
+
+	// All following steps happen under s.mu so readPTY cannot send live data to
+	// this client before the replay frame.
 	//
 	// Ordering guarantee: snapshot is always the first message the client
 	// receives, followed by any live data from subsequent readPTY cycles.
@@ -779,9 +1019,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// sequences with style diffing.
 	//
 	// Sequence: BSU → reset → scrollback + screen → cursor → ESU
-	s.mu.Lock()
 	s.drainScreenLocked()
-	snapshot := renderScreen(s.screen)
+	checkpoint, suffix := s.replay.parts()
 	cursorSeq := "\x1b[?25h" // show cursor (default)
 	if s.cursorHidden {
 		cursorSeq = "\x1b[?25l" // hide cursor
@@ -792,12 +1031,22 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	bsu := "\x1b[?2026h"                     // Begin Synchronized Update
 	resetSeq := "\x1b[r\x1b[H\x1b[2J\x1b[3J" // Reset scroll region + cursor home + erase display + erase scrollback
 	esu := "\x1b[?2026l"                     // End Synchronized Update
-	frame := []byte(bsu + resetSeq + snapshot + cursorPos + cursorSeq + esu)
-	if err := client.write(websocket.MessageBinary, frame); err != nil {
-		s.mu.Unlock()
-		conn.Close(websocket.StatusNormalClosure, "")
-		cancel()
-		return
+	if len(checkpoint) > 0 {
+		if err := client.writeRawReplay(checkpoint, suffix); err != nil {
+			s.mu.Unlock()
+			conn.Close(websocket.StatusNormalClosure, "")
+			cancel()
+			return
+		}
+	} else {
+		snapshot := renderScreen(s.screen)
+		frame := []byte(bsu + resetSeq + snapshot + cursorPos + cursorSeq + esu)
+		if err := client.write(websocket.MessageBinary, frame); err != nil {
+			s.mu.Unlock()
+			conn.Close(websocket.StatusNormalClosure, "")
+			cancel()
+			return
+		}
 	}
 	s.clients[client] = struct{}{}
 	s.lastClientLeft = time.Time{} // reset: we have an active viewer
@@ -860,8 +1109,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 // whose viewport matches the current PTY size would get a stale snapshot
 // (missing kitty images, possible drift from the emulator's reconstruction).
 //
-// Called when the last viewer (WS client or local terminal) disconnects.
-// The shrink happens while no one is watching, so there's no visible
+// Called when the last viewer (WS client or local terminal) disconnects,
+// and before replay for the first viewer of a live process. The shrink
+// happens before anyone is registered as a viewer, so there's no visible
 // flicker. The child TUI redraws at cols-1, but nobody sees it.
 //
 // Safety: re-checks that no viewer has connected between the call-site
@@ -879,11 +1129,12 @@ func (s *Server) shrinkForReconnect() {
 	}
 
 	s.mu.Lock()
-	if s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil {
+	if s.hiddenReconnectShrink || s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil {
 		s.mu.Unlock()
 		return
 	}
 	s.ptyCols--
+	s.hiddenReconnectShrink = true
 	cols := s.ptyCols
 	rows := s.ptyRows
 	s.drainScreenLocked()
@@ -915,6 +1166,10 @@ func (s *Server) resize(msg ResizeMsg) {
 		s.drainScreenLocked()
 		s.screen.Resize(int(msg.Cols), int(msg.Rows))
 	}
+	// Any explicit client resize resolves the hidden reconnect shrink. If the
+	// size changed, the SIGWINCH below is the intended redraw trigger; if not,
+	// the client deliberately accepted the current dimensions.
+	s.hiddenReconnectShrink = false
 	s.mu.Unlock()
 
 	if sizeChanged {
@@ -994,7 +1249,9 @@ func (s *Server) readPTY() {
 		accum = nil
 
 		// Process adapter/title hooks on the accumulated chunk.
-		if title := adapters.ParseOSCTitle(data); title != "" {
+		if title := adapters.ParseOSCTitle(data); strings.TrimSpace(title) != "" {
+			// OSC 0/2 is the application's explicit terminal title; adapter title
+			// heuristics apply only to adapter metadata, not terminal protocol.
 			s.state.SetShellTitle(title)
 		}
 		if s.adapter != nil {
@@ -1013,6 +1270,7 @@ func (s *Server) readPTY() {
 		// atomically so new clients always see their replay frame first.
 		s.mu.Lock()
 		s.screenPending = append(s.screenPending, data...)
+		s.replay.write(data)
 		localOut := s.localOut
 		clients := make([]*wsClient, 0, len(s.clients))
 		for c := range s.clients {
@@ -1104,6 +1362,7 @@ func (s *Server) readPTY() {
 
 func (s *Server) waitChild() {
 	s.err = s.cmd.Wait()
+	s.agentMessages.close()
 	close(s.done)
 
 	// Wait for readPTY to finish draining all buffered PTY output before
@@ -1155,14 +1414,12 @@ func buildChildEnv(parent, extra []string, version string) []string {
 	}
 	env := make([]string, 0, len(parent)+len(extra)+5)
 	for _, e := range parent {
-		// GMUX_RESUME_ID is a private daemon→runner directive (see
-		// ADR 0003). Inheriting it into PTY children would let a
-		// nested `gmux foo` invocation inside a session try to
-		// re-bind the parent runner's id; it'd survive on the
-		// collision fallback, but that's exactly the safety-net
-		// dependency the dedicated env var name was supposed to
-		// avoid. Strip on the way out.
-		if strings.HasPrefix(e, "GMUX_RESUME_ID=") {
+		// GMUX_RESUME_ID and GMUX_HANDSHAKE_FD are private daemon/parent→runner
+		// directives. Inheriting them into PTY children would let a nested `gmux`
+		// invocation try to re-bind the parent runner's id, or interpret fd 3 as a
+		// stale handshake pipe and close/write to an unrelated descriptor. Strip
+		// both on the runner→child boundary.
+		if strings.HasPrefix(e, "GMUX_RESUME_ID=") || strings.HasPrefix(e, "GMUX_HANDSHAKE_FD=") {
 			continue
 		}
 		env = append(env, e)

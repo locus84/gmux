@@ -36,3 +36,11 @@ gmux gmuxd
 
 # Agent handoff/scratch docs
 .memory/
+
+# Pi local/runtime state
+.pi/settings.json
+.pi/subagent-runs/
+.pi/subagent-results/
+.pi/tmp/
+.pi/worktrees/
+.pi/worktree-runs/

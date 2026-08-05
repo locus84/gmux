@@ -152,6 +152,76 @@ func TestRegisterReRegistrationPreservesAttributionAndHistory(t *testing.T) {
 	}
 }
 
+func TestRegisterOldRunnerDoesNotClearPersistedExplicitTitle(t *testing.T) {
+	srv := startUnixServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"sess-resume","kind":"shell","alive":true}`))
+	}))
+	defer srv.cleanup()
+
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "sess-resume", Kind: "shell", ExplicitTitle: "persisted name"})
+	if err := Register(sessions, nil, nil, srv.socketPath, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got, _ := sessions.Get("sess-resume")
+	if got.ExplicitTitle != "persisted name" {
+		t.Fatalf("old runner cleared explicit title: %q", got.ExplicitTitle)
+	}
+}
+
+func TestRegisterNewRunnerCanClearExplicitTitle(t *testing.T) {
+	srv := startUnixServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"sess-resume","kind":"shell","alive":true,"explicit_title":"","agent_title":""}`))
+	}))
+	defer srv.cleanup()
+
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "sess-resume", Kind: "shell", ExplicitTitle: "stale explicit", AgentTitle: "stale agent"})
+	if err := Register(sessions, nil, nil, srv.socketPath, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got, _ := sessions.Get("sess-resume")
+	if got.ExplicitTitle != "" || got.AgentTitle != "" {
+		t.Fatalf("new runner did not clear titles: explicit=%q agent=%q", got.ExplicitTitle, got.AgentTitle)
+	}
+}
+
+func TestRegisterReRegistrationUsesRunnerExplicitAndShellTitles(t *testing.T) {
+	srv := startUnixServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/meta" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"sess-resume","kind":"pi","alive":true,"explicit_title":"fresh explicit","agent_title":"fresh agent","shell_title":"fresh shell"}`))
+	}))
+	defer srv.cleanup()
+
+	sessions := store.New()
+	sessions.Upsert(store.Session{
+		ID:            "sess-resume",
+		Kind:          "pi",
+		Alive:         false,
+		ExplicitTitle: "stale explicit",
+		AgentTitle:    "stale agent",
+		ShellTitle:    "stale shell",
+		AdapterTitle:  "preserved adapter",
+	})
+
+	if err := Register(sessions, nil, nil, srv.socketPath, nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	got, _ := sessions.Get("sess-resume")
+	if got.ExplicitTitle != "fresh explicit" || got.AgentTitle != "fresh agent" || got.ShellTitle != "fresh shell" {
+		t.Fatalf("runner titles not reconciled: explicit=%q agent=%q shell=%q", got.ExplicitTitle, got.AgentTitle, got.ShellTitle)
+	}
+	if got.AdapterTitle != "preserved adapter" {
+		t.Fatalf("adapter fallback = %q, want preserved", got.AdapterTitle)
+	}
+	if got.Title != "fresh explicit" {
+		t.Fatalf("resolved title = %q, want fresh explicit", got.Title)
+	}
+}
+
 // TestRegisterFreshSessionRunsOnRegisterForShell captures the
 // counterpart guarantee: a brand-new id (not present in the store)
 // goes through the adapter's OnRegister hook so the initial slug
@@ -185,7 +255,6 @@ func TestRegisterFreshSessionRunsOnRegisterForShell(t *testing.T) {
 		t.Error("Slug = \"\", want non-empty (Shell.OnRegister derives a slug from cwd)")
 	}
 }
-
 
 // TestScanIgnoresMissingPathWhileSubscriptionAlive guards a race
 // introduced by ptyserver.handleKill's early sockfile unlink:

@@ -57,7 +57,7 @@ func TestE2E(t *testing.T) {
 	// ── Unauthenticated API requests return 401 JSON ──
 
 	t.Run("unauthenticated API paths return 401", func(t *testing.T) {
-		for _, path := range []string{"/v1/health", "/v1/sessions", "/v1/launch"} {
+		for _, path := range []string{"/v1/health", "/v1/sessions", "/v1/launch", "/v1/frontend-config"} {
 			resp, err := http.Get(srv.URL + path)
 			if err != nil {
 				t.Fatalf("%s: %v", path, err)
@@ -69,6 +69,15 @@ func TestE2E(t *testing.T) {
 			if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
 				t.Errorf("%s: Content-Type = %q, want JSON", path, ct)
 			}
+		}
+		req, _ := http.NewRequest(http.MethodPatch, srv.URL+"/v1/frontend-config", strings.NewReader(`{"vsCodeServerUrl":"https://code.example.test"}`))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("PATCH /v1/frontend-config: got %d, want 401", resp.StatusCode)
 		}
 	})
 

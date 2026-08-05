@@ -11,6 +11,9 @@ code {
 }
 
 :root {
+  /* User-adjustable gmux chrome scale; set from settings.jsonc uiScale. */
+  --ui-scale: 1;
+
   /* Surfaces — widened gaps for clearer distinction */
   --bg: oklch(12% 0.015 250);
   --bg-sidebar: oklch(16.5% 0.015 250);
@@ -48,6 +51,7 @@ code {
   --radius-lg: 10px;
 
   /* Sizing */
+  --ui-font-size: 14px;
   --sidebar-width: 272px;
   --header-height: 44px;
   --radius: 6px;
@@ -96,7 +100,11 @@ code {
 html, body, #app {
   height: 100%;
   overflow: hidden;
+  /* Disable browser/page-level overscroll navigation such as Chrome
+     swipe back/forward and pull-to-refresh for every device class. */
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  overscroll-behavior-y: none;
   /* This is a terminal, not a document. `manipulation` drops
      double-tap-to-zoom and the tap delay/suppression it causes —
      notably taps landing right after a long-press release. (Pinch-zoom
@@ -111,7 +119,7 @@ body {
   font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, sans-serif;
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--ui-font-size);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -145,15 +153,15 @@ body {
   display: flex;
   align-items: center;
   height: var(--header-height);
-  padding: 0 6px 0 14px;
-  gap: 10px;
+  padding: 0 0.4286em 0 1em;
+  gap: 0.7143em;
   flex-shrink: 0;
   border-bottom: 1px solid var(--border);
 }
 
 .sidebar-logo {
   font-family: 'Instrument Sans', sans-serif;
-  font-size: 18px;
+  font-size: 1.2857em;
   font-weight: 700;
   letter-spacing: -0.04em;
   color: var(--text);
@@ -170,15 +178,16 @@ body {
   text-shadow: 0 0 6px rgba(255, 255, 255, 0.25);
 }
 
-/* Settings gear, pinned opposite the logo in the header. */
+/* Header actions, pinned opposite the logo. On mobile this header sits at
+   the bottom of the hamburger drawer, so keep the controls thumb-sized. */
+.sidebar-refresh-btn,
 .sidebar-settings-btn {
   position: relative;
-  margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 2em;
+  height: 2em;
   padding: 0;
   border: none;
   background: transparent;
@@ -187,6 +196,10 @@ body {
   cursor: pointer;
   transition: color 0.15s, background 0.15s;
 }
+.sidebar-refresh-btn {
+  margin-left: auto;
+}
+.sidebar-refresh-btn:hover,
 .sidebar-settings-btn:hover {
   color: var(--text);
   background: var(--bg-hover);
@@ -210,7 +223,7 @@ body {
 .sidebar-empty-launch {
   display: flex;
   justify-content: center;
-  padding: 16px 14px 4px;
+  padding: 1.1429em 1em 0.2857em;
 }
 
 /* Waiting dot on the logo. Only the waiting state is surfaced (see the
@@ -248,7 +261,7 @@ body {
    * the extra whitespace is the visual cue that the user has actually
    * reached the end of the list (rather than wondering whether more
    * content is hidden by the fold). */
-  padding: 6px 0 48px;
+  padding: 0.4286em 0 3.4286em;
   display: flex;
   flex-direction: column;
 }
@@ -276,9 +289,9 @@ body {
 .folder-header {
   display: flex;
   align-items: center;
-  padding: 5px 12px 5px 14px;
+  padding: 0.3571em 0.8571em 0.3571em 1em;
   user-select: none;
-  gap: 6px;
+  gap: 0.4286em;
   cursor: pointer;
   transition: background 0.1s;
 }
@@ -300,36 +313,48 @@ body {
   margin-left: auto;
 }
 
-.launch-container.folder-launch-btn {
+.folder-header-actions {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.1429em;
   opacity: 0;
   transition: opacity 0.1s;
 }
 
-.folder-header:hover .launch-container.folder-launch-btn,
-.launch-container.folder-launch-btn:has(.loading) {
+.launch-container.folder-launch-btn {
+  margin-left: 0;
+}
+
+.folder-header:hover .folder-header-actions,
+.folder-header-actions:focus-within,
+.folder-header-actions:has(.loading) {
   opacity: 1;
 }
 
-.launch-btn {
+.launch-btn,
+.folder-file-btn,
+.folder-vscode-btn {
   background: none;
   border: none;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 16px;
+  font-size: 1.1429em;
   font-weight: 600;
   line-height: 1;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 0.125em 0.375em;
+  border-radius: 0.25em;
   transition: all 0.15s ease;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 24px;
-  min-height: 24px;
+  min-width: 1.5em;
+  min-height: 1.5em;
 }
 
-.launch-btn:hover {
+.launch-btn:hover,
+.folder-file-btn:hover,
+.folder-vscode-btn:hover {
   background: var(--accent);
   color: var(--bg);
 }
@@ -346,22 +371,24 @@ body {
   to { transform: rotate(360deg); }
 }
 
-/* Inline menu — fixed-positioned by JS so it escapes overflow:hidden parents */
+/* Inline menu — portaled to <body> and fixed-positioned by JS so it escapes transformed/overflow-hidden parents. */
 .launch-inline-menu {
   position: fixed;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
-  min-width: 180px;
+  border-radius: 0.5714em;
+  box-shadow: 0 0.5714em 1.7143em rgba(0, 0, 0, 0.4), 0 0.1429em 0.5714em rgba(0, 0, 0, 0.2);
+  min-width: 12.8571em;
   z-index: 1000;
-  padding: 4px;
-  overflow: hidden;
+  padding: 0.2857em;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .launch-target-line {
-  padding: 5px 10px 4px;
-  font-size: 11px;
+  padding: 0.4545em 0.9091em 0.3636em;
+  font-size: 0.7857em;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -372,15 +399,15 @@ body {
 .launch-inline-item {
   display: block;
   width: 100%;
-  padding: 6px 10px;
+  padding: 0.4286em 0.7143em;
   background: none;
   border: none;
-  border-radius: 6px;
+  border-radius: 0.4286em;
   cursor: pointer;
   text-align: left;
   transition: background 0.1s ease;
   color: var(--text);
-  font-size: 14px;
+  font-size: 1em;
   white-space: nowrap;
 }
 
@@ -411,7 +438,7 @@ body {
 }
 
 .folder-name {
-  font-size: 12px;
+  font-size: 0.8571em;
   font-weight: 600;
   color: var(--text);
   flex: 1;
@@ -426,6 +453,307 @@ body {
 .folder-sessions {
   overflow: hidden;
   padding-top: 1px;
+}
+
+.folder-checkouts {
+  overflow: hidden;
+}
+
+.checkout-group + .checkout-group {
+  margin-top: 2px;
+}
+
+.checkout-header {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  color: var(--text-muted);
+  font-size: 0.75em;
+  line-height: 1.5;
+  font-family: 'Fira Code', monospace;
+}
+
+.checkout-fold-btn {
+  min-width: 0;
+  min-height: 32px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.35em 0.15em 1em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.checkout-fold-btn:hover,
+.checkout-fold-btn:focus-visible,
+.checkout-actions button:hover,
+.checkout-actions button:focus-visible {
+  background: var(--bg-hover);
+}
+
+.checkout-chevron {
+  flex: none;
+  font-family: sans-serif;
+  font-size: 1.35em;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 0.12s ease;
+}
+
+.checkout-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.checkout-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding-right: 0.65em;
+}
+
+.checkout-actions .launch-btn,
+.checkout-remove-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.checkout-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.checkout-remove-btn:hover,
+.checkout-remove-btn:focus-visible {
+  color: var(--status-error);
+}
+
+.checkout-tree-mark {
+  flex: none;
+  opacity: 0.55;
+}
+
+.checkout-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checkout-primary-label,
+.checkout-state-label,
+.checkout-session-count {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.4em;
+  font-family: 'Instrument Sans', sans-serif;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+
+.checkout-state-label {
+  color: var(--status-warning);
+}
+
+.checkout-session-count {
+  min-width: 1.5em;
+  text-align: center;
+}
+
+.checkout-inventory-error {
+  width: calc(100% - 2em);
+  min-height: 44px;
+  margin: 0 1em 0.2em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--status-warning);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: 0.78em;
+}
+
+.checkout-inventory-error:hover,
+.checkout-inventory-error:focus-visible {
+  background: var(--bg-hover);
+}
+
+.checkout-sessions {
+  overflow: hidden;
+}
+
+.checkout-sessions .session-item {
+  padding-left: 1.65em;
+}
+
+.launch-inline-footer {
+  color: var(--text-secondary);
+}
+
+.worktree-remove-sheet,
+.worktree-create-sheet {
+  width: 380px;
+  padding: 18px;
+  gap: 10px;
+}
+
+.worktree-create-sheet h2,
+.worktree-create-sheet p {
+  margin: 0;
+}
+
+.worktree-create-project,
+.worktree-create-help {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.worktree-create-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.worktree-create-field input {
+  width: 100%;
+  min-height: 44px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--bg-surface);
+  color: var(--text);
+  padding: 9px 10px;
+  font: 13px 'Fira Code', monospace;
+}
+
+.worktree-create-field input:focus {
+  border-color: var(--accent);
+  outline: 2px solid color-mix(in oklch, var(--accent) 30%, transparent);
+  outline-offset: 1px;
+}
+
+.worktree-create-advanced summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.worktree-create-advanced[open] summary {
+  margin-bottom: 6px;
+}
+
+.worktree-create-submit {
+  min-width: 132px;
+}
+
+@media (max-width: 640px) {
+  .worktree-create-sheet {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    max-width: none;
+    max-height: calc(var(--app-height, 100vh) - 16px);
+    padding: 18px 18px calc(18px + env(safe-area-inset-bottom));
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 14px 14px 0 0;
+    overflow-y: auto;
+  }
+}
+
+.worktree-remove-sheet h2,
+.worktree-remove-sheet p {
+  margin: 0;
+}
+
+.worktree-remove-sheet code {
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.worktree-remove-safety {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.worktree-remove-error {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 55%, var(--border));
+  border-radius: 7px;
+  color: var(--status-error);
+  font-size: 13px;
+}
+
+.worktree-remove-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.worktree-remove-buttons .sheet-btn {
+  min-height: 44px;
+}
+
+.worktree-remove-confirm {
+  border-color: var(--status-error);
+  background: var(--status-error);
+  color: var(--bg);
+}
+
+.worktree-remove-buttons button:disabled,
+.worktree-remove-buttons button[aria-disabled="true"] {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+@media (pointer: coarse) {
+  .launch-inline-footer {
+    min-height: 44px;
+  }
+
+  .checkout-fold-btn,
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn {
+    min-height: 44px;
+    height: 44px;
+  }
+
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn {
+    min-width: 44px;
+    width: 44px;
+  }
 }
 
 /* ── Host suffix (project headers) ── */
@@ -447,9 +775,9 @@ body {
 .session-item {
   display: flex;
   align-items: center;
-  padding: 5px 5px 5px 14px;
+  padding: 0.3571em 0.3571em 0.3571em 1em;
   cursor: pointer;
-  gap: 8px;
+  gap: 0.5714em;
   transition: background 0.1s;
   position: relative;
   text-decoration: none;
@@ -458,6 +786,12 @@ body {
 
 .session-item:hover {
   background: var(--bg-hover);
+}
+
+/* The compact close button is absolutely positioned. Reserve its column so
+   the repository marker remains visible instead of sliding underneath it. */
+.session-item.has-close {
+  padding-right: 2.35em;
 }
 
 .session-item.selected {
@@ -478,8 +812,8 @@ body {
 /* Status dot — left of title, vertically centered on first line */
 .session-dot-indicator {
   flex-shrink: 0;
-  width: 7px;
-  height: 7px;
+  width: 0.5em;
+  height: 0.5em;
   border-radius: 50%;
 
 }
@@ -580,6 +914,27 @@ body {
   gap: 1px;
 }
 
+.session-git-layout-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  opacity: 0.58;
+}
+.session-git-layout-icon.worktree {
+  opacity: 0.68;
+}
+.session-item > .session-git-layout-icon {
+  width: 13px;
+  height: 13px;
+}
+.session-item:hover .session-git-layout-icon,
+.session-row:hover .session-git-layout-icon,
+.session-item.selected .session-git-layout-icon,
+.session-row.selected .session-git-layout-icon {
+  opacity: 0.9;
+}
+
 .session-title-row {
   display: flex;
   align-items: baseline;
@@ -588,7 +943,7 @@ body {
 }
 
 .session-title {
-  font-size: 14px;
+  font-size: 1em;
   font-weight: 400;
   color: var(--text);
   overflow: hidden;
@@ -602,8 +957,8 @@ body {
 .session-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
+  gap: 0.5em;
+  font-size: 0.8571em;
   color: var(--text-muted);
   line-height: 1.3;
 }
@@ -705,17 +1060,17 @@ body {
 /* ── Close button on session items ── */
 .session-close-btn {
   position: absolute;
-  right: 4px;
+  right: 0.2857em;
   top: 50%;
   transform: translateY(-50%);
-  width: 20px;
-  height: 20px;
+  width: 1.4286em;
+  height: 1.4286em;
   opacity: 0;
   border: none;
   border-radius: 4px;
   background: transparent;
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: 1em;
   line-height: 1;
   cursor: pointer;
   display: flex;
@@ -744,6 +1099,9 @@ body {
 .mock-mode .session-close-btn,
 .mock-mode .session-row-close {
   display: none;
+}
+.mock-mode .session-item.has-close {
+  padding-right: 0.3571em;
 }
 
 /* Session drag-to-reorder */
@@ -830,6 +1188,13 @@ body {
   font-weight: 500;
 }
 
+.session-row-trailing {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .session-row-close {
   background: none;
   border: none;
@@ -856,7 +1221,7 @@ body {
 
 /* On touch devices (no hover), show interactive buttons permanently */
 @media (hover: none) {
-  .launch-container.folder-launch-btn { opacity: 1; }
+  .folder-header-actions { opacity: 1; }
   .session-close-btn { opacity: 1; }
 }
 
@@ -1070,6 +1435,93 @@ body {
   color: var(--text);
 }
 
+.integration-settings-help {
+  margin-bottom: 14px;
+}
+
+.integration-settings-form,
+.integration-settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.integration-settings-form {
+  gap: 16px;
+}
+
+.integration-settings-field > span:first-child {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.integration-settings-field .mp-filter-input {
+  width: 100%;
+  min-height: 44px;
+}
+
+.integration-settings-field .field-invalid {
+  border-color: var(--status-error);
+}
+
+.integration-settings-error {
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.integration-settings-saved {
+  color: var(--status-connected);
+  font-size: 12px;
+}
+
+.integration-settings-save {
+  align-self: flex-start;
+  min-width: 120px;
+  min-height: 44px;
+}
+
+.ui-scale-help {
+  margin-bottom: 12px;
+}
+
+.ui-scale-control {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 12px;
+  align-items: center;
+  margin: 10px 0 12px;
+}
+
+.ui-scale-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ui-scale-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.ui-scale-range {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.ui-scale-number {
+  width: 96px;
+}
+
+.ui-scale-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
 /* Narrow viewports: stack the rail on top as a horizontal,
    side-to-side scrollable strip of tabs. */
 @media (max-width: 560px) {
@@ -1092,11 +1544,18 @@ body {
   .settings-rail-title { display: none; }
   .settings-tab {
     width: auto;
+    min-height: 44px;
     flex-shrink: 0;
+    padding: 10px 6px;
+    font-size: 12px;
   }
   /* On mobile the top tab strip already shows the current page, so the
      title row is redundant — drop it entirely. */
   .settings-main-header { display: none; }
+  .integration-settings-save {
+    align-self: stretch;
+    width: 100%;
+  }
 }
 
 /* Hosts roster (read-only). */
@@ -1587,8 +2046,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
-  gap: 12px;
+  padding: 0 1.1429em;
+  gap: 0.8571em;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   /* overflow must NOT be hidden here — the session menu drops below the header */
@@ -1614,7 +2073,7 @@ body {
 
 .main-header-title {
   font-family: 'Source Sans 3', sans-serif;
-  font-size: 14px;
+  font-size: 1em;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
@@ -1629,8 +2088,8 @@ body {
 .main-header-meta {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
+  gap: 0.4167em;
+  font-size: 0.8571em;
   color: var(--text-muted);
 }
 
@@ -1643,8 +2102,8 @@ body {
 .main-header-status {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
+  gap: 0.4167em;
+  font-size: 0.8571em;
   font-weight: 500;
   white-space: nowrap;
   flex-shrink: 0;
@@ -1803,7 +2262,7 @@ body {
   position: relative;
   overflow: auto;
   background: var(--terminal-bg, #0f141a);
-  overscroll-behavior: contain;
+  overscroll-behavior: none;
 }
 
 .terminal-shell-passive {
@@ -1835,12 +2294,14 @@ body {
 .terminal-resize-overlay {
   pointer-events: auto;
   position: relative;
-  top: 12px;
+  top: 14px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  max-width: min(calc(100% - 24px), 460px);
-  padding: 10px 16px;
+  justify-content: center;
+  gap: 10px;
+  min-height: 48px;
+  max-width: min(calc(100% - 24px), 560px);
+  padding: 14px 22px;
   border: 1px solid color-mix(in oklch, var(--accent) 22%, var(--border-strong));
   border-radius: 999px;
   background: color-mix(in oklch, var(--bg-sidebar) 76%, #0f141a 24%);
@@ -1849,8 +2310,9 @@ body {
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   font: inherit;
-  font-size: 13px;
-  line-height: 1;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.15;
   letter-spacing: 0.01em;
   cursor: pointer;
   white-space: nowrap;
@@ -2014,7 +2476,7 @@ body {
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 32px clamp(16px, 4vw, 32px) 48px;
+  padding: 2.2857em clamp(1.1429em, 4vw, 2.2857em) 3.4286em;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2025,7 +2487,7 @@ body {
 }
 
 .home-section-title {
-  font-size: 11px;
+  font-size: 0.7857em;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -2049,6 +2511,16 @@ body {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.mp-push-error {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 35%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--status-error) 9%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
 }
 .mp-configured-row {
   display: flex;
@@ -2111,26 +2583,45 @@ body {
 .mp-configured-rest {
   color: var(--text-muted);
 }
+.mp-configured-notify,
 .mp-configured-remove {
   background: none;
   border: none;
   color: var(--text-muted);
-  font-size: 18px;
   line-height: 1;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 4px;
-  opacity: 0;
   flex-shrink: 0;
   transition: opacity 0.1s, color 0.1s, background 0.1s;
 }
+.mp-configured-notify {
+  min-width: 34px;
+  min-height: 34px;
+  font-size: 16px;
+  opacity: 0.8;
+}
+.mp-configured-notify.active {
+  color: var(--accent);
+  opacity: 1;
+}
+.mp-configured-notify:disabled {
+  opacity: 0.45;
+  cursor: wait;
+}
+.mp-configured-remove {
+  font-size: 18px;
+  opacity: 0;
+}
 .mp-configured-row:hover .mp-configured-remove { opacity: 1; }
+.mp-configured-notify:hover,
 .mp-configured-remove:hover {
   color: var(--text);
   background: var(--bg-active);
 }
 @media (hover: none) {
   .mp-configured-remove { opacity: 1; }
+  .mp-configured-notify { min-width: 40px; min-height: 40px; }
 }
 
 .home-empty-hint {
@@ -2177,7 +2668,9 @@ body {
 
 /* ── Mobile ── */
 
-.mobile-bottom-bar {
+.mobile-input-stack,
+.mobile-bottom-bar,
+.mobile-menu-button {
   display: none;
 }
 
@@ -2210,12 +2703,33 @@ body {
   .session-item {
     padding: 8px 10px 8px 14px;
   }
+
+  .checkout-sessions .session-item {
+    padding: 8px 10px 8px 22px;
+  }
 }
 
 /* Touch devices: sidebar becomes an overlay, mobile toolbar appears.
    Uses pointer:coarse so tablets in landscape still get touch controls,
    while a desktop user with a narrow window keeps the sidebar visible. */
 @media (pointer: coarse) {
+  .session-item {
+    min-height: 44px;
+  }
+  .session-item.has-close {
+    padding-right: 3.25em;
+  }
+  .session-close-btn,
+  .session-row-close {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .session-close-btn {
+    right: 0;
+    width: 44px;
+    height: 44px;
+  }
+
   .sidebar {
     position: fixed;
     left: 0;
@@ -2239,61 +2753,127 @@ body {
 
   .main-panel {
     width: 100%;
-    /* Stacking-context root for the key layering: key borders (z:1) <
-       terminal (z:2) < glyphs + feedback (z:3). Also anchors the overlaid
-       control bar. */
+    /* Stacking-context root and anchor for the overlaid mobile control bar. */
     position: relative;
     z-index: 0;
   }
 
+  .mobile-menu-button {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: color-mix(in oklch, var(--bg) 88%, var(--bg-sidebar) 12%);
+    color: var(--text);
+    border-radius: 10px;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: 'Source Sans 3', sans-serif;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    position: relative;
+  }
+
+  .mobile-menu-button:active {
+    border-color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 16%, transparent);
+  }
+
+  .mobile-menu-button.bg-waiting::after {
+    content: '';
+    position: absolute;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    top: 6px;
+    right: 6px;
+    pointer-events: none;
+    background: var(--unread);
+    box-shadow: 0 0 0 1.5px var(--bg);
+  }
+
+  .mobile-menu-button.bg-arriving::after {
+    animation: dot-arrival 520ms cubic-bezier(0.25, 1, 0.5, 1) both;
+  }
+
+  .home-activity-header .hub-title,
+  .hub-title-row .hub-title {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .hub-title-row {
+    align-items: center;
+  }
+
   /* Control bar floating over the bottom of the terminal (out of flow,
-     transparent container) so the terminal can slide one rounded-up row in
-     behind the translucent keys instead of stopping short above an opaque
-     strip — see the ceil/reserve path in measureTerminalFit. Keys are placed
-     by named grid-area (.mk-*); the layout (incl. the single-row landscape /
-     tablet steps further down) is purely a matter of redefining the template,
-     never the DOM. */
-  .mobile-bottom-bar {
+     transparent container). measureTerminalFit reserves this bar's height so
+     scrollback/content stops above the keys instead of sliding under and
+     covering their top edge. Keys are placed by named grid-area (.mk-*); the
+     layout (incl. the single-row landscape / tablet steps further down) is
+     purely a matter of redefining the template, never the DOM. */
+  .mobile-input-stack {
     position: absolute;
     left: 0;
     right: 0;
     bottom: 0;
-    /* Phones: 7-column × 2-row grid. The empty top-left corner and the
-       scroll-end / empty top-right simply fall out of the template (no
-       placeholder elements needed). */
+    display: flex;
+    flex-direction: column;
+    gap: 0.2857em;
+    padding: 0 0.2857em calc(0.2857em + env(safe-area-inset-bottom));
+    background: linear-gradient(to top, var(--bg) 0%, oklch(from var(--bg) l c h / 0.92) 70%, transparent 100%);
+    z-index: 3;
+  }
+
+
+  .mobile-bottom-bar {
+    position: relative;
+    /* Phones: 7-column × 2-row grid. Paste sits in the top-left corner;
+       the top-right slot is file attach until scroll-to-end takes over. */
     display: grid;
     grid-template-columns: repeat(7, 1fr);
-    grid-template-rows: repeat(2, 40px);
+    grid-template-rows: repeat(2, 2.8571em);
     grid-template-areas:
-      '.    esc  tab  wl  au  wr  end'
-      'menu ctrl alt  al  ad  ar  send';
+      'paste esc  tab  wl  au  wr  end'
+      'menu  ctrl alt  al  ad  ar  send';
     /* One knob for spacing: the visual gap between keys. Hitboxes bridge it
        automatically (each .mkey-face extends half of it), so there are no
        dead gaps between buttons no matter what you set this to. */
-    --key-gap: 5px;
+    --key-gap: 0.3571em;
     gap: var(--key-gap);
-    padding: 0 4px calc(4px + env(safe-area-inset-bottom));
+    padding: 0;
     background: transparent;
-    /* No z-index: the bar must NOT form a stacking context, so its keys'
-       borders (z:1) and glyphs (z:3) can sit on either side of the
-       terminal (z:2) in .main-panel's context. */
+    /* Keep the controls fully above the terminal so the first row does not
+       get dimmed/covered by the terminal's painted background. */
+    z-index: 3;
   }
 
   /* Key → grid-area map. The same names are reused by every breakpoint, so
      only the template (above / below) changes between layouts. */
-  .mk-menu { grid-area: menu; }
-  .mk-esc  { grid-area: esc; }
-  .mk-tab  { grid-area: tab; }
-  .mk-ctrl { grid-area: ctrl; }
-  .mk-alt  { grid-area: alt; }
-  .mk-wl   { grid-area: wl; }
-  .mk-wr   { grid-area: wr; }
-  .mk-al   { grid-area: al; }
-  .mk-ad   { grid-area: ad; }
-  .mk-au   { grid-area: au; }
-  .mk-ar   { grid-area: ar; }
-  .mk-end  { grid-area: end; }
-  .mk-send { grid-area: send; }
+  .mk-menu  { grid-area: menu; }
+  .mk-paste { grid-area: paste; }
+  .mk-esc   { grid-area: esc; }
+  .mk-tab   { grid-area: tab; }
+  .mk-ctrl  { grid-area: ctrl; }
+  .mk-alt   { grid-area: alt; }
+  .mk-wl    { grid-area: wl; }
+  .mk-wr    { grid-area: wr; }
+  .mk-al    { grid-area: al; }
+  .mk-ad    { grid-area: ad; }
+  .mk-au    { grid-area: au; }
+  .mk-ar    { grid-area: ar; }
+  .mk-end    { grid-area: end; }
+  .mk-attach { grid-area: end; }
+  .mk-send   { grid-area: send; }
 
   /* No bottom padding under the grid: the control bar overlays it, so the
      reclaimed terminal row can run right to the bottom edge. */
@@ -2301,11 +2881,9 @@ body {
     padding-bottom: 0;
   }
 
-  /* Middle layer. The shell/container go transparent and the opaque fill
-     moves onto the grid itself (.xterm-screen), so the terminal's painted
-     area ends exactly at the content's bottom edge — wherever the row math
-     lands it. A background-coloured drop shadow extends just below that
-     edge, masking the key borders into the terminal as it overlaps them. */
+  /* The shell/container go transparent and the opaque fill moves onto the
+     grid itself (.xterm-screen), so the terminal's painted area ends exactly
+     at the content's bottom edge — wherever the row math lands it. */
   .terminal-shell {
     z-index: 2;
     background: transparent;
@@ -2322,13 +2900,6 @@ body {
   .terminal-container .xterm-screen {
     background: var(--terminal-bg, #0f141a);
   }
-  /* Background-coloured drop shadow on the viewport (the grid's visible
-     box), bleeding past its edges to mask the key borders into the terminal
-     exactly at the content edge. */
-  .terminal-container .xterm-viewport {
-    box-shadow: 0 0 16px 16px var(--terminal-bg, #0f141a);
-  }
-
   /* The floating scroll-to-end pill is desktop-only; on touch the toolbar's
      top-right key takes over. */
   .terminal-scroll-end {
@@ -2337,20 +2908,17 @@ body {
 
   .mobile-bottom-action {
     /* Just a layout/hit box. Visuals split across two layers: the border
-       (::before, z:1) sits UNDER the terminal so it's hidden where the
-       terminal overlaps and visible below it; the glyph + feedback
-       (.mkey-face, z:3) sit ON TOP of the terminal, always crisp. The
-       button itself must create no stacking context (no filter/opacity/
-       z-index) or it would trap both layers together. */
+       (::before) and glyph/feedback (.mkey-face), both above the terminal
+       through the toolbar stacking layer. */
     appearance: none;
     border: none;
     background: transparent;
-    border-radius: 6px;
-    min-height: 40px;
+    border-radius: 0.4615em;
+    min-height: 3.0769em;
     min-width: 0;
-    padding: 0 8px;
+    padding: 0 0.6154em;
     font-family: 'Source Sans 3', sans-serif;
-    font-size: 13px;
+    font-size: 0.9286em;
     font-weight: 600;
     display: inline-flex;
     align-items: center;
@@ -2365,15 +2933,17 @@ body {
     position: relative;
   }
 
-  /* Bottom layer: the key border outline. (Background omitted for now —
-     this is where a key fill would go.) */
+  /* Bottom layer: the key fill + border outline. The fill keeps the top row
+     legible now that the terminal no longer paints a masking shadow behind
+     it. */
   .mobile-bottom-action::before {
     content: '';
     position: absolute;
     inset: 0;
     z-index: 1;
     border-radius: inherit;
-    border: 1px solid oklch(from var(--border-strong) l c h / 0.65);
+    background: color-mix(in oklch, var(--bg-surface) 88%, var(--terminal-bg, #0f141a) 12%);
+    border: 1px solid oklch(from var(--border-strong) l c h / 0.72);
     pointer-events: none;
   }
 
@@ -2401,11 +2971,9 @@ body {
       drop-shadow(0 0 0.75px var(--bg))
       drop-shadow(0 0 0.75px var(--bg))
       drop-shadow(0 0 0.75px var(--bg));
-    /* Must catch taps: this layer sits above the terminal (z:3), whereas the
-       <button> itself is below it (z:auto, so the border can sit at z:1).
-       With pointer-events:none the tap fell through to the terminal-shell;
-       auto makes this layer the hit target and the event bubbles to the
-       button. (On-device this was masked by iOS touch-target fuzzing.) */
+    /* Must catch taps: auto makes this layer the hit target and the event
+       bubbles to the button. (On-device this was masked by iOS touch-target
+       fuzzing.) */
     pointer-events: auto;
   }
 
@@ -2413,6 +2981,10 @@ body {
   .mobile-bottom-bar .mobile-bottom-action {
     min-height: 0;
     padding: 0 4px;
+  }
+
+  .mobile-attach-input {
+    display: none;
   }
 
   /* Waiting dot on the hamburger menu button. Only the waiting (unread)
@@ -2618,6 +3190,20 @@ body {
   margin-bottom: 6px;
 }
 
+.diag-help {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+.diag-help code {
+  color: var(--text);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
 .diag-terminal {
   height: 180px;
   border-radius: var(--radius);
@@ -2695,7 +3281,7 @@ body {
   font-family: 'Fira Code', monospace;
   font-size: 11px;
   line-height: 1.5;
-  overscroll-behavior: contain;
+  overscroll-behavior: none;
 }
 
 .diag-entry {
@@ -2791,16 +3377,16 @@ body {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: 0.8571em;
 }
 .hub-title {
-  font-size: 18px;
+  font-size: 1.2857em;
   font-weight: 600;
   color: var(--text);
   margin: 0;
 }
 .hub-subtitle {
-  font-size: 12px;
+  font-size: 0.8571em;
   color: var(--text-muted);
   margin-top: 4px;
 }
@@ -2815,6 +3401,27 @@ body {
   font-family: "JetBrains Mono", "SF Mono", monospace;
   font-size: 11px;
 }
+.hub-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5714em;
+  flex-shrink: 0;
+}
+.hub-files-btn {
+  min-height: 2.6667em;
+  padding: 0.5833em 0.8333em;
+  border: 1px solid var(--border);
+  border-radius: 0.6667em;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.8571em;
+  font-weight: 600;
+}
+.hub-files-btn:hover,
+.hub-files-btn:focus-visible {
+  color: var(--text);
+  border-color: var(--accent);
+}
 .hub-header-launch {
   flex-shrink: 0;
 }
@@ -2823,14 +3430,259 @@ body {
 .hub-empty {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
+  gap: 0.8571em;
+  padding: 1em 1.1429em;
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text-muted);
   font-size: 13px;
   margin-top: 16px;
 }
+/* ── Mobile file browser overlay ─────────────────────────────────────────── */
+.file-view {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  height: var(--app-height, 100dvh);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.file-view-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.file-back-btn,
+.file-close-btn,
+.file-copy-btn {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-secondary);
+  border-radius: 9px;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0 10px;
+  font: inherit;
+}
+.file-copy-btn {
+  min-width: auto;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.file-close-btn {
+  font-size: 22px;
+  line-height: 1;
+}
+.file-view-title-block {
+  min-width: 0;
+  flex: 1;
+}
+.file-view-title {
+  font-size: 15px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-view-subtitle {
+  margin-top: 2px;
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-breadcrumbs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.file-breadcrumbs button {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.file-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+.file-entry {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+.file-entry-icon {
+  width: 24px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.file-entry-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.file-entry-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.file-entry-meta,
+.file-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.file-empty {
+  padding: 18px 12px;
+}
+.file-content-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.file-content-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.file-content-actions > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-image-zoom-level {
+  flex-shrink: 0;
+  min-width: 36px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.file-image-mode {
+  display: inline-flex;
+  flex-shrink: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+}
+.file-image-mode button {
+  border: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  min-height: 38px;
+  min-width: 44px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+}
+.file-image-mode button:first-child {
+  border-left: 0;
+}
+.file-image-mode button.active {
+  background: var(--accent);
+  color: var(--bg);
+}
+.file-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  font-family: "JetBrains Mono", "SF Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+.file-image-preview-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: color-mix(in srgb, var(--bg) 92%, var(--text) 8%);
+  overscroll-behavior: none;
+  touch-action: pan-x pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+.file-image-preview-wrap > .state-subtitle,
+.file-image-preview-wrap > .file-error {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+.file-image-stage {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  min-width: 100%;
+  min-height: 100%;
+  padding: 12px;
+}
+.file-image-preview {
+  display: block;
+  max-width: none;
+  max-height: none;
+  border-radius: 10px;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.file-error {
+  margin: 24px 16px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  text-align: center;
+}
+.file-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 18px);
+  transform: translateX(-50%);
+  z-index: 1110;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .btn:disabled,
 .btn-primary:disabled {
   opacity: 0.6;
@@ -3049,37 +3901,22 @@ body {
 /* Single row, word-jumps dropped. */
 @media (pointer: coarse) and (min-width: 600px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(10, 1fr);
-    grid-template-rows: 40px;
-    grid-template-areas: 'menu esc tab ctrl alt al ad au ar send';
+    grid-template-columns: repeat(12, 1fr);
+    grid-template-rows: 2.8571em;
+    grid-template-areas: 'menu paste end esc tab ctrl alt al ad au ar send';
   }
   /* Word-jumps aren't part of the single-row layout. */
   .mk-wl,
   .mk-wr {
     display: none;
   }
-  /* Scroll-end floats above the top-right of the row instead of taking a
-     column. Unlike the in-row keys (which the terminal slides under), it
-     sits fully above the terminal with its own fill + border at z:3. */
-  .mk-end {
-    position: absolute;
-    grid-area: auto;
-    right: 6px;
-    bottom: calc(100% + 8px);
-    z-index: 3;
-    width: 46px;
-    height: 34px;
-    min-height: 0;
-    border-radius: 8px;
-    background: var(--bg-surface);
-  }
 }
 
 /* Wider still: fold the word-jumps back in, flanking the arrow cluster. */
 @media (pointer: coarse) and (min-width: 820px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(12, 1fr);
-    grid-template-areas: 'menu esc tab ctrl alt wl al ad au ar wr send';
+    grid-template-columns: repeat(14, 1fr);
+    grid-template-areas: 'menu paste end esc tab ctrl alt wl al ad au ar wr send';
   }
   .mk-wl,
   .mk-wr {

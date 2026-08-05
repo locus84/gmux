@@ -3,9 +3,13 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,6 +49,61 @@ func waitURL(srv *httptest.Server, id string) string {
 // composition (`gmux --send X && gmux --wait X` after the agent
 // races ahead between the two CLI calls), and the no-op-when-idle
 // behavior is what makes that composition reliable.
+func TestWaitUsesCorrelatedPiMessageInsteadOfStaleIdleCache(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "gmux-wait-message-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socketPath := filepath.Join(dir, "runner.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reads atomic.Int32
+	runner := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state := "running"
+		result := ""
+		outcome := ""
+		if reads.Add(1) >= 2 {
+			state, result, outcome = "settled", "verified result", "completed"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"request_id": "req-1", "runner_epoch": "runner", "runtime_epoch": "runtime",
+			"sequence": 1, "state": state, "result": result, "outcome": outcome,
+		})
+	})}
+	go runner.Serve(ln)
+	defer runner.Close()
+
+	srv, st := waitTestServer(t)
+	st.Upsert(store.Session{ID: "sess-pi-message", Kind: "pi", Alive: true, SocketPath: socketPath, Status: &store.Status{Working: false}})
+	start := time.Now()
+	resp, body := postWait(t, srv, "sess-pi-message")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+	}
+	data := body["data"].(map[string]any)
+	if data["reason"] != "idle" || data["message"].(map[string]any)["result"] != "verified result" {
+		t.Fatalf("data=%v", data)
+	}
+	if time.Since(start) < 75*time.Millisecond {
+		t.Fatal("wait returned the stale idle cache before the correlated Pi message settled")
+	}
+}
+
+func TestWaitDoesNotFallBackToStaleIdleWhenPiBrokerIsUnreachable(t *testing.T) {
+	srv, st := waitTestServer(t)
+	st.Upsert(store.Session{
+		ID: "sess-pi-unreachable", Kind: "pi", Alive: true,
+		SocketPath: "/tmp/gmux-missing-runner.sock", Status: &store.Status{Working: false},
+	})
+	resp, body := postWait(t, srv, "sess-pi-unreachable")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
 func TestWaitReturnsImmediatelyWhenAlreadyIdle(t *testing.T) {
 	srv, st := waitTestServer(t)
 	st.Upsert(store.Session{

@@ -17,6 +17,10 @@ Terminal options, keybinds, and frontend preferences. All fields are optional.
 Missing fields use the defaults shown below. Numeric values are clamped to
 their valid range (not rejected). Unknown keys produce a console warning.
 
+The VS Code Server fields can also be edited under **Settings → Integrations** in gmux web.
+Web edits are shared by every browser connected to that gmux host and safely preserve
+comments and unrelated values in `settings.jsonc`. Peer-host settings are not changed.
+
 ## Example
 
 ```jsonc
@@ -28,6 +32,10 @@ their valid range (not rejected). Unknown keys produce a console warning.
   "cursorBlink": true,
   "scrollback": 10000,
 
+  // Optional: show a VS Code button on project rows.
+  // Expose your VS Code Server with trnsrv/tsnsrv and paste its base URL here.
+  "vsCodeServerUrl": "https://code-host.example.ts.net",
+
   // Keybind overrides
   "keybinds": [
     { "key": "ctrl+alt+t", "action": "sendKeys", "args": "ctrl+t" },
@@ -38,6 +46,14 @@ their valid range (not rejected). Unknown keys produce a console warning.
 ```
 
 ## Fields
+
+### `uiScale`
+
+Overall web UI scale multiplier. Affects gmux chrome and scales the terminal font size.
+
+- **Type:** `number`
+- **Default:** `1`
+- **Range:** 0.7–2
 
 ### `fontSize`
 
@@ -215,6 +231,20 @@ Argument for the action (e.g. the text or key combo to send).
 On macOS, remap every Cmd+character to its Ctrl equivalent. Cmd+arrow/backspace keep their navigation behavior. When enabled, define keybinds with ctrl (not cmd/meta/secondary) since Cmd events are transformed before matching.
 
 - **Type:** `boolean`
+
+### `vsCodeServerUrl`
+
+Optional VS Code Server base URL. When set, project rows show a button that opens this server with the project path as the folder query parameter.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
+
+### `vsCodeServerHomeDir`
+
+Optional home directory for VS Code Server path expansion. When set, project paths like ~/repo are opened as /home/user/repo.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
 
 ## Keybinds guide
 

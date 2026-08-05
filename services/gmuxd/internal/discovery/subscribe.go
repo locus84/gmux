@@ -233,21 +233,29 @@ func (sub *Subscriptions) handleEvent(sessionID, socketPath, eventType string, d
 
 	case "meta":
 		var meta struct {
-			ShellTitle   *string `json:"shell_title"`
-			AdapterTitle *string `json:"adapter_title"`
-			Subtitle     *string `json:"subtitle"`
-			Unread       *bool   `json:"unread"`
-			Slug         *string `json:"slug"`
+			ExplicitTitle *string `json:"explicit_title"`
+			AgentTitle    *string `json:"agent_title"`
+			ShellTitle    *string `json:"shell_title"`
+			AdapterTitle  *string `json:"adapter_title"`
+			Subtitle      *string `json:"subtitle"`
+			Unread        *bool   `json:"unread"`
+			Slug          *string `json:"slug"`
 		}
 		if err := json.Unmarshal(data, &meta); err != nil {
 			log.Printf("subscribe: %s: bad meta event: %v", sessionID, err)
 			return
 		}
 		sub.store.Update(sessionID, func(sess *store.Session) {
+			if meta.ExplicitTitle != nil {
+				sess.ExplicitTitle = *meta.ExplicitTitle
+			}
+			if meta.AgentTitle != nil {
+				sess.AgentTitle = *meta.AgentTitle
+			}
 			if meta.ShellTitle != nil {
 				sess.ShellTitle = *meta.ShellTitle
 			}
-			if meta.AdapterTitle != nil && *meta.AdapterTitle != "" {
+			if meta.AdapterTitle != nil {
 				sess.AdapterTitle = *meta.AdapterTitle
 			}
 			if meta.Subtitle != nil {
@@ -297,12 +305,21 @@ func (sub *Subscriptions) handleEvent(sessionID, socketPath, eventType string, d
 			}
 		}
 		if !sub.store.Update(sessionID, func(current *store.Session) {
-			*current = sess
+			// Merge only exit-owned fields. Metadata (including a concurrent
+			// explicit rename) may have changed while OnExit was deriving the
+			// resume command; replacing the whole snapshot would lose it.
+			current.Alive = false
+			current.ExitCode = sess.ExitCode
+			current.ExitedAt = sess.ExitedAt
+			current.Command = sess.Command
+			current.Status = sess.Status
 		}) {
 			return
 		}
 		if sub.OnDead != nil {
-			sub.OnDead(sess)
+			if dead, ok := sub.store.Get(sessionID); ok {
+				sub.OnDead(dead)
+			}
 		}
 
 	case "session_file":

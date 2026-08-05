@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"sync"
 	"time"
 
@@ -33,8 +34,8 @@ func DefaultConfig() Config {
 
 // NotifyMessage is sent to the browser over the presence WebSocket.
 type NotifyMessage struct {
-	Type      string `json:"type"`       // "notify"
-	ID        string `json:"id"`         // daemon-assigned notification ID
+	Type      string `json:"type"` // "notify"
+	ID        string `json:"id"`   // daemon-assigned notification ID
 	SessionID string `json:"session_id"`
 	Title     string `json:"title"`
 	Body      string `json:"body"`
@@ -47,13 +48,18 @@ type CancelMessage struct {
 	ID   string `json:"id"`
 }
 
+type PushSender interface {
+	Send(ctx context.Context, projectSlug string, payload []byte)
+}
+
 type pendingNotif struct {
-	sessionID string
-	notifType string // "finished" | "unread"
-	title     string
-	body      string
-	timer     *time.Timer
-	notifID   string
+	sessionID   string
+	projectSlug string
+	notifType   string // "finished" | "unread"
+	title       string
+	body        string
+	timer       *time.Timer
+	notifID     string
 }
 
 // Router watches session state and delivers notifications to browser clients.
@@ -67,6 +73,7 @@ type Router struct {
 	pending   map[string]*pendingNotif // sessionID → pending
 	active    map[string]activeNotif   // notifID → active (sent but not dismissed)
 	nextID    int
+	push      PushSender
 }
 
 type sessionSnapshot struct {
@@ -95,6 +102,14 @@ func New(p *presence.Table, s *store.Store, cfg Config) *Router {
 func (r *Router) genID() string {
 	r.nextID++
 	return fmt.Sprintf("notif-%d", r.nextID)
+}
+
+// SetPushSender enables best-effort Web Push delivery in addition to the
+// foreground presence WebSocket notification path.
+func (r *Router) SetPushSender(sender PushSender) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.push = sender
 }
 
 // Run subscribes to store events and processes them until ctx is cancelled.
@@ -159,7 +174,7 @@ func (r *Router) handleEvent(ev store.Event) {
 	// Transition: working → idle on a live session
 	if prev.Working && !cur.Working && cur.Alive {
 		body := formatFinishedBody(sess)
-		r.scheduleNotification(sess.ID, "finished", sess.Title, body)
+		r.scheduleNotification(sess.ID, sess.ProjectSlug, "finished", sess.Title, body)
 	}
 
 	// Transition: unread flipped on
@@ -168,7 +183,7 @@ func (r *Router) handleEvent(ev store.Event) {
 		if sess.Status != nil && sess.Status.Label != "" {
 			body = sess.Status.Label
 		}
-		r.scheduleNotification(sess.ID, "unread", sess.Title, body)
+		r.scheduleNotification(sess.ID, sess.ProjectSlug, "unread", sess.Title, body)
 	}
 }
 
@@ -197,7 +212,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm", h, m)
 }
 
-func (r *Router) scheduleNotification(sessionID, notifType, title, body string) {
+func (r *Router) scheduleNotification(sessionID, projectSlug, notifType, title, body string) {
 	// Skip if user is viewing this session or focused on gmux.
 	if r.presence.AnyViewing(sessionID) {
 		return
@@ -222,11 +237,12 @@ func (r *Router) scheduleNotification(sessionID, notifType, title, body string) 
 
 	notifID := r.genID()
 	p := &pendingNotif{
-		sessionID: sessionID,
-		notifType: notifType,
-		title:     title,
-		body:      body,
-		notifID:   notifID,
+		sessionID:   sessionID,
+		projectSlug: projectSlug,
+		notifType:   notifType,
+		title:       title,
+		body:        body,
+		notifID:     notifID,
 	}
 
 	p.timer = time.AfterFunc(r.config.GracePeriod, func() {
@@ -249,16 +265,21 @@ func (r *Router) firePending(sessionID string) {
 	delete(r.pending, sessionID)
 	pendingCount := len(r.pending) + 1 // +1 for the one we just removed
 
-	// Coalesce: if 3+ events are pending simultaneously, send a summary.
+	// Coalesce: if 3+ events are pending simultaneously, send a summary to
+	// foreground clients, but still Web Push each project-specific event so
+	// per-project subscriptions don't lose their filter semantics.
 	if pendingCount >= 3 {
-		count := 1
+		pendings := []*pendingNotif{p}
 		for sid, other := range r.pending {
 			other.timer.Stop()
 			delete(r.pending, sid)
-			count++
+			pendings = append(pendings, other)
 		}
 		r.mu.Unlock()
-		r.fireCoalesced(count)
+		r.fireCoalesced(len(pendings))
+		for _, pending := range pendings {
+			r.firePush(pending)
+		}
 		return
 	}
 	r.mu.Unlock()
@@ -268,27 +289,32 @@ func (r *Router) firePending(sessionID string) {
 		return
 	}
 
+	r.firePresence(p)
+	r.firePush(p)
+}
+
+func (r *Router) firePresence(p *pendingNotif) {
 	target := r.presence.BestNotifyTarget(r.config.IdleThreshold)
 	if target == nil {
-		log.Printf("notify: no target for session %s (no client with granted permission)", sessionID)
+		log.Printf("notify: no foreground target for session %s (no client with granted permission)", p.sessionID)
 		return
 	}
 
 	msg := NotifyMessage{
 		Type:      "notify",
 		ID:        p.notifID,
-		SessionID: sessionID,
+		SessionID: p.sessionID,
 		Title:     p.title,
 		Body:      p.body,
-		Tag:       sessionID,
+		Tag:       p.sessionID,
 	}
 
 	r.mu.Lock()
-	r.active[p.notifID] = activeNotif{sessionID: sessionID, clientID: target.ID}
+	r.active[p.notifID] = activeNotif{sessionID: p.sessionID, clientID: target.ID}
 	r.mu.Unlock()
 
 	sendJSON(target.Conn, msg)
-	log.Printf("notify: sent %s to client %s for session %s (%s)", p.notifID, target.ID, sessionID, p.notifType)
+	log.Printf("notify: sent %s to client %s for session %s (%s)", p.notifID, target.ID, p.sessionID, p.notifType)
 
 	// Auto-expire the active entry after 5 minutes so dismissed-without-click
 	// notifications don't leak memory in the active map.
@@ -297,6 +323,27 @@ func (r *Router) firePending(sessionID string) {
 		delete(r.active, p.notifID)
 		r.mu.Unlock()
 	})
+}
+
+func (r *Router) firePush(p *pendingNotif) {
+	r.mu.Lock()
+	sender := r.push
+	r.mu.Unlock()
+	if sender == nil || p.projectSlug == "" {
+		return
+	}
+	payload, err := json.Marshal(map[string]string{
+		"id":         p.notifID,
+		"session_id": p.sessionID,
+		"title":      p.title,
+		"body":       p.body,
+		"tag":        p.sessionID,
+		"url":        "/?notificationSession=" + url.QueryEscape(p.sessionID),
+	})
+	if err != nil {
+		return
+	}
+	sender.Send(context.Background(), p.projectSlug, payload)
 }
 
 func (r *Router) fireCoalesced(count int) {

@@ -38,15 +38,19 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
    Power users who want terseness alias `gm='gmux --'` — which is shorter
    than the old shorthand and lives in their shell, not the tool.
 
-5. **The top-level verb namespace is deliberately closed and small.**
-   Functionality grows under **namespace groups**, not new top-level
-   verbs:
+5. **The top-level action-verb namespace is deliberately closed and small.**
+   Functionality grows under explicit **namespace groups**, not new standalone
+   action verbs. Namespace groups are the reserved extension mechanism and may
+   be added without reopening the bare-command shorthand ambiguity:
    - `gmux daemon start|stop|restart|status|log-path` — daemon process
      lifecycle (was the `gmuxd` verbs).
+   - `gmux worktree current|ps|create` — local Git checkout management.
+   - `gmux workspace add` — local workspace registration.
    - future groups (e.g. `gmux peer …`) as needed.
    `auth` and `remote` remain top-level (rare, deliberate, setup-time).
-   Adding a new top-level verb is a breaking change requiring a major
-   bump.
+   Adding a new standalone top-level action verb is a breaking change requiring
+   a major bump; adding a namespace group with explicit subcommands is the
+   intended additive growth path.
 
 6. **`gmux daemon …` is the canonical front; `gmuxd` keeps its verbs for
    backwards-compatible ops.** `gmux daemon start|stop|restart|status|

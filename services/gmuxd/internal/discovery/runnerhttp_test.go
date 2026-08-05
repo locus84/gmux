@@ -3,6 +3,7 @@ package discovery
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -158,6 +159,21 @@ func TestRunnerRequest_HonorsCallerContext(t *testing.T) {
 	// elapsed time well under that proves the caller's ctx won.
 	if elapsed > time.Second {
 		t.Fatalf("request took %v; expected <1s (caller ctx must short-circuit runner timeout)", elapsed)
+	}
+}
+
+func TestGetAgentMessageAllowsWorstCaseEscapedBoundedResult(t *testing.T) {
+	result := strings.Repeat("\n", 256*1024)
+	s := startUnixServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(AgentMessage{RequestID: "req", State: "settled", Result: result})
+	}))
+	defer s.cleanup()
+	message, _, err := GetAgentMessage(context.Background(), s.socketPath, "req")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Result != result {
+		t.Fatalf("result bytes=%d want=%d", len(message.Result), len(result))
 	}
 }
 

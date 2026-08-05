@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -39,6 +40,7 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/peerstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/presence"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/projects"
+	pushpkg "github.com/gmuxapp/gmux/services/gmuxd/internal/push"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionfiles"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionmeta"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sleep"
@@ -60,6 +62,11 @@ var version = "dev"
 // edge (with a 413) instead of silently truncating inside the
 // runner.
 const maxInputBytes = 1 << 20 // 1 MiB
+
+const (
+	runnerHandshakeFDEnv   = "GMUX_HANDSHAKE_FD"
+	runnerHandshakeTimeout = 5 * time.Second
+)
 
 type LaunchConfig struct {
 	DefaultLauncher string             `json:"default_launcher"`
@@ -157,7 +164,7 @@ func launcherStates(ls []adapter.Launcher) []string {
 }
 
 // launchGmux forks a gmux runner with the given command and cwd.
-// Returns the PID on success.
+// Returns the PID and runner-registered session id once registration succeeds.
 //
 // resumeID, when non-empty, is passed via --resume-id so the
 // runner uses the daemon-supplied id instead of generating a fresh
@@ -166,7 +173,8 @@ func launcherStates(ls []adapter.Launcher) []string {
 // session's id so identity (and the scrollback directory on disk)
 // carry across the seam. See ADR 0003.
 //
-// initialCols / initialRows, when non-zero, are passed via
+// initialTitle and initialAgentTitle preserve title layers when a dead session
+// is resumed or restarted. initialCols / initialRows, when non-zero, are passed via
 // --initial-cols / --initial-rows so the PTY starts at the right
 // size instead of the 80x24 default. Without this, /resume and
 // /restart momentarily expose the child process to a
@@ -179,8 +187,11 @@ func launcherStates(ls []adapter.Launcher) []string {
 // contract is greppable and shows up in `ps`. The runner still
 // honours the legacy GMUX_RESUME_ID env var as a fallback for
 // rolling upgrades, but this code path no longer sets it.
-func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, error) {
-	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialCols, initialRows, command)...)
+func launchGmux(gmuxBin string, command []string, cwd, resumeID, initialTitle, initialAgentTitle string, initialCols, initialRows uint16) (int, string, error) {
+	worktreeLifecycleMu.RLock()
+	defer worktreeLifecycleMu.RUnlock()
+
+	cmd := exec.Command(gmuxBin, buildLaunchArgs(resumeID, initialTitle, initialAgentTitle, initialCols, initialRows, command)...)
 	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdout = nil
@@ -195,13 +206,75 @@ func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialC
 	// processes don't inherit a parent session's identity (a leaked
 	// GMUX_SESSION_ID/GMUX_SOCKET/GMUX_ADAPTER would otherwise be
 	// stamped onto every launched session). See packages/sessionenv.
-	cmd.Env = sessionenv.Strip(captureLoginEnv(gmuxBin, cwd))
+	cmd.Env = buildRunnerEnv(sessionenv.Strip(captureLoginEnv(gmuxBin, cwd)))
+
+	handshakeRead, handshakeWrite, err := os.Pipe()
+	if err != nil {
+		return 0, "", fmt.Errorf("handshake pipe: %w", err)
+	}
+	defer handshakeRead.Close()
+	cmd.ExtraFiles = []*os.File{handshakeWrite}
+	cmd.Env = upsertEnv(cmd.Env, runnerHandshakeFDEnv, "3")
 
 	if err := cmd.Start(); err != nil {
-		return 0, err
+		handshakeWrite.Close()
+		return 0, "", err
 	}
+	// The child owns the write end now; close the daemon's copy so EOF/timeout
+	// reflects the runner's registration path rather than our own fd leak.
+	handshakeWrite.Close()
 	go cmd.Wait()
-	return cmd.Process.Pid, nil
+
+	registeredID, err := readRunnerHandshake(handshakeRead, runnerHandshakeTimeout)
+	if err != nil {
+		return cmd.Process.Pid, "", fmt.Errorf("registration handshake: %w", err)
+	}
+	return cmd.Process.Pid, registeredID, nil
+}
+
+func buildRunnerEnv(env []string) []string {
+	// A login shell may override XDG_STATE_HOME/XDG_RUNTIME_DIR while sourcing
+	// dotfiles. That is good for user commands, but gmux's own runner must still
+	// talk to this daemon and bind sockets in the directory this daemon scans.
+	// Pin gmux-specific path overrides without changing the generic XDG vars that
+	// the child application sees.
+	env = upsertEnv(env, "GMUX_STATE_DIR", paths.StateDir())
+	env = upsertEnv(env, "GMUX_SOCKET_DIR", paths.SessionSocketDir())
+	return env
+}
+
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	entry := prefix + value
+	for i, e := range env {
+		if e == key || strings.HasPrefix(e, prefix) {
+			env[i] = entry
+			return env
+		}
+	}
+	return append(env, entry)
+}
+
+func readRunnerHandshake(r *os.File, timeout time.Duration) (string, error) {
+	if err := r.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return "", err
+	}
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(line)
+	if id == "" {
+		return "", errors.New("empty session id from runner")
+	}
+	return id, nil
+}
+
+func resumableRunnerID(sessionID string) string {
+	if paths.IsValidSessionID(sessionID) {
+		return sessionID
+	}
+	return ""
 }
 
 // buildLaunchArgs assembles the gmux runner argv for the internal
@@ -209,11 +282,17 @@ func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialC
 // __run verb, any non-empty daemon→runner directive flags, then a `--`
 // terminator and the user command verbatim. The `--` delivers the
 // command intact even when its own arguments look like flags.
-func buildLaunchArgs(resumeID string, initialCols, initialRows uint16, command []string) []string {
-	args := make([]string, 0, len(command)+5)
+func buildLaunchArgs(resumeID, initialTitle, initialAgentTitle string, initialCols, initialRows uint16, command []string) []string {
+	args := make([]string, 0, len(command)+7)
 	args = append(args, "__run")
 	if resumeID != "" {
 		args = append(args, "--resume-id="+resumeID)
+	}
+	if initialTitle != "" {
+		args = append(args, "--initial-title="+initialTitle)
+	}
+	if initialAgentTitle != "" {
+		args = append(args, "--initial-agent-title="+initialAgentTitle)
 	}
 	if initialCols > 0 {
 		args = append(args, fmt.Sprintf("--initial-cols=%d", initialCols))
@@ -515,6 +594,7 @@ func serve(stderr io.Writer) int {
 	subs := discovery.NewSubscriptions(sessions)
 	subs.OnDead = persistDead
 	var resumeMu sync.Mutex
+	var renameMu sync.Mutex
 
 	// Start file monitor — watches adapter session directories with inotify
 	// to extract title and working status from JSONL files.
@@ -606,6 +686,13 @@ func serve(stderr io.Writer) int {
 
 	// State directory for persistent files (projects.json, auth-token, etc).
 	stateDir := paths.StateDir()
+
+	pushMgr, err := pushpkg.Open(stateDir)
+	if err != nil {
+		log.Printf("push: disabled: %v", err)
+	} else {
+		notifRouter.SetPushSender(pushMgr)
+	}
 
 	// Stable, opaque per-node identity (ADR 0007). Generated once and
 	// persisted alongside the auth token; used for peer dedup, never
@@ -876,6 +963,123 @@ func serve(stderr io.Writer) int {
 			},
 		})
 	})
+	mux.HandleFunc("PATCH /v1/frontend-config", func(w http.ResponseWriter, r *http.Request) {
+		handleFrontendConfigPatch(w, r, config.UpdateSettings)
+	})
+
+	// ── Web Push ──
+
+	mux.HandleFunc("GET /v1/push/vapid-public-key", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		key, err := pushMgr.PublicKey()
+		if err != nil {
+			log.Printf("push: public key: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to load push key")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": map[string]string{"public_key": key}})
+	})
+
+	mux.HandleFunc("POST /v1/push/lookup", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := readJSONLimited(r, 4096, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, ok, err := pushMgr.Lookup(req.Endpoint)
+		if err != nil {
+			log.Printf("push: lookup: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to load push subscription")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"found": ok, "subscription": sub}})
+	})
+
+	mux.HandleFunc("POST /v1/push/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Subscription struct {
+				Endpoint string       `json:"endpoint"`
+				Keys     pushpkg.Keys `json:"keys"`
+			} `json:"subscription"`
+			Projects    []string `json:"projects"`
+			DeviceLabel string   `json:"device_label"`
+		}
+		if err := readJSONLimited(r, 64*1024, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, err := pushMgr.Upsert(pushpkg.Subscription{
+			Endpoint:    req.Subscription.Endpoint,
+			Keys:        req.Subscription.Keys,
+			Projects:    localProjectSubset(projectMgr, req.Projects),
+			DeviceLabel: req.DeviceLabel,
+			UserAgent:   r.UserAgent(),
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": sub})
+	})
+
+	mux.HandleFunc("PATCH /v1/push/subscription", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string   `json:"endpoint"`
+			Projects []string `json:"projects"`
+		}
+		if err := readJSONLimited(r, 64*1024, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		sub, ok, err := pushMgr.UpdateProjects(req.Endpoint, localProjectSubset(projectMgr, req.Projects))
+		if err != nil {
+			log.Printf("push: update projects: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to update push subscription")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found", "push subscription not found")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "data": sub})
+	})
+
+	mux.HandleFunc("DELETE /v1/push/subscription", func(w http.ResponseWriter, r *http.Request) {
+		if pushMgr == nil {
+			writeError(w, http.StatusServiceUnavailable, "push_unavailable", "web push is unavailable")
+			return
+		}
+		var req struct {
+			Endpoint string `json:"endpoint"`
+		}
+		if err := readJSONLimited(r, 4096, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		if err := pushMgr.Delete(req.Endpoint); err != nil {
+			log.Printf("push: delete: %v", err)
+			writeError(w, http.StatusInternalServerError, "internal", "failed to remove push subscription")
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
 
 	// ── Projects ──
 	//
@@ -997,6 +1201,24 @@ func serve(stderr io.Writer) int {
 		// on the first fetch.
 		projectMgr.AutoAssignAll(buildSessionInfos(sessions, func(name string) bool { return peerManager != nil && peerManager.IsLocalPeer(name) }))
 		writeJSON(w, map[string]any{"ok": true, "data": item})
+	})
+
+	mux.HandleFunc("GET /v1/projects/{slug}/files", func(w http.ResponseWriter, r *http.Request) {
+		workspaceProjectFilesListHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+
+	mux.HandleFunc("GET /v1/projects/{slug}/file", func(w http.ResponseWriter, r *http.Request) {
+		workspaceProjectFilesContentHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+
+	mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreesHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+	mux.HandleFunc("POST /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreeCreateHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
+	})
+	mux.HandleFunc("DELETE /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+		projectWorktreeDeleteHandler(w, r, r.PathValue("slug"), projectMgr, sessions)
 	})
 
 	mux.HandleFunc("PATCH /v1/projects/{slug}/sessions", func(w http.ResponseWriter, r *http.Request) {
@@ -1311,17 +1533,17 @@ func serve(stderr io.Writer) int {
 		// added; fixing /launch requires a protocol change to
 		// carry cols/rows in the launch request and is left as a
 		// follow-up.
-		pid, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
+		pid, registeredID, err := launchGmux(gmuxBin, req.Command, cwd, "", "", "", 0, 0)
 		if err != nil {
 			log.Printf("launch: failed to start gmux: %v", err)
 			writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
 			return
 		}
 
-		log.Printf("launch: started gmux pid=%d cwd=%s cmd=%v", pid, cwd, req.Command)
+		log.Printf("launch: registered gmux pid=%d session=%s cwd=%s cmd=%v", pid, registeredID, cwd, req.Command)
 		writeJSON(w, map[string]any{
 			"ok":   true,
-			"data": map[string]any{"pid": pid},
+			"data": map[string]any{"pid": pid, "session_id": registeredID},
 		})
 	})
 
@@ -1335,8 +1557,8 @@ func serve(stderr io.Writer) int {
 		}
 		sessionID := parts[2]
 		action := ""
-		if len(parts) == 4 {
-			action = parts[3]
+		if len(parts) >= 4 {
+			action = strings.Join(parts[3:], "/")
 		}
 
 		// Route to peer if this is a remote session.
@@ -1409,7 +1631,11 @@ func serve(stderr io.Writer) int {
 			// fork; without them claude / vim / prompt frameworks
 			// reading $COLUMNS at startup would clamp to 80.
 			resumeCwd := projects.NormalizePath(sess.Cwd)
-			pid, err := launchGmux(gmuxBin, sess.Command, resumeCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			requestedID := resumableRunnerID(sessionID)
+			if requestedID == "" {
+				log.Printf("resume: %s is not a runner-owned session id; launching replacement session", sessionID)
+			}
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, resumeCwd, requestedID, sess.ExplicitTitle, sess.AgentTitle, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("resume: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
@@ -1420,10 +1646,14 @@ func serve(stderr io.Writer) int {
 			// until the runner calls POST /register and the
 			// re-registration upsert flips alive=true.
 			// The frontend shows a local "resuming" indicator.
-			log.Printf("resume: started gmux pid=%d for %s cwd=%s", pid, sessionID, resumeCwd)
+			if registeredID != sessionID {
+				log.Printf("resume: requested %s but runner registered %s (collision fallback) pid=%d cwd=%s", sessionID, registeredID, pid, resumeCwd)
+			} else {
+				log.Printf("resume: registered gmux pid=%d for %s cwd=%s", pid, sessionID, resumeCwd)
+			}
 			writeJSON(w, map[string]any{
 				"ok":   true,
-				"data": map[string]any{"pid": pid, "session_id": sessionID},
+				"data": map[string]any{"pid": pid, "session_id": registeredID},
 			})
 
 		case "restart":
@@ -1493,16 +1723,24 @@ func serve(stderr io.Writer) int {
 			// session id; Register's re-registration branch handles
 			// the rest.
 			restartCwd := projects.NormalizePath(sess.Cwd)
-			pid, err := launchGmux(gmuxBin, sess.Command, restartCwd, sessionID, sess.TerminalCols, sess.TerminalRows)
+			requestedID := resumableRunnerID(sessionID)
+			if requestedID == "" {
+				log.Printf("restart: %s is not a runner-owned session id; launching replacement session", sessionID)
+			}
+			pid, registeredID, err := launchGmux(gmuxBin, sess.Command, restartCwd, requestedID, sess.ExplicitTitle, sess.AgentTitle, sess.TerminalCols, sess.TerminalRows)
 			if err != nil {
 				log.Printf("restart: failed to start gmux: %v", err)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
 				return
 			}
-			log.Printf("restart: started gmux pid=%d for %s cwd=%s", pid, sessionID, restartCwd)
+			if registeredID != sessionID {
+				log.Printf("restart: requested %s but runner registered %s (collision fallback) pid=%d cwd=%s", sessionID, registeredID, pid, restartCwd)
+			} else {
+				log.Printf("restart: registered gmux pid=%d for %s cwd=%s", pid, sessionID, restartCwd)
+			}
 			writeJSON(w, map[string]any{
 				"ok":   true,
-				"data": map[string]any{"pid": pid, "session_id": sessionID},
+				"data": map[string]any{"pid": pid, "session_id": registeredID},
 			})
 
 		case "kill":
@@ -1539,6 +1777,14 @@ func serve(stderr io.Writer) int {
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{}})
 
+		case "rename":
+			// Keep runner and cache updates in one order. Without serialization,
+			// two concurrent responses can complete cache writes in the opposite
+			// order from the runner's title writes.
+			renameMu.Lock()
+			defer renameMu.Unlock()
+			handleSessionRename(w, r, sessionID, sessions, discovery.SetExplicitTitle, persistDead)
+
 		case "read":
 			if r.Method != http.MethodPost {
 				writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
@@ -1551,6 +1797,54 @@ func serve(stderr io.Writer) int {
 				}
 			})
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{}})
+
+		case "message":
+			// Semantic Pi input. Unlike /input this is consumed by the injected
+			// extension and correlated through the runner's runtime-only broker.
+			sess, ok := sessions.Get(sessionID)
+			if !ok {
+				writeError(w, http.StatusNotFound, "not_found", "session not found")
+				return
+			}
+			if !sess.Alive || sess.SocketPath == "" {
+				writeError(w, http.StatusConflict, "not_running", "session is not running")
+				return
+			}
+			if sess.Kind != "pi" {
+				writeError(w, http.StatusNotImplemented, "unsupported", "semantic messages are only supported for pi sessions")
+				return
+			}
+			switch r.Method {
+			case http.MethodPost:
+				body, err := io.ReadAll(io.LimitReader(r.Body, maxInputBytes*6+4097))
+				if err != nil || len(body) > maxInputBytes*6+4096 {
+					writeError(w, http.StatusRequestEntityTooLarge, "too_large", "semantic message exceeds limit")
+					return
+				}
+				message, status, err := discovery.EnqueueAgentMessage(r.Context(), sess.SocketPath, bytes.NewReader(body))
+				if err != nil {
+					if status == 0 {
+						status = http.StatusBadGateway
+					}
+					writeError(w, status, "message_failed", err.Error())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": message})
+			case http.MethodGet:
+				message, status, err := discovery.GetAgentMessage(r.Context(), sess.SocketPath, r.URL.Query().Get("request_id"))
+				if err != nil {
+					if status == 0 {
+						status = http.StatusBadGateway
+					}
+					writeError(w, status, "message_failed", err.Error())
+					return
+				}
+				writeJSON(w, map[string]any{"ok": true, "data": message})
+			default:
+				writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+			}
 
 		case "input":
 			// Cross-peer `gmux --send`. The peer-routing branch above
@@ -1595,18 +1889,31 @@ func serve(stderr io.Writer) int {
 		case "scrollback":
 			scrollbackBrokerHandler(w, r, sessionID, sessions, metaStore.SessionDir)
 
+		case "files":
+			workspaceSessionFilesListHandler(w, r, sessionID, sessions)
+
+		case "file", "files/content":
+			workspaceSessionFilesContentHandler(w, r, sessionID, sessions)
+
+		case "temp-file":
+			sessionTempImageContentHandler(w, r, sessionID, sessions, os.TempDir())
+
 		case "clipboard":
-			// Materialize a clipboard binary payload as a file in this
-			// gmuxd's os.TempDir() and return the absolute path. For
+			// Materialize a clipboard binary payload in this session's
+			// directory under the owning gmuxd's os.TempDir(). For
 			// devcontainer/peer sessions, the request was already
 			// forwarded above to the gmuxd that owns the session, so
 			// reaching this branch always means "write locally". The
 			// session must exist; we don't otherwise need fields from it.
+			if !validSessionTempImageID(sessionID) {
+				writeError(w, http.StatusBadRequest, "bad_request", "invalid session ID")
+				return
+			}
 			if _, ok := sessions.Get(sessionID); !ok {
 				writeError(w, http.StatusNotFound, "not_found", "session not found")
 				return
 			}
-			clipboardHandler(clipfile.NewLocalWriter(os.TempDir())).ServeHTTP(w, r)
+			clipboardHandler(clipfile.NewLocalWriter(sessionTempImageDir(os.TempDir(), sessionID))).ServeHTTP(w, r)
 
 		case "dismiss":
 			if r.Method != http.MethodPost {
@@ -1956,16 +2263,17 @@ func serve(stderr io.Writer) int {
 		}
 	})
 
-	// ── Embedded frontend (SPA fallback) ──
-
-	mux.Handle("/", spaHandler())
-
 	// ── Load config ──
 
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("FATAL: %v", err)
 	}
+
+	// ── Frontend (SPA fallback) ──
+
+	mux.Handle("/", spaHandler(cfg.WebDir))
+
 	// ── Resolve TCP listen address and auth token ──
 
 	resolved, err := cfg.ListenAddr()
@@ -2106,15 +2414,18 @@ func serve(stderr io.Writer) int {
 		if tsSeed == "" {
 			tsSeed = tsauth.SeedFromHostname(hostname)
 		}
-		// The tailnet handler is the *token-authenticated* handler, not the
-		// raw mux: tsauth's identity check is the outer gate (only the
-		// owner's tailnet login may reach the prompt) and netauth's bearer
-		// token is the inner gate (ADR 0008). A passing tailnet identity no
-		// longer grants the full API on its own.
+		tailnetHandler := authedHandler
+		if !cfg.Tailscale.RequireToken {
+			// Compatibility/mobile-first mode: Tailscale WhoIs + allow-list is
+			// the trust boundary, so browsers on allowed tailnet identities do
+			// not need to paste a gmux token before they can steer sessions.
+			log.Printf("tsauth: gmux token disabled for Tailscale listener; relying on Tailscale identity allow-list")
+			tailnetHandler = mux
+		}
 		tsListener = tsauth.Start(tsauth.Config{
 			Hostname: tsSeed,
 			Allow:    cfg.Tailscale.Allow,
-		}, stateDir, authedHandler)
+		}, stateDir, tailnetHandler)
 		defer tsListener.Shutdown()
 	}
 
@@ -2430,15 +2741,23 @@ func shouldForwardActivity(asPeer bool, sessionID string, isLocalPeer func(strin
 }
 
 // isAllowedPeerProxyPath gates the generic /v1/peers/{peer}/...
-// proxy. We deliberately allowlist a small surface, scoped to writes
-// the frontend actually issues for peer-owned state today, rather
-// than blanket-forwarding every method+path. New peer-write features
-// extend this function explicitly.
+// proxy. We deliberately allowlist a small surface, scoped to operations
+// the frontend actually issues for peer-owned state today, rather than
+// blanket-forwarding every method+path. New peer features extend this
+// function explicitly.
 //
 // `sub` is the path relative to the peer's API root, with no leading
 // slash (e.g. "v1/projects/gmux/sessions").
 func isAllowedPeerProxyPath(method, sub string) bool {
 	parts := strings.Split(sub, "/")
+	// Project worktree inventory and safe removal. Git must run on the
+	// daemon that owns the project's filesystem.
+	if (method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete) &&
+		len(parts) == 4 &&
+		parts[0] == "v1" && parts[1] == "projects" &&
+		parts[2] != "" && parts[3] == "worktrees" {
+		return true
+	}
 	// Project session reorder: PATCH v1/projects/<slug>/sessions.
 	// The frontend uses this to push a new session order into a
 	// peer's projects.json. The peer applies the change atomically
@@ -2501,6 +2820,38 @@ func sendSSE(w http.ResponseWriter, event string, payload any) {
 		return
 	}
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, bytes)
+}
+
+func readJSONLimited(r *http.Request, limit int64, dst any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
+	if err != nil {
+		return fmt.Errorf("read error")
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		return fmt.Errorf("invalid JSON")
+	}
+	return nil
+}
+
+func localProjectSubset(projectMgr *projects.Manager, requested []string) []string {
+	state, err := projectMgr.Load()
+	if err != nil {
+		log.Printf("push: projects load: %v", err)
+		return nil
+	}
+	local := make(map[string]bool)
+	for _, item := range state.Items {
+		if !item.IsReference() {
+			local[item.Slug] = true
+		}
+	}
+	out := make([]string, 0, len(requested))
+	for _, slug := range requested {
+		if local[slug] {
+			out = append(out, slug)
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {

@@ -59,6 +59,32 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "workspace add", args: []string{"workspace", "add", "."}, wantMode: modeWorkspace,
+			check: func(t *testing.T, c *command) {
+				if c.workspaceSub != "add" || c.workspacePath != "." {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
+		{name: "worktree current json", args: []string{"worktree", "current", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "current" || !c.json {
+					t.Errorf("sub=%q json=%v", c.worktreeSub, c.json)
+				}
+			}},
+		{name: "worktree ps selector", args: []string{"worktree", "ps", "branch:feature/x", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "ps" || c.worktreeSelector != "branch:feature/x" || !c.json {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+		{name: "worktree create", args: []string{"worktree", "create", "fix-login", "--base", "origin/main", "--agent", "pi", "--prompt", "fix it", "--json"}, wantMode: modeWorktree,
+			check: func(t *testing.T, c *command) {
+				if c.worktreeSub != "create" || c.worktreeName != "fix-login" || c.worktreeBase != "origin/main" || c.worktreeAgent != "pi" || c.worktreePrompt != "fix it" || !c.json {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
 		{name: "attach", args: []string{"attach", "abc"}, wantMode: modeAttach,
 			check: func(t *testing.T, c *command) {
 				if c.ref != "abc" {
@@ -110,6 +136,13 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "send semantic correlation flags", args: []string{"send", "--json", "--request-id", "req-1", "abc", "hello", "Enter"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if !c.json || c.requestID != "req-1" || c.ref != "abc" || c.sendText == nil || *c.sendText != "hello" {
+					t.Errorf("command=%#v", c)
+				}
+			}},
+
 		{name: "send-keys tmux compat", args: []string{"send-keys", "-t", "abc", "C-c"}, wantMode: modeSendKeys,
 			check: func(t *testing.T, c *command) {
 				if c.ref != "abc" || len(c.keys) != 1 || c.keys[0] != "C-c" {
@@ -124,6 +157,12 @@ func TestParseCLI(t *testing.T) {
 			}},
 
 		{name: "wait idle default", args: []string{"wait", "abc"}, wantMode: modeWait},
+		{name: "wait json", args: []string{"wait", "abc", "--json", "--request-id", "req-1"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if !c.json || c.ref != "abc" || c.requestID != "req-1" {
+					t.Errorf("json=%v ref=%q request=%q", c.json, c.ref, c.requestID)
+				}
+			}},
 		{name: "wait --timeout", args: []string{"wait", "--timeout", "30", "abc"}, wantMode: modeWait,
 			check: func(t *testing.T, c *command) {
 				if c.timeout != 30 || c.ref != "abc" {
@@ -137,6 +176,25 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "session rename", args: []string{"session", "rename", "abc@laptop", "작업 이름"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.sessionSub != "rename" || c.ref != "abc@laptop" || c.sessionTitle != "작업 이름" || c.clearTitle {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+		{name: "session rename clear", args: []string{"session", "rename", "abc", "--clear"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || !c.clearTitle || c.sessionTitle != "" {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+		{name: "session dismiss", args: []string{"session", "dismiss", "abc@laptop"}, wantMode: modeSession,
+			check: func(t *testing.T, c *command) {
+				if c.sessionSub != "dismiss" || c.ref != "abc@laptop" {
+					t.Errorf("command = %#v", c)
+				}
+			}},
+
 		{name: "daemon status", args: []string{"daemon", "status"}, wantMode: modeDaemon,
 			check: func(t *testing.T, c *command) {
 				if c.daemonSub != "status" {
@@ -146,10 +204,10 @@ func TestParseCLI(t *testing.T) {
 		{name: "auth", args: []string{"auth"}, wantMode: modeAuth},
 		{name: "remote", args: []string{"remote"}, wantMode: modeRemote},
 
-		{name: "internal __run with directives", args: []string{"__run", "--resume-id=sess-1", "--initial-cols=80", "--", "pi"}, wantMode: modeRun,
+		{name: "internal __run with directives", args: []string{"__run", "--resume-id=sess-1", "--initial-cols=80", "--initial-title=작업 이름", "--initial-agent-title=Pi 이름", "--", "pi"}, wantMode: modeRun,
 			check: func(t *testing.T, c *command) {
-				if c.resumeID != "sess-1" || c.initialCols != 80 {
-					t.Errorf("resumeID=%q cols=%d", c.resumeID, c.initialCols)
+				if c.resumeID != "sess-1" || c.initialCols != 80 || c.initialTitle != "작업 이름" || c.initialAgentTitle != "Pi 이름" {
+					t.Errorf("resumeID=%q cols=%d title=%q agentTitle=%q", c.resumeID, c.initialCols, c.initialTitle, c.initialAgentTitle)
 				}
 				if strings.Join(c.runArgs, " ") != "pi" {
 					t.Errorf("runArgs = %v", c.runArgs)
@@ -176,6 +234,27 @@ func TestParseCLI(t *testing.T) {
 
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
+		{"session"},
+		{"session", "unknown"},
+		{"session", "rename"},
+		{"session", "rename", "abc"},
+		{"session", "rename", "abc", ""},
+		{"session", "rename", "abc", "name", "extra"},
+		{"session", "rename", "abc", "name", "--clear"},
+		{"session", "dismiss"},
+		{"session", "dismiss", ""},
+		{"session", "dismiss", "abc", "extra"},
+		{"workspace"},
+		{"workspace", "unknown"},
+		{"workspace", "add"},
+		{"workspace", "add", ""},
+		{"workspace", "add", ".", "extra"},
+		{"worktree"},
+		{"worktree", "unknown"},
+		{"worktree", "current", "extra"},
+		{"worktree", "ps", "one", "two"},
+		{"worktree", "create"},
+		{"worktree", "create", "name", "--prompt", "fix", "--agent", ""},
 		{"-d"},                     // detach without command
 		{"-d", "ls"},               // detach only pairs with --
 		{"--"},                     // run with no command
@@ -185,10 +264,10 @@ func TestParseCLIErrors(t *testing.T) {
 		{"tail"},                   // missing id
 		{"tail", "-n", "0", "abc"}, // non-positive count
 		{"wait"},                   // missing id
-		{"send-keys", "C-c"},     // missing -t
-		{"daemon"},               // missing subcommand
-		{"daemon", "frobnicate"}, // unknown subcommand
-		{"ls", "stray"},          // ls takes no positional
+		{"send-keys", "C-c"},       // missing -t
+		{"daemon"},                 // missing subcommand
+		{"daemon", "frobnicate"},   // unknown subcommand
+		{"ls", "stray"},            // ls takes no positional
 	}
 	for _, args := range bad {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {

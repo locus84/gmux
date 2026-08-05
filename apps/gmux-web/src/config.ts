@@ -18,6 +18,7 @@ export {
   type Keybind,
   DEFAULT_THEME_COLORS,
   buildTerminalOptions,
+  resolveUiScale,
   normalizeThemeColors,
 } from './settings-schema'
 
@@ -56,5 +57,34 @@ export async function fetchFrontendConfig(): Promise<FrontendConfig> {
     }
   } catch {
     return { settings: null, themeColors: null }
+  }
+}
+
+export interface VSCodeServerConfig {
+  vsCodeServerUrl: string
+  vsCodeServerHomeDir: string
+}
+
+/** Persist host-shared VS Code integration settings without replacing unrelated settings.jsonc keys. */
+export async function saveVSCodeServerConfig(patch: Partial<VSCodeServerConfig>): Promise<VSCodeServerConfig> {
+  const request: Partial<VSCodeServerConfig> = {}
+  if (patch.vsCodeServerUrl !== undefined) request.vsCodeServerUrl = patch.vsCodeServerUrl.trim()
+  if (patch.vsCodeServerHomeDir !== undefined) request.vsCodeServerHomeDir = patch.vsCodeServerHomeDir.trim()
+  const resp = await fetch('/v1/frontend-config', {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+  const body = await resp.json().catch(() => ({})) as {
+    data?: { settings?: Partial<VSCodeServerConfig> }
+    error?: { message?: string }
+  }
+  if (!resp.ok) {
+    throw new Error(body.error?.message || `Could not save VS Code Server settings (${resp.status})`)
+  }
+  const settings = body.data?.settings
+  return {
+    vsCodeServerUrl: settings?.vsCodeServerUrl?.trim() ?? request.vsCodeServerUrl ?? '',
+    vsCodeServerHomeDir: settings?.vsCodeServerHomeDir?.trim() ?? request.vsCodeServerHomeDir ?? '',
   }
 }

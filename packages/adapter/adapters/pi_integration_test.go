@@ -86,16 +86,20 @@ func TestPiNameOverridesTitle(t *testing.T) {
 	sendAndWaitForTurn(t, g, send, sess.ID)
 
 	initial, _ := g.GetSession(sess.ID)
-	t.Logf("initial title: %q", initial.Title)
+	initialSlug := initial.Slug
+	t.Logf("initial title: %q slug: %q", initial.Title, initialSlug)
 
 	// Set explicit name.
 	send("/name integration-test-name\r")
 
 	// Title should update to the explicit name.
-	g.WaitForSession(sess.ID, func(s testutil.Session) bool {
+	renamed := g.WaitForSession(sess.ID, func(s testutil.Session) bool {
 		return s.Title == "integration-test-name"
 	}, 30*time.Second, "title from /name")
-	t.Log("title overridden to 'integration-test-name'")
+	if renamed.Slug != initialSlug {
+		t.Fatalf("/name changed stable slug: got %q, want %q", renamed.Slug, initialSlug)
+	}
+	t.Log("title overridden to 'integration-test-name' without changing slug")
 }
 
 // TestPiSecondTurnKeepsTitle verifies title doesn't change on second message.

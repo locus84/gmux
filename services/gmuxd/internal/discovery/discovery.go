@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,8 +219,8 @@ func probeSocket(socketPath string) bool {
 //     daemon-restart-with-surviving-runner both land here. The
 //     existing record is mutated in place: runtime fields (alive,
 //     pid, socket, status, started/exit times, binary hash, runner
-//     version, command, terminal size) take their values from the
-//     fresh /meta payload, while everything else — slug,
+//     version, command, explicit/application titles, terminal size) take
+//     their values from the fresh /meta payload, while everything else — slug,
 //     created_at, attribution-derived adapter title and subtitle,
 //     workspace root, remotes — carries across the seam. The
 //     adapter's OnRegister hook is intentionally skipped: its
@@ -265,6 +266,13 @@ func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, 
 		existing.BinaryHash = newSess.BinaryHash
 		existing.RunnerVersion = newSess.RunnerVersion
 		existing.Command = newSess.Command
+		if newSess.ExplicitTitleKnown {
+			existing.ExplicitTitle = newSess.ExplicitTitle
+		}
+		if newSess.AgentTitleKnown {
+			existing.AgentTitle = newSess.AgentTitle
+		}
+		existing.ShellTitle = newSess.ShellTitle
 		existing.TerminalCols = newSess.TerminalCols
 		existing.TerminalRows = newSess.TerminalRows
 		// Resumable is a derived attribute of dead sessions; a
@@ -316,6 +324,15 @@ func queryMeta(socketPath string) (*store.Session, error) {
 	if err := json.Unmarshal(body, &sess); err != nil {
 		return nil, err
 	}
+	// Old runners omit title layers they do not understand. New runners emit
+	// these keys even when empty, making clear authoritative across daemon
+	// restart without treating mixed-version absence as a clear.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	_, sess.ExplicitTitleKnown = fields["explicit_title"]
+	_, sess.AgentTitleKnown = fields["agent_title"]
 
 	// Ensure socket_path is set (runner might not include it)
 	if sess.SocketPath == "" {
@@ -334,6 +351,26 @@ func KillSession(socketPath string) error {
 		return err
 	}
 	resp.Body.Close()
+	return nil
+}
+
+// SetExplicitTitle updates the mux-owned session name in the live runner.
+// The runner emits the resulting metadata event back to gmuxd; callers may
+// also update their local cache optimistically after this request succeeds.
+func SetExplicitTitle(ctx context.Context, socketPath, title string) error {
+	body, err := json.Marshal(map[string]string{"title": title})
+	if err != nil {
+		return err
+	}
+	resp, err := runnerRequest(ctx, socketPath, http.MethodPut, "/title", strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("runner /title: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
 	return nil
 }
 
@@ -357,4 +394,55 @@ func SendInput(ctx context.Context, socketPath string, body io.Reader) error {
 		return fmt.Errorf("runner /input: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+// AgentMessage is a runtime-only semantic Pi message status returned by the
+// owning runner. It is deliberately kept outside session state and metadata.
+type AgentMessage struct {
+	RequestID    string `json:"request_id"`
+	RunnerEpoch  string `json:"runner_epoch"`
+	RuntimeEpoch string `json:"runtime_epoch,omitempty"`
+	Sequence     uint64 `json:"sequence"`
+	State        string `json:"state"`
+	Outcome      string `json:"outcome,omitempty"`
+	Result       string `json:"result,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// EnqueueAgentMessage asks the runner's injected Pi extension to deliver a
+// semantic user message. HTTP status is returned so callers can preserve
+// unavailable/conflict distinctions at the public API edge.
+func EnqueueAgentMessage(ctx context.Context, socketPath string, body io.Reader) (AgentMessage, int, error) {
+	return agentMessageRequest(ctx, socketPath, http.MethodPost, "/agent/message", body)
+}
+
+// GetAgentMessage returns a correlated request, or the latest request when
+// requestID is empty.
+func GetAgentMessage(ctx context.Context, socketPath, requestID string) (AgentMessage, int, error) {
+	path := "/agent/message"
+	if requestID != "" {
+		path += "?request_id=" + url.QueryEscape(requestID)
+	}
+	return agentMessageRequest(ctx, socketPath, http.MethodGet, path, nil)
+}
+
+func agentMessageRequest(ctx context.Context, socketPath, method, path string, body io.Reader) (AgentMessage, int, error) {
+	resp, err := runnerRequest(ctx, socketPath, method, path, body)
+	if err != nil {
+		return AgentMessage{}, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return AgentMessage{}, resp.StatusCode, fmt.Errorf("runner %s: %s: %s", path, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	var message AgentMessage
+	// A bounded 256 KiB UTF-8 result can expand substantially when JSON
+	// escapes control characters. Keep the encoded envelope bounded while
+	// allowing the runner's full decoded result cap.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&message); err != nil {
+		return AgentMessage{}, resp.StatusCode, fmt.Errorf("decode runner message: %w", err)
+	}
+	return message, resp.StatusCode, nil
 }

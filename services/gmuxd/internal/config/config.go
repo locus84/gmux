@@ -23,6 +23,11 @@ type Config struct {
 	// Port is the TCP port for the HTTP listener (default 8790).
 	Port int `toml:"port"`
 
+	// WebDir, when set, serves frontend assets from this directory instead
+	// of the embedded build. Intended for local web-only installs and
+	// development; the directory must contain index.html.
+	WebDir string `toml:"web_dir"`
+
 	Tailscale TailscaleConfig `toml:"tailscale"`
 	Discovery DiscoveryConfig `toml:"discovery"`
 
@@ -90,6 +95,11 @@ type TailscaleConfig struct {
 	// (e.g. "user@github"). The node owner is always auto-whitelisted at runtime.
 	// Entries are matched against the peer's UserProfile.LoginName.
 	Allow []string `toml:"allow"`
+
+	// RequireToken keeps gmux's bearer/cookie token as an inner auth gate on
+	// the Tailscale listener after the peer identity allow-list check. Disable
+	// only when the tailnet identity gate is the desired trust boundary.
+	RequireToken bool `toml:"require_token"`
 }
 
 // Load reads the config file. Returns defaults if the file doesn't exist.
@@ -230,6 +240,9 @@ func isPrivateOrCGNAT(ip net.IP) bool {
 func defaults() Config {
 	return Config{
 		Port: 8790,
+		Tailscale: TailscaleConfig{
+			RequireToken: true,
+		},
 		Discovery: DiscoveryConfig{
 			Devcontainers: true,
 		},
@@ -264,4 +277,3 @@ func Dir() string {
 func Path() string {
 	return filepath.Join(Dir(), "host.toml")
 }
-

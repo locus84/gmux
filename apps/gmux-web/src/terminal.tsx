@@ -1,4 +1,6 @@
+import { effect } from '@preact/signals'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
+import { useLocation } from 'preact-iso'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ImageAddon } from '@xterm/addon-image'
@@ -6,19 +8,25 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import { loadWebglRenderer } from './webgl-renderer'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
-import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handlePasteAction } from './keyboard'
+import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handleBlobPasteAction, handlePasteAction } from './keyboard'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
-import { attachMobileInputHandler } from './mobile-input'
+import { attachMobileInputHandler, flushMobileWebKitImePending, shouldSkipMobileWebKitImeData } from './mobile-input'
 import { isTouchDevice } from './touch'
 import { createReplayBuffer } from './replay'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
+import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext, type TerminalFileTarget } from './terminal-file-link'
+import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
 import { createLongPressRecognizer } from './long-press'
+import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 import { LinkActionSheet } from './link-action-sheet'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pressedBufferRow, readTerminalText } from './terminal-text'
+import { acceleratedScrollRows, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
+import { fetchAuthoritativeReconnectSize, shouldHandleTerminalSocketClose } from './terminal-connection'
 import { decideViewportResize, sameSize } from './terminal-resize'
-import { terminalScrolledUp, terminalScrollToBottom } from './store'
+import { keyboardOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
+import { resolveTerminalWebUrl } from './vscode-server'
 import { MOCK_BY_ID } from './mock-data/index'
 import type { Session } from './types'
 
@@ -75,12 +83,17 @@ function measureTerminalFit(
   // (.terminal-shell has no border/padding, so offset* == the viewport.)
   // On mobile the control bar floats over the terminal's bottom (out of
   // flow, translucent — see styles.css), so the shell fills the full height
-  // behind it. Reserve the bar's height, but round the row count UP: the
-  // terminal then claims one extra row whose bottom sliver tucks behind the
-  // translucent keys, instead of leaving a sub-cell gap above an opaque bar.
+  // behind it. Reserve the bar's full height and floor the row count: letting
+  // the terminal claim a rounded-up row makes scrollback/content underlap the
+  // toolbar and visually cover the top edge of the keys on phones.
   // Detected here — not at the call sites — so every resize path (initial
   // fit, keyboard transitions, manual refit) computes identically. The bar's
-  // offsetParent is null when it's display:none (desktop) ⇒ plain floor fit.
+  // offsetParent is null when it's display:none (desktop) ⇒ plain fit.
+  // Reserve only the fixed terminal key row. The optional composer lives above
+  // it and may focus the iOS software keyboard; subtracting the full composer
+  // stack during visualViewport shrink can collapse xterm to a near-empty
+  // grid, which looks like a black screen. Let the composer overlay the bottom
+  // row instead of resizing the PTY around transient text-entry chrome.
   const bar = document.querySelector<HTMLElement>('.mobile-bottom-bar')
   const overlayBar = bar?.offsetParent ? bar.offsetHeight : 0
 
@@ -88,7 +101,7 @@ function measureTerminalFit(
   const availH = shellEl.offsetHeight - padY - overlayBar
 
   let cols = Math.max(2, Math.floor(availW / dims.css.cell.width))
-  let rows = Math.max(1, (overlayBar > 0 ? Math.ceil : Math.floor)(availH / dims.css.cell.height))
+  let rows = Math.max(1, Math.floor(availH / dims.css.cell.height))
 
   // Guard against 1px overflow: xterm computes screen width as
   // Math.round(device.cell.width * cols / dpr). Because css.cell.width is
@@ -104,9 +117,7 @@ function measureTerminalFit(
   // Same guard vertically: row height rounding across device/css pixels can
   // overflow by 1px at fractional DPRs (the monitor-move case), which is
   // exactly what seeds the scrollbar flicker described above.
-  // (Skipped in overlay-bar mode: the gained row intentionally exceeds
-  // availH, spilling its bottom sliver behind the translucent bar.)
-  if (overlayBar === 0 && dims.device.cell.height > 0) {
+  if (dims.device.cell.height > 0) {
     const predictedHeight = Math.round(dims.device.cell.height * rows / dpr)
     if (predictedHeight > availH && rows > 1) rows--
   }
@@ -146,12 +157,16 @@ function announceResize(ws: WebSocket | null, dims: TerminalSize): void {
 function focusTerminalInput(term: Terminal | null): void {
   if (!term) return
 
-  term.focus()
-
   const textarea = term.textarea
-  if (!textarea) return
+  if (!isTouchDevice()) {
+    term.focus()
+    return
+  }
 
-  if (!isTouchDevice()) return
+  if (!textarea) {
+    term.focus()
+    return
+  }
 
   const prev = {
     position: textarea.style.position,
@@ -220,6 +235,8 @@ export function TerminalView({
   altArmed,
   onAltConsumed,
   onInputReady,
+  onPasteReady,
+  onAttachFileReady,
   onFocusReady,
 }: {
   session: Session
@@ -231,8 +248,11 @@ export function TerminalView({
   altArmed: boolean
   onAltConsumed: () => void
   onInputReady?: (send: ((data: string) => void) | null) => void
+  onPasteReady?: (paste: (() => void) | null) => void
+  onAttachFileReady?: (attach: ((file: File) => void) | null) => void
   onFocusReady?: (focus: (() => void) | null) => void
 }) {
+  const loc = useLocation()
   const shellRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -245,6 +265,26 @@ export function TerminalView({
   const altArmedRef = useRef(altArmed)
   const termIoRef = useRef<ReturnType<typeof createTerminalIO> | null>(null)
   const termEpochRef = useRef(0)
+  const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const fileOverlayOpenRef = useRef(false)
+  const webLinkHrefRef = useRef<(uri: string) => string>(uri => uri)
+  fileOverlayOpenRef.current = !!(loc.query.files || loc.query.projectFiles || loc.query.pasteFile)
+  fileHrefRef.current = (sessionId, path, pasteImage) => {
+    const search = loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''
+    return pasteImage
+      ? pasteFileBrowserPath(sessionId, path, loc.path, search)
+      : fileBrowserPath(sessionId, path, loc.path, search)
+  }
+  openFileRef.current = (sessionId, path, pasteImage) => {
+    termRef.current?.textarea?.blur()
+    loc.route(fileHrefRef.current(sessionId, path, pasteImage))
+  }
+  webLinkHrefRef.current = (uri) => resolveTerminalWebUrl(
+    uri,
+    vsCodeServerUrl.value,
+    sessionRef.current.peer,
+  )
 
   // True once the terminal's font is downloaded; gates xterm mount.
   // See the preload effect below for why this matters.
@@ -473,16 +513,36 @@ export function TerminalView({
       ...terminalOptions,
       linkHandler: {
         activate(_event, text) {
-          window.open(text, '_blank', 'noopener')
+          window.open(webLinkHrefRef.current(text), '_blank', 'noopener')
         },
       },
     })
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.loadAddon(new ImageAddon())
+    const getFileLinkContext = (): TerminalFileLinkContext => {
+      const current = sessionRef.current
+      return {
+        sessionId: current.id,
+        root: current.workspace_root?.trim() || current.cwd.trim(),
+        cwd: current.cwd.trim(),
+      }
+    }
+    // Detect workspace paths using the live session context. Register this
+    // before WebLinksAddon; path candidates explicitly reject URL schemes, so
+    // normal web and OSC 8 links retain their existing providers/handlers.
+    term.registerLinkProvider(createTerminalFileLinkProvider(
+      term,
+      getFileLinkContext,
+      (sessionId, path, pasteImage) => fileHrefRef.current(sessionId, path, pasteImage),
+      (sessionId, path, pasteImage) => openFileRef.current(sessionId, path, pasteImage),
+    ))
     // Detect plain-text URLs in terminal output and make them clickable.
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(new WebLinksAddon((_event, uri) => {
+      window.open(webLinkHrefRef.current(uri), '_blank', 'noopener')
+    }))
     term.open(containerRef.current)
+    const disposeImeResidueGuard = attachImeResidueGuard(term)
     loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
@@ -543,7 +603,8 @@ export function TerminalView({
       sendRawInput(r.seq)
     }
 
-    onInputReady?.(sendRawInput)
+    const sendToolbarInput = (data: string) => sendAfterFlushingComposition(term, sendRawInput, data)
+    onInputReady?.(sendToolbarInput)
     terminalScrollToBottom.value = () => term.scrollToBottom()
     // The paste trigger reads bracketedPasteMode and the clipboard fresh
     // on every invocation: bracketed mode flips at runtime as TUIs come
@@ -552,18 +613,48 @@ export function TerminalView({
     // binary-paste support without divergent code.
     pasteActionRef.current = () => {
       void handlePasteAction({
-        sessionId: session.id,
+        sessionId: currentSessionId.current,
         bracketedPasteMode: term.modes.bracketedPasteMode,
         feedback: defaultPasteFeedback,
         emit: sendRawInput,
       })
     }
+    onPasteReady?.(pasteActionRef.current)
+    onAttachFileReady?.((file: File) => {
+      void handleBlobPasteAction({
+        blob: file,
+        sessionId: currentSessionId.current,
+        bracketedPasteMode: term.modes.bracketedPasteMode,
+        feedback: defaultPasteFeedback,
+        emit: sendRawInput,
+      })
+    })
     onFocusReady?.(() => focusTerminalInput(term))
 
-    const dataDisposable = term.onData((data) => sendInput(data))
+    const dataDisposable = term.onData((data) => {
+      // iPadOS Safari/WKWebView can leak raw Korean compatibility jamo through
+      // xterm.onData before/around beforeinput. The mobile input handler owns
+      // that IME path and sends composed Hangul, so drop the leaked echo here.
+      if (shouldSkipMobileWebKitImeData(data)) return
+      flushMobileWebKitImePending()
+      sendInput(data)
+    })
     attachKeyboardHandler(term, sendInput, sendRawInput, keybinds, macCommandIsCtrl, session.id)
     const disposePasteHandler = attachPasteHandler(term, containerRef.current!, sendRawInput, session.id)
     const disposeMobileHandler = attachMobileInputHandler(term, containerRef.current!, sendRawInput)
+    let keyboardWasOpen = keyboardOpen.value
+    const disposeKeyboardCloseBlur = effect(() => {
+      const open = keyboardOpen.value
+      if (isTouchDevice() && keyboardWasOpen && !open && document.activeElement === term.textarea) {
+        // The browser can dismiss the soft keyboard while leaving xterm's
+        // hidden textarea focused. In that half-focused state, the next
+        // terminal drag/scroll often reopens the keyboard. Treat a visual
+        // keyboard close as the user's intent to leave text-entry mode; a
+        // deliberate tap still focuses the terminal and opens it again.
+        term.textarea?.blur()
+      }
+      keyboardWasOpen = open
+    })
 
     // OSC 52 clipboard: applications (e.g. pi /copy) write
     //   ESC ] 52 ; <selection> ; <base64-payload> BEL
@@ -595,6 +686,7 @@ export function TerminalView({
       const tag = (ev.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (containerRef.current?.contains(ev.target as Node)) return
+      if (fileOverlayOpenRef.current) return
       term.focus()
     }
     window.addEventListener('keydown', handleGlobalKeydown, true)
@@ -610,7 +702,10 @@ export function TerminalView({
     // intent from a tap: even when nothing is under the finger, the
     // release must not open a link or toggle the keyboard.
     const longPress = createLongPressRecognizer((x, y) => {
-      const link = linkAtPoint(term, x, y)
+      const fileTarget = touchPanState.fileTarget
+      const link = fileTarget
+        ? { uri: fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage), label: fileTarget.text }
+        : linkAtPoint(term, x, y)
       try { navigator.vibrate?.(10) } catch { /* unsupported */ }
       // On a link: offer open/copy. On empty space: open the text sheet —
       // the buffer as natively-selectable text, scrolled to the pressed
@@ -620,39 +715,128 @@ export function TerminalView({
       const anchorRow = Math.max(0, Math.min(pressedBufferRow(term, y), lines.length - 1))
       setTextSheet({ lines, anchorRow })
     })
-    const touchPanState = {
+    const touchPanState: {
+      active: boolean
+      moved: boolean
+      lastY: number
+      lastMoveAt: number
+      rowRemainder: number
+      velocityRowsPerMs: number
+      momentumFrame: number | null
+      dragScrollFrame: number | null
+      pendingDragRows: number
+      fileTarget: TerminalFileTarget | null
+      start: TerminalTouchSnapshot
+    } = {
       active: false,
       moved: false,
-      startX: 0,
-      startY: 0,
-      startScrollLeft: 0,
-      startScrollTop: 0,
+      lastY: 0,
+      lastMoveAt: 0,
+      rowRemainder: 0,
+      velocityRowsPerMs: 0,
+      momentumFrame: null,
+      dragScrollFrame: null,
+      pendingDragRows: 0,
+      fileTarget: null,
+      start: { x: 0, y: 0, scrollLeft: 0, scrollTop: 0, viewportY: 0 },
+    }
+
+    const flushDragScroll = () => {
+      touchPanState.dragScrollFrame = null
+      const rows = touchPanState.pendingDragRows
+      touchPanState.pendingDragRows = 0
+      if (rows !== 0) term.scrollLines(rows)
+    }
+
+    const queueDragScroll = (rows: number) => {
+      if (rows === 0) return
+      touchPanState.pendingDragRows += rows
+      if (touchPanState.dragScrollFrame === null) {
+        touchPanState.dragScrollFrame = requestAnimationFrame(flushDragScroll)
+      }
+    }
+
+    const cancelDragScroll = (flush = false) => {
+      if (touchPanState.dragScrollFrame !== null) cancelAnimationFrame(touchPanState.dragScrollFrame)
+      touchPanState.dragScrollFrame = null
+      if (flush && touchPanState.pendingDragRows !== 0) term.scrollLines(touchPanState.pendingDragRows)
+      touchPanState.pendingDragRows = 0
+    }
+
+    const cancelScrollMomentum = () => {
+      if (touchPanState.momentumFrame !== null) cancelAnimationFrame(touchPanState.momentumFrame)
+      touchPanState.momentumFrame = null
+    }
+
+    const resetTouchPan = () => {
+      touchPanState.active = false
+      touchPanState.moved = false
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+      touchPanState.fileTarget = null
+    }
+
+    const startScrollMomentum = () => {
+      let velocity = touchPanState.velocityRowsPerMs
+      velocity *= 0.5
+      if (Math.abs(velocity) < 0.01) return
+      let last = performance.now()
+      let momentumRemainder = 0
+      const tick = (now: number) => {
+        const elapsed = Math.min(32, now - last)
+        last = now
+        const rawRows = momentumRemainder + (velocity * elapsed)
+        const wholeRows = rawRows > 0 ? Math.floor(rawRows) : Math.ceil(rawRows)
+        momentumRemainder = rawRows - wholeRows
+        if (wholeRows !== 0) term.scrollLines(wholeRows)
+        // Strong friction: enough to feel like a flick, not enough to run away.
+        velocity *= 0.90
+        if (Math.abs(velocity) >= 0.006) {
+          touchPanState.momentumFrame = requestAnimationFrame(tick)
+        } else {
+          touchPanState.momentumFrame = null
+        }
+      }
+      touchPanState.momentumFrame = requestAnimationFrame(tick)
     }
 
     const handleTouchStartCapture = (ev: TouchEvent) => {
       if (ev.touches.length !== 1 || isInteractiveTarget(ev.target)) {
         longPress.cancel()
-        touchPanState.active = false
-        touchPanState.moved = false
+        cancelDragScroll()
+        cancelScrollMomentum()
+        resetTouchPan()
         return
       }
 
       const host = shellRef.current
       if (!host) {
-        touchPanState.active = false
-        touchPanState.moved = false
+        cancelDragScroll()
+        cancelScrollMomentum()
+        resetTouchPan()
         return
       }
 
+      cancelDragScroll()
+      cancelScrollMomentum()
       // Track touch start for both modes — focus happens on touchend
-      // only if the user didn't drag (tap vs scroll distinction).
+      // only if neither the finger nor either scroll container moved.
+      const touch = ev.touches[0]
       touchPanState.active = true
       touchPanState.moved = false
-      touchPanState.startX = ev.touches[0].clientX
-      touchPanState.startY = ev.touches[0].clientY
-      touchPanState.startScrollLeft = host.scrollLeft
-      touchPanState.startScrollTop = host.scrollTop
-      longPress.start(touchPanState.startX, touchPanState.startY)
+      touchPanState.lastY = touch.clientY
+      touchPanState.lastMoveAt = performance.now()
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+      touchPanState.start = {
+        x: touch.clientX,
+        y: touch.clientY,
+        scrollLeft: host.scrollLeft,
+        scrollTop: host.scrollTop,
+        viewportY: term.buffer.active.viewportY,
+      }
+      touchPanState.fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), touch.clientX, touch.clientY)
+      longPress.start(touchPanState.start.x, touchPanState.start.y)
     }
 
     const handleTouchMoveCapture = (ev: TouchEvent) => {
@@ -662,27 +846,61 @@ export function TerminalView({
       if (!host) return
 
       const touch = ev.touches[0]
-      const deltaX = touch.clientX - touchPanState.startX
-      const deltaY = touch.clientY - touchPanState.startY
-      if (Math.abs(deltaX) > 6 || Math.abs(deltaY) > 6) {
+      const current = {
+        x: touch.clientX,
+        y: touch.clientY,
+        scrollLeft: host.scrollLeft,
+        scrollTop: host.scrollTop,
+        viewportY: term.buffer.active.viewportY,
+      }
+      const deltaX = current.x - touchPanState.start.x
+      const deltaY = current.y - touchPanState.start.y
+      if (terminalTouchMoved(touchPanState.start, current)) {
         touchPanState.moved = true
         longPress.cancel()
       }
+      if (!touchPanState.moved) return
 
-      // If viewport matches PTY (in sync), no overflow to pan — let xterm
-      // handle the gesture for selection/scrollback.
+      // Once a touch becomes a drag, own it. Letting xterm/browser see the
+      // eventual synthesized mouse cascade can focus the hidden textarea and
+      // pop the soft keyboard even though the user's intent was scrollback.
+      const stopDragFocus = () => {
+        ev.preventDefault()
+        ev.stopPropagation()
+      }
+
       const vp = viewportSizeRef.current
       const pty = ptySizeRef.current
-      if (vp && pty && vp.cols === pty.cols && vp.rows === pty.rows) return
-
+      const viewportMatchesPty = !!vp && !!pty && vp.cols === pty.cols && vp.rows === pty.rows
       const canScrollX = host.scrollWidth > host.clientWidth
       const canScrollY = host.scrollHeight > host.clientHeight
-      if (!canScrollX && !canScrollY) return
 
-      if (canScrollX) host.scrollLeft = touchPanState.startScrollLeft - deltaX
-      if (canScrollY) host.scrollTop = touchPanState.startScrollTop - deltaY
-      ev.preventDefault()
-      ev.stopPropagation()
+      // When the terminal is sized for another device, the shell may really
+      // overflow and should pan. Otherwise (including transient keyboard
+      // close/open mismatches where there is no actual shell overflow), drive
+      // xterm scrollback ourselves. That keeps acceleration active after the
+      // keyboard has been opened once and avoids xterm's focus-prone fallback.
+      if (!viewportMatchesPty && (canScrollX || canScrollY)) {
+        if (canScrollX) host.scrollLeft = touchPanState.start.scrollLeft - deltaX
+        if (canScrollY) host.scrollTop = touchPanState.start.scrollTop - deltaY
+        stopDragFocus()
+        return
+      }
+
+      const now = performance.now()
+      const deltaTime = Math.max(1, now - touchPanState.lastMoveAt)
+      const { rows, remainder, exactRows } = acceleratedScrollRows({
+        deltaY: current.y - touchPanState.lastY,
+        totalDeltaY: current.y - touchPanState.start.y,
+        cellHeight: term.dimensions?.css.cell.height || 16,
+        remainder: touchPanState.rowRemainder,
+      })
+      touchPanState.lastY = current.y
+      touchPanState.lastMoveAt = now
+      touchPanState.rowRemainder = remainder
+      touchPanState.velocityRowsPerMs = (touchPanState.velocityRowsPerMs * 0.45) + ((exactRows / deltaTime) * 0.55)
+      queueDragScroll(rows)
+      stopDragFocus()
     }
 
     const handleTouchEndCapture = (ev: TouchEvent) => {
@@ -690,12 +908,39 @@ export function TerminalView({
       // the browser's synthesized cascade.
       if (longPress.end()) {
         ev.preventDefault()
-        touchPanState.active = false
-        touchPanState.moved = false
+        cancelDragScroll(true)
+        cancelScrollMomentum()
+        resetTouchPan()
         return
       }
 
-      if (touchPanState.active && !touchPanState.moved) {
+      const touch = ev.changedTouches[0]
+      const host = shellRef.current
+      const shouldFocus = touch && host && shouldFocusTerminalFromTouch(
+        touchPanState.active,
+        touchPanState.moved,
+        touchPanState.start,
+        {
+          x: touch.clientX,
+          y: touch.clientY,
+          scrollLeft: host.scrollLeft,
+          scrollTop: host.scrollTop,
+          viewportY: term.buffer.active.viewportY,
+        },
+      )
+
+      if (touchPanState.active && !shouldFocus) {
+        // A scroll/pan must not fall through to xterm's synthesized mouse
+        // cascade, which can focus the hidden textarea and pop the keyboard.
+        ev.preventDefault()
+        ev.stopPropagation()
+        if (touchPanState.moved) {
+          cancelDragScroll(true)
+          startScrollMomentum()
+        }
+      }
+
+      if (shouldFocus) {
         // Tap on a link opens it by driving xterm's Linkifier with a
         // synthetic mousemove/mousedown/mouseup handshake (see
         // terminal-link.ts for why the browser's own synthesized cascade
@@ -704,13 +949,24 @@ export function TerminalView({
         // so the link can't be activated twice. When a link opens, skip
         // the keyboard focus/scroll — the tap was navigation, not input
         // intent.
-        if (openLinkAtPoint(term, touchPanState.startX, touchPanState.startY)) {
+        const fileTarget = touchPanState.fileTarget
+        if (fileTarget) {
           ev.preventDefault()
-          touchPanState.active = false
-          touchPanState.moved = false
+          cancelDragScroll(true)
+          cancelScrollMomentum()
+          openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          resetTouchPan()
+          return
+        }
+        if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+          ev.preventDefault()
+          cancelDragScroll(true)
+          cancelScrollMomentum()
+          resetTouchPan()
           return
         }
 
+        ev.preventDefault()
         focusTerminalInput(term)
         // No eager scroll-to-bottom here: the keyboard-open viewport
         // shrink triggers one PTY reflow that already lands at the
@@ -719,16 +975,31 @@ export function TerminalView({
         // the keyboard animation), producing a redundant scroll jump
         // before the reflow does the same thing again.
       }
-      touchPanState.active = false
-      touchPanState.moved = false
+      resetTouchPan()
     }
 
     const clearTouchPan = () => {
       longPress.end() // full reset: discard pending and fired state
-      touchPanState.active = false
-      touchPanState.moved = false
+      cancelDragScroll()
+      cancelScrollMomentum()
+      resetTouchPan()
     }
 
+    // File links also bypass xterm's hover cache on desktop. Linkifier may
+    // retain the provider result for a screen row after a TUI redraw, so a
+    // visually current path can otherwise ignore a click until the pointer
+    // leaves and re-enters the row. Resolve the public buffer cell at click
+    // time and reserve xterm's normal link path for web/OSC-8 links.
+    const handleMouseClickCapture = (ev: MouseEvent) => {
+      if (ev.button !== 0 || isInteractiveTarget(ev.target)) return
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), ev.clientX, ev.clientY)
+      if (!fileTarget) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+    }
+
+    shell?.addEventListener('click', handleMouseClickCapture, true)
     shell?.addEventListener('touchstart', handleTouchStartCapture, { capture: true, passive: false })
     shell?.addEventListener('touchmove', handleTouchMoveCapture, { capture: true, passive: false })
     shell?.addEventListener('touchend', handleTouchEndCapture, { capture: true, passive: false })
@@ -751,15 +1022,34 @@ export function TerminalView({
 
     let resizeFrame: number | null = null
     let lastViewportPixels = getResizeSignalPixels(shell, vv)
+    let keyboardSettleTimers: number[] = []
 
     const flushViewportResize = () => {
       resizeFrame = null
+      lastViewportPixels = getResizeSignalPixels(shell, vv)
       processViewportResize()
     }
 
     const scheduleViewportResize = () => {
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
       resizeFrame = requestAnimationFrame(flushViewportResize)
+    }
+
+    const clearKeyboardSettleTimers = () => {
+      for (const timer of keyboardSettleTimers) clearTimeout(timer)
+      keyboardSettleTimers = []
+    }
+
+    const scheduleKeyboardSettleResize = () => {
+      clearKeyboardSettleTimers()
+      // Soft-keyboard open/close animates visualViewport and, on phones,
+      // separately flips the header collapse class via App's keyboardOpen
+      // signal. Some browsers report the viewport resize before that CSS
+      // layout has fully settled, so remeasure the terminal itself at a few
+      // post-animation points. This intentionally does not dispatch a global
+      // window.resize event and does not force PTY ownership; it reuses the
+      // normal viewport decision path.
+      keyboardSettleTimers = [120, 280, 500].map(delay => window.setTimeout(scheduleViewportResize, delay))
     }
 
     const onViewportResize = () => {
@@ -782,24 +1072,53 @@ export function TerminalView({
     const shellObserver = new ResizeObserver(() => onViewportResize())
     if (shell) shellObserver.observe(shell)
 
+    const onVisualViewportResize = () => {
+      onViewportResize()
+      scheduleKeyboardSettleResize()
+    }
+
+    const onVisualViewportResizeEnd = () => {
+      clearKeyboardSettleTimers()
+      scheduleViewportResize()
+    }
+
+    const onExplicitViewportResync = () => {
+      scheduleViewportResize()
+      scheduleKeyboardSettleResize()
+    }
+
     // Also listen on window/visualViewport for zoom and soft keyboard.
     window.addEventListener('resize', onViewportResize)
-    if (vv) vv.addEventListener('resize', onViewportResize)
+    window.addEventListener('gmux:viewport-resync', onExplicitViewportResync)
+    if (vv) {
+      vv.addEventListener('resize', onVisualViewportResize)
+      vv.addEventListener('resizeend', onVisualViewportResizeEnd)
+    }
 
     return () => {
       shellObserver.disconnect()
+      clearKeyboardSettleTimers()
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
+      cancelDragScroll()
+      cancelScrollMomentum()
       longPress.cancel()
       disposed.current = true
       window.removeEventListener('keydown', handleGlobalKeydown, true)
       window.removeEventListener('resize', onViewportResize)
-      if (vv) vv.removeEventListener('resize', onViewportResize)
+      window.removeEventListener('gmux:viewport-resync', onExplicitViewportResync)
+      if (vv) {
+        vv.removeEventListener('resize', onVisualViewportResize)
+        vv.removeEventListener('resizeend', onVisualViewportResizeEnd)
+      }
+      shell?.removeEventListener('click', handleMouseClickCapture, true)
       shell?.removeEventListener('touchstart', handleTouchStartCapture, true)
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)
       shell?.removeEventListener('touchcancel', clearTouchPan, true)
       disposePasteHandler()
       disposeMobileHandler()
+      disposeKeyboardCloseBlur()
+      disposeImeResidueGuard()
       osc52Disposable.dispose()
       dataDisposable.dispose()
       scrollDisposable.dispose()
@@ -810,6 +1129,8 @@ export function TerminalView({
       wsRef.current = null
       onInputReady?.(null)
       pasteActionRef.current = null
+      onPasteReady?.(null)
+      onAttachFileReady?.(null)
       onFocusReady?.(null)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null
       ;(window as any).__gmuxInject = null
@@ -818,7 +1139,46 @@ export function TerminalView({
       termRef.current = null
       termIoRef.current = null
     }
-  }, [onCtrlConsumed, onInputReady, fontReady])
+  }, [onCtrlConsumed, onInputReady, onPasteReady, onAttachFileReady, fontReady])
+
+  // Apply runtime option changes without remounting the terminal. This is
+  // especially important for UI scale: changing the slider should behave like
+  // browser zoom (larger cells, fewer rows/cols, normal PTY resize), not tear
+  // down the xterm instance on every input event.
+  useEffect(() => {
+    const term = termRef.current
+    if (!term || !fontReady) return
+
+    let cancelled = false
+    const spec = `${terminalOptions.fontSize}px ${terminalOptions.fontFamily}`
+    document.fonts.load(spec).finally(() => {
+      if (cancelled || termRef.current !== term) return
+
+      term.options.fontFamily = terminalOptions.fontFamily
+      term.options.fontSize = terminalOptions.fontSize
+      term.options.fontWeight = terminalOptions.fontWeight
+      term.options.fontWeightBold = terminalOptions.fontWeightBold
+      term.options.lineHeight = terminalOptions.lineHeight
+      term.options.letterSpacing = terminalOptions.letterSpacing
+      term.options.theme = terminalOptions.theme
+      term.options.cursorStyle = terminalOptions.cursorStyle
+      term.options.cursorBlink = terminalOptions.cursorBlink
+      term.options.cursorInactiveStyle = terminalOptions.cursorInactiveStyle
+      term.options.cursorWidth = terminalOptions.cursorWidth
+      term.options.drawBoldTextInBrightColors = terminalOptions.drawBoldTextInBrightColors
+      term.options.minimumContrastRatio = terminalOptions.minimumContrastRatio
+      term.options.scrollSensitivity = terminalOptions.scrollSensitivity
+      term.options.fastScrollSensitivity = terminalOptions.fastScrollSensitivity
+      term.options.smoothScrollDuration = terminalOptions.smoothScrollDuration
+      term.options.wordSeparator = terminalOptions.wordSeparator
+
+      requestAnimationFrame(() => {
+        if (!cancelled && termRef.current === term) processViewportResize()
+      })
+    })
+
+    return () => { cancelled = true }
+  }, [fontReady, processViewportResize, terminalOptions])
 
   // WebSocket connection (reconnects when session.id changes).
   useEffect(() => {
@@ -884,20 +1244,27 @@ export function TerminalView({
         setWsState('open')
 
         if (!isFirstConnect) {
-          // Reconnect: re-sync ptySize from session metadata in case a
-          // terminal_resize WS event was missed during the drop. Session
-          // metadata is updated via SSE independently, so it may be
-          // fresher than our cached ptySize after a network blip.
+          // Reconnect: fetch the daemon's current logical size instead of using
+          // the component/SSE cache, which may be stale after mobile suspend.
+          // Even when the fresh size matches our cache, reassert it once: the
+          // runner intentionally hides a one-column shrink after the last
+          // client disconnects and expects the next explicit resize to restore
+          // the logical size and trigger a TUI redraw. Following the fresh
+          // daemon value avoids reclaiming a size chosen by another device.
           resetResizeEchoGate()
-          const sess = sessionRef.current
-          if (sess.terminal_cols && sess.terminal_rows) {
+          void fetchAuthoritativeReconnectSize(session.id).then((size) => {
+            if (!size
+              || wsRef.current !== ws
+              || ws.readyState !== WebSocket.OPEN
+              || currentSessionId.current !== session.id) return
+
             const cached = ptySizeRef.current
-            if (!cached || cached.cols !== sess.terminal_cols || cached.rows !== sess.terminal_rows) {
-              const size = { cols: sess.terminal_cols, rows: sess.terminal_rows }
+            if (!sameSize(cached, size)) {
               setPtySize(size); ptySizeRef.current = size
-              queueResize(size)
             }
-          }
+            queueResize(size)
+            announceResize(ws, size)
+          })
           return
         }
         isFirstConnect = false
@@ -963,11 +1330,16 @@ export function TerminalView({
       }
 
       ws.onclose = () => {
+        if (!shouldHandleTerminalSocketClose({
+          closedSocket: ws,
+          currentSocket: wsRef.current,
+          intentionalClose,
+          disposed: disposed.current,
+          sessionStillCurrent: currentSessionId.current === session.id,
+        })) return
+
         resetResizeEchoGate()
         setWsState(prev => prev === 'open' ? 'lost' : prev)
-        if (disposed.current || intentionalClose) return
-        if (currentSessionId.current !== session.id) return
-
         const delay = Math.min(500 * Math.pow(2, attempt), 8000)
         attempt++
         reconnectTimer.current = setTimeout(connect, delay)

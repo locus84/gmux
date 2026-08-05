@@ -18,6 +18,17 @@ import (
 
 // ── Construction + basics ────────────────────────────────────────
 
+func TestWaitActionPathSkipsOneShotTimeout(t *testing.T) {
+	for _, path := range []string{"/v1/sessions/sess-1/wait", "/v1/sessions/sess-1/wait?timeout=900"} {
+		if !isWaitActionPath(path) {
+			t.Errorf("wait path not recognized: %q", path)
+		}
+	}
+	if isWaitActionPath("/v1/sessions/sess-1/input") {
+		t.Fatal("input path incorrectly recognized as wait")
+	}
+}
+
 func TestNew_TrimsTrailingSlash(t *testing.T) {
 	c := New("http://host:8790/")
 	if c.BaseURL() != "http://host:8790" {
@@ -673,7 +684,6 @@ func TestProxyWS_NoCompressionToBrowser(t *testing.T) {
 		t.Errorf("server negotiated permessage-deflate (%q); it must stay disabled on the browser-facing peer hop (#279)", ext)
 	}
 }
-
 
 // TestForwardAction_PreservesQueryString locks in the contract that
 // action endpoints with query parameters (e.g. /scrollback?tail=N)

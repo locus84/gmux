@@ -4,7 +4,8 @@
 // Launcher definitions come from the store's health signal (populated
 // from /v1/health). The component reads them reactively.
 
-import { useState, useRef, useEffect, useMemo } from 'preact/hooks'
+import { createPortal } from 'preact/compat'
+import { useState, useRef, useEffect, useLayoutEffect, useMemo } from 'preact/hooks'
 import type { Session, LauncherDef, PeerInfo } from './types'
 import { launchers as launchersSignal, defaultLauncher as defaultLauncherSignal, peers as peersSignal, launchSession } from './store'
 
@@ -68,6 +69,57 @@ export function formatTarget(target: LaunchTarget): string {
   return shortCwd
 }
 
+export interface LauncherMenuViewport {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+export interface LauncherMenuPosition {
+  left: number
+  top: number
+  maxWidth: number
+  maxHeight: number
+}
+
+export function launcherMenuPosition(
+  anchor: { left: number; top: number; right: number },
+  menu: { width: number; height: number },
+  viewport: LauncherMenuViewport,
+  targetOffset: number,
+  gutter = 8,
+  gap = 4,
+): LauncherMenuPosition {
+  const maxWidth = Math.max(0, viewport.width - gutter * 2)
+  const maxHeight = Math.max(0, viewport.height - gutter * 2)
+  const width = Math.min(menu.width, maxWidth)
+  const height = Math.min(menu.height, maxHeight)
+  const minLeft = viewport.left + gutter
+  const maxLeft = viewport.left + viewport.width - gutter - width
+  const minTop = viewport.top + gutter
+  const maxTop = viewport.top + viewport.height - gutter - height
+
+  let top = anchor.top - 4 - targetOffset
+  if (top + height > viewport.top + viewport.height - gutter) {
+    top = anchor.top - height - gap
+  }
+
+  return {
+    left: Math.min(maxLeft, Math.max(minLeft, anchor.right - width)),
+    top: Math.min(maxTop, Math.max(minTop, top)),
+    maxWidth,
+    maxHeight,
+  }
+}
+
+function visibleViewport(): LauncherMenuViewport {
+  const viewport = window.visualViewport
+  return viewport
+    ? { left: viewport.offsetLeft, top: viewport.offsetTop, width: viewport.width, height: viewport.height }
+    : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }
+}
+
 // ── LaunchButton ──
 //
 // Transforms into an inline menu on click:
@@ -89,6 +141,8 @@ export function formatTarget(target: LaunchTarget): string {
 interface LaunchButtonProps {
   className?: string
   onLaunch?: () => void
+  /** Optional infrequent action rendered below the launcher list and a divider. */
+  footerAction?: { label: string; onSelect: () => void; triggerKey?: string }
   /** Async action to run before the launch request (e.g. seed a project). */
   beforeLaunch?: () => Promise<void>
   /** Explicit target: working directory for the new session. */
@@ -105,7 +159,7 @@ interface LaunchButtonProps {
   fallbackCwd?: string
 }
 
-export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, sessions, selectedId, fallbackCwd }: LaunchButtonProps) {
+export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, cwd, peer, sessions, selectedId, fallbackCwd }: LaunchButtonProps) {
   // Resolve the target: context-aware mode (sessions provided) derives
   // a smart cwd, while an explicit `peer` prop is always authoritative
   // (the caller knows the folder's owner; ADR 0002). This matters for
@@ -122,26 +176,29 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
   const showTarget = target.cwd !== ''
 
   const [state, setState] = useState<'idle' | 'open' | 'launching'>('idle')
-  const [menuPos, setMenuPos] = useState<{ top: number; right: number } | null>(null)
+  const [menuPos, setMenuPos] = useState<LauncherMenuPosition | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
 
   // Read launcher config from the store (populated by /v1/health).
   const hasLaunchers = launchersSignal.value.length > 0
+  const hasMenuItems = hasLaunchers || !!footerAction
+  const isOpen = state === 'open' && hasMenuItems
 
-  /** Compute fixed position for the menu so it escapes overflow:hidden parents. */
+  // The target line and divider sit above the default launcher item.
+  const targetOffset = showTarget ? 32 : 0
+
+  /** Seed a fixed position; useLayoutEffect corrects it after measuring the portal. */
   const computeMenuPos = () => {
     const btn = btnRef.current
     if (!btn) return
-    const r = btn.getBoundingClientRect()
-    // Align the menu's default item (first adapter) with the button.
-    // The menu has 4px padding; if a target line is shown it adds ~32px
-    // (target line + divider) that we offset so the first adapter stays aligned.
-    const targetOffset = showTarget ? 32 : 0
-    setMenuPos({
-      top: r.top - 4 - targetOffset,       // 4px = menu padding-top
-      right: window.innerWidth - r.right,  // align menu's right edge with button's right edge
-    })
+    setMenuPos(launcherMenuPosition(
+      btn.getBoundingClientRect(),
+      { width: 180, height: 0 },
+      visibleViewport(),
+      targetOffset,
+    ))
   }
 
   const handleClick = (e: MouseEvent) => {
@@ -163,18 +220,58 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
     })
   }
 
-  // Close on outside click
+  useLayoutEffect(() => {
+    if (!isOpen) return
+
+    const reposition = () => {
+      const btn = btnRef.current
+      const menu = menuRef.current
+      if (!btn || !menu) return
+      const rect = menu.getBoundingClientRect()
+      const next = launcherMenuPosition(
+        btn.getBoundingClientRect(),
+        { width: Math.max(rect.width, menu.scrollWidth), height: Math.max(rect.height, menu.scrollHeight) },
+        visibleViewport(),
+        targetOffset,
+      )
+      setMenuPos(current => current
+        && current.left === next.left
+        && current.top === next.top
+        && current.maxWidth === next.maxWidth
+        && current.maxHeight === next.maxHeight
+        ? current
+        : next)
+    }
+
+    reposition()
+    const viewport = window.visualViewport
+    window.addEventListener('resize', reposition)
+    window.addEventListener('scroll', reposition, true)
+    viewport?.addEventListener('resize', reposition)
+    viewport?.addEventListener('scroll', reposition)
+    return () => {
+      window.removeEventListener('resize', reposition)
+      window.removeEventListener('scroll', reposition, true)
+      viewport?.removeEventListener('resize', reposition)
+      viewport?.removeEventListener('scroll', reposition)
+    }
+  }, [isOpen, targetOffset, target.peer, launchersSignal.value.length, !!footerAction])
+
+  // Close on outside press. The menu is portaled to <body> so it can
+  // escape transformed/clipped ancestors such as the mobile sidebar; treat
+  // both the original button container and the portaled menu as "inside".
   useEffect(() => {
     if (state !== 'open') return
-    const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setState('idle')
-      }
+    const handler = (e: Event) => {
+      const targetNode = e.target as Node
+      const inContainer = !!containerRef.current?.contains(targetNode)
+      const inMenu = !!menuRef.current?.contains(targetNode)
+      if (!inContainer && !inMenu) setState('idle')
     }
-    const timer = setTimeout(() => document.addEventListener('mousedown', handler), 0)
+    const timer = setTimeout(() => document.addEventListener('pointerdown', handler), 0)
     return () => {
       clearTimeout(timer)
-      document.removeEventListener('mousedown', handler)
+      document.removeEventListener('pointerdown', handler)
     }
   }, [state])
 
@@ -186,7 +283,6 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
     return () => document.removeEventListener('keydown', handler)
   }, [state])
 
-  const isOpen = state === 'open' && hasLaunchers
   const isLoading = state === 'launching'
 
   let defLauncher: LauncherDef | undefined
@@ -200,11 +296,60 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
     others = resolved.launchers.filter(l => l.id !== resolved.default_launcher)
   }
 
+  const menu = isOpen && menuPos ? (
+    <div
+      ref={menuRef}
+      class="launch-inline-menu"
+      style={{ top: menuPos.top, left: menuPos.left, maxWidth: menuPos.maxWidth, maxHeight: menuPos.maxHeight }}
+    >
+      {showTarget && (
+        <>
+          <div class="launch-target-line">{formatTarget(target)}</div>
+          <div class="launch-inline-divider" />
+        </>
+      )}
+      {defLauncher && (
+        <button
+          class="launch-inline-item launch-inline-default"
+          onClick={(e) => { e.stopPropagation(); handleLaunch(defLauncher!.id) }}
+        >
+          {defLauncher.label}
+        </button>
+      )}
+      {others.map((l, i) => (
+        <button
+          key={l.id}
+          class="launch-inline-item"
+          style={{ animationDelay: `${(i + 1) * 50}ms` }}
+          onClick={(e) => { e.stopPropagation(); handleLaunch(l.id) }}
+        >
+          {l.label}
+        </button>
+      ))}
+      {footerAction && (
+        <>
+          {(defLauncher || others.length > 0) && <div class="launch-inline-divider" />}
+          <button
+            class="launch-inline-item launch-inline-footer"
+            onClick={(e) => {
+              e.stopPropagation()
+              setState('idle')
+              footerAction.onSelect()
+            }}
+          >
+            {footerAction.label}
+          </button>
+        </>
+      )}
+    </div>
+  ) : null
+
   return (
     <div class={`launch-container ${className ?? ''}`} ref={containerRef}>
       <button
         ref={btnRef}
         class={`launch-btn ${isLoading ? 'loading' : ''}`}
+        data-new-worktree-key={footerAction?.triggerKey}
         title={target.cwd
           ? target.peer ? `New session on ${target.peer} in ${target.cwd}` : `New session in ${target.cwd}`
           : 'New session'}
@@ -217,37 +362,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer, ses
           </svg>
         ) : '+'}
       </button>
-      {isOpen && menuPos && (
-        <div
-          class="launch-inline-menu"
-          style={{ top: menuPos.top, right: menuPos.right }}
-        >
-          {showTarget && (
-            <>
-              <div class="launch-target-line">{formatTarget(target)}</div>
-              <div class="launch-inline-divider" />
-            </>
-          )}
-          {defLauncher && (
-            <button
-              class="launch-inline-item launch-inline-default"
-              onClick={(e) => { e.stopPropagation(); handleLaunch(defLauncher!.id) }}
-            >
-              {defLauncher.label}
-            </button>
-          )}
-          {others.map((l, i) => (
-            <button
-              key={l.id}
-              class="launch-inline-item"
-              style={{ animationDelay: `${(i + 1) * 50}ms` }}
-              onClick={(e) => { e.stopPropagation(); handleLaunch(l.id) }}
-            >
-              {l.label}
-            </button>
-          ))}
-        </div>
-      )}
+      {menu && typeof document !== 'undefined' && createPortal(menu, document.body)}
     </div>
   )
 }

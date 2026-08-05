@@ -57,8 +57,31 @@ func SessionSocketDir() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("gmux-sessions-%d", os.Getuid()))
 }
 
+// DataDir returns the gmux data directory (~/.local/share/gmux).
+// Durable user content such as managed Git worktrees belongs here rather than
+// in StateDir, which may be redirected to an ephemeral location.
+func DataDir() string {
+	if dir := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(dir) {
+		return filepath.Join(dir, "gmux")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "gmux")
+}
+
+// WorktreesDir returns the root for worktrees created without an explicit
+// `gmux worktree create --path` destination.
+func WorktreesDir() string {
+	return filepath.Join(DataDir(), "worktrees")
+}
+
 // StateDir returns the gmux state directory (~/.local/state/gmux).
+// GMUX_STATE_DIR is an internal gmux override used to pin daemon-launched
+// runners to the same state directory even when a login shell changes
+// XDG_STATE_HOME for the wrapped command.
 func StateDir() string {
+	if dir := os.Getenv("GMUX_STATE_DIR"); dir != "" {
+		return dir
+	}
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
 		return filepath.Join(dir, "gmux")
 	}

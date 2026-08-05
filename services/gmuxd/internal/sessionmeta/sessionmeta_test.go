@@ -28,16 +28,18 @@ func sampleSession() store.Session {
 		ExitCode:     &exit,
 		StartedAt:    "2026-04-26T10:00:00Z",
 		ExitedAt:     "2026-04-26T10:05:00Z",
-		Title:        "proj",
-		ShellTitle:   "shell-title-internal",
-		AdapterTitle: "adapter-title-internal",
+		Title:         "proj",
+		ExplicitTitle: "explicit-title-internal",
+		AgentTitle:    "agent-title-internal",
+		ShellTitle:    "shell-title-internal",
+		AdapterTitle:  "adapter-title-internal",
 		Slug:         "proj",
 	}
 }
 
 // TestRoundTripPreservesInternalFields is the central correctness
 // claim of this package: persisted sessions come back with the
-// internal Title-precedence fields (ShellTitle, AdapterTitle) intact.
+// internal title-precedence fields intact.
 // Without this, a restored session loses its title resolution and
 // shows up as the bare Kind ("shell") instead of "proj".
 func TestRoundTripPreservesInternalFields(t *testing.T) {
@@ -52,6 +54,12 @@ func TestRoundTripPreservesInternalFields(t *testing.T) {
 		t.Fatalf("Read: %v", err)
 	}
 
+	if out.ExplicitTitle != in.ExplicitTitle {
+		t.Errorf("ExplicitTitle: got %q, want %q", out.ExplicitTitle, in.ExplicitTitle)
+	}
+	if out.AgentTitle != in.AgentTitle {
+		t.Errorf("AgentTitle: got %q, want %q", out.AgentTitle, in.AgentTitle)
+	}
 	if out.ShellTitle != in.ShellTitle {
 		t.Errorf("ShellTitle: got %q, want %q", out.ShellTitle, in.ShellTitle)
 	}
@@ -83,6 +91,7 @@ func TestRoundTripFullSession(t *testing.T) {
 		Cwd:           "~/work",
 		Kind:          "shell",
 		WorkspaceRoot: "~/work/repo",
+		GitLayout:     "repository",
 		Remotes:       map[string]string{"origin": "github.com/me/repo"},
 		Alive:         false,
 		Pid:           12345,
@@ -100,6 +109,8 @@ func TestRoundTripFullSession(t *testing.T) {
 		Slug:          "my-slug",
 		RunnerVersion: "v1.4.0",
 		BinaryHash:    "abc123",
+		ExplicitTitle: "explicit-title",
+		AgentTitle:    "agent-title",
 		ShellTitle:    "shell-title",
 		AdapterTitle:  "adapter-title",
 		LastActivityAt: "2026-04-26T10:04:30Z",

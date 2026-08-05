@@ -58,9 +58,9 @@ const httpActionTimeout = 10 * time.Second
 // Client is an authenticated HTTP + WebSocket client pointed at one
 // gmuxd instance (the "spoke" from the hub's perspective).
 type Client struct {
-	baseURL          string
-	token            string
-	transport        http.RoundTripper
+	baseURL           string
+	token             string
+	transport         http.RoundTripper
 	streamIdleTimeout time.Duration
 
 	// httpClient is a long-lived client with no Timeout so SSE
@@ -281,7 +281,11 @@ func stripPeerField(body []byte) ([]byte, error) {
 // and copies the response back to the caller, preserving method,
 // body, status, headers, and Content-Type.
 func (c *Client) proxyHTTP(w http.ResponseWriter, r *http.Request, path string) {
-	ctx, cancel := context.WithTimeout(r.Context(), httpActionTimeout)
+	ctx := r.Context()
+	cancel := func() {}
+	if !isWaitActionPath(path) {
+		ctx, cancel = context.WithTimeout(ctx, httpActionTimeout)
+	}
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, c.baseURL+path, r.Body)
@@ -309,6 +313,11 @@ func (c *Client) proxyHTTP(w http.ResponseWriter, r *http.Request, path string) 
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func isWaitActionPath(path string) bool {
+	path = strings.SplitN(path, "?", 2)[0]
+	return strings.HasSuffix(path, "/wait")
 }
 
 // DialWS opens a WebSocket connection to the spoke's /ws/{sessionID}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import type { ProjectItem, PeerInfo } from './types'
+import type { Folder, ProjectItem, PeerInfo } from './types'
 import {
   normalizeRemote,
   matchSession,
@@ -15,6 +15,9 @@ import {
   discoverProjects,
   countUnmatchedActive,
   projectAvailability,
+  checkoutPathContains,
+  canCreateManagedWorktree,
+  groupSessionsByCheckout,
 } from './projects'
 import { makeSession } from './test-helpers'
 
@@ -1069,5 +1072,75 @@ describe('projectAvailability', () => {
     // disconnected roster entry surfaces as unresolved — the actionable
     // state — not offline.
     expect(projectAvailability({ peer: 'bespin', unresolved: true }, connected)).toBe('unresolved')
+  })
+})
+
+describe('canCreateManagedWorktree', () => {
+  it('allows Git inventories and rejects non-Git or bare inventories', () => {
+    expect(canCreateManagedWorktree([{ path: '/repo', head: 'abc', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false }])).toBe(true)
+    expect(canCreateManagedWorktree([])).toBe(false)
+    expect(canCreateManagedWorktree([{ path: '/repo', primary: true, detached: false, bare: true, locked: false, prunable: false }])).toBe(false)
+    expect(canCreateManagedWorktree(undefined)).toBe(false)
+  })
+})
+
+describe('groupSessionsByCheckout', () => {
+  const folder = (sessions: Folder['sessions']): Folder => ({
+    key: '::gmux', slug: 'gmux', name: 'gmux', launchCwd: '~/src/gmux', sessions,
+  })
+  const worktrees = [
+    { path: '~/src/gmux', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false },
+    { path: '~/.local/share/gmux/worktrees/fix-auth', branch: 'fix/auth', primary: false, detached: false, bare: false, locked: false, prunable: false },
+  ]
+
+  it('renders every listed checkout and associates visible sessions by cwd', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'main', cwd: '~/src/gmux/apps', alive: true }),
+      makeSession({ id: 'linked', cwd: '~/.local/share/gmux/worktrees/fix-auth/src', alive: true, git_layout: 'worktree' }),
+      makeSession({ id: 'sleeping', cwd: '~/.local/share/gmux/worktrees/fix-auth', alive: false, resumable: true, git_layout: 'worktree' }),
+      makeSession({ id: 'dead', cwd: '~/src/gmux', alive: false, resumable: false }),
+    ]), worktrees)
+
+    expect(groups.map(g => [g.label, g.primary, g.sessions.map(s => s.id)])).toEqual([
+      ['main', true, ['main']],
+      ['fix/auth', false, ['linked', 'sleeping']],
+    ])
+  })
+
+  it('keeps empty linked worktrees and unmatched sessions visible', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'container', cwd: '/workspace/gmux', alive: true, peer: 'dev' }),
+    ]), worktrees)
+    expect(groups[1].sessions).toEqual([])
+    expect(groups[2].fallback).toBe(true)
+    expect(groups[2].label).toContain('dev')
+    expect(groups[2].sessions[0].id).toBe('container')
+  })
+
+  it('does not conflate identical parent and devcontainer paths', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'parent', cwd: '~/src/gmux', alive: true }),
+      makeSession({ id: 'container', cwd: '~/src/gmux', alive: true, peer: 'dev' }),
+    ]), worktrees)
+    expect(groups[0].sessions.map(s => s.id)).toEqual(['parent'])
+    expect(groups[2].sessions.map(s => s.id)).toEqual(['container'])
+    expect(groups[2].label).toContain('dev')
+  })
+
+  it('uses path boundaries instead of string prefixes', () => {
+    expect(checkoutPathContains('/repo/app', '/repo/app/src')).toBe(true)
+    expect(checkoutPathContains('/repo/app', '/repo/application')).toBe(false)
+    expect(checkoutPathContains('C:\\Repo\\App', 'c:\\repo\\app\\src')).toBe(true)
+  })
+
+  it('approximates worktree groups while inventory is loading', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'main', cwd: '~/src/gmux', alive: true, git_layout: 'repository' }),
+      makeSession({ id: 'linked', cwd: '~/work/fix-auth', alive: true, git_layout: 'worktree' }),
+    ]))
+    expect(groups.map(g => [g.primary, g.sessions.map(s => s.id)])).toEqual([
+      [true, ['main']],
+      [false, ['linked']],
+    ])
   })
 })

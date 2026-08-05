@@ -24,12 +24,25 @@ import { TERM_THEME } from './terminal'
 interface LogEntry {
   id: number
   time: string
-  category: 'data' | 'input' | 'beforeinput' | 'composition' | 'textarea' | 'info'
+  category: 'data' | 'input' | 'beforeinput' | 'composition' | 'textarea' | 'key' | 'selection' | 'info'
   message: string
   detail?: Record<string, unknown>
 }
 
-// ── Hex formatting ──
+// ── Text / byte formatting ──
+
+function toCodePoints(s: string): string {
+  return [...s].map(c => {
+    const cp = c.codePointAt(0)!
+    return `U+${cp.toString(16).toUpperCase().padStart(cp > 0xffff ? 5 : 4, '0')}`
+  }).join(' ')
+}
+
+function toUtf8Hex(s: string): string {
+  return [...new TextEncoder().encode(s)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join(' ')
+}
 
 function toHex(s: string): string {
   return [...s].map(c => {
@@ -40,6 +53,16 @@ function toHex(s: string): string {
         ? `\\x${cp.toString(16).padStart(2, '0')}`
         : c
   }).join('')
+}
+
+function textDetail(s: string): Record<string, unknown> {
+  return {
+    text: s,
+    printable: printable(s),
+    codePoints: toCodePoints(s),
+    utf8Hex: toUtf8Hex(s),
+    length: s.length,
+  }
 }
 
 function printable(s: string): string {
@@ -198,23 +221,31 @@ export default function InputDiagnostics() {
     // Welcome message
     term.writeln('\x1b[1;36m── Input Diagnostics ──\x1b[0m')
     term.writeln('\x1b[2mType here to test keyboard input. Events are logged below.')
-    term.writeln('Try: autocorrect, predictive text, voice dictation, swipe typing.\x1b[0m')
+    term.writeln('For Korean/iPad: type 가, 한, 한국어 and copy the report.')
+    term.writeln('We need to see whether xterm emits ㄱ + DEL + 가 or only ㄱ + ㅏ.\x1b[0m')
 
     // Attach local echo
     const disposeEcho = attachLocalEcho(term)
 
-    // Log onData events (what xterm sends to the application)
-    const dataDispose = term.onData((data) => {
-      addEntry('data', `onData: ${printable(data)}`, {
-        raw: toHex(data),
-        length: data.length,
-      })
-    })
-
     // Instrument the hidden textarea
     const textarea = term.textarea
+
+    // Log onData events (what xterm sends to the application). Production
+    // TerminalView sends exactly these JS strings after UTF-8 encoding, so the
+    // utf8Hex field is the raw PTY byte sequence we care about on iPad.
+    const dataDispose = term.onData((data) => {
+      addEntry('data', `onData: ${printable(data)}`, {
+        ...textDetail(data),
+        legacyRaw: toHex(data),
+        textarea: textarea ? textareaSnapshot(textarea) : null,
+      })
+    })
+    const disposeTextareaInstrumentation = textarea
+      ? instrumentTextarea(textarea, addEntry)
+      : () => {}
+
     if (textarea) {
-      instrumentTextarea(textarea, addEntry)
+      addEntry('info', 'xterm textarea attached', textareaSnapshot(textarea))
     }
 
     addEntry('info', 'Ready. Type to see events.', {
@@ -234,6 +265,7 @@ export default function InputDiagnostics() {
       window.visualViewport?.removeEventListener('resize', onResize)
       disposeEcho()
       dataDispose.dispose()
+      disposeTextareaInstrumentation()
       term.dispose()
       termRef.current = null
     }
@@ -276,6 +308,11 @@ export default function InputDiagnostics() {
         <div class="diag-terminal-label">
           Terminal (local echo, no connection)
           <button class="diag-btn diag-btn-small" onClick={handleFocusTerm}>Focus</button>
+        </div>
+        <div class="diag-help">
+          iPad Korean probe: focus the terminal, type <code>가</code>, <code>한</code>, <code>한국어</code>, then tap “Copy diagnostics”.
+          In the report, <code>data.utf8Hex</code> should reveal whether DEL (<code>7f</code>) and composed Hangul bytes are present.
+          Don’t type secrets here; the report includes raw typed text.
         </div>
         <div ref={containerRef} class="diag-terminal" />
       </div>
@@ -321,71 +358,143 @@ type AddEntryFn = (
   detail?: Record<string, unknown>,
 ) => void
 
-function instrumentTextarea(textarea: HTMLTextAreaElement, addEntry: AddEntryFn): void {
+function instrumentTextarea(textarea: HTMLTextAreaElement, addEntry: AddEntryFn): () => void {
+  const disposers: Array<() => void> = []
+  const listen = <K extends keyof HTMLElementEventMap>(
+    type: K,
+    listener: (ev: HTMLElementEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ) => {
+    textarea.addEventListener(type, listener as EventListener, options)
+    disposers.push(() => textarea.removeEventListener(type, listener as EventListener, options))
+  }
+  const listenDocument = <K extends keyof DocumentEventMap>(
+    type: K,
+    listener: (ev: DocumentEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ) => {
+    document.addEventListener(type, listener as EventListener, options)
+    disposers.push(() => document.removeEventListener(type, listener as EventListener, options))
+  }
+
   // Track textarea value changes via polling (catches changes from any source)
   let lastValue = textarea.value
   const pollTimer = setInterval(() => {
     if (textarea.value !== lastValue) {
       addEntry('textarea', `value: "${printable(lastValue)}" → "${printable(textarea.value)}"`, {
-        oldLen: lastValue.length,
-        newLen: textarea.value.length,
-        selStart: textarea.selectionStart,
-        selEnd: textarea.selectionEnd,
+        old: textDetail(lastValue),
+        next: textDetail(textarea.value),
+        ...textareaSnapshot(textarea),
       })
       lastValue = textarea.value
     }
   }, 30)
+  disposers.push(() => clearInterval(pollTimer))
 
   // beforeinput: fires before the textarea is modified
-  textarea.addEventListener('beforeinput', (ev: InputEvent) => {
+  listen('beforeinput', (ev: InputEvent) => {
     const targetRanges = ev.getTargetRanges?.() ?? []
+    const data = ev.data ?? ev.dataTransfer?.getData('text/plain') ?? ''
     addEntry('beforeinput', `${ev.inputType}`, {
-      data: ev.data,
+      data: textDetail(data),
       inputType: ev.inputType,
       isComposing: ev.isComposing,
-      dataTransfer: ev.dataTransfer?.getData('text/plain') ?? null,
+      cancelable: ev.cancelable,
+      defaultPrevented: ev.defaultPrevented,
+      eventPhase: ev.eventPhase,
       targetRanges: targetRanges.map(r => ({
         startOffset: r.startOffset,
         endOffset: r.endOffset,
       })),
-      textareaValue: textarea.value,
-      selStart: textarea.selectionStart,
-      selEnd: textarea.selectionEnd,
+      value: textDetail(textarea.value),
+      ...textareaSnapshot(textarea),
     })
   }, true)
 
   // input: fires after the textarea is modified
-  textarea.addEventListener('input', (ev: Event) => {
+  listen('input', (ev: Event) => {
     const iev = ev as InputEvent
     addEntry('input', `${iev.inputType ?? 'unknown'}`, {
-      data: iev.data,
+      data: textDetail(iev.data ?? ''),
       inputType: iev.inputType,
       isComposing: iev.isComposing,
-      textareaValue: textarea.value,
-      selStart: textarea.selectionStart,
-      selEnd: textarea.selectionEnd,
+      cancelable: iev.cancelable,
+      defaultPrevented: iev.defaultPrevented,
+      eventPhase: iev.eventPhase,
+      value: textDetail(textarea.value),
+      ...textareaSnapshot(textarea),
     })
     lastValue = textarea.value // sync so poll doesn't double-report
   }, true)
 
   // Composition events
   for (const eventName of ['compositionstart', 'compositionupdate', 'compositionend'] as const) {
-    textarea.addEventListener(eventName, (ev: CompositionEvent) => {
-      addEntry('composition', `${eventName}: "${ev.data}"`, {
-        compositionData: ev.data,
-        textareaValue: textarea.value,
-        selStart: textarea.selectionStart,
-        selEnd: textarea.selectionEnd,
+    listen(eventName, (ev: CompositionEvent) => {
+      addEntry('composition', `${eventName}: "${printable(ev.data)}"`, {
+        data: textDetail(ev.data),
+        defaultPrevented: ev.defaultPrevented,
+        eventPhase: ev.eventPhase,
+        value: textDetail(textarea.value),
+        ...textareaSnapshot(textarea),
       })
       lastValue = textarea.value
     }, true)
   }
 
-  // Clean up on unmount (we rely on the terminal disposing the textarea)
-  const origDisconnect = textarea.remove.bind(textarea)
-  textarea.remove = () => {
-    clearInterval(pollTimer)
-    origDisconnect()
+  for (const eventName of ['keydown', 'keyup'] as const) {
+    listen(eventName, (ev: KeyboardEvent) => {
+      addEntry('key', `${eventName}: ${ev.key}`, {
+        key: ev.key,
+        code: ev.code,
+        keyCode: ev.keyCode,
+        isComposing: ev.isComposing,
+        altKey: ev.altKey,
+        ctrlKey: ev.ctrlKey,
+        metaKey: ev.metaKey,
+        shiftKey: ev.shiftKey,
+        value: textDetail(textarea.value),
+        ...textareaSnapshot(textarea),
+      })
+    }, true)
+  }
+
+  listenDocument('selectionchange', () => {
+    if (document.activeElement !== textarea) return
+    addEntry('selection', 'selectionchange', {
+      value: textDetail(textarea.value),
+      ...textareaSnapshot(textarea),
+    })
+  }, true)
+
+  return () => {
+    for (const dispose of disposers.splice(0)) dispose()
+  }
+}
+
+function textareaSnapshot(textarea: HTMLTextAreaElement): Record<string, unknown> {
+  const rect = textarea.getBoundingClientRect()
+  const style = getComputedStyle(textarea)
+  return {
+    selStart: textarea.selectionStart,
+    selEnd: textarea.selectionEnd,
+    selectionDirection: textarea.selectionDirection,
+    rect: {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    },
+    style: {
+      opacity: style.opacity,
+      color: style.color,
+      caretColor: style.caretColor,
+      position: style.position,
+      left: style.left,
+      top: style.top,
+      width: style.width,
+      height: style.height,
+      fontSize: style.fontSize,
+    },
   }
 }
 

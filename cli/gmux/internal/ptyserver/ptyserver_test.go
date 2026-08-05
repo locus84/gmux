@@ -168,6 +168,96 @@ func TestPTYServerResize(t *testing.T) {
 	t.Fatal("expected terminal_resize event")
 }
 
+func TestShrinkForReconnectIsIdempotent(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	srv, err := New(Config{
+		Command:    []string{"bash", "-c", "sleep 5"},
+		Cwd:        "/tmp",
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+		Cols:       80,
+		Rows:       25,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	srv.shrinkForReconnect()
+	srv.mu.Lock()
+	cols := srv.ptyCols
+	shrunk := srv.hiddenReconnectShrink
+	srv.mu.Unlock()
+	if cols != 79 || !shrunk {
+		t.Fatalf("first shrink = cols %d hidden %v, want cols 79 hidden true", cols, shrunk)
+	}
+
+	srv.shrinkForReconnect()
+	srv.mu.Lock()
+	cols = srv.ptyCols
+	shrunk = srv.hiddenReconnectShrink
+	srv.mu.Unlock()
+	if cols != 79 || !shrunk {
+		t.Fatalf("second shrink should be idempotent, got cols %d hidden %v", cols, shrunk)
+	}
+
+	srv.resize(ResizeMsg{Type: "resize", Cols: 80, Rows: 25})
+	srv.mu.Lock()
+	cols = srv.ptyCols
+	shrunk = srv.hiddenReconnectShrink
+	srv.mu.Unlock()
+	if cols != 80 || shrunk {
+		t.Fatalf("resize should restore hidden shrink, got cols %d hidden %v", cols, shrunk)
+	}
+}
+
+func TestPTYServerShrinksBeforeFirstAttachReplay(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	srv, err := New(Config{
+		Command:    []string{"bash", "-c", "sleep 5"},
+		Cwd:        "/tmp",
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+		Cols:       80,
+		Rows:       25,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
+		HTTPClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return net.Dial("unix", sockPath)
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatalf("read replay frame: %v", err)
+	}
+
+	srv.mu.Lock()
+	cols := srv.ptyCols
+	shrunk := srv.hiddenReconnectShrink
+	srv.mu.Unlock()
+	if cols != 79 || !shrunk {
+		t.Fatalf("first attach should apply hidden shrink before replay, got cols %d hidden %v", cols, shrunk)
+	}
+}
+
 func TestPTYServerInput(t *testing.T) {
 	sockPath := filepath.Join(t.TempDir(), "test.sock")
 
@@ -682,20 +772,31 @@ func TestPTYServerResizeDedup(t *testing.T) {
 		}
 	}
 
-	// Send a resize with the SAME dimensions (80x25). This should NOT
-	// trigger SIGWINCH, so no "WINCH_FIRED" output should appear.
+	// The first same-logical-size resize restores the hidden reconnect shrink
+	// applied before attach, so it may legitimately trigger one SIGWINCH.
 	sameResize, _ := json.Marshal(ResizeMsg{Type: "resize", Cols: 80, Rows: 25})
 	if err := conn.Write(ctx, websocket.MessageText, sameResize); err != nil {
-		t.Fatalf("write same-size resize: %v", err)
+		t.Fatalf("write initial same-size resize: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	winchesBefore := countOccurrences(string(allOutput), "WINCH_FIRED")
+	mu.Unlock()
+
+	// A subsequent resize with the same dimensions should still be deduped.
+	if err := conn.Write(ctx, websocket.MessageText, sameResize); err != nil {
+		t.Fatalf("write duplicate same-size resize: %v", err)
 	}
 
 	// Give the child time to receive and process a SIGWINCH if one were sent.
 	time.Sleep(300 * time.Millisecond)
 	mu.Lock()
-	if contains(allOutput, "WINCH_FIRED") {
-		t.Error("same-size resize should not trigger SIGWINCH, but WINCH_FIRED was received")
-	}
+	winchesAfter := countOccurrences(string(allOutput), "WINCH_FIRED")
 	mu.Unlock()
+	if winchesAfter != winchesBefore {
+		t.Errorf("duplicate same-size resize should not trigger SIGWINCH, before=%d after=%d", winchesBefore, winchesAfter)
+	}
 
 	// Now send a resize with DIFFERENT dimensions. This should trigger SIGWINCH.
 	diffResize, _ := json.Marshal(ResizeMsg{Type: "resize", Cols: 120, Rows: 40})
@@ -1557,24 +1658,22 @@ func TestKillReleasesSocketPathBeforeResponding(t *testing.T) {
 	ln.Close()
 }
 
-// TestBuildChildEnv_StripsResumeID guards the runner→child boundary
-// against leaking GMUX_RESUME_ID. The runner inherits this env var
-// from gmuxd as a private "use this id when you bind" directive
-// (ADR 0003); leaking it to the PTY child would let a nested
-// `gmux foo` invocation try to re-bind the parent runner's id and
-// rely on the collision fallback as a safety net, which is exactly
-// the scenario the dedicated env var name was meant to eliminate.
-func TestBuildChildEnv_StripsResumeID(t *testing.T) {
+// TestBuildChildEnv_StripsPrivateRunnerDirectives guards the runner→child
+// boundary against leaking private parent→runner directives. GMUX_RESUME_ID
+// would let a nested `gmux` try to re-bind the parent id; GMUX_HANDSHAKE_FD
+// would let it treat a stale fd 3 as a live parent handshake pipe.
+func TestBuildChildEnv_StripsPrivateRunnerDirectives(t *testing.T) {
 	parent := []string{
 		"PATH=/usr/bin",
 		"GMUX_RESUME_ID=sess-parent",
+		"GMUX_HANDSHAKE_FD=3",
 		"GMUX_SESSION_ID=sess-parent", // intentionally NOT stripped (children consume this)
 		"HOME=/home/u",
 	}
 	env := buildChildEnv(parent, nil, "1.2.3")
 	for _, e := range env {
-		if strings.HasPrefix(e, "GMUX_RESUME_ID=") {
-			t.Errorf("child env must not contain GMUX_RESUME_ID; got %q", e)
+		if strings.HasPrefix(e, "GMUX_RESUME_ID=") || strings.HasPrefix(e, "GMUX_HANDSHAKE_FD=") {
+			t.Errorf("child env must not contain private runner directive; got %q", e)
 		}
 	}
 	if !hasEnv(env, "GMUX_SESSION_ID") {

@@ -1,14 +1,15 @@
+import { effect } from '@preact/signals'
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import {
   sessions, sessionsLoaded, worldLoaded, projects, upsertSession, removeSession,
   markSessionRead, dismissSession, reorderSessions,
   handleActivity, isSessionActive, isSessionFading, activityMap,
   sessionStaleness, peers, peerAppearance, peerStatusByName,
-  isSessionUnavailable, urlPath, urlSearch, filteredSessions, selectedId,
-  navigateToSession, setNavigate,
+  isSessionUnavailable, aggregateSessionDotState, urlPath, urlSearch, filteredSessions, selectedId,
+  navigateToSession, setNavigate, replaceSessionSnapshot,
   applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
   toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
-  view, duplicateSessionFiles,
+  view, duplicateSessionFiles, ensureProjectWorktrees, createProjectWorktree, removeProjectWorktree, projectWorktreeInventories,
 } from './store'
 import { SessionSchema } from '@gmux/protocol'
 import type { PendingMutation } from './store'
@@ -42,6 +43,7 @@ beforeEach(() => {
   _rawSessions.value = []
   _setRawWorld({ projects: [], peers: [] })
   _pendingMutations.value = []
+  projectWorktreeInventories.value = {}
   sessionsLoaded.value = false
   worldLoaded.value = false
   urlPath.value = '/'
@@ -102,6 +104,13 @@ describe('toUISession project stamp passthrough', () => {
       id: 'sess-1', alive: true,
     } as any)
     expect(ui.project_slug).toBeUndefined()
+  })
+
+  it('preserves git_layout from the owning runner', () => {
+    const ui = toUISession({
+      id: 'sess-1', alive: true, git_layout: 'worktree',
+    } as any)
+    expect(ui.git_layout).toBe('worktree')
   })
 
   it('passes last_activity_at through from the wire', () => {
@@ -216,6 +225,53 @@ describe('upsertSession', () => {
     // URL should be unchanged.
     expect(urlPath.value).toBe('/myproject/pi/fix-auth')
     expect(selectedId.value).toBe('sess-1')
+  })
+})
+
+describe('full session snapshot slug transition', () => {
+  it('keeps an ID-routed selected session active when attribution assigns a slug', () => {
+    const navigateMock = vi.fn()
+    setNavigate(navigateMock)
+    _setRawWorld({
+      projects: [{ slug: 'cosplay-frontier', match: [{ path: '/work/cosplay-frontier' }] }],
+    })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    _rawSessions.value = [
+      makeSession({
+        id: 'sess-f5bf2142',
+        cwd: '/work/cosplay-frontier',
+        kind: 'pi',
+        project_slug: 'cosplay-frontier',
+      }),
+    ]
+    urlPath.value = '/cosplay-frontier/pi/sess-f5b'
+    expect(selectedId.value).toBe('sess-f5bf2142')
+
+    // Observe the reactive selection, not just its final value: without
+    // batching the roster and URL writes, this records a transient null and
+    // xterm unmounts even though the session is selected again afterward.
+    const observedSelections: (string | null)[] = []
+    const dispose = effect(() => {
+      observedSelections.push(selectedId.value)
+    })
+
+    replaceSessionSnapshot([
+      makeSession({
+        id: 'sess-f5bf2142',
+        cwd: '/work/cosplay-frontier',
+        kind: 'pi',
+        slug: 'skill-name-resource-curator-location-use',
+        project_slug: 'cosplay-frontier',
+      }),
+    ])
+
+    const canonical = '/cosplay-frontier/pi/skill-name-resource-curator-location-use'
+    expect(urlPath.value).toBe(canonical)
+    expect(selectedId.value).toBe('sess-f5bf2142')
+    expect(observedSelections).toEqual(['sess-f5bf2142'])
+    expect(navigateMock).toHaveBeenCalledWith(canonical, true)
+    dispose()
   })
 })
 
@@ -523,6 +579,37 @@ describe('peerAppearance', () => {
       { name: 'alpha', url: '', status: 'connected', session_count: 0 },
     ] })
     expect(peerAppearance.value.get('alpha')!.color).toBe(color1)
+  })
+})
+
+describe('aggregateSessionDotState', () => {
+  it('surfaces the highest-priority child dot for a collapsed group', () => {
+    const sessions = [
+      makeSession({ id: 'active' }),
+      makeSession({ id: 'done', unread: true }),
+      makeSession({ id: 'working', status: { label: 'Working', working: true } }),
+    ]
+    expect(aggregateSessionDotState(sessions, new Map([['active', 'active']]))).toBe('working')
+  })
+
+  it('keeps completed unread work visible unless that session is selected', () => {
+    const sessions = [makeSession({ id: 'done', unread: true })]
+    expect(aggregateSessionDotState(sessions, new Map())).toBe('unread')
+    expect(aggregateSessionDotState(sessions, new Map(), { selectedId: 'done' })).toBe('none')
+  })
+
+  it('uses working while a child session is resuming and none for an empty group', () => {
+    const sessions = [makeSession({ id: 'resume' })]
+    expect(aggregateSessionDotState(sessions, new Map(), { resumingId: 'resume' })).toBe('working')
+    expect(aggregateSessionDotState([], new Map())).toBe('none')
+  })
+
+  it('ignores sessions whose row uses an unavailable or sleeping icon', () => {
+    const sessions = [
+      makeSession({ id: 'remote', peer: 'tower', unread: true }),
+      makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true }),
+    ]
+    expect(aggregateSessionDotState(sessions, new Map(), { peerStatus: new Map([['tower', 'offline']]) })).toBe('none')
   })
 })
 
@@ -953,5 +1040,145 @@ describe('session_file (duplicate-open warning)', () => {
     const dups = duplicateSessionFiles.value
     expect(dups.has('/conv.jsonl')).toBe(true)
     expect(dups.has('/other.jsonl')).toBe(false)
+  })
+})
+
+describe('ensureProjectWorktrees', () => {
+  afterEach(() => { vi.restoreAllMocks() })
+
+  it('fetches local and peer-owned inventories from the owning daemon', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: {
+          project_slug: 'gmux',
+          primary_path: '~/src/gmux',
+          worktrees: [{ path: '~/src/gmux', branch: 'main', primary: true }],
+        },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await ensureProjectWorktrees('gmux', 'tower')
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/peers/tower/v1/projects/gmux/worktrees')
+    expect(projectWorktreeInventories.value['tower::gmux'].data?.worktrees[0].branch).toBe('main')
+  })
+
+  it('creates a peer worktree then force-refreshes its inventory', async () => {
+    const created = { path: '~/wt/fix-auth', branch: 'fix/auth', head: 'abc', primary: false }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: { project_slug: 'gmux', worktree: created } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [created] },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createProjectWorktree('gmux', 'fix/auth', 'origin/main', 'tower')).resolves.toMatchObject({ branch: 'fix/auth' })
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/v1/peers/tower/v1/projects/gmux/worktrees', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ branch: 'fix/auth', base: 'origin/main' }),
+    })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/v1/peers/tower/v1/projects/gmux/worktrees')
+  })
+
+  it('removes a peer worktree then force-refreshes its inventory', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ ok: true, data: { project_slug: 'gmux', removed_path: '~/wt/fix' } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [] },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await removeProjectWorktree('gmux', '~/wt/fix', 'tower')
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/v1/peers/tower/v1/projects/gmux/worktrees', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '~/wt/fix' }),
+    })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/v1/peers/tower/v1/projects/gmux/worktrees')
+  })
+
+  it('surfaces a safe-removal conflict without refreshing', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ ok: false, error: { code: 'conflict', message: 'worktree has changes' } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(removeProjectWorktree('gmux', '~/wt/fix')).rejects.toThrow('worktree has changes')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not let an older inventory response overwrite a force refresh', async () => {
+    let resolveOld!: (value: any) => void
+    const oldResponse = new Promise(resolve => { resolveOld = resolve })
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(oldResponse)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ok: true,
+          data: {
+            project_slug: 'gmux',
+            primary_path: '~/src/gmux',
+            worktrees: [{ path: '~/src/gmux', branch: 'new', primary: true }],
+          },
+        }),
+      })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const oldFetch = ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux', undefined, true)
+    resolveOld({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: {
+          project_slug: 'gmux',
+          primary_path: '~/src/gmux',
+          worktrees: [{ path: '~/src/gmux', branch: 'old', primary: true }],
+        },
+      }),
+    })
+    await oldFetch
+
+    expect(projectWorktreeInventories.value['::gmux'].data?.worktrees[0].branch).toBe('new')
+  })
+
+  it('deduplicates a fetched inventory until force refresh', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        data: { project_slug: 'gmux', primary_path: '~/src/gmux', worktrees: [] },
+      }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux')
+    await ensureProjectWorktrees('gmux', undefined, true)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenLastCalledWith('/v1/projects/gmux/worktrees')
   })
 })

@@ -23,6 +23,7 @@ import {
   type UploadResult,
 } from './clipboard-upload'
 import { selectionToText } from './selection'
+import { shouldBlockMobileWebKitImeKey } from './mobile-input'
 
 type SendFn = (data: string) => void
 
@@ -91,6 +92,22 @@ async function uploadAndFormatPath(
   return formatPasteText(result.path, bracketedPasteMode)
 }
 
+export async function handleBlobPasteAction(args: {
+  blob: Blob
+  sessionId: string
+  bracketedPasteMode: boolean
+  feedback: PasteFeedback
+  emit: SendFn
+}): Promise<void> {
+  const { blob, sessionId, bracketedPasteMode, feedback, emit } = args
+  if (!sessionId) {
+    feedback('error', 'Paste failed: no session bound')
+    return
+  }
+  const out = await uploadAndFormatPath(blob, sessionId, bracketedPasteMode, feedback)
+  if (out !== null) emit(out)
+}
+
 function pasteErrorMessage(code: string): string {
   switch (code) {
     case 'too_large':
@@ -120,6 +137,13 @@ export function attachKeyboardHandler(
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): void {
   term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    // iPadOS Safari/WKWebView Korean IME can leak raw jamo from xterm's
+    // keydown path. Returning false here blocks xterm key processing without
+    // preventDefault(), so WebKit's native IME still receives the key.
+    if (ev.type === 'keydown' && shouldBlockMobileWebKitImeKey(ev)) {
+      return false
+    }
+
     // Mobile Enter → newline (not submit).
     // Bare Enter with no modifiers on a touch device sends \n so the user
     // can compose multi-line messages. The mobile toolbar send button sends
@@ -537,12 +561,7 @@ export async function handlePasteAction(args: {
         const binMime = firstBinaryType(item.types)
         if (!binMime) continue
         const blob = await item.getType(binMime)
-        if (!sessionId) {
-          feedback('error', 'Paste failed: no session bound')
-          return
-        }
-        const out = await uploadAndFormatPath(blob, sessionId, bracketedPasteMode, feedback)
-        if (out !== null) emit(out)
+        await handleBlobPasteAction({ blob, sessionId, bracketedPasteMode, feedback, emit })
         return
       }
       // No binary; extract text from the items we already have so we

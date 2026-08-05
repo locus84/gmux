@@ -210,6 +210,10 @@ const SETTINGS_EXAMPLE = `\
   "cursorBlink": true,
   "scrollback": 10000,
 
+  // Optional: show a VS Code button on project rows.
+  // Expose your VS Code Server with trnsrv/tsnsrv and paste its base URL here.
+  "vsCodeServerUrl": "https://code-host.example.ts.net",
+
   // Keybind overrides
   "keybinds": [
     { "key": "ctrl+alt+t", "action": "sendKeys", "args": "ctrl+t" },
@@ -350,6 +354,10 @@ function generateSettingsPage(): string {
   lines.push('Terminal options, keybinds, and frontend preferences. All fields are optional.')
   lines.push('Missing fields use the defaults shown below. Numeric values are clamped to')
   lines.push('their valid range (not rejected). Unknown keys produce a console warning.')
+  lines.push('')
+  lines.push('The VS Code Server fields can also be edited under **Settings → Integrations** in gmux web.')
+  lines.push('Web edits are shared by every browser connected to that gmux host and safely preserve')
+  lines.push('comments and unrelated values in `settings.jsonc`. Peer-host settings are not changed.')
   lines.push('')
   lines.push(SETTINGS_EXAMPLE)
 

@@ -5,6 +5,7 @@ import {
   keyComboToSequence,
   eventMatchesKeybind,
   DEFAULT_KEYBINDS,
+  IS_MAC,
   type ResolvedKeybind,
 } from './keybinds'
 import type { Keybind } from './settings-schema'
@@ -132,7 +133,7 @@ describe('resolveKeybinds', () => {
     const keys = resolved.map(r => r.key)
     expect(keys).toContain('shift+enter')
     expect(keys).toContain('ctrl+c')
-    expect(keys).toContain('ctrl+alt+t')
+    expect(keys).toContain(IS_MAC ? 'meta+v' : 'ctrl+alt+t')
   })
 
   it('adds new user keybinds', () => {

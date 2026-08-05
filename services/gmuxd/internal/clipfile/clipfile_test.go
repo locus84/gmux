@@ -86,13 +86,13 @@ func TestPasteFilenameRecognition(t *testing.T) {
 		"paste-1.png.bak":  false,
 	}
 	for name, want := range cases {
-		if got := isPasteFilename(name); got != want {
-			t.Errorf("isPasteFilename(%q) = %v, want %v", name, got, want)
+		if got := IsPasteFilename(name); got != want {
+			t.Errorf("IsPasteFilename(%q) = %v, want %v", name, got, want)
 		}
 	}
 	// Defensive: ensure we don't accidentally match a path that has separators.
-	if isPasteFilename(strings.Join([]string{"sub", "paste-1.png"}, string(filepath.Separator))) {
-		t.Errorf("isPasteFilename should reject paths with separators")
+	if IsPasteFilename(strings.Join([]string{"sub", "paste-1.png"}, string(filepath.Separator))) {
+		t.Errorf("IsPasteFilename should reject paths with separators")
 	}
 }
 

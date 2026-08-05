@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/gmuxapp/gmux/cli/gmux/internal/localterm"
 )
@@ -16,19 +22,26 @@ import (
 // session is the subset of gmuxd's Session model that the CLI cares
 // about. Defined locally to avoid pulling in the gmuxd store package.
 type cliSession struct {
-	ID         string `json:"id"`
-	Peer       string `json:"peer,omitempty"`
-	Cwd        string `json:"cwd,omitempty"`
-	Kind       string `json:"kind"`
-	Alive      bool   `json:"alive"`
-	Pid        int    `json:"pid,omitempty"`
-	Title      string `json:"title,omitempty"`
-	Slug       string `json:"slug,omitempty"`
-	SocketPath string `json:"socket_path,omitempty"`
-	Command    []string `json:"command,omitempty"`
-	StartedAt  string `json:"started_at,omitempty"`
-	ExitedAt   string `json:"exited_at,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
+	ID         string     `json:"id"`
+	Peer       string     `json:"peer,omitempty"`
+	Cwd        string     `json:"cwd,omitempty"`
+	Kind       string     `json:"kind"`
+	Alive      bool       `json:"alive"`
+	Pid        int        `json:"pid,omitempty"`
+	Title      string     `json:"title,omitempty"`
+	Slug       string     `json:"slug,omitempty"`
+	SocketPath string     `json:"socket_path,omitempty"`
+	Command    []string   `json:"command,omitempty"`
+	StartedAt  string     `json:"started_at,omitempty"`
+	ExitedAt   string     `json:"exited_at,omitempty"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	Status     *cliStatus `json:"status,omitempty"`
+}
+
+type cliStatus struct {
+	Label   string `json:"label,omitempty"`
+	Working bool   `json:"working,omitempty"`
+	Error   bool   `json:"error,omitempty"`
 }
 
 // fetchSessions queries gmuxd for the full session list. Starts gmuxd
@@ -351,6 +364,73 @@ func cmdKill(ref string) int {
 	return 0
 }
 
+func cmdSession(c *command) int {
+	switch c.sessionSub {
+	case "rename":
+		return cmdSessionRename(c.ref, c.sessionTitle)
+	case "dismiss":
+		return cmdSessionDismiss(c.ref)
+	default:
+		fmt.Fprintln(os.Stderr, "gmux: unsupported session command")
+		return 2
+	}
+}
+
+// cmdSessionDismiss terminates the runner if needed and permanently removes
+// the session from gmux's list instead of leaving a resumable dead entry.
+func cmdSessionDismiss(ref string) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/dismiss"
+	resp, err := gmuxdClient().Post(url, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		fmt.Fprintf(os.Stderr, "gmux: dismiss failed: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
+		return 1
+	}
+	fmt.Printf("dismissed %s\n", displayID(sess))
+	return 0
+}
+
+func cmdSessionRename(ref, title string) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	payload, err := json.Marshal(map[string]string{"title": title})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/rename"
+	resp, err := gmuxdClient().Post(url, "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		fmt.Fprintf(os.Stderr, "gmux: rename failed: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
+		return 1
+	}
+	if title == "" {
+		fmt.Printf("cleared session name for %s\n", displayID(sess))
+	} else {
+		fmt.Printf("renamed %s to %s\n", displayID(sess), strings.TrimSpace(title))
+	}
+	return 0
+}
+
 // cmdTail implements `gmux tail <id> [-n N] [--raw]`.
 //
 // Routes through gmuxd's scrollback broker rather than the per-session
@@ -426,17 +506,170 @@ func fetchScrollback(sess cliSession, n int) ([]byte, int) {
 // peer sessions (gmuxd forwards to the owning peer transparently).
 // Access control inherits from gmuxd: local IPC is owner-only, and
 // peers honor their own `tailscale.allow` config.
-func cmdSend(ref string, text *string, keys []string) int {
+func cmdSend(ref string, text *string, keys []string, requestID string, jsonOut bool) int {
 	// Read stdin only when no inline text was given AND stdin is a pipe.
 	// The tty guard is essential: without it, `gmux send <id> Enter` typed
-	// interactively would block reading the terminal. With it, piped input
-	// composes with trailing keys, so `echo hi | gmux send <id> Enter`
-	// sends "hi" then submits instead of silently dropping "hi".
+	// interactively would block reading the terminal.
 	var stdin io.Reader
 	if text == nil && !localterm.IsInteractive() {
 		stdin = os.Stdin
 	}
+
+	// A submitted Pi message is semantic input, not terminal typing. Preserve
+	// raw behavior for drafts, control/navigation keys, send-keys, and every
+	// non-Pi adapter.
+	if len(keys) == 1 && keys[0] == "Enter" {
+		sess, err := resolveSession(ref)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", err)
+			return 1
+		}
+		if sess.Kind == "pi" {
+			payload, ok, err := semanticSendText(text, stdin)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "gmux:", err)
+				return 1
+			}
+			if ok {
+				return sendSemanticMessage(sess, payload, requestID, jsonOut)
+			}
+		}
+	}
+	if requestID != "" || jsonOut {
+		fmt.Fprintln(os.Stderr, "gmux: --request-id/--json require submitted Pi text ending in Enter")
+		return 1
+	}
 	return sendBytes(ref, buildSendBody(text, keys, stdin))
+}
+
+func semanticSendText(text *string, stdin io.Reader) (string, bool, error) {
+	var data []byte
+	switch {
+	case text != nil:
+		data = []byte(*text)
+	case stdin != nil:
+		var err error
+		data, err = io.ReadAll(io.LimitReader(stdin, maxSendBytes+1))
+		if err != nil {
+			return "", false, err
+		}
+		if len(data) > maxSendBytes {
+			return "", false, fmt.Errorf("input exceeds %d bytes", maxSendBytes)
+		}
+	default:
+		return "", false, nil
+	}
+	if len(data) == 0 {
+		return "", false, nil
+	}
+	if len(data) > maxSendBytes {
+		return "", false, fmt.Errorf("input exceeds %d bytes", maxSendBytes)
+	}
+	if !utf8.Valid(data) {
+		return "", false, errors.New("Pi messages must be valid UTF-8")
+	}
+	return string(data), true, nil
+}
+
+type semanticMessageStatus struct {
+	RequestID string `json:"request_id"`
+	State     string `json:"state"`
+	Outcome   string `json:"outcome,omitempty"`
+	Result    string `json:"result,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func sendSemanticMessage(sess cliSession, text, requestID string, jsonOut bool) int {
+	status, err := sendSemanticMessageError(sess, text, requestID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gmux: semantic Pi send unavailable: %v\n", err)
+		fmt.Fprintln(os.Stderr, "gmux: use send-keys only when raw terminal input is intentional")
+		return 1
+	}
+	if jsonOut {
+		if err := json.NewEncoder(os.Stdout).Encode(status); err != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func sendSemanticMessageError(sess cliSession, text, requestID string) (semanticMessageStatus, error) {
+	if requestID == "" {
+		requestID = newMessageRequestID()
+	}
+	body, _ := json.Marshal(map[string]string{"request_id": requestID, "text": text})
+	client := gmuxdClient()
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/message"
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return semanticMessageStatus{}, err
+	}
+	status, err := decodeSemanticMessage(resp)
+	resp.Body.Close()
+	if err != nil {
+		return semanticMessageStatus{}, err
+	}
+	if status.RequestID != requestID {
+		return status, fmt.Errorf("runner returned request id %q, want %q", status.RequestID, requestID)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		switch status.State {
+		case "running", "settled":
+			return status, nil
+		case "failed", "replaced", "in_doubt":
+			if status.Error == "" {
+				status.Error = status.State
+			}
+			return status, fmt.Errorf("Pi message %s: %s", status.State, status.Error)
+		}
+		if time.Now().After(deadline) {
+			return status, fmt.Errorf("timed out waiting for Pi to start request %s; do not resend with a new request id", requestID)
+		}
+		time.Sleep(50 * time.Millisecond)
+		req, _ := http.NewRequest(http.MethodGet, url+"?request_id="+neturl.QueryEscape(requestID), nil)
+		resp, err = client.Do(req)
+		if err != nil {
+			return status, err
+		}
+		status, err = decodeSemanticMessage(resp)
+		resp.Body.Close()
+		if err != nil {
+			return status, err
+		}
+		if status.RequestID != requestID {
+			return status, fmt.Errorf("runner returned request id %q, want %q", status.RequestID, requestID)
+		}
+	}
+}
+
+func decodeSemanticMessage(resp *http.Response) (semanticMessageStatus, error) {
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return semanticMessageStatus{}, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
+	var envelope struct {
+		Data semanticMessageStatus `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return semanticMessageStatus{}, err
+	}
+	if envelope.Data.RequestID == "" {
+		return semanticMessageStatus{}, errors.New("runner returned no request id")
+	}
+	return envelope.Data, nil
+}
+
+func newMessageRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("gmux-%d", time.Now().UnixNano())
+	}
+	return "gmux-" + hex.EncodeToString(b[:])
 }
 
 // cmdSendKeys implements the tmux-compatible `gmux send-keys -t <id>

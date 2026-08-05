@@ -51,7 +51,10 @@ func NewLocalWriter(dir string) *LocalWriter {
 // write.
 var pasteFilenameRe = regexp.MustCompile(`^paste-([1-9][0-9]*)\.([A-Za-z0-9]+)$`)
 
-func isPasteFilename(name string) bool {
+// IsPasteFilename reports whether name uses gmux's generated paste-N.ext
+// convention. It accepts a basename only; callers remain responsible for
+// constraining the directory and allowed content types.
+func IsPasteFilename(name string) bool {
 	return pasteFilenameRe.MatchString(name)
 }
 
