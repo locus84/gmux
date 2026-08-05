@@ -75,15 +75,18 @@ Use `--repo <path>` and `--path <path>` when defaults are inappropriate. gmux
 rejects existing branches and destination paths rather than silently reusing them.
 A prompt requires an agent.
 
-The initial prompt is typed into the registered PTY. On a machine where an agent
-has a first-run trust, login, or update dialog, create without `--prompt`, inspect
-with `gmux tail`/the browser, then send the prompt explicitly once ready.
+For Pi launchers, the initial prompt is delivered through gmux's injected Pi
+extension and `worktree create` returns only after Pi starts the correlated turn;
+it is never typed into the PTY. If first-run trust/login prevents the extension
+from starting, gmux preserves the worktree and session and reports ambiguous
+in-flight delivery. Resolve the dialog in the browser, then inspect the existing
+request with `gmux wait --json`; do not blindly create or resend.
 
 ## Track and harvest
 
 ```bash
-gmux wait "$id" --timeout 900
-gmux tail "$id" -n 200
+worker_result=$(gmux wait "$id" --timeout 900 --json)
+printf '%s\n' "$worker_result"
 git -C "$path" status --short
 git -C "$path" diff --stat
 # After recording the final report and verification evidence:
@@ -95,15 +98,16 @@ all worktrees first, then wait and review each result. `gmux wait` is for agent
 sessions, not arbitrary shell commands. One-shot orchestrators must dismiss only
 the session IDs they created after harvesting output; dismissal leaves the worktree,
 commits, and files intact. Keep user-opened interactive sessions unless the user asks
-to dismiss them.
+to dismiss them. Never poll `gmux tail`, sleep, grep for a verdict, or resend a
+"continue" prompt: one semantic send plus one correlated wait is the lifecycle.
 
 ## Safety
 
 - Uncommitted changes in the source checkout are not included when creating from
   `HEAD`; choose and verify the base ref deliberately.
 - If launch or prompt delivery fails, gmux preserves the new checkout and reports
-  its path. A lost daemon response can be ambiguous, so inspect `gmux ls` before
-  deciding whether to relaunch or clean up.
+  its path. Accepted-but-unacknowledged Pi delivery is `in_doubt`; inspect the
+  same session/request and never auto-resend or create a replacement worktree.
 - Session failure or timeout never proves a worktree is disposable. Harvest any
   available output, dismiss the owned worker session, and preserve the worktree for
   recovery.

@@ -136,6 +136,13 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "send semantic correlation flags", args: []string{"send", "--json", "--request-id", "req-1", "abc", "hello", "Enter"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if !c.json || c.requestID != "req-1" || c.ref != "abc" || c.sendText == nil || *c.sendText != "hello" {
+					t.Errorf("command=%#v", c)
+				}
+			}},
+
 		{name: "send-keys tmux compat", args: []string{"send-keys", "-t", "abc", "C-c"}, wantMode: modeSendKeys,
 			check: func(t *testing.T, c *command) {
 				if c.ref != "abc" || len(c.keys) != 1 || c.keys[0] != "C-c" {
@@ -150,6 +157,12 @@ func TestParseCLI(t *testing.T) {
 			}},
 
 		{name: "wait idle default", args: []string{"wait", "abc"}, wantMode: modeWait},
+		{name: "wait json", args: []string{"wait", "abc", "--json", "--request-id", "req-1"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if !c.json || c.ref != "abc" || c.requestID != "req-1" {
+					t.Errorf("json=%v ref=%q request=%q", c.json, c.ref, c.requestID)
+				}
+			}},
 		{name: "wait --timeout", args: []string{"wait", "--timeout", "30", "abc"}, wantMode: modeWait,
 			check: func(t *testing.T, c *command) {
 				if c.timeout != 30 || c.ref != "abc" {

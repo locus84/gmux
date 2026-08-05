@@ -49,7 +49,10 @@ Capture that id and pass it to `send`, `wait`, `tail`, and `kill`.
 
 ## Sending input
 
-`gmux send <id> [text] [keys]` pushes input into a running session, as if typed at the keyboard. Text is sent literally; trailing key names (`Enter`, `C-c`, …) are sent as keys. **Submission is explicit** — add a trailing `Enter` to dispatch a line:
+`gmux send <id> [text] [keys]` sends input to a running session. For Pi,
+`text + Enter` uses the injected extension's semantic `sendUserMessage` path;
+raw drafts/special keys and other agents keep terminal semantics.
+**Submission is explicit** — add a trailing `Enter` to dispatch a line:
 
 ```bash
 gmux send <id> 'shorter inline message' Enter
@@ -57,7 +60,7 @@ gmux send <id> Enter < prompt.txt          # pipe a file, then submit
 gmux send <id> C-c                          # interrupt, no Enter
 ```
 
-When no text is given and stdin is a pipe, gmux reads stdin until EOF (capped at 1 MiB). `send` is gated by Unix-socket file permissions (owner-only); see the [CLI reference](/reference/cli/) for the access-control story.
+When no text is given and stdin is a pipe, gmux reads stdin until EOF (capped at 1 MiB). `send` is gated by Unix-socket file permissions (owner-only). If multiple orchestrators share one Pi session, pass one stable `--request-id` to both `send` and `wait`; see the [CLI reference](/reference/cli/).
 
 ## Waiting
 
@@ -68,25 +71,23 @@ gmux send <id> Enter < step-1.txt
 gmux wait <id>
 
 gmux send <id> Enter < step-2.txt
-gmux wait <id>
-
-gmux tail <id> -n 200          # extract the final answer
+result=$(gmux wait <id> --json) # correlated final Pi answer
+printf '%s\n' "$result"
 ```
 
-The idle signal is the same `Status.Working` flag the UI's spinner consumes, so `wait` returns the moment the agent emits its closing message. Exit codes: `0` idle, `2` the session died first, `3` `--timeout N` elapsed.
+For Pi, `wait` targets the extension-correlated request and returns only at
+`agent_settled`; it cannot race against the pre-send idle snapshot. Exit codes:
+`0` settled/idle, `2` died/replaced/in-doubt, `3` timeout, `4` Pi delivery/turn
+failed. Never orchestrate with `tail`/sleep/grep/resend loops.
 
 `wait` is for agent sessions (`claude`, `codex`, `pi`); shell sessions have no working signal and are rejected with a clear error. To wait for a shell command, run it through the blocking piped flow above (`gmux -- make build < /dev/null`) — that's exactly the shape `gmux -- <cmd>` already provides. (Waiting on arbitrary output — "until this text appears" — is planned as a server-side `wait` condition, [#313](https://github.com/gmuxapp/gmux/issues/313).)
 
 ## Reading output
 
-`gmux tail <id>` prints recent output as plain text (ANSI stripped; `-n N` for line count, default 100). Pair it with `wait` to capture an agent's final answer:
-
-```bash
-gmux send <id> Enter < ship-prompt.txt
-gmux wait <id> --timeout 600
-url=$(gmux tail <id> -n 50 | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | tail -1)
-echo "$url"
-```
+`gmux tail <id>` prints recent output as plain text (ANSI stripped; `-n N` for
+line count, default 100). It is a human diagnostic snapshot, not an
+orchestration signal. Retrieve Pi results with `gmux wait --json` and parse the
+returned JSON rather than scraping terminal output.
 
 ## Discovery and cleanup
 

@@ -17,8 +17,12 @@ to guess.
 ## Transport
 
 - Runner exports `GMUX_SESSION_SOCK` (its Unix socket) to the agent env.
-- Agent POSTs JSON to `POST /hook/event`, **fire-and-forget**: a failed POST
-  must never surface into the agent; the next event re-establishes truth.
+- Agent POSTs lifecycle JSON to `POST /hook/event`, **fire-and-forget**: a
+  failed metadata POST must never surface into the agent; the next event
+  re-establishes truth.
+- Pi additionally consumes semantic messages from `GET /hook/messages/next`
+  and reliably acknowledges them to `POST /hook/message-event`. These ACKs are
+  correctness signals and are retried while the same Pi runtime remains bound.
 - Socket is owner-only (0o700).
 
 ## Event schema
@@ -44,10 +48,14 @@ the mux-owned name; other zero-value fields remain no-ops.
 // op "title" — explicit user-authored session name. Empty clears it.
 { "op": "title", "name": "human title" }
 
-// op "turn" — agent loop boundary.
+// op "turn" — settled agent-loop boundary.
 { "op": "turn", "phase": "start" }                            // → working
-{ "op": "turn", "phase": "end", "outcome": "completed",       // see vocabulary
+{ "op": "turn", "phase": "end", "outcome": "completed",       // emitted at agent_settled
   "title": "human title" }                                    // optional
+
+// op "runtime" — Pi extension instance binding.
+{ "op": "runtime", "phase": "bind", "epoch": "random-runtime-id" }
+{ "op": "runtime", "phase": "unbind", "epoch": "random-runtime-id" }
 ```
 
 ### Field reference
@@ -65,6 +73,7 @@ the mux-owned name; other zero-value fields remain no-ops.
 | `phase`   | turn     | `"start"` or `"end"`. |
 | `outcome` | turn end | Normalized terminal state — see below. |
 | `title`   | turn end | Adapter-generated fallback title at turn end. |
+| `epoch`   | runtime  | Fresh extension-runtime identity; fences reload/new/resume/fork callbacks. |
 
 The runner keeps these sources separate and resolves them as:
 `gmux explicit title > agent-native explicit title > application OSC title > adapter fallback > command`.
@@ -83,6 +92,31 @@ agent's concern.
 | `completed` | Agent finished its own turn.     | idle + **unread**    |
 | `aborted`   | User interrupted (Esc).          | idle                 |
 | `error`     | Agent gave up.                   | idle + **error**     |
+
+Pi emits the terminal turn event from `agent_settled`, not `agent_end`.
+`agent_end` may be followed by automatic retry, compaction retry, or queued
+steering, so treating it as idle creates false completion windows.
+
+## Semantic Pi messages
+
+`POST /v1/sessions/{id}/message` on gmuxd forwards a bounded runtime-only
+message to the owning runner. `gmux send <pi-id> <text> Enter` uses this path;
+raw drafts and special keys still use `/input`.
+
+The runner holds a bounded FIFO and completed-status cache only for its process
+lifetime. Each request has caller `request_id`, runner epoch, Pi runtime epoch,
+and monotonic sequence. The extension calls official `pi.sendUserMessage()`:
+when idle it acknowledges `running` from `before_agent_start`; while active it
+queues the message as Pi steering and acknowledges immediately. Final assistant
+text and outcome are recorded only at `agent_settled`.
+
+States are `queued`, `dispatching`, `delivered`, `running`, `settled`, `failed`,
+`replaced`, and `in_doubt`. Identical request IDs deduplicate; conflicting reuse
+is rejected. gmux never automatically retries `in_doubt`: Pi may have accepted
+work before the ACK was lost, so exactly-once execution cannot be claimed.
+Requests and results are not session metadata, are not replayed through the
+droppable `/events` stream, and are not persisted by gmuxd. Hermes or another
+orchestrator owns durable task records, verification, and cleanup.
 
 ## The runner does NOT, for hooked sessions
 

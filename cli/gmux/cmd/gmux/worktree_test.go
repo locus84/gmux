@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +47,33 @@ func TestBuildWorktreeRowsGroupsLiveLocalSessionsByDeepestCwd(t *testing.T) {
 	}
 }
 
+func TestEncodeWorktreeRecoveryJSONPreservesSessionProvenance(t *testing.T) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	encodeErr := encodeWorktreeRecoveryJSON(worktreeCreateResult{
+		Worktree:  workspace.Worktree{Path: "/tmp/worktree", Branch: "fix/test"},
+		SessionID: "sess-recover", PID: 42,
+	}, os.ErrClosed)
+	_ = w.Close()
+	os.Stdout = old
+	body, _ := io.ReadAll(r)
+	_ = r.Close()
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode %q: %v", body, err)
+	}
+	if got["path"] != "/tmp/worktree" || got["session_id"] != "sess-recover" || got["delivery_error"] == "" {
+		t.Fatalf("recovery payload=%v", got)
+	}
+}
+
 func TestCreateWorktreeDefaultPathAndAgentLaunch(t *testing.T) {
 	repo := initCLIWorktreeRepo(t)
 	var launchedPath, sentPrompt string
@@ -56,9 +85,9 @@ func TestCreateWorktreeDefaultPathAndAgentLaunch(t *testing.T) {
 			return nil
 		},
 		launch: func(path, agent string) (string, int, error) { launchedPath = path; return "sess-test", 42, nil },
-		sendPrompt: func(id, prompt string) error {
-			if id != "sess-test" {
-				t.Fatalf("id = %q", id)
+		sendPrompt: func(id, agent, prompt string) error {
+			if id != "sess-test" || agent != "pi" {
+				t.Fatalf("id=%q agent=%q", id, agent)
 			}
 			sentPrompt = prompt
 			return nil
@@ -87,7 +116,7 @@ func TestCreateWorktreeLaunchFailurePreservesCheckout(t *testing.T) {
 	deps := worktreeCreateDeps{
 		validateLauncher: func(string) error { return nil },
 		launch:           func(string, string) (string, int, error) { return "", 0, os.ErrPermission },
-		sendPrompt:       func(string, string) error { return nil },
+		sendPrompt:       func(string, string, string) error { return nil },
 		kill:             func(string) error { return nil },
 	}
 	_, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "failed", Base: "HEAD", Agent: "pi"}, deps)
@@ -104,21 +133,21 @@ func TestCreateWorktreeLaunchFailurePreservesCheckout(t *testing.T) {
 	}
 }
 
-func TestCreateWorktreePromptFailureKillsSessionAndPreservesCheckout(t *testing.T) {
+func TestCreateWorktreePiPromptFailureLeavesInDoubtSessionRunning(t *testing.T) {
 	repo := initCLIWorktreeRepo(t)
 	killed := ""
 	deps := worktreeCreateDeps{
 		validateLauncher: func(string) error { return nil },
 		launch:           func(string, string) (string, int, error) { return "sess-prompt", 7, nil },
-		sendPrompt:       func(string, string) error { return os.ErrClosed },
+		sendPrompt:       func(string, string, string) error { return os.ErrClosed },
 		kill:             func(id string) error { killed = id; return nil },
 	}
 	_, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "prompt-failed", Agent: "pi", Prompt: "fix"}, deps)
-	if err == nil || !strings.Contains(err.Error(), "worktree preserved") {
+	if err == nil || !strings.Contains(err.Error(), "delivery may be in doubt") || !strings.Contains(err.Error(), "worktree preserved") {
 		t.Fatalf("prompt error = %v", err)
 	}
-	if killed != "sess-prompt" {
-		t.Fatalf("killed = %q", killed)
+	if killed != "" {
+		t.Fatalf("in-doubt Pi session was killed: %q", killed)
 	}
 	repoPath, pathErr := mirroredWorktreeRepoPath(repo)
 	if pathErr != nil {
@@ -130,15 +159,15 @@ func TestCreateWorktreePromptFailureKillsSessionAndPreservesCheckout(t *testing.
 	}
 }
 
-func TestCreateWorktreePromptFailureReportsKillFailure(t *testing.T) {
+func TestCreateWorktreeNonPiPromptFailureReportsKillFailure(t *testing.T) {
 	repo := initCLIWorktreeRepo(t)
 	deps := worktreeCreateDeps{
 		validateLauncher: func(string) error { return nil },
 		launch:           func(string, string) (string, int, error) { return "sess-live", 7, nil },
-		sendPrompt:       func(string, string) error { return os.ErrClosed },
+		sendPrompt:       func(string, string, string) error { return os.ErrClosed },
 		kill:             func(string) error { return os.ErrPermission },
 	}
-	_, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "kill-failed", Agent: "pi", Prompt: "fix"}, deps)
+	_, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "kill-failed", Agent: "claude", Prompt: "fix"}, deps)
 	if err == nil || !strings.Contains(err.Error(), "could not stop session sess-live") {
 		t.Fatalf("prompt error = %v", err)
 	}
@@ -239,11 +268,11 @@ func TestCreateWorktreeRejectsNestedAndSymlinkedDestinations(t *testing.T) {
 	}
 }
 
-func TestCreateWorktreeReservesEnterByteInPromptLimit(t *testing.T) {
+func TestCreateWorktreeRejectsOversizedSemanticPrompt(t *testing.T) {
 	repo := initCLIWorktreeRepo(t)
 	deps := worktreeCreateDeps{validateLauncher: func(string) error { return nil }}
-	prompt := strings.Repeat("x", maxSendBytes)
-	if _, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "large-prompt", Agent: "pi", Prompt: prompt}, deps); err == nil || !strings.Contains(err.Error(), "including Enter") {
+	prompt := strings.Repeat("x", maxSendBytes+1)
+	if _, err := createWorktree(worktreeCreateRequest{Repo: repo, Name: "large-prompt", Agent: "pi", Prompt: prompt}, deps); err == nil || !strings.Contains(err.Error(), "transport limit") {
 		t.Fatalf("prompt limit error = %v", err)
 	}
 }

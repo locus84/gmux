@@ -49,11 +49,11 @@ func main() {
 	case modeAttach:
 		os.Exit(cmdAttach(cmd.ref))
 	case modeSend:
-		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys))
+		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys, cmd.requestID, cmd.json))
 	case modeSendKeys:
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
-		os.Exit(cmdWait(cmd.ref, cmd.timeout))
+		os.Exit(cmdWait(cmd.ref, cmd.timeout, cmd.json, cmd.requestID))
 	case modeSession:
 		os.Exit(cmdSession(cmd))
 	case modeWorktree:

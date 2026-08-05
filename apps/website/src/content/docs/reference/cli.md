@@ -114,10 +114,11 @@ it in the browser.
 
 ### `gmux send <id> [text] [Key...]`
 
-Inject input into a running session as if typed at the keyboard. The text is
-sent literally; any trailing arguments that name keys (`Enter`, `C-c`,
-`Escape`, `Up`, …) are sent as those keys. **Submission is explicit** — add a
-trailing `Enter` to dispatch a line; omit it to leave the input unsent.
+Send input to a running session. For Pi, literal text followed by exactly
+`Enter` is delivered semantically through gmux's injected Pi extension, not
+through the PTY. Draft text without Enter, control/navigation keys,
+`send-keys`, and other agent kinds remain raw terminal input. **Submission is
+explicit** — add a trailing `Enter` to dispatch a line.
 
 ```bash
 gmux send a3f20187 'describe yourself' Enter   # type and submit
@@ -125,6 +126,8 @@ gmux send a3f20187 'half a thought'            # type, leave it unsent
 gmux send a3f20187 C-c                          # interrupt (Ctrl-C)
 gmux send a3f20187 Escape                       # send Escape
 echo "$body" | gmux send a3f20187 Enter         # pipe stdin, then submit
+gmux send --request-id review-42 --json a3f20187 'review' Enter
+gmux wait a3f20187 --request-id review-42 --json
 ```
 
 When no text is given and stdin is a pipe, gmux reads stdin until EOF (capped
@@ -135,21 +138,24 @@ For verbatim tmux compatibility there's also `gmux send-keys -t <id> <keys...>`
 (all arguments are key names by default; `-l` sends them as literal text).
 Use plain `send` for everyday use; `send-keys` only when porting tmux commands.
 
-**Access control.** `send` is powerful — anything you send lands in the
-session's PTY, indistinguishable from keyboard input. Access is gated by
-filesystem permissions on the session's Unix socket (owner-only), so only the
-user who started a session can send to it. Peer sessions are reached through
-gmuxd's authenticated proxy.
+**Access control.** Both semantic Pi messages and raw input are gated by the
+session's owner-only Unix socket. Peer sessions are reached through gmuxd's
+authenticated proxy.
 
 ### `gmux wait <id>`
 
-Block until an **agent** session finishes its current turn (its spinner stops),
-optionally bounded by `--timeout N`.
+Block until an **agent** session settles, optionally bounded by `--timeout N`.
+For Pi, waiting follows the latest semantic send and uses `agent_settled`,
+including automatic retries, compaction retries, and queued steering. Add
+`--json` to return the bounded final Pi response and outcome. When multiple
+callers share a session, pass the same stable `--request-id` to `send` and
+`wait` for exact caller correlation.
 
 ```bash
 gmux send a3f20187 'do the thing' Enter
 gmux wait a3f20187
 gmux wait a3f20187 --timeout 600   # or fail after 600s
+gmux wait a3f20187 --json          # latest semantic Pi result
 ```
 
 The idle signal is the same `Status.Working` flag the UI's spinner consumes,
@@ -159,6 +165,7 @@ so `wait` returns the moment the agent emits its closing message. Exit codes
 - `0` — the agent reached idle
 - `2` — the session exited before becoming idle
 - `3` — `--timeout` elapsed
+- `4` — correlated Pi delivery/turn failed
 
 Plain **shell** sessions have no idle signal and are rejected with a clear
 error; to wait for a shell command, run it through the blocking piped form

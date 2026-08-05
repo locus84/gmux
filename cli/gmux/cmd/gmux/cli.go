@@ -61,8 +61,9 @@ type command struct {
 	raw       bool
 
 	// send
-	sendText *string  // literal text to type (nil = none)
-	sendKeys []string // trailing key-name tokens (Enter, C-c, ...)
+	sendText  *string  // literal text to type (nil = none)
+	sendKeys  []string // trailing key-name tokens (Enter, C-c, ...)
+	requestID string   // semantic Pi request correlation (optional)
 
 	// send-keys (tmux-compat)
 	keysLiteral bool     // -l: treat args as literal text, not key names
@@ -287,10 +288,29 @@ func parseTail(args []string) (*command, error) {
 // literal text; any further bare tokens are key-name tokens. With no
 // text and no keys, stdin supplies the text.
 func parseSend(args []string) (*command, error) {
+	c := &command{mode: modeSend}
+	// Send text is intentionally positional and may begin with a dash. Keep
+	// semantic-control flags explicit and before the session reference.
+	for len(args) > 0 {
+		switch args[0] {
+		case "--json":
+			c.json = true
+			args = args[1:]
+		case "--request-id":
+			if len(args) < 2 || args[1] == "" {
+				return nil, errors.New("--request-id requires a value")
+			}
+			c.requestID = args[1]
+			args = args[2:]
+		default:
+			goto parsedSendFlags
+		}
+	}
+parsedSendFlags:
 	if len(args) < 1 {
 		return nil, errors.New("send requires a session id")
 	}
-	c := &command{mode: modeSend, ref: args[0]}
+	c.ref = args[0]
 	rest := args[1:]
 	if len(rest) > 0 {
 		// Heuristic: the first non-key token is the literal text; the
@@ -430,6 +450,8 @@ func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
 	fs.IntVar(&c.timeout, "timeout", 0, "fail after N seconds")
+	fs.BoolVar(&c.json, "json", false, "print the settled Pi result as JSON")
+	fs.StringVar(&c.requestID, "request-id", "", "wait for this semantic Pi request id")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, err
@@ -573,9 +595,10 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux ls [--all] [--json]          list sessions
   gmux attach <id>                  reattach to a session
   gmux tail <id> [-n N] [--raw]     print recent output (snapshot)
-  gmux send <id> <text> [Key...]    type text and/or send keys (e.g. Enter, C-c)
+  gmux send [--request-id ID] [--json] <id> <text> [Key...]
+                                      submit Pi text or send raw keys
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
-  gmux wait <id> [--timeout N]      block until an agent session is idle
+  gmux wait <id> [--timeout N] [--json]  wait for settled agent result
   gmux kill <id>                    terminate a session
   gmux session rename <id> <name>   set the explicit session name
   gmux session rename <id> --clear  reveal the application/fallback title

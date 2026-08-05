@@ -29,6 +29,11 @@ func TestPathMaterializesReadableExtension(t *testing.T) {
 	if !strings.Contains(string(data), "agent_title") || !strings.Contains(string(data), "postQueue") {
 		t.Error("materialized extension missing atomic bind title or ordered transport")
 	}
+	for _, required := range []string{"sendUserMessage", "before_agent_start", "agent_settled", "session_shutdown", "/hook/messages/next"} {
+		if !strings.Contains(string(data), required) {
+			t.Errorf("materialized extension missing semantic transport marker %q", required)
+		}
+	}
 
 	// Idempotent: a second call returns the same path.
 	p2, err := Path()

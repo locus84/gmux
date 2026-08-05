@@ -1798,6 +1798,54 @@ func serve(stderr io.Writer) int {
 			})
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{}})
 
+		case "message":
+			// Semantic Pi input. Unlike /input this is consumed by the injected
+			// extension and correlated through the runner's runtime-only broker.
+			sess, ok := sessions.Get(sessionID)
+			if !ok {
+				writeError(w, http.StatusNotFound, "not_found", "session not found")
+				return
+			}
+			if !sess.Alive || sess.SocketPath == "" {
+				writeError(w, http.StatusConflict, "not_running", "session is not running")
+				return
+			}
+			if sess.Kind != "pi" {
+				writeError(w, http.StatusNotImplemented, "unsupported", "semantic messages are only supported for pi sessions")
+				return
+			}
+			switch r.Method {
+			case http.MethodPost:
+				body, err := io.ReadAll(io.LimitReader(r.Body, maxInputBytes*6+4097))
+				if err != nil || len(body) > maxInputBytes*6+4096 {
+					writeError(w, http.StatusRequestEntityTooLarge, "too_large", "semantic message exceeds limit")
+					return
+				}
+				message, status, err := discovery.EnqueueAgentMessage(r.Context(), sess.SocketPath, bytes.NewReader(body))
+				if err != nil {
+					if status == 0 {
+						status = http.StatusBadGateway
+					}
+					writeError(w, status, "message_failed", err.Error())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": message})
+			case http.MethodGet:
+				message, status, err := discovery.GetAgentMessage(r.Context(), sess.SocketPath, r.URL.Query().Get("request_id"))
+				if err != nil {
+					if status == 0 {
+						status = http.StatusBadGateway
+					}
+					writeError(w, status, "message_failed", err.Error())
+					return
+				}
+				writeJSON(w, map[string]any{"ok": true, "data": message})
+			default:
+				writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
+			}
+
 		case "input":
 			// Cross-peer `gmux --send`. The peer-routing branch above
 			// already forwarded any non-local session, so by here the

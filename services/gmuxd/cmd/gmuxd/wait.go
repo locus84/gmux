@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/discovery"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
 
@@ -67,6 +68,31 @@ func handleWait(w http.ResponseWriter, r *http.Request, sessions *store.Store, s
 			return
 		}
 		deadline = time.After(time.Duration(secs) * time.Second)
+	}
+
+	if !sess.Alive {
+		writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": "died"}})
+		return
+	}
+
+	// A semantic Pi send is correlated in the runner. Prefer that state over
+	// the daemon's eventually-consistent Working cache so send → wait cannot
+	// race the start event and return the previous idle state.
+	if sess.Kind == "pi" && sess.SocketPath != "" {
+		requestID := r.URL.Query().Get("request_id")
+		message, status, err := discovery.GetAgentMessage(r.Context(), sess.SocketPath, requestID)
+		if err == nil {
+			handlePiMessageWait(w, r, sessions, sessionID, sess.SocketPath, message, deadline)
+			return
+		}
+		if requestID != "" && (status == http.StatusNotFound || status == http.StatusNotImplemented) {
+			writeError(w, http.StatusNotFound, "message_not_found", "semantic Pi request not found or unsupported")
+			return
+		}
+		if status != http.StatusNotFound && status != http.StatusNotImplemented {
+			writeError(w, http.StatusBadGateway, "runner_unreachable", "cannot reconcile Pi semantic message state: "+err.Error())
+			return
+		}
 	}
 
 	// Subscribe BEFORE re-reading current state. If we read first then
@@ -136,6 +162,42 @@ func handleWait(w http.ResponseWriter, r *http.Request, sessions *store.Store, s
 				writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": reason}})
 				return
 			}
+		}
+	}
+}
+
+func handlePiMessageWait(w http.ResponseWriter, r *http.Request, sessions *store.Store, sessionID, socketPath string, message discovery.AgentMessage, deadline <-chan time.Time) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		switch message.State {
+		case "settled":
+			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": "idle", "message": message}})
+			return
+		case "failed":
+			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": "failed", "message": message}})
+			return
+		case "replaced", "in_doubt":
+			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": "died", "message": message}})
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-deadline:
+			writeError(w, http.StatusRequestTimeout, "timeout", "Pi message did not settle within timeout")
+			return
+		case <-ticker.C:
+			cur, ok := sessions.Get(sessionID)
+			if !ok || !cur.Alive {
+				writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"reason": "died", "message": message}})
+				return
+			}
+			next, _, err := discovery.GetAgentMessage(r.Context(), socketPath, message.RequestID)
+			if err != nil {
+				continue
+			}
+			message = next
 		}
 	}
 }

@@ -51,7 +51,7 @@ type worktreeCreateResult struct {
 type worktreeCreateDeps struct {
 	validateLauncher func(string) error
 	launch           func(path, agent string) (string, int, error)
-	sendPrompt       func(id, prompt string) error
+	sendPrompt       func(id, agent, prompt string) error
 	kill             func(id string) error
 }
 
@@ -69,6 +69,11 @@ func cmdWorktreeCreate(c *command) int {
 		Agent: c.worktreeAgent, Prompt: c.worktreePrompt,
 	}, defaultWorktreeCreateDeps())
 	if err != nil {
+		if c.json && result.Path != "" {
+			if encodeErr := encodeWorktreeRecoveryJSON(result, err); encodeErr != nil {
+				fmt.Fprintln(os.Stderr, "gmux:", encodeErr)
+			}
+		}
 		return printWorktreeError(err)
 	}
 	if c.json {
@@ -79,6 +84,19 @@ func cmdWorktreeCreate(c *command) int {
 		fmt.Printf("session %s\n", shortID(result.SessionID))
 	}
 	return 0
+}
+
+func encodeWorktreeRecoveryJSON(result worktreeCreateResult, operationErr error) error {
+	body, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+	payload["delivery_error"] = operationErr.Error()
+	return json.NewEncoder(os.Stdout).Encode(payload)
 }
 
 func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktreeCreateResult, error) {
@@ -101,8 +119,8 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 	if req.Prompt != "" && req.Agent == "" {
 		return worktreeCreateResult{}, fmt.Errorf("prompt requires an agent")
 	}
-	if len(req.Prompt) >= maxSendBytes {
-		return worktreeCreateResult{}, fmt.Errorf("prompt exceeds %d bytes including Enter", maxSendBytes)
+	if (req.Agent == "pi" && len(req.Prompt) > maxSendBytes) || (req.Agent != "pi" && len(req.Prompt) >= maxSendBytes) {
+		return worktreeCreateResult{}, fmt.Errorf("prompt exceeds the %d-byte transport limit", maxSendBytes)
 	}
 	if req.Agent != "" {
 		if deps.validateLauncher == nil {
@@ -132,7 +150,10 @@ func createWorktree(req worktreeCreateRequest, deps worktreeCreateDeps) (worktre
 	}
 	result.SessionID, result.PID = id, pid
 	if req.Prompt != "" {
-		if err := deps.sendPrompt(id, req.Prompt); err != nil {
+		if err := deps.sendPrompt(id, req.Agent, req.Prompt); err != nil {
+			if req.Agent == "pi" {
+				return result, fmt.Errorf("send semantic prompt: %v; session %s left running because delivery may be in doubt; worktree preserved at %s", err, id, path)
+			}
 			var killErr error
 			if deps.kill != nil {
 				killErr = deps.kill(id)
@@ -260,7 +281,11 @@ func launchWorktreeAgent(path, agent string) (string, int, error) {
 	return envelope.Data.SessionID, envelope.Data.PID, nil
 }
 
-func sendWorktreePrompt(id, prompt string) error {
+func sendWorktreePrompt(id, agent, prompt string) error {
+	if agent == "pi" {
+		_, err := sendSemanticMessageError(cliSession{ID: id, Kind: "pi"}, prompt, "")
+		return err
+	}
 	req, err := http.NewRequest(http.MethodPost, gmuxdBaseURL()+"/v1/sessions/"+id+"/input", strings.NewReader(prompt+"\r"))
 	if err != nil {
 		return err

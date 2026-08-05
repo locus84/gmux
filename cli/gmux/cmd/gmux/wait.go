@@ -23,6 +23,7 @@ const (
 	waitExitIdle    = 0
 	waitExitDied    = 2
 	waitExitTimeout = 3
+	waitExitFailed  = 4
 )
 
 // cmdWait implements `gmux wait <id> [--timeout N]`.
@@ -34,27 +35,27 @@ const (
 // adapter kinds emit Status.Working, what counts as "died") live in
 // one place.
 //
-// Local sessions only: the daemon's wait handler resolves the session
-// against its local store and consults the adapter allowlist; remote
-// peer sessions are out of scope until peer subscriptions stream
-// Status events back to the hub.
-func cmdWait(ref string, timeoutSecs int) int {
+// Remote sessions route through the owning daemon using the same action path.
+func cmdWait(ref string, timeoutSecs int, jsonOut bool, requestID string) int {
 	sess, err := resolveSession(ref)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
 		return 1
 	}
-	if sess.Peer != "" {
-		// Use the bare shortID here: the message already names the peer
-		// separately, so displayID's "shortID@peer" would just repeat it.
-		fmt.Fprintf(os.Stderr, "gmux: wait is only supported for local sessions (%s is on peer %q)\n",
-			shortID(sess.ID), sess.Peer)
+	if requestID != "" && sess.Kind != "pi" {
+		fmt.Fprintln(os.Stderr, "gmux: --request-id is only supported for Pi sessions")
 		return 1
 	}
-
 	endpoint := gmuxdBaseURL() + "/v1/sessions/" + url.PathEscape(sess.ID) + "/wait"
+	query := url.Values{}
 	if timeoutSecs > 0 {
-		endpoint += "?timeout=" + strconv.Itoa(timeoutSecs)
+		query.Set("timeout", strconv.Itoa(timeoutSecs))
+	}
+	if requestID != "" {
+		query.Set("request_id", requestID)
+	}
+	if encoded := query.Encode(); encoded != "" {
+		endpoint += "?" + encoded
 	}
 
 	client := gmuxdClient()
@@ -77,7 +78,8 @@ func cmdWait(ref string, timeoutSecs int) int {
 		// Body is { ok: true, data: { reason: "idle" | "died" } }
 		var env struct {
 			Data struct {
-				Reason string `json:"reason"`
+				Reason  string          `json:"reason"`
+				Message json.RawMessage `json:"message"`
 			} `json:"data"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
@@ -86,8 +88,34 @@ func cmdWait(ref string, timeoutSecs int) int {
 		}
 		switch env.Data.Reason {
 		case "idle":
+			if jsonOut {
+				if len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
+					if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
+						fmt.Fprintln(os.Stderr, "gmux:", err)
+						return 1
+					}
+				} else if err := printWaitJSON(client, sess); err != nil {
+					fmt.Fprintln(os.Stderr, "gmux:", err)
+					return 1
+				}
+			}
 			return waitExitIdle
+		case "failed":
+			if jsonOut && len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
+				if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
+					fmt.Fprintln(os.Stderr, "gmux:", err)
+					return 1
+				}
+			}
+			fmt.Fprintf(os.Stderr, "gmux: Pi message failed in session %s\n", displayID(sess))
+			return waitExitFailed
 		case "died":
+			if jsonOut && len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
+				if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
+					fmt.Fprintln(os.Stderr, "gmux:", err)
+					return 1
+				}
+			}
 			fmt.Fprintf(os.Stderr, "gmux: session %s died before becoming idle\n", displayID(sess))
 			return waitExitDied
 		default:
@@ -105,15 +133,44 @@ func cmdWait(ref string, timeoutSecs int) int {
 			extractMessage(body))
 		return 1
 	case http.StatusNotFound:
-		// Distinct from "no idle signal": means the session id is
-		// unknown to gmuxd entirely.
-		fmt.Fprintf(os.Stderr, "gmux: session %s not found\n", displayID(sess))
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "gmux: wait target not found for %s: %s\n", displayID(sess), extractMessage(body))
 		return 1
 	default:
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Fprintf(os.Stderr, "gmux: wait failed: %s: %s\n", resp.Status, extractMessage(body))
 		return 1
 	}
+}
+
+func printWaitJSON(client *http.Client, sess cliSession) error {
+	if sess.Kind != "pi" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"reason": "idle"})
+	}
+	endpoint := gmuxdBaseURL() + "/v1/sessions/" + url.PathEscape(sess.ID) + "/message"
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return fmt.Errorf("read Pi result: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"reason": "idle"})
+	}
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("read Pi result: %s: %s", resp.Status, extractMessage(body))
+	}
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return fmt.Errorf("decode Pi result: %w", err)
+	}
+	if len(envelope.Data) == 0 {
+		return fmt.Errorf("Pi result response was empty")
+	}
+	_, err = os.Stdout.Write(append(envelope.Data, '\n'))
+	return err
 }
 
 // extractMessage pulls the .error.message field out of gmuxd's

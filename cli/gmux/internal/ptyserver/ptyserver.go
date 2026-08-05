@@ -157,14 +157,15 @@ type ResizeMsg struct {
 
 // Server holds a PTY and serves WebSocket connections.
 type Server struct {
-	cmd      *exec.Cmd
-	ptmx     *os.File
-	sockPath string
-	listener net.Listener
-	screen   *vt.Emulator // virtual terminal for replay snapshots (guarded by mu)
-	replay   rawReplay    // image-capable raw reconnect checkpoint (guarded by mu)
-	adapter  adapter.Adapter
-	state    *session.State
+	cmd           *exec.Cmd
+	ptmx          *os.File
+	sockPath      string
+	listener      net.Listener
+	screen        *vt.Emulator // virtual terminal for replay snapshots (guarded by mu)
+	replay        rawReplay    // image-capable raw reconnect checkpoint (guarded by mu)
+	adapter       adapter.Adapter
+	state         *session.State
+	agentMessages *agentMessageBroker
 
 	mu                    sync.Mutex
 	clients               map[*wsClient]struct{}
@@ -339,20 +340,21 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cmd:        cmd,
-		ptmx:       ptmx,
-		sockPath:   cfg.SocketPath,
-		listener:   listener,
-		screen:     nil, // set below after s is constructed
-		adapter:    cfg.Adapter,
-		state:      cfg.State,
-		clients:    make(map[*wsClient]struct{}),
-		localOut:   cfg.LocalOut,   // wired before readPTY starts so early output is never lost
-		scrollback: cfg.Scrollback, // same: wired pre-readPTY so fast-exit output is never lost
-		ptyCols:    cfg.Cols,
-		ptyRows:    cfg.Rows,
-		done:       make(chan struct{}),
-		ptyDone:    make(chan struct{}),
+		cmd:           cmd,
+		ptmx:          ptmx,
+		sockPath:      cfg.SocketPath,
+		listener:      listener,
+		screen:        nil, // set below after s is constructed
+		adapter:       cfg.Adapter,
+		state:         cfg.State,
+		agentMessages: newAgentMessageBroker(),
+		clients:       make(map[*wsClient]struct{}),
+		localOut:      cfg.LocalOut,   // wired before readPTY starts so early output is never lost
+		scrollback:    cfg.Scrollback, // same: wired pre-readPTY so fast-exit output is never lost
+		ptyCols:       cfg.Cols,
+		ptyRows:       cfg.Rows,
+		done:          make(chan struct{}),
+		ptyDone:       make(chan struct{}),
 	}
 
 	// The callback fires under s.mu (held during drainScreenLocked → screen.Write).
@@ -481,6 +483,7 @@ func (s *Server) Resize(cols, rows uint16) {
 
 // Shutdown closes the listener and all connections.
 func (s *Server) Shutdown() {
+	s.agentMessages.close()
 	s.listener.Close()
 	s.ptmx.Close()
 	os.Remove(s.sockPath)
@@ -499,6 +502,9 @@ func (s *Server) serve() {
 	// HTTP endpoints (checked first via explicit paths)
 	mux.HandleFunc("GET /meta", s.handleMeta)
 	mux.HandleFunc("POST /hook/event", s.handleHookEvent)
+	mux.HandleFunc("/agent/message", s.handleAgentMessage)
+	mux.HandleFunc("GET /hook/messages/next", s.handleAgentMessagesNext)
+	mux.HandleFunc("POST /hook/message-event", s.handleAgentMessageEvent)
 	mux.HandleFunc("POST /input", s.handleInput)
 	mux.HandleFunc("PUT /status", s.handlePutStatus)
 	mux.HandleFunc("PUT /title", s.handlePutTitle)
@@ -569,6 +575,7 @@ type hookEvent struct {
 	Title      string  `json:"title,omitempty"`
 	Phase      string  `json:"phase,omitempty"`   // "start" | "end" (op "turn")
 	Outcome    string  `json:"outcome,omitempty"` // "completed" | "aborted" | "error"
+	Epoch      string  `json:"epoch,omitempty"`   // pi extension runtime epoch
 }
 
 // handleHookEvent applies the authoritative session state an agent's gmux hook
@@ -585,6 +592,23 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch ev.Op {
+	case "runtime":
+		if strings.TrimSpace(ev.Epoch) == "" {
+			http.Error(w, "runtime epoch is required", http.StatusBadRequest)
+			return
+		}
+		if s.agentMessages == nil {
+			http.Error(w, "semantic message broker unavailable", http.StatusNotImplemented)
+			return
+		}
+		if ev.Phase == "bind" {
+			s.agentMessages.bindRuntime(ev.Epoch)
+		} else if ev.Phase == "unbind" {
+			s.agentMessages.unbindRuntime(ev.Epoch)
+		} else {
+			http.Error(w, "invalid runtime phase", http.StatusBadRequest)
+			return
+		}
 	case "session":
 		// Authoritative bind (e.g. pi's session_start): the file the
 		// agent holds, named and slugged.
@@ -635,6 +659,9 @@ func (s *Server) handleHookEvent(w http.ResponseWriter, r *http.Request) {
 		// Agent-loop transition. The extension reports phase + outcome; the
 		// sidebar policy (what an outcome means) lives here, in testable Go.
 		if ev.Phase == "start" {
+			if s.agentMessages != nil {
+				s.agentMessages.beginTurn()
+			}
 			s.state.SetStatus(&adapter.Status{Working: true})
 			break
 		}
@@ -1335,6 +1362,7 @@ func (s *Server) readPTY() {
 
 func (s *Server) waitChild() {
 	s.err = s.cmd.Wait()
+	s.agentMessages.close()
 	close(s.done)
 
 	// Wait for readPTY to finish draining all buffered PTY output before
