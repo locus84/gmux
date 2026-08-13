@@ -117,6 +117,8 @@ func TestPiMatchStopsAtDoubleDash(t *testing.T) {
 func TestPiIsPassthrough(t *testing.T) {
 	p := NewPi()
 	passthrough := [][]string{
+		{"pi", "auth"},
+		{"pi", "auth", "login"},
 		{"pi", "update"},
 		{"pi", "update", "self"},
 		{"pi", "list"},

@@ -53,7 +53,10 @@ func main() {
 	case modeSendKeys:
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
-		os.Exit(cmdWait(cmd.ref, cmd.timeout, cmd.json, cmd.requestID))
+		if len(cmd.waitRefs) <= 1 && !cmd.waitAll && !cmd.waitAny {
+			os.Exit(cmdWait(cmd.ref, cmd.timeout, cmd.json, cmd.requestID))
+		}
+		os.Exit(cmdWaitMany(cmd.waitRefs, cmd.waitAll, cmd.timeout, cmd.json, cmd.requestID))
 	case modeSession:
 		os.Exit(cmdSession(cmd))
 	case modeWorktree:
