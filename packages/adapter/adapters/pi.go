@@ -29,6 +29,7 @@ var (
 // prompt — so a verb missing here means `gmux -- pi <verb>` silently starts a
 // chat instead of running the command. Keep synced with `pi --help`.
 var piSubcommands = map[string]bool{
+	"auth":      true,
 	"install":   true,
 	"remove":    true,
 	"uninstall": true,
