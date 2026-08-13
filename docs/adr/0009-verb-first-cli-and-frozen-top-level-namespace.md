@@ -170,8 +170,19 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
 13. **`gmux wait` waits for agent idle, bounded by `--timeout`.**
     `gmux wait <id>` blocks until the session goes **idle** (agent turn
     end) or exits; `--timeout <secs>` bounds it (exit 0 idle, 2 died,
-    3 timeout). Cross-peer `wait` returns "not supported across peers
-    yet" (ADR 0005 deferral).
+    3 timeout, 4 correlated Pi failure). Explicit multi-target forms are
+    `gmux wait --all <id...>` and `gmux wait --any <id...>`. They fan out
+    the existing per-session endpoint concurrently under one shared
+    wall-clock deadline; `--all` preserves input order and `--any` cancels
+    losing requests. Transport/protocol errors fail fast with exit 1 and cancel
+    outstanding requests rather than hiding an uncertain target. Two or more
+    IDs require exactly one mode. Multi-target
+    JSON records contain `session_id`, `reason`, `exit_code`, and optional
+    `result`; legacy one-ID JSON remains unchanged. `--request-id` remains
+    single-session only.
+
+    Bare references remain local-only. Explicit `id@peer` targets route
+    through the owning daemon, including in a mixed multi-target wait.
 
     Output-condition variants (`--for-text` / `--for-regex` — "block
     until this text appears") were designed but **deferred**: the only

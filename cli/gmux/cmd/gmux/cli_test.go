@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -171,8 +172,20 @@ func TestParseCLI(t *testing.T) {
 			}},
 		{name: "wait flags after positional", args: []string{"wait", "abc", "--timeout", "5"}, wantMode: modeWait,
 			check: func(t *testing.T, c *command) {
-				if c.timeout != 5 || c.ref != "abc" {
-					t.Errorf("timeout=%d ref=%q", c.timeout, c.ref)
+				if c.timeout != 5 || c.ref != "abc" || len(c.waitRefs) != 1 {
+					t.Errorf("timeout=%d ref=%q waitRefs=%v", c.timeout, c.ref, c.waitRefs)
+				}
+			}},
+		{name: "wait all", args: []string{"wait", "abc", "--all", "def", "ghi", "--timeout", "30"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if !c.waitAll || c.waitAny || c.timeout != 30 || !reflect.DeepEqual(c.waitRefs, []string{"abc", "def", "ghi"}) {
+					t.Errorf("command=%#v", c)
+				}
+			}},
+		{name: "wait any json", args: []string{"wait", "--any", "--json", "abc@laptop", "def"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if c.waitAll || !c.waitAny || !c.json || !reflect.DeepEqual(c.waitRefs, []string{"abc@laptop", "def"}) {
+					t.Errorf("command=%#v", c)
 				}
 			}},
 
@@ -255,19 +268,22 @@ func TestParseCLIErrors(t *testing.T) {
 		{"worktree", "ps", "one", "two"},
 		{"worktree", "create"},
 		{"worktree", "create", "name", "--prompt", "fix", "--agent", ""},
-		{"-d"},                     // detach without command
-		{"-d", "ls"},               // detach only pairs with --
-		{"--"},                     // run with no command
-		{"open", "extra"},          // open takes no args
-		{"attach"},                 // missing id
-		{"attach", "a", "b"},       // too many
-		{"tail"},                   // missing id
-		{"tail", "-n", "0", "abc"}, // non-positive count
-		{"wait"},                   // missing id
-		{"send-keys", "C-c"},       // missing -t
-		{"daemon"},                 // missing subcommand
-		{"daemon", "frobnicate"},   // unknown subcommand
-		{"ls", "stray"},            // ls takes no positional
+		{"-d"},                                   // detach without command
+		{"-d", "ls"},                             // detach only pairs with --
+		{"--"},                                   // run with no command
+		{"open", "extra"},                        // open takes no args
+		{"attach"},                               // missing id
+		{"attach", "a", "b"},                     // too many
+		{"tail"},                                 // missing id
+		{"tail", "-n", "0", "abc"},               // non-positive count
+		{"wait"},                                 // missing id
+		{"wait", "abc", "def"},                   // multiple ids need a mode
+		{"wait", "--all", "--any", "abc", "def"}, // modes are exclusive
+		{"wait", "--all", "--request-id", "r", "abc", "def"}, // correlation is per-session
+		{"send-keys", "C-c"},     // missing -t
+		{"daemon"},               // missing subcommand
+		{"daemon", "frobnicate"}, // unknown subcommand
+		{"ls", "stray"},          // ls takes no positional
 	}
 	for _, args := range bad {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {

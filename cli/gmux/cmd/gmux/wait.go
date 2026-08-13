@@ -1,24 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Exit codes from cmdWait. Distinct codes let scripts dispatch on the
 // reason a wait ended without parsing strings.
-//
-//   - waitExitIdle (0): session reached a Working == false state
-//   - waitExitDied (2): session crashed or was killed before going idle
-//   - waitExitTimeout (3): --timeout elapsed
-//
-// Any other usage / network error returns 1, matching the rest of the
-// CLI.
 const (
 	waitExitIdle    = 0
 	waitExitDied    = 2
@@ -26,16 +22,18 @@ const (
 	waitExitFailed  = 4
 )
 
-// cmdWait implements `gmux wait <id> [--timeout N]`.
-//
-// The wait itself happens server-side: gmuxd already subscribes to
-// per-session events for its own bookkeeping, so we just hand it the
-// session id and block on the HTTP response. That keeps the CLI free
-// of SSE-parsing logic and ensures the idle-detection rules (which
-// adapter kinds emit Status.Working, what counts as "died") live in
-// one place.
-//
-// Remote sessions route through the owning daemon using the same action path.
+type waitResult struct {
+	SessionID string          `json:"session_id"`
+	Reason    string          `json:"reason"`
+	ExitCode  int             `json:"exit_code"`
+	Result    json.RawMessage `json:"result,omitempty"`
+
+	session cliSession
+	err     error
+	index   int
+}
+
+// cmdWait preserves the original single-target behavior and JSON shape.
 func cmdWait(ref string, timeoutSecs int, jsonOut bool, requestID string) int {
 	sess, err := resolveSession(ref)
 	if err != nil {
@@ -46,6 +44,154 @@ func cmdWait(ref string, timeoutSecs int, jsonOut bool, requestID string) int {
 		fmt.Fprintln(os.Stderr, "gmux: --request-id is only supported for Pi sessions")
 		return 1
 	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if timeoutSecs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	}
+	defer cancel()
+
+	client := waitHTTPClient()
+	result := waitForSession(ctx, client, sess, timeoutSecs, requestID, jsonOut)
+	if result.err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", result.err)
+		return 1
+	}
+
+	if jsonOut && len(result.Result) > 0 {
+		if _, err := os.Stdout.Write(append(result.Result, '\n')); err != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", err)
+			return 1
+		}
+	}
+
+	switch result.Reason {
+	case "idle":
+		return waitExitIdle
+	case "failed":
+		fmt.Fprintf(os.Stderr, "gmux: Pi message failed in session %s\n", displayID(sess))
+		return waitExitFailed
+	case "died":
+		fmt.Fprintf(os.Stderr, "gmux: session %s died before becoming idle\n", displayID(sess))
+		return waitExitDied
+	case "timeout":
+		fmt.Fprintf(os.Stderr, "gmux: wait timed out after %ds\n", timeoutSecs)
+		return waitExitTimeout
+	default:
+		fmt.Fprintf(os.Stderr, "gmux: unexpected wait reason %q\n", result.Reason)
+		return 1
+	}
+}
+
+// cmdWaitMany concurrently waits for explicit targets. --all returns results
+// in input order; --any cancels the losing HTTP requests after the first
+// observed terminal result.
+func cmdWaitMany(refs []string, waitAll bool, timeoutSecs int, jsonOut bool, requestID string) int {
+	sessions, err := resolveWaitSessions(refs)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	if len(sessions) > 1 && requestID != "" {
+		fmt.Fprintln(os.Stderr, "gmux: --request-id is only supported for a single session")
+		return 1
+	}
+	for _, sess := range sessions {
+		if requestID != "" && sess.Kind != "pi" {
+			fmt.Fprintln(os.Stderr, "gmux: --request-id is only supported for Pi sessions")
+			return 1
+		}
+	}
+
+	ctx := context.Background()
+	cancel := func() {}
+	if timeoutSecs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSecs)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
+
+	client := waitHTTPClient()
+	resultsCh := make(chan waitResult, len(sessions))
+	for i, sess := range sessions {
+		go func(index int, target cliSession) {
+			result := waitForSession(ctx, client, target, timeoutSecs, requestID, jsonOut)
+			result.index = index
+			resultsCh <- result
+		}(i, sess)
+	}
+
+	var results []waitResult
+	if waitAll {
+		results = make([]waitResult, len(sessions))
+		for range sessions {
+			result := <-resultsCh
+			results[result.index] = result
+		}
+	} else {
+		results = []waitResult{<-resultsCh}
+		cancel()
+	}
+
+	if jsonOut {
+		var encodeErr error
+		if waitAll {
+			encodeErr = json.NewEncoder(os.Stdout).Encode(results)
+		} else {
+			encodeErr = json.NewEncoder(os.Stdout).Encode(results[0])
+		}
+		if encodeErr != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", encodeErr)
+			return 1
+		}
+	} else if !waitAll {
+		fmt.Fprintln(os.Stdout, results[0].SessionID)
+	}
+
+	return reportWaitResults(results, timeoutSecs)
+}
+
+func resolveWaitSessions(refs []string) ([]cliSession, error) {
+	all, err := fetchSessions()
+	if err != nil {
+		return nil, err
+	}
+	resolved := make([]cliSession, 0, len(refs))
+	seen := make(map[string]bool, len(refs))
+	for _, ref := range refs {
+		sess, err := matchSession(all, ref)
+		if err != nil {
+			return nil, err
+		}
+		key := sess.Peer + "\x00" + sess.ID
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate wait target %s", canonicalSessionID(sess))
+		}
+		seen[key] = true
+		resolved = append(resolved, sess)
+	}
+	return resolved, nil
+}
+
+func canonicalSessionID(sess cliSession) string {
+	// gmuxd namespaces peer-owned IDs before exposing them in /v1/sessions
+	// (for example sess-abc@laptop), so the stored ID is already the full,
+	// copy-pasteable address for both local and peer sessions.
+	return sess.ID
+}
+
+func waitHTTPClient() *http.Client {
+	client := gmuxdClient()
+	// Wait lifetime is controlled by the shared context and optional daemon
+	// timeout, not the management client's default five-second timeout.
+	client.Timeout = 0
+	return client
+}
+
+func waitForSession(ctx context.Context, client *http.Client, sess cliSession, timeoutSecs int, requestID string, includeResult bool) waitResult {
+	result := waitResult{SessionID: canonicalSessionID(sess), session: sess}
 	endpoint := gmuxdBaseURL() + "/v1/sessions/" + url.PathEscape(sess.ID) + "/wait"
 	query := url.Values{}
 	if timeoutSecs > 0 {
@@ -58,124 +204,171 @@ func cmdWait(ref string, timeoutSecs int, jsonOut bool, requestID string) int {
 		endpoint += "?" + encoded
 	}
 
-	client := gmuxdClient()
-	// The default 5s client timeout would cut off any wait that
-	// outlasts a turn on a slow agent. With no client-side timeout
-	// the only deadline is the optional server-side --timeout.
-	client.Timeout = 0
-
-	// No request body; pass http.NoBody so we don't advertise a
-	// content-type for bytes that don't exist.
-	resp, err := client.Post(endpoint, "", http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gmux:", err)
-		return 1
+		result.Reason = "error"
+		result.err = err
+		result.ExitCode = 1
+		return result
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			result.Reason = "timeout"
+			result.ExitCode = waitExitTimeout
+			return result
+		}
+		result.Reason = "error"
+		result.err = err
+		result.ExitCode = 1
+		return result
 	}
 	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		// Body is { ok: true, data: { reason: "idle" | "died" } }
-		var env struct {
-			Data struct {
-				Reason  string          `json:"reason"`
-				Message json.RawMessage `json:"message"`
-			} `json:"data"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-			fmt.Fprintln(os.Stderr, "gmux: decode wait response:", err)
-			return 1
-		}
-		switch env.Data.Reason {
-		case "idle":
-			if jsonOut {
-				if len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
-					if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
-						fmt.Fprintln(os.Stderr, "gmux:", err)
-						return 1
-					}
-				} else if err := printWaitJSON(client, sess); err != nil {
-					fmt.Fprintln(os.Stderr, "gmux:", err)
-					return 1
-				}
-			}
-			return waitExitIdle
-		case "failed":
-			if jsonOut && len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
-				if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
-					fmt.Fprintln(os.Stderr, "gmux:", err)
-					return 1
-				}
-			}
-			fmt.Fprintf(os.Stderr, "gmux: Pi message failed in session %s\n", displayID(sess))
-			return waitExitFailed
-		case "died":
-			if jsonOut && len(env.Data.Message) > 0 && string(env.Data.Message) != "null" {
-				if _, err := os.Stdout.Write(append(env.Data.Message, '\n')); err != nil {
-					fmt.Fprintln(os.Stderr, "gmux:", err)
-					return 1
-				}
-			}
-			fmt.Fprintf(os.Stderr, "gmux: session %s died before becoming idle\n", displayID(sess))
-			return waitExitDied
-		default:
-			fmt.Fprintf(os.Stderr, "gmux: unexpected wait reason %q\n", env.Data.Reason)
-			return 1
-		}
-	case http.StatusRequestTimeout:
-		fmt.Fprintf(os.Stderr, "gmux: wait timed out after %ds\n", timeoutSecs)
-		return waitExitTimeout
-	case http.StatusUnprocessableEntity:
-		// Adapter kind doesn't emit an idle signal. Surface the
-		// daemon's message so the user knows which kind they hit.
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "gmux: wait not supported for this session: %s\n",
-			extractMessage(body))
-		return 1
-	case http.StatusNotFound:
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "gmux: wait target not found for %s: %s\n", displayID(sess), extractMessage(body))
-		return 1
-	default:
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Fprintf(os.Stderr, "gmux: wait failed: %s: %s\n", resp.Status, extractMessage(body))
-		return 1
+	if resp.StatusCode == http.StatusRequestTimeout {
+		result.Reason = "timeout"
+		result.ExitCode = waitExitTimeout
+		return result
 	}
+	if resp.StatusCode != http.StatusOK {
+		result.Reason = "error"
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		switch resp.StatusCode {
+		case http.StatusUnprocessableEntity:
+			result.err = fmt.Errorf("wait not supported for session %s: %s", displayID(sess), extractMessage(body))
+		case http.StatusNotFound:
+			result.err = fmt.Errorf("wait target not found for %s: %s", displayID(sess), extractMessage(body))
+		default:
+			result.err = fmt.Errorf("wait failed for %s: %s: %s", displayID(sess), resp.Status, extractMessage(body))
+		}
+		result.ExitCode = 1
+		return result
+	}
+
+	var envelope struct {
+		Data struct {
+			Reason  string          `json:"reason"`
+			Message json.RawMessage `json:"message"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		result.Reason = "error"
+		result.err = fmt.Errorf("decode wait response for %s: %w", displayID(sess), err)
+		result.ExitCode = 1
+		return result
+	}
+
+	result.Reason = envelope.Data.Reason
+	switch result.Reason {
+	case "idle":
+		result.ExitCode = waitExitIdle
+	case "died":
+		result.ExitCode = waitExitDied
+	case "failed":
+		result.ExitCode = waitExitFailed
+	default:
+		result.err = fmt.Errorf("unexpected wait reason %q for %s", result.Reason, displayID(sess))
+		result.ExitCode = 1
+		return result
+	}
+
+	if includeResult {
+		if len(envelope.Data.Message) > 0 && string(envelope.Data.Message) != "null" {
+			result.Result = envelope.Data.Message
+		} else if result.Reason == "idle" {
+			message, err := readWaitResult(ctx, client, sess)
+			if err != nil {
+				result.Reason = "error"
+				result.err = err
+				result.ExitCode = 1
+				return result
+			}
+			result.Result = message
+		}
+	}
+	return result
 }
 
-func printWaitJSON(client *http.Client, sess cliSession) error {
+func readWaitResult(ctx context.Context, client *http.Client, sess cliSession) (json.RawMessage, error) {
 	if sess.Kind != "pi" {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"reason": "idle"})
+		return json.RawMessage(`{"reason":"idle"}`), nil
 	}
 	endpoint := gmuxdBaseURL() + "/v1/sessions/" + url.PathEscape(sess.ID) + "/message"
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
-		return fmt.Errorf("read Pi result: %w", err)
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("read Pi result: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"reason": "idle"})
+		return json.RawMessage(`{"reason":"idle"}`), nil
 	}
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("read Pi result: %s: %s", resp.Status, extractMessage(body))
+		return nil, fmt.Errorf("read Pi result: %s: %s", resp.Status, extractMessage(body))
 	}
 	var envelope struct {
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return fmt.Errorf("decode Pi result: %w", err)
+		return nil, fmt.Errorf("decode Pi result: %w", err)
 	}
 	if len(envelope.Data) == 0 {
-		return fmt.Errorf("Pi result response was empty")
+		return nil, fmt.Errorf("Pi result response was empty")
 	}
-	_, err = os.Stdout.Write(append(envelope.Data, '\n'))
-	return err
+	return envelope.Data, nil
 }
 
-// extractMessage pulls the .error.message field out of gmuxd's
-// standard error envelope, falling back to the raw body if the
-// shape doesn't match.
+func reportWaitResults(results []waitResult, timeoutSecs int) int {
+	for _, result := range results {
+		if result.err != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", result.err)
+			return 1
+		}
+	}
+
+	exitCode := waitExitIdle
+	for _, result := range results {
+		if result.Reason == "timeout" {
+			exitCode = waitExitTimeout
+		}
+	}
+	if exitCode != waitExitTimeout {
+		for _, result := range results {
+			if result.Reason == "failed" {
+				exitCode = waitExitFailed
+				break
+			}
+		}
+	}
+	if exitCode == waitExitIdle {
+		for _, result := range results {
+			if result.Reason == "died" {
+				exitCode = waitExitDied
+				break
+			}
+		}
+	}
+
+	for _, result := range results {
+		switch result.Reason {
+		case "failed":
+			fmt.Fprintf(os.Stderr, "gmux: Pi message failed in session %s\n", displayID(result.session))
+		case "died":
+			fmt.Fprintf(os.Stderr, "gmux: session %s died before becoming idle\n", displayID(result.session))
+		}
+	}
+	if exitCode == waitExitTimeout {
+		fmt.Fprintf(os.Stderr, "gmux: wait timed out after %ds\n", timeoutSecs)
+	}
+	return exitCode
+}
+
+// extractMessage pulls the .error.message field out of gmuxd's standard error
+// envelope, falling back to the raw body if the shape doesn't match.
 func extractMessage(body []byte) string {
 	var env struct {
 		Error struct {

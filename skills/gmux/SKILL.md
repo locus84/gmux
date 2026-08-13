@@ -17,8 +17,10 @@ gmux -- <cmd> [args]         # run blocking; exits with the child's exit code
 gmux -d -- <cmd> [args]      # run detached; prints the session id on stdout
 gmux send <id> 'text' Enter  # submit; Pi uses its injected extension, not PTY typing
 gmux send <id> C-c           # send a raw control key (interrupt)
-gmux wait <id>               # block until the agent truly settles
+gmux wait <id>               # block until one agent truly settles
 gmux wait <id> --json        # for Pi, return the latest semantic result
+gmux wait --all <id...>      # concurrently wait for every explicit target
+gmux wait --any <id...>      # return the first target to settle
 gmux tail <id> [-n N]        # last N lines of output (ANSI stripped; default 100)
 gmux ls [--json]             # list sessions (--json for machine parsing)
 gmux kill <id>               # SIGTERM the runner but retain its session record
@@ -80,9 +82,11 @@ for ticket in fa-48 fa-49 fa-52; do
   ids+=( "$(gmux -d -- pi "Implement $ticket. Return when done.")" )
 done
 
-for id in "${ids[@]}"; do
-  gmux wait "$id" --timeout 600 --json >"result-$id.json" || echo "$id failed: $?"
-done
+# One shared deadline; results are returned in input order.
+gmux wait --all --timeout 600 --json "${ids[@]}" >results.json
+
+# Or return the first terminal result and cancel the losing waits.
+gmux wait --any --timeout 600 --json "${ids[@]}" >first-result.json
 
 for id in "${ids[@]}"; do
   # Verify each worktree independently before dismissing its owned session.
@@ -98,7 +102,16 @@ auto-compaction, and queued steering cannot create a false intermediate idle.
 `--json` returns the latest semantic Pi request's bounded final response. With
 multiple callers sharing one Pi session, provide the same stable
 `--request-id ID` to both `send` and `wait`; the default wait intentionally
-follows the session's latest semantic request. Exit codes:
+follows the session's latest semantic request.
+
+For explicit multi-session orchestration, `gmux wait --all <id...>` waits for
+every target concurrently and returns JSON records in input order;
+`gmux wait --any <id...>` returns the first observed terminal record and cancels
+the remaining HTTP waits. A transport/protocol error fails fast with exit 1 and
+also cancels the remaining waits rather than hiding an uncertain target.
+`--timeout` is one shared wall-clock deadline. Multi-
+session records contain `session_id`, `reason`, `exit_code`, and optional
+`result`. `--request-id` remains single-session only. Exit codes:
 
 - `0` agent reached idle (or session exited)
 - `2` session died before going idle

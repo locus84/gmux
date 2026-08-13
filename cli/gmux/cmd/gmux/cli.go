@@ -50,7 +50,8 @@ type command struct {
 	initialAgentTitle string   // internal: preserve agent-native name across resume/restart
 
 	// session-addressing verbs (attach/tail/kill/send/send-keys/wait)
-	ref string // session reference; may carry an @peer suffix
+	ref      string   // session reference; may carry an @peer suffix
+	waitRefs []string // wait targets; one or more explicit session references
 
 	// ls
 	all  bool
@@ -70,7 +71,9 @@ type command struct {
 	keys        []string // key/text arguments
 
 	// wait
-	timeout int // --timeout seconds (0 = none)
+	timeout int  // --timeout seconds (0 = none)
+	waitAll bool // --all: wait for every explicit target
+	waitAny bool // --any: return the first explicit target to settle
 
 	// session
 	sessionSub   string
@@ -450,19 +453,31 @@ func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
 	fs.IntVar(&c.timeout, "timeout", 0, "fail after N seconds")
-	fs.BoolVar(&c.json, "json", false, "print the settled Pi result as JSON")
+	fs.BoolVar(&c.json, "json", false, "print the settled result as JSON")
 	fs.StringVar(&c.requestID, "request-id", "", "wait for this semantic Pi request id")
+	fs.BoolVar(&c.waitAll, "all", false, "wait for every explicit session id")
+	fs.BoolVar(&c.waitAny, "any", false, "return when any explicit session id settles")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, err
 	}
-	if len(pos) != 1 {
-		return nil, errors.New("wait requires a session id")
+	if len(pos) == 0 {
+		return nil, errors.New("wait requires at least one session id")
+	}
+	if c.waitAll && c.waitAny {
+		return nil, errors.New("wait accepts only one of --all or --any")
+	}
+	if len(pos) > 1 && !c.waitAll && !c.waitAny {
+		return nil, errors.New("waiting for multiple sessions requires --all or --any")
+	}
+	if len(pos) > 1 && c.requestID != "" {
+		return nil, errors.New("--request-id is only supported for a single session")
 	}
 	if c.timeout < 0 {
 		return nil, errors.New("--timeout must be a non-negative number of seconds")
 	}
 	c.ref = pos[0]
+	c.waitRefs = pos
 	return c, nil
 }
 
@@ -598,7 +613,9 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux send [--request-id ID] [--json] <id> <text> [Key...]
                                       submit Pi text or send raw keys
   gmux send-keys -t <id> <keys...>  tmux-compatible key sending
-  gmux wait <id> [--timeout N] [--json]  wait for settled agent result
+  gmux wait <id> [--timeout N] [--json]  wait for one settled agent result
+  gmux wait --all <id...> [--timeout N]   wait for every explicit target
+  gmux wait --any <id...> [--timeout N]   return the first settled target
   gmux kill <id>                    terminate a session
   gmux session rename <id> <name>   set the explicit session name
   gmux session rename <id> --clear  reveal the application/fallback title
