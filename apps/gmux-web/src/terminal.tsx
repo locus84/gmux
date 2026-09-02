@@ -7,7 +7,7 @@ import { Terminal } from '@xterm/xterm'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
 import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
-import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, handlePasteAction, type PasteDestination } from './keyboard'
+import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, handleBlobPasteAction, handlePasteAction, type PasteDestination } from './keyboard'
 import { LinkActionSheet } from './link-action-sheet'
 import { createLongPressRecognizer } from './long-press'
 import {
@@ -153,11 +153,9 @@ function measureTerminalFit(
   // forever. offset* is the border-box and ignores scrollbars, so the
   // measurement is a fixed point regardless of transient overflow.
   // (.terminal-shell has no border/padding, so offset* == the viewport.)
-  // On mobile the control bar floats over the terminal's bottom (out of
-  // flow, translucent — see styles.css), so the shell fills the full height
-  // behind it. Reserve the bar's height, but round the row count UP: the
-  // terminal then claims one extra row whose bottom sliver tucks behind the
-  // translucent keys, instead of leaving a sub-cell gap above an opaque bar.
+  // On mobile the two-row control bar floats over the terminal's bottom.
+  // Reserve its full height and floor the row count so terminal content stays
+  // slightly above the keys rather than underlapping their top edge.
   // Detected here — not at the call sites — so every resize path (initial
   // fit, keyboard transitions, manual refit) computes identically. The bar's
   // offsetParent is null when it's display:none (desktop) ⇒ plain floor fit.
@@ -168,7 +166,7 @@ function measureTerminalFit(
   const availH = shellEl.offsetHeight - padY - overlayBar
 
   let cols = Math.max(2, Math.floor(availW / dims.css.cell.width))
-  let rows = Math.max(1, (overlayBar > 0 ? Math.ceil : Math.floor)(availH / dims.css.cell.height))
+  let rows = Math.max(1, Math.floor(availH / dims.css.cell.height))
 
   // Guard against 1px overflow: xterm computes screen width as
   // Math.round(device.cell.width * cols / dpr). Because css.cell.width is
@@ -184,9 +182,7 @@ function measureTerminalFit(
   // Same guard vertically: row height rounding across device/css pixels can
   // overflow by 1px at fractional DPRs (the monitor-move case), which is
   // exactly what seeds the scrollbar flicker described above.
-  // (Skipped in overlay-bar mode: the gained row intentionally exceeds
-  // availH, spilling its bottom sliver behind the translucent bar.)
-  if (overlayBar === 0 && dims.device.cell.height > 0) {
+  if (dims.device.cell.height > 0) {
     const predictedHeight = Math.round(dims.device.cell.height * rows / dpr)
     if (predictedHeight > availH && rows > 1) rows--
   }
@@ -303,6 +299,7 @@ export function TerminalView({
   onShiftConsumed,
   onModifiersCancelled,
   onInputReady,
+  onAttachFileReady,
   onFocusReady,
 }: {
   session: Session
@@ -317,6 +314,7 @@ export function TerminalView({
   onShiftConsumed: () => void
   onModifiersCancelled: () => void
   onInputReady?: (send: ((data: string) => void) | null) => void
+  onAttachFileReady?: (attach: ((file: File) => void) | null) => void
   onFocusReady?: (focus: (() => void) | null) => void
 }) {
   const shellRef = useRef<HTMLDivElement>(null)
@@ -719,6 +717,14 @@ export function TerminalView({
       }
       void handlePasteAction(destination, pasteFeedback)
     }
+    onAttachFileReady?.((file: File) => {
+      const destination = getPasteDestination()
+      if (!destination) {
+        pasteFeedback('error', 'Upload failed: no active terminal connection')
+        return
+      }
+      void handleBlobPasteAction(file, destination, pasteFeedback)
+    })
     onFocusReady?.(() => focusTerminalInput(term))
 
     const dataDisposable = term.onData((data) => {
@@ -992,6 +998,7 @@ export function TerminalView({
       connectionRef.current = null
       onInputReady?.(null)
       pasteActionRef.current = null
+      onAttachFileReady?.(null)
       onFocusReady?.(null)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null
       ;(window as any).__gmuxScrollAnchor = null
@@ -1001,7 +1008,7 @@ export function TerminalView({
       termRef.current = null
       termIoRef.current = null
     }
-  }, [onCtrlConsumed, onAltConsumed, onShiftConsumed, onModifiersCancelled, onInputReady, fontReady])
+  }, [onCtrlConsumed, onAltConsumed, onShiftConsumed, onModifiersCancelled, onInputReady, onAttachFileReady, fontReady])
 
   // WebSocket connection (reconnects when session.id changes).
   useEffect(() => {

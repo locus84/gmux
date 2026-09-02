@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, handlePasteAction, type PasteDestination, pickBinaryDataTransferItem } from './keyboard'
+import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, handleBlobPasteAction, handlePasteAction, type PasteDestination, pickBinaryDataTransferItem } from './keyboard'
 
 // Build an array-like stand-in for DataTransferItemList. Vitest runs in
 // node by default, where the real DOM type isn't available; a plain
@@ -27,6 +27,20 @@ function binaryClipboard(getType: () => Promise<Blob>): Clipboard {
 }
 
 describe('paste destination binding', () => {
+  it('uploads a file chosen from the mobile toolbar and types its path', async () => {
+    const sent: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { path: '/tmp/report.pdf' } }))))
+
+    await handleBlobPasteAction(
+      new File(['pdf'], 'report.pdf', { type: 'application/pdf' }),
+      destination('mobile-session', text => { sent.push(text); return true }),
+      vi.fn(),
+    )
+
+    expect(fetch).toHaveBeenCalledWith('/v1/sessions/mobile-session/clipboard', expect.objectContaining({ method: 'POST' }))
+    expect(sent).toEqual(['/tmp/report.pdf'])
+  })
+
   it('uses one namespaced destination for both upload and delivery', async () => {
     const sent: string[] = []
     let requestURL = ''

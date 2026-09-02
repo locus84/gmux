@@ -589,6 +589,7 @@ const IconWordLeft  = () => <svg viewBox="0 0 18 14" width="20" height="16" {...
 const IconWordRight = () => <svg viewBox="0 0 18 14" width="20" height="16" {...S}><line x1="14.5" y1="3" x2="14.5" y2="11"/><path d="M5 7h7m0 0-3-3m3 3-3 3"/></svg>
 const IconSend = () => <svg viewBox="0 0 14 14" width="16" height="16" fill="currentColor" stroke="none"><path d="M3 2.5l8 4.5-8 4.5V8.5L7.5 7 3 5.5z"/></svg>
 const IconEnd = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M7 2v7m0 0-3-3m3 3 3-3"/><path d="M3.5 12h7"/></svg>
+const IconAttach = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M5 7.5 8.8 3.7a2 2 0 0 1 2.8 2.8l-5 5a3 3 0 0 1-4.2-4.2l5.2-5.2"/><path d="M9.5 5 4.3 10.2a1 1 0 0 1-1.4-1.4L7.7 4"/></svg>
 
 // Press-and-hold auto-repeat for the navigation keys: fire once on press,
 // then after a short delay repeat until release. Arrows repeat briskly;
@@ -631,6 +632,7 @@ function MobileTerminalBar({
   shiftArmed,
   onMenu,
   onSend,
+  onAttachFile,
   onToggleCtrl,
   onToggleAlt,
   onToggleShift,
@@ -644,6 +646,7 @@ function MobileTerminalBar({
   shiftArmed: boolean
   onMenu: () => void
   onSend: (data: string) => void
+  onAttachFile: (file: File) => void
   onToggleCtrl: () => void
   onToggleAlt: () => void
   onToggleShift: () => void
@@ -651,6 +654,7 @@ function MobileTerminalBar({
   onAltConsumed: () => void
   onShiftConsumed: () => void
 }) {
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // Don't steal focus from the terminal: a control tap leaves the
   // keyboard exactly as it is (open or closed). Bytes reach the PTY via
   // the raw input channel (onSend), independent of DOM focus, so every
@@ -689,6 +693,13 @@ function MobileTerminalBar({
   // collapse to a single row, and the widest step folds the word-jumps back
   // in. Keys never relabel; ctrl/alt only arm + highlight.
   const armedClass = (armed: boolean) => `mobile-bottom-action${armed ? ' armed' : ''}`
+  const chooseFile = () => fileInputRef.current?.click()
+  const handleFileChange = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (file) onAttachFile(file)
+  }
 
   return (
     <div class="mobile-bottom-bar" role="toolbar" aria-label="Terminal keys" onMouseDown={keepFocus}>
@@ -704,9 +715,12 @@ function MobileTerminalBar({
       <button class="mobile-bottom-action mk-ad" disabled={!canSend} {...repeat(() => sendKey('\x1b[B'), ARROW_REPEAT_MS)} title="Down arrow"><span class="mkey-face"><IconDown /></span></button>
       <button class="mobile-bottom-action mk-ar" disabled={!canSend} {...repeat(() => sendKey('\x1b[C'), ARROW_REPEAT_MS)} title="Right arrow"><span class="mkey-face"><IconRight /></span></button>
       <button class="mobile-bottom-action mk-wr" disabled={!canSend} {...repeat(() => sendWord('\x1b[C'), WORD_REPEAT_MS)} title="Word right"><span class="mkey-face"><IconWordRight /></span></button>
-      {terminalScrolledUp.value && (
+      {terminalScrolledUp.value ? (
         <button class="mobile-bottom-action mk-end" onClick={() => terminalScrollToBottom.value?.()} title="Scroll to bottom"><span class="mkey-face"><IconEnd /></span></button>
+      ) : (
+        <button class="mobile-bottom-action mk-attach" disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
       )}
+      <input ref={fileInputRef} class="mobile-attach-input" type="file" onChange={handleFileChange} />
       <button class="mobile-bottom-action send-btn mk-send" disabled={!canSend} onClick={() => sendKey('\r')} title={altArmed ? 'Send Alt+Enter' : 'Send'}><span class="mkey-face"><IconSend /></span></button>
     </div>
   )
@@ -887,6 +901,7 @@ function App() {
   const [shiftArmed, setShiftArmed] = useState(false)
 
   const terminalInputRef = useRef<((data: string) => void) | null>(null)
+  const terminalAttachFileRef = useRef<((file: File) => void) | null>(null)
   const terminalFocusRef = useRef<(() => void) | null>(null)
 
   // Read signals.
@@ -959,6 +974,9 @@ function App() {
   const handleTerminalInputReady = useCallback((send: ((data: string) => void) | null) => {
     terminalInputRef.current = send
   }, [])
+  const handleTerminalAttachFileReady = useCallback((attach: ((file: File) => void) | null) => {
+    terminalAttachFileRef.current = attach
+  }, [])
   const handleTerminalFocusReady = useCallback((focus: (() => void) | null) => {
     terminalFocusRef.current = focus
     // Auto-focus on mount only off-touch; on touch this would pop the
@@ -966,6 +984,7 @@ function App() {
     if (!isTouchDevice()) focus?.()
   }, [])
   const handleMobileInput = useCallback((data: string) => { terminalInputRef.current?.(data) }, [])
+  const handleMobileAttachFile = useCallback((file: File) => { terminalAttachFileRef.current?.(file) }, [])
   const handleToggleCtrl = useCallback(() => {
     if (!canAttach) return
     setCtrlArmed(armed => !armed)
@@ -1065,6 +1084,7 @@ function App() {
             onShiftConsumed={handleShiftConsumed}
             onModifiersCancelled={handleModifiersCancelled}
             onInputReady={handleTerminalInputReady}
+            onAttachFileReady={handleTerminalAttachFileReady}
             onFocusReady={handleTerminalFocusReady}
           />
         ) : selectedVal && !selectedVal.alive && termOpts && !USE_MOCK ? (
@@ -1095,6 +1115,7 @@ function App() {
             shiftArmed={shiftArmed}
             onMenu={openSidebar}
             onSend={handleMobileInput}
+            onAttachFile={handleMobileAttachFile}
             onToggleCtrl={handleToggleCtrl}
             onToggleAlt={handleToggleAlt}
             onToggleShift={handleToggleShift}

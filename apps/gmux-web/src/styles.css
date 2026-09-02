@@ -519,6 +519,17 @@ body {
   }
 }
 
+/* Keep the mobile drawer list top-aligned. The upstream thumb-reach cavity
+ * leaves a large blank area above short lists, which is especially awkward
+ * when the drawer was opened to switch sessions quickly. */
+@media (pointer: coarse) {
+  .sidebar-scroll::before { flex: 0 0 6px; min-height: 0; }
+  .sidebar-scroll { background: none; padding-bottom: 48px; }
+  .sidebar-list { border: 0; box-shadow: none; }
+  .sidebar-list::before,
+  .sidebar-list::after { content: none; }
+}
+
 /* ── Folder ── */
 
 .folder + .folder {
@@ -3619,8 +3630,10 @@ body {
   .mk-ad   { grid-area: ad; }
   .mk-au   { grid-area: au; }
   .mk-ar   { grid-area: ar; }
-  .mk-end  { grid-area: end; }
-  .mk-send { grid-area: send; }
+  .mk-end    { grid-area: end; }
+  .mk-attach { grid-area: end; }
+  .mk-send   { grid-area: send; }
+  .mobile-attach-input { display: none; }
 
   /* No bottom padding under the grid: the control bar overlays it, so the
      reclaimed terminal row can run right to the bottom edge. */

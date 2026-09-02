@@ -103,6 +103,15 @@ async function uploadAndSendPath(
   }
 }
 
+/** Upload a file chosen by the user and type its daemon-side path safely. */
+export async function handleBlobPasteAction(
+  blob: Blob,
+  destination: PasteDestination,
+  feedback: PasteFeedback,
+): Promise<void> {
+  await uploadAndSendPath(blob, destination, feedback)
+}
+
 function sendPaste(destination: PasteDestination, text: string, feedback: PasteFeedback): void {
   if (!destination.send(formatPasteText(text, destination.bracketedPasteMode))) {
     feedback('error', 'Paste cancelled: terminal connection changed')
