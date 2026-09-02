@@ -19,11 +19,13 @@ The natural way to fill it: run a gmux command in the folder you work in (`gmux 
 
 Projects match sessions by filesystem path or git remote URL. Projects on other machines aren't matched by rules — add them under **Settings → Projects → From other hosts** once the host is [connected](/multi-machine/).
 
+The project's **+** menu also opens **Manage worktrees**. The sheet lists linked Git worktrees, creates branch-backed checkouts, and launches an agent in any checkout. Removal is deliberately conservative: gmux refuses primary, dirty, locked, or session-owning worktrees. The same local workflow is available as `gmux worktree current`, `gmux worktree ps`, and `gmux worktree create`.
+
 ## The terminal
 
 Click a session to attach a full interactive terminal. **Cmd/Ctrl+F** opens find-in-terminal; the full default keymap and how to override it is in the [settings reference](/reference/settings/#default-keymap).
 
-The **⋮** menu holds the lifecycle action — **Restart** for a live session, **Resume** or **Rerun** for a dead one. Dead sessions replay their terminal history read-only: resuming continues an agent conversation where it left off, rerunning starts the command fresh in the same directory.
+The **⋮** menu holds the lifecycle action — **Restart** for a live session, **Resume** or **Rerun** for a dead one — plus **Browse files**. The read-only file view stays scoped to the session workspace, previews text and images, and can open paths recognized in terminal output without unmounting the terminal. Dead sessions replay their terminal history read-only: resuming continues an agent conversation where it left off, rerunning starts the command fresh in the same directory.
 
 To get rid of a session, hover it in the sidebar and click **×**. This stops the session **and every session it launched**, then removes them from the UI — but it isn't data deletion: agent conversations stay in their own tools, and terminal history is kept until gmux eventually cleans it up.
 

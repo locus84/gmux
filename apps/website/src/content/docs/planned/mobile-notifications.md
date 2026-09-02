@@ -3,8 +3,10 @@ title: Native Mobile Notifications
 description: Native gmux push notifications for mobile — current landscape and planned approach.
 ---
 
-:::note[ntfy is available]
-gmux can send best-effort completion notifications to an existing [ntfy](https://ntfy.sh/) server and mobile app. See the [`[notifications.ntfy]` host configuration](/reference/host-toml/#notificationsntfy). The native gmux app described below has not shipped.
+:::note[Web Push and ntfy are available]
+gmux supports project-scoped Web Push on secure origins. Grant notification permission, then use the bell beside each local project in **Settings → Projects**. Install gmux to the Home Screen first on iOS.
+
+gmux can also send best-effort completion notifications to an existing [ntfy](https://ntfy.sh/) server and mobile app. See the [`[notifications.ntfy]` host configuration](/reference/host-toml/#notificationsntfy). The native gmux app described below has not shipped.
 :::
 
 ## The problem with Web Push on iOS
@@ -38,7 +40,7 @@ A minimal WKWebView app wrapping the existing web UI. The web UI and daemon need
 - Apple Developer Program ($99/year) — required for APNs and signing
 - Mac with Xcode for initial build and signing; subsequent builds can use `xcodebuild` from the command line
 
-## Why not Web Push?
+## Why a native wrapper is still planned
 
 | | Web Push | Native wrapper |
 |---|---|---|
@@ -47,4 +49,4 @@ A minimal WKWebView app wrapping the existing web UI. The web UI and daemon need
 | Tap opens | Safari (broken) | The app |
 | Maintenance after setup | Low | Low — web UI changes don't touch Swift |
 
-Web Push is fine on Android and desktop and could be added independently for those platforms at low cost. The native wrapper is the iOS-specific solution.
+The shipped Web Push path covers Android, desktop, and installed iOS PWAs while they are running. The native wrapper remains the planned iOS-specific solution for reliable killed-app delivery and tap routing.
