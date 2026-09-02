@@ -4572,9 +4572,8 @@ body {
   padding: 0 10px;
   font: inherit;
 }
-.file-copy-btn,
-.file-code-btn { min-width: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
-.file-code-btn { color: var(--accent); }
+.file-copy-btn { min-width: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.file-code-btn { color: var(--accent); padding: 0; }
 .file-close-btn { font-size: 22px; line-height: 1; }
 .file-view-title-block { min-width: 0; flex: 1; }
 .file-view-title { font-size: 15px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

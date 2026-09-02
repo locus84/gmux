@@ -19,6 +19,13 @@ import {
 import { vsCodeServerHomeDir, vsCodeServerUrl } from './store'
 import { buildVSCodeServerUrl } from './vscode-server'
 
+const IconVSCode = () => (
+  <svg viewBox="0 0 16 16" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M11.5 2.5 5 7.8l6.5 5.7 2-1V3.5l-2-1Z" />
+    <path d="M5 7.8 2.8 5.7 2 6.3v3l.8.6L5 7.8Z" />
+  </svg>
+)
+
 interface ApiEnvelope<T> {
   ok: boolean
   data?: T
@@ -317,7 +324,7 @@ export function FileBrowserView() {
           <div class="file-view-title">{title || 'Files'}</div>
           <div class="file-view-subtitle">{state.kind === 'list' || state.kind === 'content' ? displayPath(state.data.root, path) : target ? targetLabel(target) : 'Files'}</div>
         </div>
-        {codeUrl && <button class="file-code-btn" onClick={() => window.open(codeUrl, '_blank', 'noopener')} title="Open workspace in VS Code Server">Code</button>}
+        {codeUrl && <button class="file-code-btn" onClick={() => window.open(codeUrl, '_blank', 'noopener')} title="Open workspace in VS Code Server" aria-label="Open workspace in VS Code Server"><IconVSCode /></button>}
         <button class="file-copy-btn" disabled={!copyPath} onClick={() => copyPath && copy('path', copyPath)}>Copy path</button>
         <button class="file-close-btn" onClick={close} aria-label="Close files">×</button>
       </div>
