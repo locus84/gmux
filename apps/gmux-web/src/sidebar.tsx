@@ -5,13 +5,14 @@
  * callbacks and the mobile open/close toggle are passed as props.
  */
 
+import type { ComponentChildren } from 'preact'
 import { useState, useCallback, useRef, useEffect } from 'preact/hooks'
 import { needsReveal } from './sidebar-reveal'
 import { hasSessionSlugCollision, sessionPath, viewToPath } from './routing'
 import { FamilyIcon } from './family-icon'
 import { familyDrawerRoot } from './family-drawer-state'
 import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
-import { reorderKeysForFolder } from './projects'
+import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { LaunchButton } from './launcher'
 import { WorktreeSheet } from './worktree-sheet'
 import { useArrivalPulse } from './use-arrival-pulse'
@@ -26,6 +27,7 @@ import {
   sidebarActivity, sidebarMode, setSidebarMode,
   activeSelectors, removeSelector, setHostFilter,
   aliveOnly, setAliveOnly, tabHref, navigate, sessionStreamWarnings, sessionStreamOmittedTotal, peerStreamOmissions, peerOmittedTotal,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
@@ -432,6 +434,43 @@ function FamilyEntry({
   )
 }
 
+function CheckoutSection({ group, folder, selectedId, children }: {
+  group: CheckoutGroup
+  folder: Folder
+  selectedId: string | null
+  children: ComponentChildren
+}) {
+  const [expanded, setExpanded] = useState(group.primary)
+  useEffect(() => {
+    if (selectedId && group.sessions.some(session => session.id === selectedId)) setExpanded(true)
+  }, [selectedId, group.key])
+  return (
+    <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
+      <div class="checkout-header" title={group.path || group.label}>
+        <button
+          type="button"
+          class="checkout-fold-btn"
+          aria-expanded={expanded}
+          onClick={() => setExpanded(value => !value)}
+        >
+          <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
+          <span class="checkout-tree-mark" aria-hidden="true">↳</span>
+          <span class="checkout-name">{group.label}</span>
+          {group.primary && <span class="checkout-primary-label">default</span>}
+          {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
+          {!expanded && group.sessions.length > 0 && <span class="checkout-session-count">{group.sessions.length}</span>}
+        </button>
+        {!group.fallback && group.path && (
+          <div class="checkout-actions">
+            <LaunchButton cwd={group.path} peer={folder.peer} className="checkout-launch-btn" />
+          </div>
+        )}
+      </div>
+      {expanded && <div class="checkout-sessions">{children}</div>}
+    </div>
+  )
+}
+
 function FolderGroup({
   folder,
   selId,
@@ -454,6 +493,13 @@ function FolderGroup({
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
   const [worktreesOpen, setWorktreesOpen] = useState(false)
+  const ownerStatus = folder.peer ? peerStatus.get(folder.peer) : 'local'
+  useEffect(() => {
+    if (!location.search.includes('mock') && !folder.unresolved && !folder.missing && (ownerStatus === 'local' || ownerStatus === 'connected')) {
+      void ensureProjectWorktrees(folder.slug, folder.peer)
+    }
+  }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
+  const inventory = projectWorktreeInventories.value[projectWorktreeInventoryKey(folder.slug, folder.peer)]
   // Snapshot-wide family derivations, read once per folder render. All
   // three are O(n) maps built once per session-list identity in the
   // store, so a folder's rows stay O(rows) lookups.
@@ -502,6 +548,11 @@ function FolderGroup({
   // mobile scroll-into-view). The header reads as collapsed; the one
   // row just sits beneath it.
   const shown = collapsed ? displayItems.filter(s => s.id === selId) : displayItems
+  const checkoutGroups = groupSessionsByCheckout(
+    { ...folder, sessions: shown },
+    inventory?.data?.worktrees,
+    inventory?.data?.primary_path,
+  )
   // Drag-reorder is disabled while collapsed (the visible subset no
   // longer maps onto the stored order) or under the alive-only toggle.
   const dragDisabled = collapsed || !!aliveOnly
@@ -569,57 +620,62 @@ function FolderGroup({
           />
         )}
       </div>
-      {shown.length > 0 && (
-      <div class="folder-sessions">
-        {shown.map((s, i) => {
-          const href = tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))
-          const activity = activityById.get(s.id)
-          const slot = slots.get(s.id)
-          const item = (
-            <SessionItem
-              key={s.id}
-              session={s}
-              href={href}
-              // `selId` maps a selected descendant onto its root row.
-              // The entry now draws that selection on the member's own
-              // row instead, so the root row only lights up for itself.
-              selected={selId === s.id && !slot}
-              resuming={resumingId === s.id}
-              // Root row = root's own status. The family roll-up lives on
-              // the summary line below it (see FamilyEntry).
-              dotState={ownDotState(s, am, rawSelId)}
-              unavailable={isSessionUnavailable(s, peerStatus)}
-              showHostMarker={mixedHosts}
-              dragging={drag !== null && s.id === visible[drag.from]?.id}
-              dropTarget={drag !== null && drag.over === i && drag.from !== i}
-              onClose={() => onCloseSession(s)}
-              onClick={onClick}
-              onDragStart={dragDisabled ? undefined : () => handleDragStart(i)}
-              onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
-              onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
-            />
-          )
-          // No member to name and nothing else to count: one plain row.
-          if (!slot && !activity) return item
-          return (
-            <FamilyEntry
-              key={s.id}
-              selected={selId === s.id}
-              rootId={s.id}
-              rootHref={href}
-              onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
-              onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
-              slot={slot}
-              slotHref={slot && sessionHref(slot.session)}
-              slotTrail={slot && childTrailTitle(s, slot.ancestors, slot.session)}
-              activity={activity}
-              onClick={onClick}
-            >
-              {item}
-            </FamilyEntry>
-          )
-        })}
-      </div>
+      {(!collapsed || shown.length > 0) && (
+        <div class="folder-checkouts" aria-busy={inventory?.loading || undefined}>
+          {inventory?.error && (
+            <button
+              type="button"
+              class="checkout-inventory-error"
+              title={inventory.error}
+              onClick={() => void ensureProjectWorktrees(folder.slug, folder.peer, true)}
+            >Worktrees unavailable · Retry</button>
+          )}
+          {checkoutGroups.map(group => (
+            <CheckoutSection key={group.key} group={group} folder={folder} selectedId={selId}>
+              {group.sessions.map(s => {
+                const i = displayItems.indexOf(s)
+                const href = tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))
+                const activity = activityById.get(s.id)
+                const slot = slots.get(s.id)
+                const item = (
+                  <SessionItem
+                    key={s.id}
+                    session={s}
+                    href={href}
+                    selected={selId === s.id && !slot}
+                    resuming={resumingId === s.id}
+                    dotState={ownDotState(s, am, rawSelId)}
+                    unavailable={isSessionUnavailable(s, peerStatus)}
+                    showHostMarker={mixedHosts}
+                    dragging={drag !== null && s.id === visible[drag.from]?.id}
+                    dropTarget={drag !== null && drag.over === i && drag.from !== i}
+                    onClose={() => onCloseSession(s)}
+                    onClick={onClick}
+                    onDragStart={dragDisabled ? undefined : () => handleDragStart(i)}
+                    onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
+                    onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
+                  />
+                )
+                if (!slot && !activity) return item
+                return (
+                  <FamilyEntry
+                    key={s.id}
+                    selected={selId === s.id}
+                    rootId={s.id}
+                    rootHref={href}
+                    onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
+                    onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
+                    slot={slot}
+                    slotHref={slot && sessionHref(slot.session)}
+                    slotTrail={slot && childTrailTitle(s, slot.ancestors, slot.session)}
+                    activity={activity}
+                    onClick={onClick}
+                  >{item}</FamilyEntry>
+                )
+              })}
+            </CheckoutSection>
+          ))}
+        </div>
       )}
       {worktreesOpen && <WorktreeSheet slug={folder.slug} peer={folder.peer} onClose={() => setWorktreesOpen(false)} />}
     </div>

@@ -741,6 +741,99 @@ body {
   padding-top: 1px;
 }
 
+.folder-checkouts { overflow: hidden; }
+.checkout-group + .checkout-group { margin-top: 2px; }
+.checkout-header {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  color: var(--text-muted);
+  font-size: 0.75em;
+  line-height: 1.5;
+  font-family: 'Fira Code', monospace;
+}
+.checkout-fold-btn {
+  min-width: 0;
+  min-height: 32px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.35em 0.15em 1em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.checkout-fold-btn:hover,
+.checkout-fold-btn:focus-visible,
+.checkout-actions button:hover,
+.checkout-actions button:focus-visible { background: var(--bg-hover); }
+.checkout-chevron {
+  flex: none;
+  font-family: sans-serif;
+  font-size: 1.35em;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+.checkout-chevron.expanded { transform: rotate(90deg); }
+.checkout-tree-mark { flex: none; opacity: 0.55; }
+.checkout-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.checkout-primary-label,
+.checkout-state-label,
+.checkout-session-count {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.4em;
+  font-family: 'Instrument Sans', sans-serif;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.checkout-state-label { color: var(--status-warning); }
+.checkout-session-count { min-width: 1.5em; text-align: center; }
+.checkout-actions { flex: none; display: flex; align-items: center; padding-right: 0.65em; }
+.checkout-actions .launch-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.checkout-sessions { overflow: hidden; }
+.checkout-sessions .session-item { padding-left: 1.65em; }
+.checkout-inventory-error {
+  width: calc(100% - 2em);
+  min-height: 44px;
+  margin: 0 1em 0.2em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--status-warning);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: 0.78em;
+}
+.checkout-inventory-error:hover,
+.checkout-inventory-error:focus-visible { background: var(--bg-hover); }
+@media (pointer: coarse) {
+  .checkout-fold-btn { min-height: 44px; }
+  .checkout-actions .launch-btn { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
+}
+
 /* ── Host suffix (project headers) ── */
 .host-suffix {
   font-weight: 400;

@@ -15,8 +15,33 @@ import {
   countUnmatchedActive,
   projectAvailability,
   placeChildSessions,
+  groupSessionsByCheckout,
+  checkoutPathContains,
 } from './projects'
 import { makeSession } from './test-helpers'
+
+describe('worktree checkout grouping', () => {
+  const folder = (sessions: ReturnType<typeof makeSession>[]) => ({ key: '::backend', slug: 'backend', name: 'backend', launchCwd: '~/WorkSpace/backend', sessions })
+
+  it('places the primary checkout session under Main', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'main-session', cwd: '~/WorkSpace/backend' }),
+      makeSession({ id: 'linked-session', cwd: '~/.local/share/gmux/worktrees/backend/fix-auth' }),
+    ]), [
+      { path: '~/WorkSpace/backend', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false },
+      { path: '~/.local/share/gmux/worktrees/backend/fix-auth', branch: 'fix/auth', primary: false, detached: false, bare: false, locked: false, prunable: false },
+    ])
+    expect(groups.map(group => [group.label, group.sessions.map(session => session.id)])).toEqual([
+      ['Main', ['main-session']],
+      ['fix/auth', ['linked-session']],
+    ])
+  })
+
+  it('uses the deepest containing checkout', () => {
+    expect(checkoutPathContains('/repo', '/repo/packages/api')).toBe(true)
+    expect(checkoutPathContains('/repo', '/repo-other')).toBe(false)
+  })
+})
 
 describe('placeChildSessions', () => {
   const s = (id: string, parent?: string) =>
