@@ -39,6 +39,14 @@ their valid range (not rejected). Unknown keys produce a console warning.
 
 ## Fields
 
+### `uiScale`
+
+Overall web UI scale multiplier. Affects gmux chrome and scales the terminal font size.
+
+- **Type:** `number`
+- **Default:** `1`
+- **Range:** 0.7–2
+
 ### `fontSize`
 
 Terminal font size in pixels.

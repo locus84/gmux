@@ -157,6 +157,7 @@ export type Keybind = v.InferOutput<typeof KeybindSchema>
 
 /** Field definitions for settings.jsonc, separated for introspection. */
 const settingsEntries = {
+    uiScale:          clampedNumber(1, 0.7, 2, 'Overall web UI scale multiplier. Affects gmux chrome and scales the terminal font size.'),
     fontSize:         clampedNumber(13, 6, 48, 'Terminal font size in pixels.'),
     fontFamily:       optStr("'Fira Code', 'Symbols Nerd Font Mono', monospace", 'Font family (CSS font-family value).'),
     fontWeight:       v.optional(v.pipe(FontWeightSchema, v.description('Font weight for normal text.')), 'normal' as const),
@@ -217,7 +218,7 @@ export type ResolvedSettings = v.InferOutput<typeof SettingsSchema>
  *  optional), so consumers can rely on `fontFamily`, `fontSize`, etc.
  *  being defined. */
 export type ResolvedTerminalOptions =
-  & Omit<ResolvedSettings, 'keybinds' | 'macCommandIsCtrl'>
+  & Omit<ResolvedSettings, 'uiScale' | 'keybinds' | 'macCommandIsCtrl' | 'vsCodeServerUrl' | 'vsCodeServerHomeDir'>
   & { theme: ITheme }
 
 // ── Default theme colors ──
@@ -282,6 +283,11 @@ function warnUnknownKeys(raw: Record<string, unknown>): void {
  * Does not include linkHandler or other non-serializable options; the caller
  * adds those separately.
  */
+export function resolveUiScale(rawSettings: SettingsConfig | null | undefined): number {
+  const result = v.safeParse(SettingsSchema, rawSettings ?? {})
+  return result.success ? result.output.uiScale : v.parse(SettingsSchema, {}).uiScale
+}
+
 export function buildTerminalOptions(
   rawSettings: SettingsConfig | null | undefined,
   rawTheme: ThemeColors | null | undefined,
@@ -304,6 +310,6 @@ export function buildTerminalOptions(
   const theme: ITheme = { ...DEFAULT_THEME_COLORS, ...userColors }
 
   // Build ITerminalOptions from parsed settings (exclude non-terminal keys).
-  const { keybinds: _kb, macCommandIsCtrl: _mac, ...terminalOpts } = settings
+  const { uiScale: _scale, keybinds: _kb, macCommandIsCtrl: _mac, vsCodeServerUrl: _vscode, vsCodeServerHomeDir: _vscodeHome, ...terminalOpts } = settings
   return { ...terminalOpts, theme }
 }

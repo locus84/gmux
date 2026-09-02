@@ -22,7 +22,7 @@ import {
   type Worktree,
 } from '@gmux/protocol'
 import { batch, computed, effect, signal, untracked } from '@preact/signals'
-import { buildTerminalOptions, fetchFrontendConfig, type ResolvedKeybind, resolveKeybinds } from './config'
+import { buildTerminalOptions, fetchFrontendConfig, type ResolvedKeybind, resolveKeybinds, resolveUiScale } from './config'
 import {
   createFamilyIndex, 
   type FamilyActivity, type FamilyIndex,familyAncestors, familyIndex, familyRootId, familyStateOf, isProcessSession, promotionAction,
@@ -521,9 +521,62 @@ export const peerAppearance = computed<ReadonlyMap<string, PeerAppearance>>(() =
   return map
 })
 
-export const terminalOptions = signal<ResolvedTerminalOptions | null>(null)
+const terminalOptionsBase = signal<ResolvedTerminalOptions | null>(null)
 export const keybinds = signal<ResolvedKeybind[] | null>(null)
 export const macCommandIsCtrl = signal(false)
+
+export const UI_SCALE_MIN = 0.7
+export const UI_SCALE_MAX = 2
+const UI_SCALE_STORAGE_KEY = 'gmux.uiScale'
+export const uiScaleDefault = signal(1)
+export const uiScaleOverride = signal<number | null>(null)
+export const uiScaleEffective = computed(() => uiScaleOverride.value ?? uiScaleDefault.value)
+export const terminalOptions = computed<ResolvedTerminalOptions | null>(() => {
+  const base = terminalOptionsBase.value
+  return base ? { ...base, fontSize: base.fontSize * uiScaleEffective.value } : null
+})
+
+export function clampUiScale(scale: number): number {
+  if (!Number.isFinite(scale)) return 1
+  return Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, scale))
+}
+
+function readBrowserUiScale(): number | null {
+  try {
+    const raw = localStorage.getItem(UI_SCALE_STORAGE_KEY)
+    if (raw == null || raw.trim() === '') return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? clampUiScale(parsed) : null
+  } catch { return null }
+}
+
+function applyUiScale(scale: number) {
+  if (typeof document === 'undefined') return
+  const root = document.documentElement.style
+  root.setProperty('--ui-font-size', `${14 * scale}px`)
+  root.setProperty('--sidebar-width', `${272 * scale}px`)
+  root.setProperty('--header-height', `${44 * scale}px`)
+  root.setProperty('--radius', `${6 * scale}px`)
+}
+
+function applyConfiguredUiScale(defaultScale: number) {
+  uiScaleDefault.value = clampUiScale(defaultScale)
+  uiScaleOverride.value = readBrowserUiScale()
+  applyUiScale(uiScaleEffective.value)
+}
+
+export function setBrowserUiScale(scale: number) {
+  const next = clampUiScale(scale)
+  try { localStorage.setItem(UI_SCALE_STORAGE_KEY, String(next)) } catch { /* in-memory still applies */ }
+  uiScaleOverride.value = next
+  applyUiScale(next)
+}
+
+export function resetBrowserUiScale() {
+  try { localStorage.removeItem(UI_SCALE_STORAGE_KEY) } catch { /* in-memory still applies */ }
+  uiScaleOverride.value = null
+  applyUiScale(uiScaleDefault.value)
+}
 
 /**
  * True while the on-screen keyboard is open, detected via visual-viewport
@@ -2447,7 +2500,8 @@ export function initStore(): () => void {
       sessionsLoaded.value = true
       worldLoaded.value = true
       connState.value = 'connected'
-      terminalOptions.value = buildTerminalOptions(null, null)
+      terminalOptionsBase.value = buildTerminalOptions(null, null)
+      applyConfiguredUiScale(resolveUiScale(null))
       keybinds.value = resolveKeybinds(null, false)
     })
     const activeIds = MOCK_SESSIONS.filter(s => s.mockActive).map(s => s.id)
@@ -2465,7 +2519,8 @@ export function initStore(): () => void {
   fetchFrontendConfig().then(fc => {
     const macCtrl = fc.settings?.macCommandIsCtrl === true
     batch(() => {
-      terminalOptions.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      terminalOptionsBase.value = buildTerminalOptions(fc.settings, fc.themeColors)
+      applyConfiguredUiScale(resolveUiScale(fc.settings))
       macCommandIsCtrl.value = macCtrl
       keybinds.value = resolveKeybinds(fc.settings?.keybinds ?? null, macCtrl)
     })

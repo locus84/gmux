@@ -149,7 +149,7 @@ body {
   font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, sans-serif;
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--ui-font-size, 14px);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -4635,3 +4635,14 @@ body {
   .worktree-create { grid-template-columns: 1fr; }
   .worktree-create h3, .worktree-create .worktree-error { grid-column: auto; }
 }
+
+
+/* Browser-local appearance preferences. */
+.ui-scale-help { margin-bottom: 18px; }
+.ui-scale-control { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px 14px; }
+.ui-scale-label { font-weight: 650; }
+.ui-scale-value { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 700; }
+.ui-scale-range { grid-column: 1 / -1; width: 100%; min-height: 44px; accent-color: var(--accent); }
+.ui-scale-number { width: 110px; min-height: 44px; }
+.ui-scale-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.ui-scale-actions button { min-height: 44px; }

@@ -21,6 +21,8 @@ import {
   removeProject, removePeerReference, localHostLabel,
   health, peers, sessions, connectHost, removeHost, parseConnectURL,
   unresolvedHosts, removeReferences,
+  UI_SCALE_MIN, UI_SCALE_MAX, uiScaleDefault, uiScaleOverride, uiScaleEffective,
+  setBrowserUiScale, resetBrowserUiScale,
 } from './store'
 import { HostSuffix } from './host-suffix'
 import { hostStatus } from './host-status'
@@ -28,7 +30,7 @@ import { projectAvailability } from './projects'
 import type { ProjectItem, DiscoveredProject, Folder, PeerInfo } from './types'
 import type { UnresolvedHost } from './references'
 
-type SettingsTab = 'projects' | 'hosts'
+type SettingsTab = 'projects' | 'hosts' | 'appearance'
 
 // ── SettingsModal ──
 
@@ -43,9 +45,7 @@ export function SettingsModal({
   onClose: () => void
   onSelectTab: (tab: SettingsTab) => void
 }) {
-  // Normalize the raw `?settings` value: anything that isn't 'hosts'
-  // falls back to the projects tab (covers bare `?settings`).
-  const activeTab: SettingsTab = tab === 'hosts' ? 'hosts' : 'projects'
+  const activeTab: SettingsTab = tab === 'hosts' || tab === 'appearance' ? tab : 'projects'
   const [discoveredQuery, setDiscoveredQuery] = useState('')
   const [pathDraft, setPathDraft] = useState('')
   const [pathError, setPathError] = useState('')
@@ -164,11 +164,17 @@ export function SettingsModal({
             aria-selected={activeTab === 'hosts'}
             onClick={() => onSelectTab('hosts')}
           >Hosts</button>
+          <button
+            class={`settings-tab${activeTab === 'appearance' ? ' active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'appearance'}
+            onClick={() => onSelectTab('appearance')}
+          >Appearance</button>
         </nav>
 
         <div class="settings-main">
           <div class="settings-main-header">
-            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : 'Projects'}</span>
+            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : activeTab === 'appearance' ? 'Appearance' : 'Projects'}</span>
             {activeTab === 'projects' && (
               <a
                 class="mp-docs-link"
@@ -183,6 +189,10 @@ export function SettingsModal({
         {activeTab === 'hosts' ? (
           <div class="modal-body">
             <HostsTab />
+          </div>
+        ) : activeTab === 'appearance' ? (
+          <div class="modal-body">
+            <AppearanceTab />
           </div>
         ) : (
         <div class="modal-body">
@@ -261,6 +271,36 @@ export function SettingsModal({
         </div>
       </div>
     </div>
+  )
+}
+
+function AppearanceTab() {
+  const effective = uiScaleEffective.value
+  const override = uiScaleOverride.value
+  const format = (scale: number) => `${Math.round(scale * 100)}%`
+  const update = (value: string) => {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) setBrowserUiScale(parsed)
+  }
+  return (
+    <section class="mp-section">
+      <div class="mp-section-label">This browser</div>
+      <div class="mp-path-hint ui-scale-help">
+        Stored only on this device. Scales gmux controls and terminal text. The shared default is {format(uiScaleDefault.value)}.
+      </div>
+      <label class="ui-scale-control">
+        <span class="ui-scale-label">UI scale</span>
+        <span class="ui-scale-value">{format(effective)}</span>
+        <input class="ui-scale-range" type="range" min={UI_SCALE_MIN} max={UI_SCALE_MAX} step="0.05" value={effective}
+          onInput={event => update(event.currentTarget.value)} />
+        <input class="mp-filter-input ui-scale-number" type="number" min={UI_SCALE_MIN} max={UI_SCALE_MAX} step="0.05" value={effective}
+          onInput={event => update(event.currentTarget.value)} />
+      </label>
+      <div class="ui-scale-actions">
+        <button class="mp-manual-btn" onClick={() => setBrowserUiScale(1)}>Use 100%</button>
+        <button class="mp-manual-btn" onClick={resetBrowserUiScale} disabled={override == null}>Reset to shared default</button>
+      </div>
+    </section>
   )
 }
 
