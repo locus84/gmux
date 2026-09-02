@@ -16,6 +16,8 @@ import {
   type ImageSizingMode,
   wheelImageZoom,
 } from './file-browser'
+import { vsCodeServerHomeDir, vsCodeServerUrl } from './store'
+import { buildVSCodeServerUrl } from './vscode-server'
 
 interface ApiEnvelope<T> {
   ok: boolean
@@ -134,6 +136,10 @@ export function FileBrowserView() {
       : ''
   const imageLoadState = imageLoad.src === imageSrc ? imageLoad.state : 'loading'
   const copyPath = state.kind === 'list' || state.kind === 'content' ? state.data.abs_path : ''
+  const workspaceRoot = state.kind === 'list' || state.kind === 'content' ? state.data.root : ''
+  const codeUrl = target?.kind === 'session'
+    ? buildVSCodeServerUrl(vsCodeServerUrl.value, workspaceRoot, vsCodeServerHomeDir.value)
+    : null
   const close = () => loc.route(closeFileBrowserPath(loc.path, loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''), true)
 
   useEffect(() => {
@@ -311,6 +317,7 @@ export function FileBrowserView() {
           <div class="file-view-title">{title || 'Files'}</div>
           <div class="file-view-subtitle">{state.kind === 'list' || state.kind === 'content' ? displayPath(state.data.root, path) : target ? targetLabel(target) : 'Files'}</div>
         </div>
+        {codeUrl && <button class="file-code-btn" onClick={() => window.open(codeUrl, '_blank', 'noopener')} title="Open workspace in VS Code Server">Code</button>}
         <button class="file-copy-btn" disabled={!copyPath} onClick={() => copyPath && copy('path', copyPath)}>Copy path</button>
         <button class="file-close-btn" onClick={close} aria-label="Close files">×</button>
       </div>

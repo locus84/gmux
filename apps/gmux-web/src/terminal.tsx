@@ -19,7 +19,7 @@ import { MOCK_BY_ID } from './mock-data/index'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { createReplayBuffer } from './replay'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import { navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
+import { navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
@@ -593,7 +593,7 @@ export function TerminalView({
       linkHandler: {
         activate(_event, text) {
           const current = sessionRef.current
-          window.open(resolveTerminalWebUrl(text, terminalOptions.vsCodeServerUrl, current.peer), '_blank', 'noopener')
+          window.open(resolveTerminalWebUrl(text, vsCodeServerUrl.value, current.peer), '_blank', 'noopener')
         },
       },
     })
@@ -607,6 +607,24 @@ export function TerminalView({
     term.loadAddon(searchAddon)
     searchAddonRef.current = searchAddon
     term.open(containerRef.current)
+    const disposeImeResidueGuard = attachImeResidueGuard(term)
+    const fileLinkDisposable = term.registerLinkProvider(createTerminalFileLinkProvider(
+      term,
+      () => {
+        const current = sessionRef.current
+        return {
+          sessionId: current.id,
+          root: current.workspace_root || current.cwd,
+          cwd: current.cwd,
+        }
+      },
+      (sessionId, path, pasteImage) => pasteImage
+        ? pasteFileBrowserPath(sessionId, path)
+        : fileBrowserPath(sessionId, path),
+      (sessionId, path, pasteImage) => navigate(pasteImage
+        ? pasteFileBrowserPath(sessionId, path)
+        : fileBrowserPath(sessionId, path)),
+    ))
     // Load after open so the addon can observe wheel/touch intent on
     // terminal.element as well as parser-level output sequences.
     const scrollAnchor = new ScrollAnchorAddon()
@@ -1398,24 +1416,6 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
-    const disposeImeResidueGuard = attachImeResidueGuard(term)
-    const fileLinkDisposable = term.registerLinkProvider(createTerminalFileLinkProvider(
-      term,
-      () => {
-        const current = sessionRef.current
-        return {
-          sessionId: current.id,
-          root: current.workspace_root || current.cwd,
-          cwd: current.cwd,
-        }
-      },
-      (sessionId, path, pasteImage) => pasteImage
-        ? pasteFileBrowserPath(sessionId, path)
-        : fileBrowserPath(sessionId, path),
-      (sessionId, path, pasteImage) => navigate(pasteImage
-        ? pasteFileBrowserPath(sessionId, path)
-        : fileBrowserPath(sessionId, path)),
-    ))
     loadWebglRenderer(term)
     // Fit like the real terminal: measureTerminalFit reserves the mobile
     // control bar's height (rounding rows up so one row tucks behind the

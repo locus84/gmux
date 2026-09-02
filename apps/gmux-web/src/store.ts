@@ -524,6 +524,8 @@ export const peerAppearance = computed<ReadonlyMap<string, PeerAppearance>>(() =
 const terminalOptionsBase = signal<ResolvedTerminalOptions | null>(null)
 export const keybinds = signal<ResolvedKeybind[] | null>(null)
 export const macCommandIsCtrl = signal(false)
+export const vsCodeServerUrl = signal('')
+export const vsCodeServerHomeDir = signal('')
 
 export const UI_SCALE_MIN = 0.7
 export const UI_SCALE_MAX = 2
@@ -2503,6 +2505,8 @@ export function initStore(): () => void {
       terminalOptionsBase.value = buildTerminalOptions(null, null)
       applyConfiguredUiScale(resolveUiScale(null))
       keybinds.value = resolveKeybinds(null, false)
+      vsCodeServerUrl.value = ''
+      vsCodeServerHomeDir.value = ''
     })
     const activeIds = MOCK_SESSIONS.filter(s => s.mockActive).map(s => s.id)
     activeIds.forEach(id => { handleActivity(id) })
@@ -2523,6 +2527,8 @@ export function initStore(): () => void {
       applyConfiguredUiScale(resolveUiScale(fc.settings))
       macCommandIsCtrl.value = macCtrl
       keybinds.value = resolveKeybinds(fc.settings?.keybinds ?? null, macCtrl)
+      vsCodeServerUrl.value = (fc.settings?.vsCodeServerUrl ?? '').trim()
+      vsCodeServerHomeDir.value = (fc.settings?.vsCodeServerHomeDir ?? '').trim()
     })
   })
 
