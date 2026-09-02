@@ -133,6 +133,7 @@ func TestIsValidSessionID(t *testing.T) {
 		"1uml07gq",
 		"19af1jz5",
 		"1spbhw3s",
+		"sess-0e456a30", // imported gmux 1.x identity
 	}
 	for _, id := range valid {
 		if !IsValidSessionID(id) {
@@ -142,16 +143,19 @@ func TestIsValidSessionID(t *testing.T) {
 
 	invalid := []string{
 		"",
-		"abcdefg",     // too short
-		"abcdefghi",   // too long
-		"ABC12345",    // uppercase
-		"abcd-123",    // punctuation
-		"../abcd1efg", // leading traversal
-		"abcd1efg/b",  // separator
-		`abcd1efg\b`,  // backslash separator
-		"abcd1efg::b", // folder-key separator
-		"abcd1efg b",  // space
-		"abcd1efg\n",  // newline
+		"abcdefg",        // too short
+		"abcdefghi",      // too long
+		"ABC12345",       // uppercase
+		"abcd-123",       // punctuation
+		"../abcd1efg",    // leading traversal
+		"abcd1efg/b",     // separator
+		`abcd1efg\b`,     // backslash separator
+		"abcd1efg::b",    // folder-key separator
+		"abcd1efg b",     // space
+		"abcd1efg\n",     // newline
+		"sess-0e456a3",   // short legacy id
+		"sess-0e456a3z",  // non-hex legacy id
+		"sess-../456a30", // traversal-shaped legacy id
 	}
 	for _, id := range invalid {
 		if IsValidSessionID(id) {

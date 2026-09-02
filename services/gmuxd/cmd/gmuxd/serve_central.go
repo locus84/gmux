@@ -31,6 +31,7 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/devcontainers"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/discovery"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/identity"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/legacyimport"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/netauth"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/nodeid"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/ntfy"
@@ -223,10 +224,37 @@ func serveCentral(stderr io.Writer, replace bool) int {
 		defer bounded.Stop()
 	}
 
-	// Conversation discovery (convIndex.StartSnapshot below, after the source
-	// watchers start) is deferred until listeners are about to bind: it reads
-	// and parses the complete on-disk history — tens of seconds on large
-	// corpora — and must block neither takeover ordering nor first requests.
+	// Conversation discovery normally stays deferred until listeners are about
+	// to bind. A one-time v1 import is the exception: project slots use legacy
+	// conversation slugs, so the complete index must exist before the atomic
+	// SQLite import can resolve them.
+	conversationSnapshotPrimed := false
+	if eligible, checkErr := storeHandle.LegacyImportEligible(context.Background()); checkErr != nil {
+		_, _ = fmt.Fprintf(stderr, "gmuxd: check legacy import eligibility: %v\n", checkErr)
+		return 1
+	} else if eligible {
+		exists, existsErr := legacyimport.Exists(stateDir)
+		if existsErr != nil {
+			_, _ = fmt.Fprintf(stderr, "gmuxd: inspect legacy state: %v\n", existsErr)
+			return 1
+		}
+		if exists {
+			started := time.Now()
+			convIndex.Snapshot()
+			conversationSnapshotPrimed = true
+			input, report, loadErr := legacyimport.Load(stateDir, convIndex.All())
+			if loadErr != nil {
+				_, _ = fmt.Fprintf(stderr, "gmuxd: load legacy state: %v\n", loadErr)
+				return 1
+			}
+			result, importErr := storeHandle.ImportLegacy(context.Background(), input, centralstore.UnixMillis(time.Now().UnixMilli()))
+			if importErr != nil {
+				_, _ = fmt.Fprintf(stderr, "gmuxd: import legacy state: %v\n", importErr)
+				return 1
+			}
+			log.Printf("legacy import: restored %d sessions, %d projects, %d placements, and %d manual peers (%d from metadata, %d from conversations, %d stale slots skipped) in %s", result.Sessions, result.Projects, result.Placements, result.Peers, report.MetaSessions, report.ConversationSessions, report.UnresolvedSlots, time.Since(started).Round(time.Millisecond))
+		}
+	}
 
 	var peerManager *peering.Manager
 	var tsListener *tsauth.Listener
@@ -1090,13 +1118,15 @@ func serveCentral(stderr io.Writer, replace bool) int {
 	// last-known-good, #508 — this index never writes the store) and gain
 	// resume commands progressively: each adapter completion re-marks the
 	// composer dirty so subscribers see the enrichment without reconnecting.
-	convIndexStarted := time.Now()
-	convIndex.StartSnapshot(daemonCtx, conversations.DefaultSnapshotWorkers, func(string) {
-		boot.Composer.MarkDirty(true, false)
-	}, func() {
-		log.Printf("conversations: indexed %d conversations in %s", convIndex.Count(), time.Since(convIndexStarted).Round(time.Millisecond))
-		boot.Composer.MarkDirty(true, false)
-	})
+	if !conversationSnapshotPrimed {
+		convIndexStarted := time.Now()
+		convIndex.StartSnapshot(daemonCtx, conversations.DefaultSnapshotWorkers, func(string) {
+			boot.Composer.MarkDirty(true, false)
+		}, func() {
+			log.Printf("conversations: indexed %d conversations in %s", convIndex.Count(), time.Since(convIndexStarted).Round(time.Millisecond))
+			boot.Composer.MarkDirty(true, false)
+		})
+	}
 
 	authedHandler := netauth.Middleware(authToken, commonMux)
 	tcpLn, err := net.Listen("tcp", tcpAddr)

@@ -2,7 +2,7 @@
 
 This package implements the authoritative SQLite store for daemon-owned state described by ADR 0026. Production opens it during gmuxd bootstrap and uses it through the singleton `sessioncoord.Coordinator`; the central snapshot composer and wire converter query it for REST and SSE projections.
 
-SQLite owns durable local session rows, project definitions and rules, placement/order, and manual peers. It does not own live runner liveness, peer snapshots, adapter transcripts, or scrollback bytes:
+SQLite owns durable local session rows, project definitions and rules, placement/order, and manual peers. A guarded bootstrap importer may populate an otherwise empty store from retired 1.x files; the complete import and marker commit in one transaction and never overwrite v2-authored state. SQLite does not own live runner liveness, peer snapshots, adapter transcripts, or scrollback bytes:
 
 - `sessioncoord.Registry` provides the runtime liveness/generation overlay.
 - live runners supply runner-authoritative common facts through registration and observation;

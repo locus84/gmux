@@ -5,14 +5,14 @@ tableOfContents:
   maxHeadingLevel: 3
 ---
 
-gmux 2.0 is a breaking release. It starts with a clean SQLite state store; it does **not** import 1.x projects, peers, or dead-session metadata. The CLI tells you the new form of removed commands. This page lists every breaking change and the required migration steps.
+gmux 2.0 is a breaking release. On first startup, this distribution imports 1.x local projects, project-tracked session history, manual peers, and dead-session metadata when the SQLite store is empty. The import is atomic and never overwrites existing v2 state; legacy files and scrollback are retained. The CLI tells you the new form of removed commands. This page lists every other breaking change and the required migration steps.
 
 **The short version:**
 
 1. Upgrade every machine (and rebuild devcontainers) **together** — 2.0 hosts can't peer with 1.x hosts.
 2. Update scripts and muscle memory to the verb-first CLI: `gmux -- <cmd>` to run, `gmux open` for the UI, `gmux ls/attach/send/wait/kill` instead of flags.
 3. Re-add each remote host with its connect URL (**Settings → Hosts → Connect to host**, using `gmux auth` on that host), then add the projects you want under **Settings → Projects → From other hosts**.
-4. Recreate local projects. Restart any sessions that were running under 1.x — they, along with dead history, project order, references, and connected hosts, do not carry over.
+4. Verify the one-time local-state import, then restart any sessions that were running under 1.x. Durable history, project order/references, and manual hosts carry over; live 1.x runner processes do not.
 5. If you parse gmux JSON: `kind` → `adapter`, `session_file` → `conversation_file`.
 
 ---
@@ -87,7 +87,7 @@ Before, passing the Tailscale allow list granted the full API. Now tailnet ident
 
 Before, gmux machines on your tailnet appeared as hosts automatically. Now peers are explicit: run `gmux auth` on the host, paste its connect URL into **Settings → Hosts → Connect to host**.
 
-There is no host/reference importer. On first 2.0 start, the daemon creates a clean SQLite database (`state.db`) and ignores the old discovery cache and JSON state. Re-add every wanted host with **Connect to host**, then add its projects under **Settings → Projects → From other hosts**. Recreate local projects as well.
+On first v2 startup with an empty SQLite store, the daemon atomically imports manually connected hosts and project references from the 1.x state alongside local projects and history. Runtime-discovered hosts were never durable and must be re-added explicitly with **Connect to host**. If v2 state already exists, the importer refuses to overwrite it.
 
 ### Removed `host.toml` keys
 

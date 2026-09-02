@@ -9,12 +9,12 @@ import (
 	"strings"
 )
 
-// sessionIDRe matches the fixed-width lowercase base36 shape minted by
-// cli/gmux/internal/naming.SessionID. This tight allowlist keeps an
-// attacker-influenced ID from carrying path separators or ".." into
-// filepath.Join. The mint additionally guarantees a digit for readability;
-// validation intentionally checks the wire/path shape, not mint provenance.
-var sessionIDRe = regexp.MustCompile(`^[0-9a-z]{8}$`)
+// sessionIDRe matches both the fixed-width lowercase base36 shape minted by
+// current gmux and the sess-xxxxxxxx hex shape minted by gmux 1.x. The legacy
+// arm is retained so imported session metadata and scrollback remain safely
+// addressable after migration. This tight allowlist keeps attacker-influenced
+// IDs from carrying path separators or ".." into filepath.Join.
+var sessionIDRe = regexp.MustCompile(`^(?:[0-9a-z]{8}|sess-[0-9a-f]{8})$`)
 
 // IsValidSessionID reports whether id is a well-formed local session
 // ID safe to use as a path segment under SessionsDir.

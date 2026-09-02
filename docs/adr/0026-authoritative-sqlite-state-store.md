@@ -21,7 +21,9 @@ This split has repeatedly produced lifecycle seams. A representative bug is a de
 
 ADR 0012 rejected SQLite because the then-motivating project-attribution bugs had been fixed without a relational store, and a migration would have bought mostly structural tidiness. The motivation is now different: the in-memory map and several independently persisted representations cannot provide one authoritative state transition across session lifecycle, project membership, and peer configuration. Fixing each missed write preserves the underlying failure mode.
 
-The 2.0 rewrite permits a clean state start; importing the existing JSON and per-session metadata is not required.
+The 2.0 rewrite permits a clean state start; upstream does not require importing existing JSON and per-session metadata.
+
+**Local migration amendment (2026-09-02):** this distribution preserves an existing 1.x workspace on first v2 startup. When, and only when, SQLite contains no sessions, project entries, or manual peers and no completed-import marker, gmuxd reads the retired project/session/peer files, resolves project-tracked adapter conversations, and commits sessions, catalog, placements, peers, and a completion marker in one SQLite transaction. A non-empty v2 store is never overwritten. Legacy files and scrollback remain untouched; legacy session IDs remain accepted by the bounded path validator so their scrollback stays addressable. Parse, validation, or commit failure aborts startup rather than publishing a partial/empty world.
 
 ## Decision
 
@@ -189,7 +191,7 @@ Manual-peer rows are likewise durable authority while the peering manager is an 
 
 ### 10. Migrations and failure behavior
 
-SQL migrations are immutable, reviewed source files embedded into gmuxd and applied by Goose before state-serving startup. They are the schema history and sqlc schema input. sqlc is pinned through Go's module-managed tool mechanism; CI regenerates queries and fails on a diff. The migration floor is the first 2.0 SQLite schema—existing JSON state is intentionally outside the upgrade graph. CI migrates fresh and every released SQLite schema fixture and verifies foreign keys.
+SQL migrations are immutable, reviewed source files embedded into gmuxd and applied by Goose before state-serving startup. They are the schema history and sqlc schema input. sqlc is pinned through Go's module-managed tool mechanism; CI regenerates queries and fails on a diff. The migration floor is the first 2.0 SQLite schema. Existing JSON state is outside the SQL schema-migration graph; the local amendment above handles it as a guarded, one-time bootstrap import into an otherwise empty store. CI migrates fresh and every released SQLite schema fixture and verifies foreign keys.
 
 A database open, integrity, or migration failure stops normal daemon startup. gmuxd never silently creates replacement state, falls back to JSON, or publishes an empty world after such a failure. The database, WAL, and SHM files are preserved for diagnosis.
 
@@ -253,5 +255,5 @@ The cutover uses endpoint-sized tracer bullets rather than horizontal “session
 6. Move conversation takeover and bounded adapter reconciliation, applying external decisions conditionally and protecting live/changed rows.
 7. Move project editing, ordering, references, and the Local-peer exception after hierarchy scope invariants are executable.
 8. Move manual peers/tokens and idempotent runtime peering reconciliation while preserving peer-owned ephemeral projections.
-9. Remove the superseded in-memory/JSON authorities only after every production read/write route uses the domain interface. Add state check/backup/export, restore and failure drills, race/stress tests, and full release size/build measurements before enabling the new path by default. Do not add an old-state importer.
+9. Remove the superseded in-memory/JSON authorities only after every production read/write route uses the domain interface. Add state check/backup/export, restore and failure drills, race/stress tests, and full release size/build measurements before enabling the new path by default. Upstream ships without an importer; this distribution's guarded importer is documented in the local amendment above.
 10. Add dynamic CWD/workspace reporting and reassignment as a separate follow-up after the storage cutover.
