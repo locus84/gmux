@@ -17,7 +17,13 @@ Variables that affect the daemon.
 | `XDG_STATE_HOME` | Base directory for runtime state (socket, auth token). | `~/.local/state` |
 | `GMUXD_TS_HOSTNAME` | Seed the requested Tailscale node name at *first* registration (advanced/multi-instance setups); ignored once registered. | `gmux-<hostname>` |
 | `GMUXD_DEV_PROXY` | Proxy frontend requests to a Vite dev server (development only). | *(none)* |
+| `GMUXD_WEB_DIR` | Serve built frontend assets from a directory instead of the embedded build. Overrides `web_dir`. | *(embedded)* |
 
+### External frontend assets
+
+Set `GMUXD_WEB_DIR` to test or deploy a web build without replacing the daemon binary. The directory must contain `index.html`. `GMUXD_DEV_PROXY` takes precedence when both are set.
+
+For a persistent local install, prefer the `web_dir` field in [`host.toml`](/reference/host-toml/) and update it with `./scripts/install-web.sh`.
 
 ### Bind address
 

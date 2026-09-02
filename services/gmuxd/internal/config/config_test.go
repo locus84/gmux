@@ -39,6 +39,7 @@ func TestLoadFromFile(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	writeConfig(t, dir, `
 port = 9999
+web_dir = "~/.local/state/gmux/web"
 
 [agent]
 max_subagents_by_depth = [64, 12]
@@ -54,6 +55,9 @@ allow = ["alice@github", "bob@github"]
 	}
 	if cfg.Port != 9999 {
 		t.Errorf("port = %d, want 9999", cfg.Port)
+	}
+	if cfg.WebDir != "~/.local/state/gmux/web" {
+		t.Errorf("web_dir = %q", cfg.WebDir)
 	}
 	if got := fmt.Sprint(cfg.Agent.MaxSubagentsByDepth.Values); got != "[64 12]" {
 		t.Errorf("max_subagents_by_depth = %v, want [64 12]", cfg.Agent.MaxSubagentsByDepth.Values)

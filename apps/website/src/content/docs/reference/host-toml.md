@@ -16,6 +16,9 @@ Daemon behavior. gmuxd reads this file once at startup. Create or edit it manual
 # Default: 8790
 port = 8790
 
+# Optional frontend build directory. The directory must contain index.html.
+# web_dir = "~/.local/state/gmux/web"
+
 # Semantic-agent policy for this host.
 [agent]
 # Per behavioral root, cap live semantic agents at each descendant depth.
@@ -61,6 +64,9 @@ There is **no `[[peers]]` config**. Add a host you want to aggregate sessions fr
 | Field | Type | Default | Range | Description |
 |-------|------|---------|-------|-------------|
 | `port` | `number` | `8790` | 1–65535 | TCP port for the HTTP listener. |
+| `web_dir` | `string` | *(embedded)* | Existing directory containing `index.html` | Serve frontend assets from a local build. `GMUXD_WEB_DIR` and `GMUXD_DEV_PROXY` override it. |
+
+Use `./scripts/install-web.sh` to atomically update the configured directory without replacing or restarting the daemon.
 
 ### `[agent]`
 

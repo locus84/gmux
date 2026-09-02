@@ -988,7 +988,7 @@ func serveCentral(stderr io.Writer, replace bool) int {
 				}
 			}
 		})
-		mux.Handle("/", spaHandler())
+		mux.Handle("/", spaHandler(cfg.WebDir))
 	}
 	registerCommon(commonMux, false)
 	registerCommon(unixMux, true)
