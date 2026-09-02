@@ -3293,24 +3293,25 @@ body {
 .mp-configured-rest {
   color: var(--text-muted);
 }
+.mp-configured-notify,
 .mp-configured-remove {
   background: none;
   border: none;
   color: var(--text-muted);
-  font-size: 18px;
   line-height: 1;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 4px;
-  opacity: 0;
   flex-shrink: 0;
   transition: opacity 0.1s, color 0.1s, background 0.1s;
 }
+.mp-configured-notify { min-width: 40px; min-height: 40px; font-size: 16px; opacity: .8; }
+.mp-configured-notify.active { color: var(--accent); opacity: 1; }
+.mp-configured-notify:disabled { opacity: .45; cursor: wait; }
+.mp-configured-remove { min-width: 40px; min-height: 40px; font-size: 18px; opacity: 0; }
 .mp-configured-row:hover .mp-configured-remove { opacity: 1; }
-.mp-configured-remove:hover {
-  color: var(--text);
-  background: var(--bg-active);
-}
+.mp-configured-notify:hover,
+.mp-configured-remove:hover { color: var(--text); background: var(--bg-active); }
 @media (hover: none) {
   .mp-configured-remove { opacity: 1; }
 }

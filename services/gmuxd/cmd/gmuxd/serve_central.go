@@ -37,6 +37,7 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/peering"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/presence"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/projects"
+	pushpkg "github.com/gmuxapp/gmux/services/gmuxd/internal/push"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionmeta"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sleep"
@@ -360,6 +361,13 @@ func serveCentral(stderr io.Writer, replace bool) int {
 	}
 	defer cancelNotify()
 	notifier = newCentralNotifyRouter(presenceTable, defaultNotifyConfig())
+	pushManager, pushErr := pushpkg.Open(stateDir)
+	if pushErr != nil {
+		log.Printf("push: disabled: %v", pushErr)
+	} else {
+		notifier.push = pushManager
+		notifier.store = boot.Store
+	}
 	if cfg.Notifications.Ntfy.Enabled {
 		hostname, _ := os.Hostname()
 		ntfyCfg := cfg.Notifications.Ntfy
@@ -388,6 +396,7 @@ func serveCentral(stderr io.Writer, replace bool) int {
 	commonMux := http.NewServeMux()
 	unixMux := http.NewServeMux()
 	registerCommon := func(mux *http.ServeMux, unixOnly bool) {
+		registerPushRoutes(mux, pushManager, boot.Store)
 		mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
 			// Store-direct read (ADR 0026 §2a): render from SQLite so
 			// session counts are always fresh. Subsumes the

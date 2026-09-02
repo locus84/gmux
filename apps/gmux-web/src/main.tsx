@@ -83,6 +83,12 @@ if (USE_MOCK) {
 // watcher is pointless there and would risk masking real bugs.
 if (!USE_MOCK) installVersionWatch()
 
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.warn('service worker registration failed:', err))
+  })
+}
+
 // Disable pinch-to-zoom app-wide. This is a terminal, not a document;
 // page zoom only breaks the layout. iOS Safari ignores user-scalable=no
 // and touch-action for *page* pinch, so the only reliable lever is
@@ -832,6 +838,11 @@ function App() {
       urlHash.value = location.hash
     })
   }, [loc.url])
+
+  useEffect(() => {
+    const sessionId = new URLSearchParams(urlSearch.value).get('notificationSession')
+    if (sessionId) navigateToSession(sessionId, true)
+  }, [loc.url, sessions.value, projects.value])
 
   // Preact-iso routes path/query changes but deliberately ignores hash-only
   // navigation. Keep the fragment signal current for native hash links and

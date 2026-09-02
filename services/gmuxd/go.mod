@@ -2,21 +2,20 @@ module github.com/gmuxapp/gmux/services/gmuxd
 
 go 1.26.1
 
-toolchain go1.26.1
-
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/pressly/goose/v3 v3.27.2
 	github.com/tidwall/jsonc v0.3.3
-	nhooyr.io/websocket v1.8.17
 	modernc.org/sqlite v1.53.0
+	nhooyr.io/websocket v1.8.17
 	tailscale.com v1.96.1
 )
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/SherClockHolmes/webpush-go v1.4.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/aws/aws-sdk-go-v2 v1.41.0 // indirect
@@ -40,6 +39,7 @@ require (
 	github.com/gaissmai/bart v0.26.1 // indirect
 	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect

@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/ntfy"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/presence"
+	pushpkg "github.com/gmuxapp/gmux/services/gmuxd/internal/push"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
 	"nhooyr.io/websocket"
 )
@@ -74,6 +76,8 @@ type centralNotifyRouter struct {
 	presence *presence.Table
 	config   notifyConfig
 	external externalNotifier
+	push     *pushpkg.Manager
+	store    *centralstore.Store
 
 	// deliveryMu linearizes a timer's complete pending→active→send transition
 	// with cancellation. Without it, cancellation can observe the gap after a
@@ -278,14 +282,21 @@ func (r *centralNotifyRouter) firePending(sessionID string) {
 	delete(r.pending, sessionID)
 	pendingCount := len(r.pending) + 1
 	if pendingCount >= 3 {
-		count := 1
+		pendings := []*pendingCentralNotif{p}
 		for sid, other := range r.pending {
 			other.timer.Stop()
 			delete(r.pending, sid)
-			count++
+			pendings = append(pendings, other)
 		}
 		r.mu.Unlock()
-		r.fireCoalesced(count)
+		r.fireCoalesced(len(pendings))
+		if r.push != nil && r.store != nil {
+			for _, pending := range pendings {
+				if !r.presence.AnyViewing(pending.sessionID) {
+					r.sendWebPush(pending)
+				}
+			}
+		}
 		return
 	}
 	r.mu.Unlock()
@@ -294,6 +305,9 @@ func (r *centralNotifyRouter) firePending(sessionID string) {
 	}
 	if r.presence.AnyViewing(sessionID) {
 		return
+	}
+	if r.push != nil && r.store != nil {
+		r.sendWebPush(p)
 	}
 	if r.external != nil {
 		kind := ntfy.KindUnread
@@ -317,6 +331,34 @@ func (r *centralNotifyRouter) firePending(sessionID string) {
 		delete(r.active, p.notifID)
 		r.mu.Unlock()
 	})
+}
+
+func (r *centralNotifyRouter) sendWebPush(p *pendingCentralNotif) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := r.store.ReadSnapshot(ctx, centralstore.SnapshotQuery{IncludeSessions: true})
+	if err != nil {
+		log.Printf("push: resolve project: %v", err)
+		return
+	}
+	projectSlug := ""
+	for _, session := range snapshot.Sessions {
+		if string(session.ID) == p.sessionID && session.Placement != nil {
+			projectSlug = session.Placement.ProjectSlug
+			break
+		}
+	}
+	if projectSlug == "" {
+		return
+	}
+	payload, err := json.Marshal(pushpkg.Payload{
+		ID: p.notifID, SessionID: p.sessionID, Title: p.title, Body: p.body,
+		Tag: p.sessionID, URL: "/?notificationSession=" + p.sessionID,
+	})
+	if err != nil {
+		return
+	}
+	r.push.Send(context.Background(), projectSlug, payload)
 }
 
 func (r *centralNotifyRouter) fireCoalesced(count int) {
