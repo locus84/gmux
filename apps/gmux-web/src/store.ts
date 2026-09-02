@@ -13,7 +13,14 @@
  * Call `initStore()` once from the app root to start SSE, fetch data, etc.
  */
 
-import type { Session as ProtocolSession } from '@gmux/protocol'
+import {
+  CreateProjectWorktreeResponseSchema,
+  ProjectWorktreesResponseSchema,
+  RemoveProjectWorktreeResponseSchema,
+  type ProjectWorktrees,
+  type Session as ProtocolSession,
+  type Worktree,
+} from '@gmux/protocol'
 import { batch, computed, effect, signal, untracked } from '@preact/signals'
 import { buildTerminalOptions, fetchFrontendConfig, type ResolvedKeybind, resolveKeybinds } from './config'
 import {
@@ -102,6 +109,69 @@ export const _rawWorld = signal<RawWorld>({
 /** Merge a partial world update into `_rawWorld`. Used by SSE handlers,
  * bulk-fetch responses, and tests; callers don't have to spread the
  * whole bundle every time. */
+export interface ProjectWorktreeInventoryState {
+  data?: ProjectWorktrees
+  loading: boolean
+  error?: string
+}
+
+/** Fetched on demand because checkout inventories are filesystem data, not durable app state. */
+export const projectWorktreeInventories = signal<Record<string, ProjectWorktreeInventoryState>>({})
+const projectWorktreeInventoryRequests = new Map<string, number>()
+
+export function projectWorktreeInventoryKey(slug: string, peer?: string): string {
+  return `${peer ?? ''}::${slug}`
+}
+
+function projectWorktreeURL(slug: string, peer?: string): string {
+  const prefix = peer ? `/v1/peers/${encodeURIComponent(peer)}` : ''
+  return `${prefix}/v1/projects/${encodeURIComponent(slug)}/worktrees`
+}
+
+export async function ensureProjectWorktrees(slug: string, peer?: string, force = false): Promise<void> {
+  const key = projectWorktreeInventoryKey(slug, peer)
+  const current = projectWorktreeInventories.value[key]
+  if (!force && (current?.loading || current?.data)) return
+  const requestId = (projectWorktreeInventoryRequests.get(key) ?? 0) + 1
+  projectWorktreeInventoryRequests.set(key, requestId)
+  projectWorktreeInventories.value = { ...projectWorktreeInventories.value, [key]: { ...current, loading: true, error: undefined } }
+  try {
+    const resp = await fetch(projectWorktreeURL(slug, peer))
+    const body = await resp.json()
+    if (!resp.ok) throw new Error(body?.error?.message || `request failed (${resp.status})`)
+    const parsed = ProjectWorktreesResponseSchema.parse(body)
+    if (!parsed.ok) throw new Error(parsed.error.message)
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
+    projectWorktreeInventories.value = { ...projectWorktreeInventories.value, [key]: { data: parsed.data, loading: false } }
+  } catch (err) {
+    if (projectWorktreeInventoryRequests.get(key) !== requestId) return
+    projectWorktreeInventories.value = { ...projectWorktreeInventories.value, [key]: { data: current?.data, loading: false, error: err instanceof Error ? err.message : String(err) } }
+  }
+}
+
+export async function createProjectWorktree(slug: string, branch: string, base = 'HEAD', peer?: string): Promise<Worktree> {
+  const resp = await fetch(projectWorktreeURL(slug, peer), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ branch, base }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  const parsed = CreateProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
+  return parsed.data.worktree
+}
+
+export async function removeProjectWorktree(slug: string, path: string, peer?: string): Promise<void> {
+  const resp = await fetch(projectWorktreeURL(slug, peer), {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }),
+  })
+  const body = await resp.json().catch(() => undefined)
+  if (!resp.ok) throw new Error(body?.error?.message || `request failed (${resp.status})`)
+  const parsed = RemoveProjectWorktreeResponseSchema.parse(body)
+  if (!parsed.ok) throw new Error(parsed.error.message)
+  await ensureProjectWorktrees(slug, peer, true)
+}
+
 export function _setRawWorld(patch: Partial<RawWorld>) {
   _rawWorld.value = { ..._rawWorld.value, ...patch }
 }

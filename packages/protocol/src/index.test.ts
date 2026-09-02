@@ -4,6 +4,7 @@ import {
   SessionSchema,
   successEnvelope,
   SessionStatusSchema,
+  ProjectWorktreesResponseSchema,
 } from './index.js'
 
 describe('protocol schemas', () => {
@@ -69,6 +70,18 @@ describe('protocol schemas', () => {
       id: '1vshk4fu',
     })
     expect(event.type).toBe('session-remove')
+  })
+
+  it('parses project worktree inventories', () => {
+    const parsed = ProjectWorktreesResponseSchema.parse({
+      ok: true,
+      data: {
+        project_slug: 'gmux',
+        primary_path: '/repo',
+        worktrees: [{ path: '/repo', branch: 'main', primary: true }],
+      },
+    })
+    expect(parsed.ok && parsed.data.worktrees[0].branch).toBe('main')
   })
 
   it('builds typed success envelopes', () => {

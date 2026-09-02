@@ -4601,3 +4601,37 @@ body {
 .file-image-preview { display: block; max-width: none; max-height: none; border-radius: 10px; user-select: none; -webkit-user-select: none; }
 .file-error { margin: 24px 16px; padding: 18px; border: 1px solid var(--border); border-radius: 12px; text-align: center; }
 .file-toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 18px); transform: translateX(-50%); z-index: 1110; padding: 8px 12px; border-radius: 999px; background: var(--accent); color: var(--bg); font-size: 12px; font-weight: 700; }
+
+/* Project worktree manager — a touch-first bottom sheet that leaves xterm mounted. */
+.launch-inline-footer { color: var(--accent); }
+.worktree-sheet { box-sizing: border-box; width: min(560px, calc(100vw - 24px)); max-height: min(720px, calc(var(--app-height, 100vh) - 24px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 16px; background: var(--bg-surface); color: var(--text); box-shadow: 0 18px 60px rgb(0 0 0 / .35); }
+.worktree-sheet-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border); }
+.worktree-sheet h2, .worktree-sheet h3, .worktree-sheet p { margin: 0; }
+.worktree-sheet h2 { font-size: 17px; }
+.worktree-sheet-header p { margin-top: 3px; color: var(--text-muted); font-size: 12px; }
+.worktree-close, .worktree-remove { min-width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--text-secondary); }
+.worktree-close { font-size: 24px; }
+.worktree-list { min-height: 80px; overflow: auto; padding: 8px; }
+.worktree-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.worktree-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.worktree-row-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.worktree-row-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.worktree-row-main small { color: var(--accent); }
+.worktree-launch .launch-btn { min-width: 44px; min-height: 44px; }
+.worktree-remove { padding: 0 8px; font-size: 12px; }
+.worktree-remove.confirm { background: var(--danger, #b54141); color: white; }
+.worktree-create { display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 10px; padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
+.worktree-create h3, .worktree-create .worktree-error { grid-column: 1 / -1; }
+.worktree-create h3 { font-size: 13px; }
+.worktree-create label { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 11px; }
+.worktree-create input { box-sizing: border-box; min-width: 0; width: 100%; min-height: 44px; padding: 0 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); color: var(--text); font: inherit; }
+.worktree-create button[type="submit"] { min-height: 44px; padding: 0 14px; border: 0; border-radius: 9px; background: var(--accent); color: var(--bg); font-weight: 700; }
+.worktree-create button:disabled { opacity: .5; }
+.worktree-state, .worktree-error { padding: 12px; color: var(--text-muted); font-size: 12px; }
+.worktree-error { color: var(--danger, #d66767); }
+@media (max-width: 520px) {
+  .worktree-sheet { width: 100vw; max-height: calc(var(--app-height, 100vh) - 8px); border-radius: 16px 16px 0 0; }
+  .action-sheet-backdrop:has(.worktree-sheet) { align-items: flex-end; }
+  .worktree-create { grid-template-columns: 1fr; }
+  .worktree-create h3, .worktree-create .worktree-error { grid-column: auto; }
+}

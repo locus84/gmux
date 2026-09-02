@@ -115,6 +115,7 @@ export function computeMenuPos(
 interface LaunchButtonProps {
   className?: string
   onLaunch?: () => void
+  footerAction?: { label: string; onSelect: () => void }
   /** Async action to run before the launch request (e.g. seed a project). */
   beforeLaunch?: () => Promise<void>
   /** Working directory for the new session (the project's canonical dir). */
@@ -123,7 +124,7 @@ interface LaunchButtonProps {
   peer?: string
 }
 
-export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer }: LaunchButtonProps) {
+export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, cwd, peer }: LaunchButtonProps) {
   const target = useMemo((): LaunchTarget => ({ peer, cwd: cwd || '' }), [peer, cwd])
 
   const showTarget = target.cwd !== ''
@@ -201,7 +202,7 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer }: L
     return () => document.removeEventListener('keydown', handler)
   }, [state])
 
-  const isOpen = state === 'open' && hasLaunchers
+  const isOpen = state === 'open' && (hasLaunchers || !!footerAction)
   const isLoading = state === 'launching'
 
   let defLauncher: LauncherDef | undefined
@@ -266,6 +267,17 @@ export function LaunchButton({ className, onLaunch, beforeLaunch, cwd, peer }: L
               {l.label}
             </button>
           ))}
+          {footerAction && (
+            <>
+              {(defLauncher || others.length > 0) && <div class="launch-inline-divider" />}
+              <button
+                class="launch-inline-item launch-inline-footer"
+                onClick={(e) => { e.stopPropagation(); setState('idle'); footerAction.onSelect() }}
+              >
+                {footerAction.label}
+              </button>
+            </>
+          )}
         </div>,
         document.body,
       )}

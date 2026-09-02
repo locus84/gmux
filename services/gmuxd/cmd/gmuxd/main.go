@@ -702,6 +702,13 @@ func isAllowedPeerProxyPath(method, sub string) bool {
 		parts[2] != "" && parts[3] == "sessions" {
 		return true
 	}
+	// Read and manage linked worktrees on the daemon that owns the project filesystem.
+	if (method == http.MethodGet || method == http.MethodPost || method == http.MethodDelete) &&
+		len(parts) == 4 &&
+		parts[0] == "v1" && parts[1] == "projects" &&
+		parts[2] != "" && parts[3] == "worktrees" {
+		return true
+	}
 	// Create a project on a peer: POST v1/projects/add.
 	// The frontend uses this to add a project on the peer's own
 	// durable catalog from the Manage Projects modal (Discovered

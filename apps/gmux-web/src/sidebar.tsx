@@ -13,6 +13,7 @@ import { familyDrawerRoot } from './family-drawer-state'
 import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
 import { reorderKeysForFolder } from './projects'
 import { LaunchButton } from './launcher'
+import { WorktreeSheet } from './worktree-sheet'
 import { useArrivalPulse } from './use-arrival-pulse'
 import {
   folders, familySelectedId, sessions,
@@ -452,6 +453,7 @@ function FolderGroup({
   onClick?: () => void
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
+  const [worktreesOpen, setWorktreesOpen] = useState(false)
   // Snapshot-wide family derivations, read once per folder render. All
   // three are O(n) maps built once per session-list identity in the
   // store, so a folder's rows stay O(rows) lookups.
@@ -563,6 +565,7 @@ function FolderGroup({
             cwd={folder.launchCwd ?? ''}
             peer={folder.peer}
             className="folder-launch-btn"
+            footerAction={{ label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }}
           />
         )}
       </div>
@@ -618,6 +621,7 @@ function FolderGroup({
         })}
       </div>
       )}
+      {worktreesOpen && <WorktreeSheet slug={folder.slug} peer={folder.peer} onClose={() => setWorktreesOpen(false)} />}
     </div>
   )
 }
