@@ -22,6 +22,7 @@ import {
   keyComboToSequence,
   type ResolvedKeybind,
 } from './config'
+import { shouldBlockMobileWebKitImeKey } from './mobile-input'
 import { selectionToText } from './selection'
 import { terminalFindOpen } from './store'
 
@@ -136,6 +137,12 @@ export function attachKeyboardHandler(
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): void {
   term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    // iPadOS Korean IME can leak compatibility jamo through xterm's keydown
+    // path. Block xterm processing while leaving the native IME event intact.
+    if (ev.type === 'keydown' && shouldBlockMobileWebKitImeKey(ev)) {
+      return false
+    }
+
     // Mobile Enter → newline (not submit).
     // Bare Enter with no modifiers on a touch device sends \n so the user
     // can compose multi-line messages. The mobile toolbar send button sends

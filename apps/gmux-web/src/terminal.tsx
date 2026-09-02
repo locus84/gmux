@@ -9,7 +9,11 @@ import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, handlePasteAction, type PasteDestination } from './keyboard'
 import { LinkActionSheet } from './link-action-sheet'
 import { createLongPressRecognizer } from './long-press'
-import { attachMobileInputHandler } from './mobile-input'
+import {
+  attachMobileInputHandler,
+  flushMobileWebKitImePending,
+  shouldSkipMobileWebKitImeData,
+} from './mobile-input'
 import { MOCK_BY_ID } from './mock-data/index'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { createReplayBuffer } from './replay'
@@ -29,6 +33,7 @@ import { isTouchDevice } from './touch'
 import type { Session } from './types'
 import { loadWebglRenderer } from './webgl-renderer'
 import { type WsState, wsStateOnClose, wsStateOnOutput } from './ws-state'
+import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 
 // ── Config ──
 
@@ -652,7 +657,8 @@ export function TerminalView({
       sendRawInput(r.seq)
     }
 
-    onInputReady?.(sendRawInput)
+    const sendToolbarInput = (data: string) => sendAfterFlushingComposition(term, sendRawInput, data)
+    onInputReady?.(sendToolbarInput)
     // follow() already scrolls to the bottom, so a second term.scrollToBottom()
     // here would compute a zero delta and only add a scroll event for the addon
     // to classify.
@@ -693,7 +699,11 @@ export function TerminalView({
     }
     onFocusReady?.(() => focusTerminalInput(term))
 
-    const dataDisposable = term.onData((data) => sendInput(data))
+    const dataDisposable = term.onData((data) => {
+      if (shouldSkipMobileWebKitImeData(data)) return
+      flushMobileWebKitImePending()
+      sendInput(data)
+    })
     attachKeyboardHandler(term, sendInput, keybinds, macCommandIsCtrl, getPasteDestination, pasteFeedback)
     const disposePasteHandler = attachPasteHandler(containerRef.current!, getPasteDestination, pasteFeedback)
     const sendMobileReplacement = (data: string) => {
@@ -944,6 +954,7 @@ export function TerminalView({
       shell?.removeEventListener('touchcancel', clearTouchPan, true)
       disposePasteHandler()
       disposeMobileHandler()
+      disposeImeResidueGuard()
       osc52Disposable.dispose()
       dataDisposable.dispose()
       scrollDisposable.dispose()
@@ -1382,6 +1393,7 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
+    const disposeImeResidueGuard = attachImeResidueGuard(term)
     loadWebglRenderer(term)
     // Fit like the real terminal: measureTerminalFit reserves the mobile
     // control bar's height (rounding rows up so one row tucks behind the
