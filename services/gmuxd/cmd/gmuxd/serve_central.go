@@ -517,6 +517,15 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": item})
 		})
+		mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+			projectWorktreesHandler(w, r, r.PathValue("slug"), boot.Store)
+		})
+		mux.HandleFunc("POST /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+			projectWorktreeCreateHandler(w, r, r.PathValue("slug"), boot.Store)
+		})
+		mux.HandleFunc("DELETE /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
+			projectWorktreeDeleteHandler(w, r, r.PathValue("slug"), boot.Store)
+		})
 		mux.HandleFunc("PATCH /v1/projects/{slug}/sessions", func(w http.ResponseWriter, r *http.Request) {
 			slug := r.PathValue("slug")
 			body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))

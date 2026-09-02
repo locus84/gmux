@@ -74,6 +74,23 @@ func LegacySessionSocketDirs() []string {
 	return dirs
 }
 
+// DataDir returns the gmux data directory (~/.local/share/gmux).
+// Durable user content such as managed Git worktrees belongs here rather than
+// in StateDir, which may be redirected to an ephemeral location.
+func DataDir() string {
+	if dir := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(dir) {
+		return filepath.Join(dir, "gmux")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "gmux")
+}
+
+// WorktreesDir returns the root for worktrees created without an explicit
+// `gmux worktree create --path` destination.
+func WorktreesDir() string {
+	return filepath.Join(DataDir(), "worktrees")
+}
+
 // StateDir returns the gmux state directory (~/.local/state/gmux).
 func StateDir() string {
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {

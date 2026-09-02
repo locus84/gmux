@@ -36,6 +36,11 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux reparent <id> <parent-id>    move a session under a new parent
   gmux kill <id>                    terminate a session
 
+Git worktrees (local only):
+  gmux worktree current [--json]    show the enclosing worktree
+  gmux worktree ps [ref] [--json]   show worktrees and their live sessions
+  gmux worktree create <name> ...   create a worktree and optionally launch an agent
+
 Editing (usable as $EDITOR; blocks until the editor closes):
   gmux edit [file]                  open a file for the user to inspect or edit
 
@@ -84,6 +89,17 @@ unrecognized name.
 // one-liners in the synopsis. The agent namespace has its own pages in
 // printAgentUsage, and daemon help is served by the gmuxd binary itself.
 var verbHelpPages = map[string]string{
+	"worktree": `gmux worktree: create and inspect local Git worktrees
+
+  gmux worktree current [--json]
+  gmux worktree ps [ref] [--json]
+  gmux worktree create <name> [--repo PATH] [--base REF] [--path PATH]
+                       [--agent LAUNCHER] [--prompt TEXT] [--json]
+
+create uses a managed data directory unless --path is provided. With --agent,
+it launches that configured gmux launcher in the new checkout; --prompt sends
+its initial prompt without waiting for the turn to finish.
+`,
 	"run": `gmux run: run a command in a managed session
 
   gmux -- <cmd> [args]

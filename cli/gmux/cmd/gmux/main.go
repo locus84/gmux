@@ -72,6 +72,8 @@ func main() {
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
 		os.Exit(cmdWait(cmd.waitRefs, cmd.timeout, cmd.forText, cmd.forRegex, cmd.quiet))
+	case modeWorktree:
+		os.Exit(cmdWorktree(cmd))
 	case modePromote:
 		os.Exit(cmdPromote(cmd.ref))
 	case modeReparent:

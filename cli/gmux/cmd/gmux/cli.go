@@ -25,6 +25,7 @@ const (
 	modeSend                   // gmux send <id> <text> [keys...]
 	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
 	modeWait                   // gmux wait <id>...
+	modeWorktree               // gmux worktree <current|ps|create>
 	modePromote                // gmux promote <id>
 	modeReparent               // gmux reparent <id> <parent-id>
 	modeAgent                  // gmux agent prompt|cancel|output <id>
@@ -93,6 +94,16 @@ type command struct {
 	forRegex string // --for-regex: wait for regex match in output
 	quiet    bool   // --quiet: synchronize only, print no result
 
+	// worktree
+	worktreeSub      string
+	worktreeSelector string
+	worktreeName     string
+	worktreeRepo     string
+	worktreeBase     string
+	worktreePath     string
+	worktreeAgent    string
+	worktreePrompt   string
+
 	// edit
 	editFile string // file path to open
 
@@ -115,7 +126,7 @@ type command struct {
 // no verb at all: it is a side effect of observing a result.
 var reservedVerbs = []string{
 	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "promote", "reparent", "agent", "edit", "daemon", "auth", "remote", "version", "help",
+	"wait", "worktree", "promote", "reparent", "agent", "edit", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -211,6 +222,8 @@ func parseCLI(args []string) (*command, error) {
 		return dispatchVerb("send-keys", rest, parseSendKeys)
 	case "wait":
 		return dispatchVerb("wait", rest, parseWait)
+	case "worktree":
+		return dispatchVerb("worktree", rest, parseWorktree)
 	case "promote":
 		return dispatchVerb("promote", rest, parsePromote)
 	case "reparent":
@@ -531,6 +544,57 @@ func parseSendKeys(args []string) (*command, error) {
 	c.keys = fs.Args()
 	if len(c.keys) == 0 {
 		return nil, errors.New("send-keys requires at least one key or string")
+	}
+	return c, nil
+}
+
+func parseWorktree(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("worktree requires one of: current, ps, create")
+	}
+	c := &command{mode: modeWorktree, worktreeSub: args[0], worktreeBase: "HEAD"}
+	fs := newFlagSet("worktree " + c.worktreeSub)
+	switch c.worktreeSub {
+	case "current":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return nil, err
+		}
+		if len(fs.Args()) != 0 {
+			return nil, errors.New("worktree current takes no arguments")
+		}
+	case "ps":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) > 1 {
+			return nil, errors.New("worktree ps takes at most one selector")
+		}
+		if len(pos) == 1 {
+			c.worktreeSelector = pos[0]
+		}
+	case "create":
+		fs.StringVar(&c.worktreeRepo, "repo", "", "repository path (default current directory)")
+		fs.StringVar(&c.worktreeBase, "base", "HEAD", "base ref")
+		fs.StringVar(&c.worktreePath, "path", "", "destination path")
+		fs.StringVar(&c.worktreeAgent, "agent", "", "gmux launcher id")
+		fs.StringVar(&c.worktreePrompt, "prompt", "", "initial agent prompt")
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) != 1 {
+			return nil, errors.New("worktree create requires exactly one name")
+		}
+		c.worktreeName = pos[0]
+		if c.worktreePrompt != "" && c.worktreeAgent == "" {
+			return nil, errors.New("--prompt requires --agent")
+		}
+	default:
+		return nil, fmt.Errorf("unknown worktree command %q", c.worktreeSub)
 	}
 	return c, nil
 }

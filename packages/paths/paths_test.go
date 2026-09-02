@@ -116,6 +116,16 @@ func TestLegacySessionSocketDirs(t *testing.T) {
 	})
 }
 
+func TestDataAndWorktreesDir(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "/tmp/xdg-data")
+	if got := DataDir(); got != filepath.Join("/tmp/xdg-data", "gmux") {
+		t.Fatalf("DataDir() = %q", got)
+	}
+	if got := WorktreesDir(); got != filepath.Join("/tmp/xdg-data", "gmux", "worktrees") {
+		t.Fatalf("WorktreesDir() = %q", got)
+	}
+}
+
 func TestIsValidSessionID(t *testing.T) {
 	valid := []string{
 		"1va8lvdv",
