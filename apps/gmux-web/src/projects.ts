@@ -531,7 +531,20 @@ export function checkoutPathContains(root: string, candidate: string): boolean {
   root = normalizeCheckoutPath(root)
   candidate = normalizeCheckoutPath(candidate)
   if (!root || !candidate) return false
-  return candidate === root || candidate.startsWith(root.endsWith('/') ? root : `${root}/`)
+  if (candidate === root || candidate.startsWith(root.endsWith('/') ? root : `${root}/`)) return true
+
+  // Daemon worktree inventory intentionally uses portable ~/ paths, while
+  // newly registered v2 sessions report an absolute cwd. Match the same home
+  // suffix without teaching the browser the daemon user's home directory.
+  if (root.startsWith('~/') && candidate.startsWith('/')) {
+    const homeRelative = root.slice(1)
+    const offset = candidate.indexOf(homeRelative)
+    if (offset > 0) {
+      const absoluteRoot = candidate.slice(0, offset) + homeRelative
+      return candidate === absoluteRoot || candidate.startsWith(`${absoluteRoot}/`)
+    }
+  }
+  return false
 }
 
 function normalizeCheckoutPath(path: string): string {

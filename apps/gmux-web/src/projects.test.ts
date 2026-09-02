@@ -37,9 +37,25 @@ describe('worktree checkout grouping', () => {
     ])
   })
 
+  it('matches portable worktree paths against absolute v2 session cwd values', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'absolute-main', cwd: '/Users/rhee/WorkSpace/backend' }),
+      makeSession({ id: 'absolute-linked', cwd: '/Users/rhee/.local/share/gmux/worktrees/Users/rhee/WorkSpace/backend/fix-auth/src' }),
+    ]), [
+      { path: '~/WorkSpace/backend', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false },
+      { path: '~/.local/share/gmux/worktrees/Users/rhee/WorkSpace/backend/fix-auth', branch: 'fix/auth', primary: false, detached: false, bare: false, locked: false, prunable: false },
+    ])
+    expect(groups.map(group => [group.label, group.sessions.map(session => session.id)])).toEqual([
+      ['Main', ['absolute-main']],
+      ['fix/auth', ['absolute-linked']],
+    ])
+  })
+
   it('uses the deepest containing checkout', () => {
     expect(checkoutPathContains('/repo', '/repo/packages/api')).toBe(true)
     expect(checkoutPathContains('/repo', '/repo-other')).toBe(false)
+    expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend/src')).toBe(true)
+    expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend-other')).toBe(false)
   })
 })
 
