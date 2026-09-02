@@ -66,6 +66,15 @@ export const IconSettings = () => (
   </svg>
 )
 
+export const IconRefresh = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
+    <path d="M13 5.2A5.2 5.2 0 0 0 3.4 4" />
+    <path d="M13 2.5v2.7h-2.7" />
+    <path d="M3 10.8A5.2 5.2 0 0 0 12.6 12" />
+    <path d="M3 13.5v-2.7h2.7" />
+  </svg>
+)
+
 const IconArrange = () => (
   <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
     <path d="M2.5 4h8M2.5 8h6M2.5 12h4"/>
@@ -1000,6 +1009,14 @@ export function Sidebar({
             onClick={onClose}
           >gmux</a>
           <ViewMenu open={menuOpen} onToggle={() => setMenuOpen(v => !v)} />
+          <button
+            class="sidebar-refresh-btn"
+            onClick={() => location.reload()}
+            aria-label="Refresh app"
+            title="Refresh app"
+          >
+            <IconRefresh />
+          </button>
           <button
             class="sidebar-settings-btn"
             onClick={onOpenSettings}

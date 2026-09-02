@@ -250,10 +250,11 @@ body {
   text-shadow: 0 0 6px rgba(255, 255, 255, 0.25);
 }
 
-/* Settings gear, pinned opposite the logo in the header. */
+/* Header actions. The view-menu anchor owns the auto spacer; refresh and
+ * settings stay grouped beside it. */
+.sidebar-refresh-btn,
 .sidebar-settings-btn {
   position: relative;
-  margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -267,6 +268,7 @@ body {
   cursor: pointer;
   transition: color 0.15s, background 0.15s;
 }
+.sidebar-refresh-btn:hover,
 .sidebar-settings-btn:hover,
 .sidebar-settings-btn.open {
   color: var(--text);
