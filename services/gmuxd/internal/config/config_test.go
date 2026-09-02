@@ -26,6 +26,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Tailscale.Enabled {
 		t.Error("tailscale should be disabled by default")
 	}
+	if !cfg.Tailscale.RequireToken {
+		t.Error("tailscale.require_token should default to true")
+	}
 	if !cfg.Discovery.Devcontainers {
 		t.Error("discovery.devcontainers should default to true")
 	}
@@ -46,6 +49,7 @@ max_subagents_by_depth = [64, 12]
 
 [tailscale]
 enabled = true
+require_token = false
 allow = ["alice@github", "bob@github"]
 `)
 
@@ -64,6 +68,9 @@ allow = ["alice@github", "bob@github"]
 	}
 	if !cfg.Tailscale.Enabled {
 		t.Error("tailscale should be enabled")
+	}
+	if cfg.Tailscale.RequireToken {
+		t.Error("tailscale.require_token should load false")
 	}
 	if len(cfg.Tailscale.Allow) != 2 {
 		t.Fatalf("allow = %v, want 2 entries", cfg.Tailscale.Allow)

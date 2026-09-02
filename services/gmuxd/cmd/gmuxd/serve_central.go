@@ -92,6 +92,13 @@ func registerGetProjectsRoute(mux *http.ServeMux, render func(*http.Request) (wi
 // convergeTailnetPeerTransport installs the embedded LocalAPI client
 // immediately, even when ready-time suffix discovery failed, then retries the
 // suffix independently so same-tailnet routing also converges without restart.
+func tailscaleHTTPHandler(requireToken bool, commonMux, authedHandler http.Handler) http.Handler {
+	if requireToken {
+		return authedHandler
+	}
+	return commonMux
+}
+
 func convergeTailnetPeerTransport(ctx context.Context, transport *tsauth.RoutedTransport, suffix string, rt http.RoundTripper, client tsauth.PeerClient, reconnect func(), retry <-chan time.Time) {
 	transport.SetTailnet(suffix, rt, client)
 	if reconnect != nil {
@@ -1162,7 +1169,14 @@ func serveCentral(stderr io.Writer, replace bool) int {
 		if tsSeed == "" {
 			tsSeed = tsauth.SeedFromHostname(hostname)
 		}
-		tsListener = tsauth.Start(tsauth.Config{Hostname: tsSeed, Allow: cfg.Tailscale.Allow}, stateDir, authedHandler)
+		tailnetHandler := tailscaleHTTPHandler(cfg.Tailscale.RequireToken, commonMux, authedHandler)
+		if !cfg.Tailscale.RequireToken {
+			// Compatibility/mobile-first mode: Tailscale WhoIs plus the
+			// owner/allow-list remains the outer authorization boundary, but
+			// browsers do not need gmux's additional token cookie.
+			log.Printf("tsauth: gmux token disabled for Tailscale listener; relying on Tailscale identity allow-list")
+		}
+		tsListener = tsauth.Start(tsauth.Config{Hostname: tsSeed, Allow: cfg.Tailscale.Allow}, stateDir, tailnetHandler)
 		defer tsListener.Shutdown()
 		go func(l *tsauth.Listener) {
 			select {

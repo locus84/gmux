@@ -86,7 +86,7 @@ Each machine joins the tailnet under `gmux-<its-hostname>`, derived from the OS 
 
 ### 4. Connect
 
-On your other device, open the URL that `gmux remote` printed — typically `https://gmux-<hostname>.your-tailnet.ts.net`. The connection is HTTPS with a valid certificate. You'll be asked for the host's access token (run `gmux auth` on the host to get it, or scan its QR/connect URL) — being on the tailnet lets you *reach* the host, but the token is what authorizes you ([ADR 0008](https://github.com/gmuxapp/gmux/blob/main/docs/adr/0008-peer-authentication-via-token.md)).
+On your other device, open the URL that `gmux remote` printed — typically `https://gmux-<hostname>.your-tailnet.ts.net`. The connection is HTTPS with a valid certificate. By default you'll be asked for the host's access token (run `gmux auth` on the host to get it, or scan its QR/connect URL). For an installed mobile web app where repeated browser authentication is undesirable, set `require_token = false` under `[tailscale]`; permitted Tailscale identities then open the app directly.
 
 :::note
 The Tailscale listener is independent from the localhost listener. Local access (`127.0.0.1:8790`) always works, so you can't lock yourself out by misconfiguring Tailscale.
@@ -94,7 +94,7 @@ The Tailscale listener is independent from the localhost listener. Local access 
 
 ## Sharing access
 
-Every connection over the tailnet is gated twice: Tailscale's cryptographic identity is checked against an allow list (your primary account is allowed automatically), **and** the request must carry the host's bearer token. The allow list is the outer gate — who may reach the host at all — not the access decision on its own ([ADR 0008](https://github.com/gmuxapp/gmux/blob/main/docs/adr/0008-peer-authentication-via-token.md)). See [Security](/security) for the full verification design.
+By default every connection over the tailnet is gated twice: Tailscale's cryptographic identity is checked against an allow list (your primary account is allowed automatically), **and** the request must carry the host's bearer token. Setting `tailscale.require_token = false` removes the second gate, so every permitted owner/allow-list identity receives terminal access without a gmux login. See [Security](/security) for the tradeoff.
 
 ### Adding your other accounts
 

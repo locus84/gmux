@@ -23,7 +23,9 @@ gmuxd uses two listeners:
 
 1. **Unix socket** (`~/.local/state/gmux/gmuxd.sock`) for local CLI-to-daemon IPC. No authentication needed; access is enforced by filesystem permissions (0600 socket, 0700 directory). Unlike a TCP port, it is never auto-forwarded by VS Code, Docker Desktop, or SSH port forwarding.
 
-2. **TCP listener** (`127.0.0.1:8790` by default) for browser access. Every request must present a bearer token or session cookie — the only unauthenticated paths are the login page itself and the web-app manifest. There is no option to disable auth, and daemon shutdown is refused on the TCP listener entirely (it is a Unix-socket-only operation), even with valid credentials.
+2. **TCP listener** (`127.0.0.1:8790` by default) for browser access. Every request must present a bearer token or session cookie — the only unauthenticated paths are the login page itself and the web-app manifest. There is no option to disable auth on this listener, and daemon shutdown is refused on it entirely (it is a Unix-socket-only operation), even with valid credentials.
+
+The separate Tailscale HTTPS listener may be configured with `tailscale.require_token = false`. In that mode Tailscale WhoIs plus the node-owner/`allow` identity list remains the authorization boundary, but gmux does not require a second token login. This is convenient for installed mobile web apps, at the cost of trusting every permitted Tailscale identity with terminal access.
 
 By default, the TCP listener binds to `127.0.0.1`:
 
@@ -117,7 +119,7 @@ The file remains the primary storage. Environment variables are inherited by chi
 
 The [`examples/`](https://github.com/gmuxapp/gmux/tree/main/examples) directory has ready-to-run Docker Compose setups showing how to handle auth in common deployment scenarios: [Tailscale](/running-in-docker/#tailscale-recommended), [WireGuard](/running-in-docker/#wireguard), and [Traefik with OIDC](/running-in-docker/#reverse-proxy-with-oidc-traefik--pocketid).
 
-**For easy access from other devices**, use [Tailscale remote access](/remote-access). It gives you HTTPS with automatic certificates and cryptographic identity verification; access still requires the host's token (run `gmux auth` to get its connect URL).
+**For easy access from other devices**, use [Tailscale remote access](/remote-access). It gives you HTTPS with automatic certificates and cryptographic identity verification. By default access also requires the host's token (`gmux auth`); trusted-tailnet installations can opt out of that second gate with `tailscale.require_token = false`.
 
 ## Config validation
 

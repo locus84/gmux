@@ -181,6 +181,11 @@ type TailscaleConfig struct {
 	// (e.g. "user@github"). The node owner is always auto-whitelisted at runtime.
 	// Entries are matched against the peer's UserProfile.LoginName.
 	Allow []string `toml:"allow"`
+
+	// RequireToken keeps gmux's bearer/cookie token as an inner auth gate on
+	// the Tailscale listener after the peer identity allow-list check. Disable
+	// only when the tailnet identity gate is the desired trust boundary.
+	RequireToken bool `toml:"require_token"`
 }
 
 // Load reads the config file. Returns defaults if the file doesn't exist.
@@ -457,6 +462,9 @@ func defaults() Config {
 			MaxSubagentsByDepth: SubagentDepthLimits{
 				Values: []int{-1, 8},
 			},
+		},
+		Tailscale: TailscaleConfig{
+			RequireToken: true,
 		},
 		Discovery: DiscoveryConfig{
 			Devcontainers: true,

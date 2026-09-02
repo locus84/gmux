@@ -30,6 +30,7 @@ max_subagents_by_depth = [-1, 8]
 [tailscale]
 enabled = false
 allow = []               # additional login names or device tags (owner is auto-whitelisted)
+require_token = true      # false trusts Tailscale identity without a second gmux login
 
 # Auto-discover devcontainer peers. Defaults to true.
 [discovery]
@@ -173,6 +174,7 @@ chmod 600 ~/.config/gmux/host.toml
 |-------|------|---------|-------------|
 | `enabled` | `boolean` | `false` | Enable Tailscale remote access. |
 | `allow` | `string[]` | `[]` | Additional Tailscale login names (e.g. `user@github`) or device tags (e.g. `tag:gmux`) to allow (owner is auto-whitelisted). Login entries must contain `@`; tag entries start with `tag:`. |
+| `require_token` | `boolean` | `true` | Require gmux token/cookie authentication after Tailscale identity authorization. Set `false` to use the Tailscale owner/allow-list as the sole remote-access boundary. |
 
 ### `[discovery]`
 
