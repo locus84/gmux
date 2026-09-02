@@ -8,29 +8,42 @@ import (
 	"strings"
 )
 
-// DetectRoot walks up from dir looking for jj or git repository markers and
-// returns the workspace root. Returns "" if no VCS root is found.
-//
-// Detection order:
-//  1. jj: look for .jj/ directory. If .jj/repo is a file (secondary
-//     workspace), read it to find the main workspace root.
-//  2. git: look for .git. If it's a file (worktree), read it to find the
-//     main worktree root. If it's a directory, its parent is the root.
-//  3. No VCS found: return "".
-func DetectRoot(dir string) string {
+// GitLayout describes the Git marker found for a workspace.
+type GitLayout string
+
+const (
+	GitLayoutRepository GitLayout = "repository"
+	GitLayoutWorktree   GitLayout = "worktree"
+)
+
+// Detection is the VCS metadata derived from a session's starting directory.
+// GitLayout is empty for jj-only workspaces and directories outside Git.
+type Detection struct {
+	Root      string
+	GitLayout GitLayout
+}
+
+// Detect walks up from dir looking for jj or git repository markers.
+// Root preserves the existing jj-first grouping behavior, while GitLayout
+// independently records whether a colocated Git marker is a repository or a
+// linked worktree. Returns the zero value if no VCS root is found.
+func Detect(dir string) Detection {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
-		return ""
+		return Detection{}
 	}
 
 	cur := dir
 	for {
-		// Check jj first (preferred when colocated with git).
-		if root := checkJJ(cur); root != "" {
-			return root
+		// Check jj first for the grouping root, but retain a colocated Git
+		// marker so the UI can distinguish repositories from worktrees.
+		jjRoot := checkJJ(cur)
+		gitRoot, gitLayout := checkGit(cur)
+		if jjRoot != "" {
+			return Detection{Root: jjRoot, GitLayout: gitLayout}
 		}
-		if root := checkGit(cur); root != "" {
-			return root
+		if gitRoot != "" {
+			return Detection{Root: gitRoot, GitLayout: gitLayout}
 		}
 
 		parent := filepath.Dir(cur)
@@ -39,7 +52,13 @@ func DetectRoot(dir string) string {
 		}
 		cur = parent
 	}
-	return ""
+	return Detection{}
+}
+
+// DetectRoot returns the workspace grouping root. Kept as a compatibility
+// wrapper for callers that do not need Git layout metadata.
+func DetectRoot(dir string) string {
+	return Detect(dir).Root
 }
 
 // checkJJ checks for a .jj directory at dir and resolves the workspace root.
@@ -94,27 +113,28 @@ func checkJJ(dir string) string {
 // checkGit checks for a .git entry at dir and resolves the workspace root.
 // Handles both regular repos (.git is a directory) and worktrees (.git is a
 // file containing "gitdir: /path/to/.git/worktrees/<name>").
-func checkGit(dir string) string {
+func checkGit(dir string) (string, GitLayout) {
 	gitPath := filepath.Join(dir, ".git")
 	info, err := os.Lstat(gitPath)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	if info.IsDir() {
 		// Regular git repo: .git is a directory, dir is the root.
-		return dir
+		return dir, GitLayoutRepository
 	}
 
-	// .git is a file (worktree marker). Read it to find the main repo.
+	// Preserve DetectRoot's historical fallback for unreadable or malformed
+	// .git files, but leave the layout unknown rather than mislabeling them.
 	data, err := os.ReadFile(gitPath)
 	if err != nil {
-		return dir // can't read, fall back to this directory
+		return dir, ""
 	}
 
 	line := strings.TrimSpace(string(data))
 	if !strings.HasPrefix(line, "gitdir: ") {
-		return dir
+		return dir, ""
 	}
 
 	gitdir := strings.TrimPrefix(line, "gitdir: ")
@@ -123,7 +143,11 @@ func checkGit(dir string) string {
 	}
 	gitdir, err = filepath.Abs(gitdir)
 	if err != nil {
-		return dir
+		return dir, ""
+	}
+	gitdirInfo, err := os.Stat(gitdir)
+	if err != nil || !gitdirInfo.IsDir() {
+		return dir, ""
 	}
 
 	// gitdir is something like /path/to/main-repo/.git/worktrees/<name>
@@ -131,11 +155,13 @@ func checkGit(dir string) string {
 	// Standard layout: .git/worktrees/<name> → 2 levels up is .git
 	mainGitDir := resolveMainGitDir(gitdir)
 	if mainGitDir == "" {
-		return dir
+		// Submodules and repositories created with --separate-git-dir also
+		// use a .git file, but are not linked worktrees.
+		return dir, GitLayoutRepository
 	}
 
 	// The main repo root is the parent of .git/
-	return filepath.Dir(mainGitDir)
+	return filepath.Dir(mainGitDir), GitLayoutWorktree
 }
 
 // resolveMainGitDir walks up from a worktree gitdir path to find the main
@@ -157,9 +183,9 @@ func resolveMainGitDir(gitdir string) string {
 	}
 
 	// Fallback: walk up assuming standard .git/worktrees/<name> layout.
-	parent := filepath.Dir(gitdir)           // .git/worktrees
+	parent := filepath.Dir(gitdir) // .git/worktrees
 	if filepath.Base(parent) == "worktrees" {
-		return filepath.Dir(parent)          // .git
+		return filepath.Dir(parent) // .git
 	}
 	return ""
 }
