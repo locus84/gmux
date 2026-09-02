@@ -161,17 +161,56 @@ func (s *Store) ImportLegacy(ctx context.Context, input LegacyImport, at UnixMil
 	if err != nil {
 		return LegacyImportResult{}, err
 	}
-	for position, placement := range input.Placements {
+	parents := make(map[SessionID]SessionID, len(input.Sessions))
+	for _, session := range input.Sessions {
+		if session.ParentSessionID != nil {
+			parents[session.ID] = *session.ParentSessionID
+		}
+	}
+	projectSubjects := make([]map[SessionID]bool, len(projects))
+	for i := range projectSubjects {
+		projectSubjects[i] = make(map[SessionID]bool)
+	}
+	for _, placement := range input.Placements {
+		projectSubjects[placement.ProjectIndex][placement.SessionID] = true
+	}
+	type importedScope struct {
+		project int
+		scope   string
+	}
+	nextPosition := make(map[importedScope]int64)
+	for _, placement := range input.Placements {
+		scope := "r"
+		if parent := parents[placement.SessionID]; parent != "" && projectSubjects[placement.ProjectIndex][parent] {
+			scope = "c:l:" + string(parent)
+		}
+		key := importedScope{project: placement.ProjectIndex, scope: scope}
 		_, err = q.InsertLocalPlacement(ctx, db.InsertLocalPlacementParams{
 			ProjectEntryID: int64(catalog[placement.ProjectIndex].ID), LocalSessionID: nullString(string(placement.SessionID)),
-			SiblingScope: "r", Position: int64(position),
+			SiblingScope: scope, Position: nextPosition[key],
 		})
 		if err != nil {
 			return LegacyImportResult{}, fmt.Errorf("centralstore: insert legacy placement: %w", err)
 		}
+		nextPosition[key]++
 	}
-	if _, err = normalizePlacements(ctx, q, s.beforePlacementFinalize); err != nil {
+	// Do not run the ordinary placement normalizer here: newly moved family
+	// members are sorted by creation time there. The importer has already
+	// emitted dense final scopes in the user's legacy Sessions[] order.
+	allPlacements, err := placements(ctx, q)
+	if err != nil {
 		return LegacyImportResult{}, err
+	}
+	index := indexPlacements(allPlacements)
+	for _, placement := range allPlacements {
+		if placement.scope != desiredScope(index, placement) {
+			return LegacyImportResult{}, errors.New("centralstore: invalid imported family scope")
+		}
+	}
+	if s.beforePlacementFinalize != nil {
+		if err := s.beforePlacementFinalize(); err != nil {
+			return LegacyImportResult{}, err
+		}
 	}
 	for _, peer := range input.Peers {
 		if _, err = q.InsertManualPeer(ctx, db.InsertManualPeerParams{

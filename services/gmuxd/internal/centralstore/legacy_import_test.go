@@ -17,24 +17,26 @@ func TestImportLegacyRestoresCatalogSessionsAndFamilyOrderAtomically(t *testing.
 	input := LegacyImport{
 		Sessions: []NewSession{
 			{ID: parent, Adapter: "pi", CWD: "/repo", Slug: "parent", CreatedAt: 1},
-			{ID: "child", Adapter: "pi", CWD: "/repo", Slug: "child", CreatedAt: 2, ParentSessionID: &parent},
+			// CreatedAt is deliberately opposite the legacy placement order.
+			{ID: "child-a", Adapter: "pi", CWD: "/repo", Slug: "child-a", CreatedAt: 3, ParentSessionID: &parent},
+			{ID: "child-b", Adapter: "pi", CWD: "/repo", Slug: "child-b", CreatedAt: 2, ParentSessionID: &parent},
 		},
 		Projects:   []ProjectEntrySpec{{Owned: &OwnedProjectSpec{Slug: "repo", Rules: []MatchRule{{Path: "/repo"}}}}},
-		Placements: []LegacyPlacement{{ProjectIndex: 0, SessionID: "parent"}, {ProjectIndex: 0, SessionID: "child"}},
+		Placements: []LegacyPlacement{{ProjectIndex: 0, SessionID: "parent"}, {ProjectIndex: 0, SessionID: "child-a"}, {ProjectIndex: 0, SessionID: "child-b"}},
 		Peers:      []ManualPeerSpec{{Name: "laptop", URL: "https://laptop.example", Token: "secret", NodeID: "node-1"}},
 	}
 	result, err := store.ImportLegacy(ctx, input, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Imported || result.Sessions != 2 || result.Projects != 1 || result.Placements != 2 || result.Peers != 1 {
+	if !result.Imported || result.Sessions != 3 || result.Projects != 1 || result.Placements != 3 || result.Peers != 1 {
 		t.Fatalf("unexpected result: %+v", result)
 	}
 	snapshot, err := store.ReadSnapshot(ctx, SnapshotQuery{IncludeSessions: true, IncludeProjects: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Sessions) != 2 || len(snapshot.Projects) != 1 {
+	if len(snapshot.Sessions) != 3 || len(snapshot.Projects) != 1 {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
 	peers, err := store.ListManualPeers(ctx)
@@ -48,8 +50,11 @@ func TestImportLegacyRestoresCatalogSessionsAndFamilyOrderAtomically(t *testing.
 	if got := byID[parent].Placement; got == nil || got.SiblingScope != "r" || got.Position != 0 {
 		t.Fatalf("parent placement: %+v", got)
 	}
-	if got := byID["child"].Placement; got == nil || got.SiblingScope != "c:l:parent" || got.Position != 0 {
-		t.Fatalf("child placement: %+v", got)
+	if got := byID["child-a"].Placement; got == nil || got.SiblingScope != "c:l:parent" || got.Position != 0 {
+		t.Fatalf("first child placement: %+v", got)
+	}
+	if got := byID["child-b"].Placement; got == nil || got.SiblingScope != "c:l:parent" || got.Position != 1 {
+		t.Fatalf("second child placement: %+v", got)
 	}
 	eligible, err := store.LegacyImportEligible(ctx)
 	if err != nil {

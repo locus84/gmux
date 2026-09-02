@@ -4,6 +4,8 @@
 package legacyimport
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"sort"
 	"time"
 
+	pathpkg "github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/conversations"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/projectmatch"
@@ -34,6 +37,9 @@ type projectItem struct {
 	NodeID   string        `json:"node_id,omitempty"`
 	Match    []projectRule `json:"match,omitempty"`
 	Sessions []string      `json:"sessions,omitempty"`
+	// Original/unversioned and v1 shape, migrated in memory only.
+	Remote string   `json:"remote,omitempty"`
+	Paths  []string `json:"paths,omitempty"`
 }
 type projectRule struct {
 	Path, Remote string
@@ -48,6 +54,8 @@ type peerRecord struct {
 
 // Report makes stale/unresolvable v1 slots visible without failing the safe
 // subset. Report counts never include peer credentials and are safe to log.
+var ErrUnresolvedSlots = errors.New("legacy import: unresolved project slots")
+
 type Report struct {
 	MetaSessions         int
 	ConversationSessions int
@@ -58,30 +66,63 @@ type Report struct {
 }
 
 func Exists(stateDir string) (bool, error) {
-	_, err := os.Stat(filepath.Join(stateDir, legacyProjectsFile))
-	if err == nil {
-		return true, nil
+	for _, name := range []string{legacyProjectsFile, legacyPeersFile} {
+		if _, err := os.Stat(filepath.Join(stateDir, name)); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
 	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "sessions"))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
-	return false, err
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, "sessions", entry.Name(), "meta.json")); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // Load reads a stable point-in-time snapshot. It imports every valid local
 // meta record, then fills project slots that only have an adapter-owned
 // conversation transcript. Stale slots are counted and omitted.
 func Load(stateDir string, infos []conversations.Info) (centralstore.LegacyImport, Report, error) {
-	data, err := os.ReadFile(filepath.Join(stateDir, legacyProjectsFile))
-	if err != nil {
-		return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: read projects: %w", err)
-	}
 	var state projectState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: parse projects: %w", err)
-	}
-	if state.Version < 1 || state.Version > 4 {
-		return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: unsupported projects version %d", state.Version)
+	data, err := os.ReadFile(filepath.Join(stateDir, legacyProjectsFile))
+	if err == nil {
+		if err := json.Unmarshal(data, &state); err != nil {
+			return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: parse projects: %w", err)
+		}
+		if state.Version < 0 || state.Version > 4 {
+			return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: unsupported projects version %d", state.Version)
+		}
+		if state.Version < 2 {
+			for i := range state.Items {
+				if len(state.Items[i].Match) > 0 {
+					continue
+				}
+				if state.Items[i].Remote != "" {
+					state.Items[i].Match = append(state.Items[i].Match, projectRule{Remote: state.Items[i].Remote})
+				}
+				for _, path := range state.Items[i].Paths {
+					if path != "" {
+						state.Items[i].Match = append(state.Items[i].Match, projectRule{Path: pathpkg.CanonicalizePath(path)})
+					}
+				}
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return centralstore.LegacyImport{}, Report{}, fmt.Errorf("legacy import: read projects: %w", err)
 	}
 
 	out := centralstore.LegacyImport{}
@@ -118,22 +159,19 @@ func Load(stateDir string, infos []conversations.Info) (centralstore.LegacyImpor
 	}
 	report := Report{MetaSessions: len(meta)}
 	byID := make(map[string]int, len(meta))
-	bySlug := make(map[string]int, len(meta))
-	ambiguousSlug := make(map[string]bool)
+	bySlug := make(map[string][]int)
+	usedIDs := make(map[centralstore.SessionID]bool, len(meta))
 	for i, session := range meta {
 		byID[string(session.ID)] = i
+		usedIDs[session.ID] = true
 		if session.Slug != "" {
-			if _, found := bySlug[session.Slug]; found {
-				ambiguousSlug[session.Slug] = true
-			} else {
-				bySlug[session.Slug] = i
-			}
+			bySlug[session.Slug] = append(bySlug[session.Slug], i)
 		}
 	}
 	out.Sessions = append(out.Sessions, meta...)
 
-	// Sort first: Index.All intentionally has map order, but migration output
-	// and ambiguity handling must be deterministic.
+	// Index.All intentionally has map order; stable sorting makes generated
+	// fallback IDs and placement expansion deterministic across retries.
 	sort.Slice(infos, func(i, j int) bool {
 		if infos[i].Adapter != infos[j].Adapter {
 			return infos[i].Adapter < infos[j].Adapter
@@ -156,60 +194,68 @@ func Load(stateDir string, infos []conversations.Info) (centralstore.LegacyImpor
 		}
 	}
 
+	conversationIDs := make(map[int]centralstore.SessionID)
 	placed := make(map[centralstore.SessionID]bool)
 	for projectIndex, item := range state.Items {
 		if item.Peer != "" {
 			continue
 		}
 		for _, key := range item.Sessions {
-			var id centralstore.SessionID
+			var ids []centralstore.SessionID
 			if i, ok := byID[key]; ok {
-				id = out.Sessions[i].ID
-			} else if i, ok := bySlug[key]; ok && !ambiguousSlug[key] {
-				id = out.Sessions[i].ID
-			} else if i, ok := resolveConversation(conversationByKey[key], infos, state.Items, projectIndex); ok {
-				info := infos[i]
-				// A meta row for the same adapter+slug owns the durable identity.
-				if mi, exists := findMetaConversation(out.Sessions, info); exists {
-					id = out.Sessions[mi].ID
-				} else {
-					session := conversationSession(info)
-					if session.ID == "" {
-						report.UnresolvedSlots++
-						report.UnresolvedKeys = append(report.UnresolvedKeys, key)
-						continue
-					}
-					if _, collision := byID[string(session.ID)]; collision {
-						report.UnresolvedSlots++
-						report.UnresolvedKeys = append(report.UnresolvedKeys, key)
-						continue
-					}
-					byID[string(session.ID)] = len(out.Sessions)
-					out.Sessions = append(out.Sessions, session)
-					report.ConversationSessions++
-					id = session.ID
-				}
+				// An exact durable ID is unambiguous; do not reinterpret it as a
+				// coincidentally equal title.
+				ids = append(ids, out.Sessions[i].ID)
 			} else {
+				// v3 keys were adapter-less. Preserve every matching metadata
+				// session exactly as the retired v3→v4 migration did, then also
+				// inspect transcript-only candidates: a metadata match in one
+				// adapter must not hide another adapter's conversation.
+				for _, i := range bySlug[key] {
+					ids = append(ids, out.Sessions[i].ID)
+				}
+				for _, i := range resolveConversations(conversationByKey[key], infos, state.Items, projectIndex) {
+					info := infos[i]
+					if mi, exists := findMetaConversation(meta, info); exists {
+						ids = append(ids, meta[mi].ID)
+						continue
+					}
+					id, exists := conversationIDs[i]
+					if !exists {
+						id = allocateConversationSessionID(info, usedIDs)
+						conversationIDs[i] = id
+						usedIDs[id] = true
+						out.Sessions = append(out.Sessions, conversationSession(info, id))
+						report.ConversationSessions++
+					}
+					ids = append(ids, id)
+				}
+			}
+			if len(ids) == 0 {
 				report.UnresolvedSlots++
 				report.UnresolvedKeys = append(report.UnresolvedKeys, key)
 				continue
 			}
-			if placed[id] {
-				continue
+			seenSlot := make(map[centralstore.SessionID]bool, len(ids))
+			for _, id := range ids {
+				if seenSlot[id] || placed[id] {
+					continue
+				}
+				seenSlot[id] = true
+				placed[id] = true
+				out.Placements = append(out.Placements, centralstore.LegacyPlacement{ProjectIndex: projectIndex, SessionID: id})
 			}
-			placed[id] = true
-			out.Placements = append(out.Placements, centralstore.LegacyPlacement{ProjectIndex: projectIndex, SessionID: id})
 		}
+	}
+	if report.UnresolvedSlots > 0 {
+		return out, report, fmt.Errorf("%w: %d project slots", ErrUnresolvedSlots, report.UnresolvedSlots)
 	}
 	return out, report, nil
 }
 
-func resolveConversation(candidates []int, infos []conversations.Info, items []projectItem, projectIndex int) (int, bool) {
-	if len(candidates) == 1 {
-		return candidates[0], true
-	}
-	if len(candidates) == 0 {
-		return 0, false
+func resolveConversations(candidates []int, infos []conversations.Info, items []projectItem, projectIndex int) []int {
+	if len(candidates) <= 1 {
+		return append([]int(nil), candidates...)
 	}
 	entries := make([]projectmatch.Entry, len(items))
 	for i, item := range items {
@@ -218,18 +264,24 @@ func resolveConversation(candidates []int, infos []conversations.Info, items []p
 			entries[i].Rules = append(entries[i].Rules, projectmatch.Rule{Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact})
 		}
 	}
-	resolved := -1
+	var matchedHere, unknown []int
 	for _, candidate := range candidates {
 		winner, matched := projectmatch.Match(entries, projectmatch.Inputs{CWD: infos[candidate].Cwd})
-		if !matched || winner != projectIndex {
-			continue
+		switch {
+		case matched && winner == projectIndex:
+			matchedHere = append(matchedHere, candidate)
+		case !matched:
+			unknown = append(unknown, candidate)
 		}
-		if resolved != -1 {
-			return 0, false
-		}
-		resolved = candidate
 	}
-	return resolved, resolved != -1
+	if len(matchedHere) > 0 {
+		// At least one candidate has positive path evidence for this project;
+		// unknown candidates are more likely unrelated same-title transcripts.
+		return matchedHere
+	}
+	// No candidate has positive path evidence. Preserve unknowns because the
+	// project may be remote-only or its workspace may have moved.
+	return unknown
 }
 
 func loadMetaSessions(dir string) ([]centralstore.NewSession, error) {
@@ -246,6 +298,9 @@ func loadMetaSessions(dir string) ([]centralstore.NewSession, error) {
 		if !entry.IsDir() || entry.Name() == ".invalid" {
 			continue
 		}
+		if !pathpkg.IsValidSessionID(entry.Name()) {
+			return nil, fmt.Errorf("legacy import: invalid session directory %q", entry.Name())
+		}
 		session, readErr := legacy.Read(entry.Name())
 		if errors.Is(readErr, os.ErrNotExist) {
 			continue
@@ -253,21 +308,35 @@ func loadMetaSessions(dir string) ([]centralstore.NewSession, error) {
 		if readErr != nil {
 			return nil, readErr
 		}
-		// v1 used last_activity_at before the field was renamed to
-		// last_output_at. sessionmeta's compatibility decoder handles the
-		// other renamed fields; preserve this timestamp here as well.
+		if session.ID != entry.Name() || !pathpkg.IsValidSessionID(session.ID) {
+			return nil, fmt.Errorf("legacy import: session metadata identity mismatch in %q", entry.Name())
+		}
+		data, rawErr := os.ReadFile(filepath.Join(dir, entry.Name(), "meta.json"))
+		if rawErr != nil {
+			return nil, rawErr
+		}
+		var compatibility struct {
+			LastActivityAt string `json:"last_activity_at"`
+			Status         *struct {
+				Working *bool `json:"working"`
+				Active  *bool `json:"active"`
+			} `json:"status"`
+		}
+		if jsonErr := json.Unmarshal(data, &compatibility); jsonErr != nil {
+			return nil, jsonErr
+		}
+		// v1 used last_activity_at and status.working before the fields were
+		// renamed. sessionmeta handles the other renamed fields; preserve these
+		// two explicitly. Do not let working override a current active field if
+		// a hand-edited/transitional record happens to contain both.
 		if session.LastOutputAt == "" {
-			data, rawErr := os.ReadFile(filepath.Join(dir, entry.Name(), "meta.json"))
-			if rawErr != nil {
-				return nil, rawErr
+			session.LastOutputAt = compatibility.LastActivityAt
+		}
+		if compatibility.Status != nil && compatibility.Status.Working != nil && compatibility.Status.Active == nil {
+			if session.Status == nil {
+				session.Status = &store.Status{}
 			}
-			var legacyTimes struct {
-				LastActivityAt string `json:"last_activity_at"`
-			}
-			if jsonErr := json.Unmarshal(data, &legacyTimes); jsonErr != nil {
-				return nil, jsonErr
-			}
-			session.LastOutputAt = legacyTimes.LastActivityAt
+			session.Status.Active = *compatibility.Status.Working
 		}
 		converted, convertErr := metaSession(session)
 		if convertErr != nil {
@@ -322,11 +391,18 @@ func metaSession(v store.Session) (centralstore.NewSession, error) {
 	}, nil
 }
 
-func conversationSession(info conversations.Info) centralstore.NewSession {
-	id := info.ConversationID
-	if id == "" {
-		id = info.Key
+func allocateConversationSessionID(info conversations.Info, used map[centralstore.SessionID]bool) centralstore.SessionID {
+	identity := info.Adapter + "\x00" + info.ConversationID + "\x00" + info.Ref + "\x00" + info.Key
+	for nonce := 0; ; nonce++ {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", identity, nonce)))
+		id := centralstore.SessionID(hex.EncodeToString(sum[:4]))
+		if !used[id] {
+			return id
+		}
 	}
+}
+
+func conversationSession(info conversations.Info, id centralstore.SessionID) centralstore.NewSession {
 	created := info.Created.UnixMilli()
 	if created < 0 {
 		created = 0
@@ -336,7 +412,7 @@ func conversationSession(info conversations.Info) centralstore.NewSession {
 		x := centralstore.UnixMillis(info.LastActivity.UnixMilli())
 		activity = &x
 	}
-	return centralstore.NewSession{ID: centralstore.SessionID(id), Adapter: info.Adapter, ConversationRef: info.Ref,
+	return centralstore.NewSession{ID: id, Adapter: info.Adapter, ConversationRef: info.Ref,
 		Command: append([]string(nil), info.ResumeCommand...), CWD: info.Cwd, Slug: info.Slug, SlugBase: info.Slug,
 		AdapterTitle: info.Title, CreatedAt: centralstore.UnixMillis(created), LastActivityAt: activity}
 }
