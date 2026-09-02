@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"reflect"
@@ -32,6 +33,8 @@ const defaultStreamIdleTimeout = 60 * time.Second
 // in the apiclient package so peering can focus on the peering-specific
 // concerns: namespacing session IDs, ownership filtering, reconnect
 // policy, and status reporting.
+const peerReadProxyLimit = 11 * 1024 * 1024
+
 type Peer struct {
 	Config config.PeerConfig
 	sink   ProjectionSink
@@ -361,6 +364,34 @@ func (p *Peer) fetchHealth(ctx context.Context) {
 func (p *Peer) ProxyWS(w http.ResponseWriter, r *http.Request, originalID string) {
 	log.Printf("peering: %s: ws proxying %s", p.Config.Name, originalID)
 	p.api.ProxyWS(w, r, originalID)
+}
+
+// ProxyGET forwards a bounded read-only API request to this peer. The caller
+// supplies the peer-local path (including the original, unnamespaced session
+// ID); authentication and routed transport stay owned by apiclient.
+func (p *Peer) ProxyGET(w http.ResponseWriter, r *http.Request, path string) {
+	resp, err := p.api.Get(r.Context(), path, r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "peer unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, peerReadProxyLimit+1))
+	if err != nil {
+		http.Error(w, "peer response failed", http.StatusBadGateway)
+		return
+	}
+	if len(body) > peerReadProxyLimit {
+		http.Error(w, "peer response too large", http.StatusBadGateway)
+		return
+	}
+	for _, name := range []string{"Content-Type", "Cache-Control", "Content-Disposition", "Last-Modified", "X-Content-Type-Options"} {
+		if value := resp.Header.Get(name); value != "" {
+			w.Header().Set(name, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
 }
 
 // Backoff bounds for peer reconnects. The ceiling stays at 30s

@@ -827,6 +827,36 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"pid": pid}})
 		})
+		mux.HandleFunc("GET /v1/sessions/{id}/files", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			if peerManager != nil {
+				if peer, originalID := peerManager.FindPeer(id); peer != nil {
+					peer.ProxyGET(w, r, "/v1/sessions/"+originalID+"/files")
+					return
+				}
+			}
+			workspaceSessionFilesListHandler(w, r, id, storeHandle)
+		})
+		mux.HandleFunc("GET /v1/sessions/{id}/file", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			if peerManager != nil {
+				if peer, originalID := peerManager.FindPeer(id); peer != nil {
+					peer.ProxyGET(w, r, "/v1/sessions/"+originalID+"/file")
+					return
+				}
+			}
+			workspaceSessionFilesContentHandler(w, r, id, storeHandle)
+		})
+		mux.HandleFunc("GET /v1/sessions/{id}/temp-file", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			if peerManager != nil {
+				if peer, originalID := peerManager.FindPeer(id); peer != nil {
+					peer.ProxyGET(w, r, "/v1/sessions/"+originalID+"/temp-file")
+					return
+				}
+			}
+			sessionTempImageContentHandler(w, r, id, storeHandle, os.TempDir())
+		})
 		mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
 			handleCentralSessionAction(w, r, boot, fanout, converter, peerManager, sessionDirs, gmuxBin, notifier)
 		})
@@ -1391,7 +1421,11 @@ func handleCentralSessionAction(w http.ResponseWriter, r *http.Request, boot *Bo
 			writeError(w, http.StatusNotFound, "not_found", "session not found")
 			return
 		}
-		clipboardHandler(clipfile.NewLocalWriter(os.TempDir())).ServeHTTP(w, r)
+		if !validSessionTempImageID(sessionID) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid session ID")
+			return
+		}
+		clipboardHandler(clipfile.NewLocalWriter(sessionTempImageDir(os.TempDir(), sessionID))).ServeHTTP(w, r)
 	case "dismiss":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")

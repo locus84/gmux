@@ -109,6 +109,26 @@ func New(baseURL string, opts ...Option) *Client {
 // BaseURL returns the base URL this client was constructed with.
 func (c *Client) BaseURL() string { return c.baseURL }
 
+// Get issues an authenticated GET against a relative API path. The caller
+// owns and must close the returned response body. It is used by peer-aware
+// read-only endpoints whose response should stream through the hub unchanged.
+func (c *Client) Get(ctx context.Context, path, rawQuery string) (*http.Response, error) {
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("apiclient Get: path must be absolute")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("apiclient Get: %w", err)
+	}
+	req.URL.RawQuery = rawQuery
+	c.setAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("apiclient Get: %w", err)
+	}
+	return resp, nil
+}
+
 // setAuth adds the bearer token to a request if one is configured.
 func (c *Client) setAuth(req *http.Request) {
 	if c.token != "" {

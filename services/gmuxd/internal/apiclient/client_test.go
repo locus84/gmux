@@ -25,6 +25,36 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestGetForwardsAuthPathAndQuery(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/sessions/local/files" || r.URL.RawQuery != "path=src" {
+			t.Fatalf("request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer ts.Close()
+
+	resp, err := New(ts.URL, WithBearerToken("secret")).Get(context.Background(), "/v1/sessions/local/files", "path=src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q, err = %v", body, err)
+	}
+}
+
+func TestGetRejectsRelativePath(t *testing.T) {
+	if _, err := New("http://example.invalid").Get(context.Background(), "v1/files", ""); err == nil {
+		t.Fatal("expected relative path rejection")
+	}
+}
+
 func TestNew_WithBearerToken(t *testing.T) {
 	c := New("http://host", WithBearerToken("abc"))
 	if c.token != "abc" {
