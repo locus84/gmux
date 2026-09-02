@@ -174,6 +174,20 @@ Characters treated as word boundaries for double-click selection.
 - **Type:** `string`
 - **Default:** <code>" ()[]{}',&quot;`:;"</code>
 
+### `vsCodeServerUrl`
+
+Base URL of a VS Code Server/code-server instance used for workspace links and loopback port proxying.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
+
+### `vsCodeServerHomeDir`
+
+Absolute home directory on the VS Code Server host, used to expand workspace paths beginning with ~/.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
+
 ### `keybinds`
 
 Key-to-action mappings. Layered on top of platform-specific defaults.

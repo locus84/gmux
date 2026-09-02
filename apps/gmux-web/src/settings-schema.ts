@@ -184,6 +184,8 @@ const settingsEntries = {
     minimumContrastRatio: clampedNumber(1, 1, 21, 'Minimum contrast ratio for text. 1 disables contrast adjustment.'),
     macOptionIsMeta:  optBool(true, 'Treat the macOS Option key as Meta (sends ESC prefix). When false, Option produces special characters like ñ and ß.'),
     wordSeparator:    optStr(' ()[]{}\',"`:;', 'Characters treated as word boundaries for double-click selection.'),
+    vsCodeServerUrl:  optStr('', 'Base URL of a VS Code Server/code-server instance used for workspace links and loopback port proxying.'),
+    vsCodeServerHomeDir: optStr('', 'Absolute home directory on the VS Code Server host, used to expand workspace paths beginning with ~/.'),
 
     // Keybinds (validated structurally; semantic validation in keybinds.ts).
     keybinds: v.optional(v.pipe(

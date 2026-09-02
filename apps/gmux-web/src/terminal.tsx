@@ -6,6 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links'
 import { Terminal } from '@xterm/xterm'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
+import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
 import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, handlePasteAction, type PasteDestination } from './keyboard'
 import { LinkActionSheet } from './link-action-sheet'
 import { createLongPressRecognizer } from './long-press'
@@ -18,10 +19,11 @@ import { MOCK_BY_ID } from './mock-data/index'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { createReplayBuffer } from './replay'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import { terminalFindOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
+import { navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
+import { createTerminalFileLinkProvider } from './terminal-file-link'
 import { canSendTerminalInput } from './terminal-input'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { type LinkInfo, linkAtPoint, openLinkAtPoint } from './terminal-link'
@@ -31,6 +33,7 @@ import { TerminalTextSheet } from './terminal-text-sheet'
 import { pushError } from './toasts'
 import { isTouchDevice } from './touch'
 import type { Session } from './types'
+import { resolveTerminalWebUrl } from './vscode-server'
 import { loadWebglRenderer } from './webgl-renderer'
 import { type WsState, wsStateOnClose, wsStateOnOutput } from './ws-state'
 import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
@@ -589,7 +592,8 @@ export function TerminalView({
       ...terminalOptions,
       linkHandler: {
         activate(_event, text) {
-          window.open(text, '_blank', 'noopener')
+          const current = sessionRef.current
+          window.open(resolveTerminalWebUrl(text, terminalOptions.vsCodeServerUrl, current.peer), '_blank', 'noopener')
         },
       },
     })
@@ -955,6 +959,7 @@ export function TerminalView({
       disposePasteHandler()
       disposeMobileHandler()
       disposeImeResidueGuard()
+      fileLinkDisposable.dispose()
       osc52Disposable.dispose()
       dataDisposable.dispose()
       scrollDisposable.dispose()
@@ -1394,6 +1399,23 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     term.loadAddon(fit)
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
+    const fileLinkDisposable = term.registerLinkProvider(createTerminalFileLinkProvider(
+      term,
+      () => {
+        const current = sessionRef.current
+        return {
+          sessionId: current.id,
+          root: current.workspace_root || current.cwd,
+          cwd: current.cwd,
+        }
+      },
+      (sessionId, path, pasteImage) => pasteImage
+        ? pasteFileBrowserPath(sessionId, path)
+        : fileBrowserPath(sessionId, path),
+      (sessionId, path, pasteImage) => navigate(pasteImage
+        ? pasteFileBrowserPath(sessionId, path)
+        : fileBrowserPath(sessionId, path)),
+    ))
     loadWebglRenderer(term)
     // Fit like the real terminal: measureTerminalFit reserves the mobile
     // control bar's height (rounding rows up so one row tucks behind the

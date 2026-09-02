@@ -10,6 +10,8 @@ import { familyAncestors, familyRoot, familySegments, hasFamily, promotionAction
 import { FamilyDrawer } from './family-drawer'
 import { familyDrawerRoot } from './family-drawer-state'
 import { FamilyIcon } from './family-icon'
+import { FileBrowserView } from './file-browser-view'
+import { fileBrowserPath } from './file-browser'
 import { Home } from './home'
 import { applyArmedModifiers } from './keyboard'
 import { MenuButton } from './menu-button'
@@ -453,6 +455,15 @@ function SessionMenu({ session, onRestart, onResume, resuming }: {
               Find in terminal
             </button>
           )}
+          <button
+            class="session-menu-action"
+            onClick={() => {
+              setOpen(false)
+              navigate(fileBrowserPath(session.id))
+            }}
+          >
+            Browse files
+          </button>
           {promotion && promotionWords && (
             <button
               class="session-menu-action session-menu-promotion"
@@ -502,7 +513,7 @@ function SessionMenu({ session, onRestart, onResume, resuming }: {
               {showStale && <span class="session-menu-action-tag">outdated</span>}
             </button>
           )}
-          {(canFind || (action && actionHandler) || promotion) && <div class="session-menu-divider" />}
+          <div class="session-menu-divider" />
           <div class="session-menu-section-title">Session info</div>
           <div class="session-menu-row">
             <span class="session-menu-label">ID</span>
@@ -1090,6 +1101,8 @@ function App() {
         {!keyBarShown && !replayShown && (
           <MenuButton variant="floating" onMenu={openSidebar} />
         )}
+
+        <FileBrowserView />
       </div>
     </div>
   )
