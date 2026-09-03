@@ -32,6 +32,7 @@ import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pushError } from './toasts'
 import { isTouchDevice } from './touch'
+import { acceleratedScrollRows, decayScrollVelocity, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import type { Session } from './types'
 import { resolveTerminalWebUrl } from './vscode-server'
 import { loadWebglRenderer } from './webgl-renderer'
@@ -300,6 +301,7 @@ export function TerminalView({
   onModifiersCancelled,
   onInputReady,
   onAttachFileReady,
+  onPasteReady,
   onFocusReady,
 }: {
   session: Session
@@ -315,6 +317,7 @@ export function TerminalView({
   onModifiersCancelled: () => void
   onInputReady?: (send: ((data: string) => void) | null) => void
   onAttachFileReady?: (attach: ((file: File) => void) | null) => void
+  onPasteReady?: (paste: (() => void) | null) => void
   onFocusReady?: (focus: (() => void) | null) => void
 }) {
   const shellRef = useRef<HTMLDivElement>(null)
@@ -717,6 +720,7 @@ export function TerminalView({
       }
       void handlePasteAction(destination, pasteFeedback)
     }
+    onPasteReady?.(pasteActionRef.current)
     onAttachFileReady?.((file: File) => {
       const destination = getPasteDestination()
       if (!destination) {
@@ -802,113 +806,173 @@ export function TerminalView({
       const anchorRow = Math.max(0, Math.min(pressedBufferRow(term, y), lines.length - 1))
       setTextSheet({ lines, anchorRow })
     })
-    const touchPanState = {
+    const touchPanState: {
+      active: boolean
+      moved: boolean
+      lastY: number
+      lastMoveAt: number
+      rowRemainder: number
+      velocityRowsPerMs: number
+      momentumFrame: number | null
+      dragScrollFrame: number | null
+      pendingDragRows: number
+      start: TerminalTouchSnapshot
+    } = {
       active: false,
       moved: false,
-      startX: 0,
-      startY: 0,
-      startScrollLeft: 0,
-      startScrollTop: 0,
+      lastY: 0,
+      lastMoveAt: 0,
+      rowRemainder: 0,
+      velocityRowsPerMs: 0,
+      momentumFrame: null,
+      dragScrollFrame: null,
+      pendingDragRows: 0,
+      start: { x: 0, y: 0, scrollLeft: 0, scrollTop: 0 },
+    }
+
+    const flushDragScroll = () => {
+      touchPanState.dragScrollFrame = null
+      const rows = touchPanState.pendingDragRows
+      touchPanState.pendingDragRows = 0
+      if (rows !== 0) term.scrollLines(rows)
+    }
+    const queueDragScroll = (rows: number) => {
+      if (!rows) return
+      touchPanState.pendingDragRows += rows
+      if (touchPanState.dragScrollFrame === null) touchPanState.dragScrollFrame = requestAnimationFrame(flushDragScroll)
+    }
+    const cancelDragScroll = (flush = false) => {
+      if (touchPanState.dragScrollFrame !== null) cancelAnimationFrame(touchPanState.dragScrollFrame)
+      touchPanState.dragScrollFrame = null
+      if (flush && touchPanState.pendingDragRows) term.scrollLines(touchPanState.pendingDragRows)
+      touchPanState.pendingDragRows = 0
+    }
+    const cancelScrollMomentum = () => {
+      if (touchPanState.momentumFrame !== null) cancelAnimationFrame(touchPanState.momentumFrame)
+      touchPanState.momentumFrame = null
+    }
+    const resetTouchPan = () => {
+      touchPanState.active = false
+      touchPanState.moved = false
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+    }
+    const startScrollMomentum = () => {
+      let velocity = touchPanState.velocityRowsPerMs * 0.5
+      if (Math.abs(velocity) < 0.01) return
+      let last = performance.now()
+      let remainder = 0
+      const tick = (now: number) => {
+        const elapsed = Math.min(32, now - last)
+        last = now
+        const rawRows = remainder + velocity * elapsed
+        const rows = rawRows > 0 ? Math.floor(rawRows) : Math.ceil(rawRows)
+        remainder = rawRows - rows
+        if (rows) term.scrollLines(rows)
+        velocity = decayScrollVelocity(velocity, elapsed)
+        if (Math.abs(velocity) >= 0.006) touchPanState.momentumFrame = requestAnimationFrame(tick)
+        else touchPanState.momentumFrame = null
+      }
+      touchPanState.momentumFrame = requestAnimationFrame(tick)
     }
 
     const handleTouchStartCapture = (ev: TouchEvent) => {
       if (ev.touches.length !== 1 || isInteractiveTarget(ev.target)) {
-        longPress.cancel()
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
+        longPress.cancel(); cancelDragScroll(); cancelScrollMomentum(); resetTouchPan(); return
       }
-
       const host = shellRef.current
-      if (!host) {
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
-      }
-
-      // Track touch start for both modes — focus happens on touchend
-      // only if the user didn't drag (tap vs scroll distinction).
+      if (!host) { cancelDragScroll(); cancelScrollMomentum(); resetTouchPan(); return }
+      cancelDragScroll()
+      cancelScrollMomentum()
+      const touch = ev.touches[0]
       touchPanState.active = true
       touchPanState.moved = false
-      touchPanState.startX = ev.touches[0].clientX
-      touchPanState.startY = ev.touches[0].clientY
-      touchPanState.startScrollLeft = host.scrollLeft
-      touchPanState.startScrollTop = host.scrollTop
-      longPress.start(touchPanState.startX, touchPanState.startY)
+      touchPanState.lastY = touch.clientY
+      touchPanState.lastMoveAt = performance.now()
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+      touchPanState.start = {
+        x: touch.clientX, y: touch.clientY,
+        scrollLeft: host.scrollLeft, scrollTop: host.scrollTop,
+      }
+      longPress.start(touch.clientX, touch.clientY)
     }
 
     const handleTouchMoveCapture = (ev: TouchEvent) => {
       if (!touchPanState.active || ev.touches.length !== 1) return
-
       const host = shellRef.current
       if (!host) return
-
       const touch = ev.touches[0]
-      const deltaX = touch.clientX - touchPanState.startX
-      const deltaY = touch.clientY - touchPanState.startY
-      if (Math.abs(deltaX) > 6 || Math.abs(deltaY) > 6) {
+      const current = {
+        x: touch.clientX, y: touch.clientY,
+        scrollLeft: host.scrollLeft, scrollTop: host.scrollTop,
+      }
+      const deltaX = current.x - touchPanState.start.x
+      const deltaY = current.y - touchPanState.start.y
+      if (terminalTouchMoved(touchPanState.start, current)) {
         touchPanState.moved = true
         longPress.cancel()
       }
+      if (!touchPanState.moved) return
 
-      // If viewport matches PTY (in sync), no overflow to pan — let xterm
-      // handle the gesture for selection/scrollback.
       const vp = viewportSizeRef.current
       const pty = ptySizeRef.current
-      if (vp && pty && vp.cols === pty.cols && vp.rows === pty.rows) return
-
+      const viewportMatchesPty = !!vp && !!pty && vp.cols === pty.cols && vp.rows === pty.rows
       const canScrollX = host.scrollWidth > host.clientWidth
       const canScrollY = host.scrollHeight > host.clientHeight
-      if (!canScrollX && !canScrollY) return
+      if (!viewportMatchesPty && (canScrollX || canScrollY)) {
+        if (canScrollX) host.scrollLeft = touchPanState.start.scrollLeft - deltaX
+        if (canScrollY) host.scrollTop = touchPanState.start.scrollTop - deltaY
+        ev.preventDefault(); ev.stopPropagation(); return
+      }
 
-      if (canScrollX) host.scrollLeft = touchPanState.startScrollLeft - deltaX
-      if (canScrollY) host.scrollTop = touchPanState.startScrollTop - deltaY
+      const now = performance.now()
+      const deltaTime = Math.max(1, now - touchPanState.lastMoveAt)
+      const result = acceleratedScrollRows({
+        deltaY: current.y - touchPanState.lastY,
+        totalDeltaY: current.y - touchPanState.start.y,
+        cellHeight: term.dimensions?.css.cell.height || 16,
+        remainder: touchPanState.rowRemainder,
+      })
+      touchPanState.lastY = current.y
+      touchPanState.lastMoveAt = now
+      touchPanState.rowRemainder = result.remainder
+      touchPanState.velocityRowsPerMs = touchPanState.velocityRowsPerMs * 0.45 + (result.exactRows / deltaTime) * 0.55
+      queueDragScroll(result.rows)
       ev.preventDefault()
       ev.stopPropagation()
     }
 
     const handleTouchEndCapture = (ev: TouchEvent) => {
-      // A fired long-press owns this touch: suppress tap behavior and
-      // the browser's synthesized cascade.
       if (longPress.end()) {
+        ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
+      }
+      const touch = ev.changedTouches[0]
+      const host = shellRef.current
+      const shouldFocus = !!touch && !!host && shouldFocusTerminalFromTouch(
+        touchPanState.active, touchPanState.moved, touchPanState.start,
+        { x: touch.clientX, y: touch.clientY, scrollLeft: host.scrollLeft, scrollTop: host.scrollTop },
+      )
+      if (touchPanState.active && !shouldFocus) {
         ev.preventDefault()
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
+        ev.stopPropagation()
+        if (touchPanState.moved) { cancelDragScroll(true); startScrollMomentum() }
       }
-
-      if (touchPanState.active && !touchPanState.moved) {
-        // Tap on a link opens it by driving xterm's Linkifier with a
-        // synthetic mousemove/mousedown/mouseup handshake (see
-        // terminal-link.ts for why the browser's own synthesized cascade
-        // is unreliable here, especially on iOS). preventDefault stops
-        // the browser from synthesizing its own cascade for this touch,
-        // so the link can't be activated twice. When a link opens, skip
-        // the keyboard focus/scroll — the tap was navigation, not input
-        // intent.
-        if (openLinkAtPoint(term, touchPanState.startX, touchPanState.startY)) {
-          ev.preventDefault()
-          touchPanState.active = false
-          touchPanState.moved = false
-          return
+      if (shouldFocus) {
+        if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+          ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
         }
-
+        ev.preventDefault()
         focusTerminalInput(term)
-        // No eager scroll-to-bottom here: the keyboard-open viewport
-        // shrink triggers one PTY reflow that already lands at the
-        // bottom. A scrollToBottom here would fire mid-slide (its
-        // setTimeout is deferred by the focus/layout work to ~30% of
-        // the keyboard animation), producing a redundant scroll jump
-        // before the reflow does the same thing again.
       }
-      touchPanState.active = false
-      touchPanState.moved = false
+      resetTouchPan()
     }
 
     const clearTouchPan = () => {
-      longPress.end() // full reset: discard pending and fired state
-      touchPanState.active = false
-      touchPanState.moved = false
+      longPress.end()
+      cancelDragScroll()
+      cancelScrollMomentum()
+      resetTouchPan()
     }
 
     shell?.addEventListener('touchstart', handleTouchStartCapture, { capture: true, passive: false })
@@ -980,6 +1044,7 @@ export function TerminalView({
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)
       shell?.removeEventListener('touchcancel', clearTouchPan, true)
+      clearTouchPan()
       disposePasteHandler()
       disposeMobileHandler()
       disposeImeResidueGuard()
@@ -998,6 +1063,7 @@ export function TerminalView({
       connectionRef.current = null
       onInputReady?.(null)
       pasteActionRef.current = null
+      onPasteReady?.(null)
       onAttachFileReady?.(null)
       onFocusReady?.(null)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null

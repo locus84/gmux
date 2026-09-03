@@ -5,6 +5,7 @@ import {
   closeFileBrowserPath,
   fileApiPath,
   fileBrowserPath,
+  projectFileBrowserPath,
   formatBytes,
   imageSizeForMode,
   parentPath,
@@ -16,7 +17,7 @@ import {
   type ImageSizingMode,
   wheelImageZoom,
 } from './file-browser'
-import { vsCodeServerHomeDir, vsCodeServerUrl } from './store'
+import { sessions, vsCodeServerHomeDir, vsCodeServerUrl } from './store'
 import { buildVSCodeServerUrl } from './vscode-server'
 
 const IconVSCode = () => (
@@ -42,7 +43,7 @@ function displayPath(root: string, path: string): string {
   return path ? `${root}/${path}` : root
 }
 
-type FileTarget = { kind: 'session'; id: string } | { kind: 'paste'; id: string }
+type FileTarget = { kind: 'session'; id: string } | { kind: 'project'; slug: string; peer?: string } | { kind: 'paste'; id: string }
 type ImageMode = ImageSizingMode
 type ImageLoadState = 'loading' | 'loaded' | 'error'
 type ImageLoad = { src: string; state: ImageLoadState }
@@ -67,7 +68,12 @@ function saveImageMode(mode: ImageMode): void {
 }
 
 function targetLabel(target: FileTarget): string {
+  if (target.kind === 'project') return `project ${target.slug}${target.peer ? ` on ${target.peer}` : ''}`
   return target.kind === 'paste' ? 'temporary image' : `session ${target.id}`
+}
+
+function targetApi(target: Exclude<FileTarget, { kind: 'paste' }>) {
+  return target.kind === 'session' ? { sessionId: target.id } : { projectSlug: target.slug, peer: target.peer }
 }
 
 async function loadFileBrowser(target: FileTarget, path: string): Promise<LoadState> {
@@ -82,7 +88,7 @@ async function loadFileBrowser(target: FileTarget, path: string): Promise<LoadSt
     }
   }
 
-  const listResp = await fetch(fileApiPath('list', target.id, path))
+  const listResp = await fetch(fileApiPath('list', targetApi(target), path))
   if (listResp.ok) {
     const body = await listResp.json() as ApiEnvelope<FileListData>
     if (body.ok && body.data) return { kind: 'list', data: body.data }
@@ -98,7 +104,7 @@ async function loadFileBrowser(target: FileTarget, path: string): Promise<LoadSt
     return { kind: 'error', code: body?.error?.code, message: body?.error?.message || `Request failed (${listResp.status})` }
   }
 
-  const contentResp = await fetch(fileApiPath('content', target.id, path))
+  const contentResp = await fetch(fileApiPath('content', targetApi(target), path))
   const body = await contentResp.json().catch(() => null) as ApiEnvelope<FileContentData> | null
   if (contentResp.ok && body?.ok && body.data) return { kind: 'content', data: body.data }
   return {
@@ -117,10 +123,14 @@ function FileIcon({ entry }: { entry: FileEntry }) {
 export function FileBrowserView() {
   const loc = useLocation()
   const sessionId = `${loc.query.files ?? ''}`
+  const projectSlug = `${loc.query.projectFiles ?? ''}`
+  const projectPeer = `${loc.query.projectFilesPeer ?? ''}` || undefined
   const pasteSessionId = `${loc.query.pasteFile ?? ''}`
   const target: FileTarget | null = pasteSessionId
     ? { kind: 'paste', id: pasteSessionId }
-    : sessionId ? { kind: 'session', id: sessionId } : null
+    : sessionId
+      ? { kind: 'session', id: sessionId }
+      : projectSlug ? { kind: 'project', slug: projectSlug, peer: projectPeer } : null
   const path = `${loc.query.filePath ?? ''}`
   const [state, setState] = useState<LoadState>({ kind: 'loading' })
   const [copied, setCopied] = useState<string | null>(null)
@@ -139,12 +149,17 @@ export function FileBrowserView() {
   const imageSrc = target?.kind === 'paste'
     ? tempFileApiPath('raw', target.id, path)
     : target && state.kind === 'content' && state.data.kind === 'image'
-      ? fileApiPath('raw', target.id, path)
+      ? fileApiPath('raw', targetApi(target), path)
       : ''
   const imageLoadState = imageLoad.src === imageSrc ? imageLoad.state : 'loading'
   const copyPath = state.kind === 'list' || state.kind === 'content' ? state.data.abs_path : ''
   const workspaceRoot = state.kind === 'list' || state.kind === 'content' ? state.data.root : ''
-  const codeUrl = target?.kind === 'session'
+  const targetSession = target?.kind === 'session'
+    ? sessions.value.find(session => session.id === target.id)
+    : undefined
+  const codeUrl = target && target.kind !== 'paste'
+    && (target.kind !== 'project' || !target.peer)
+    && (target.kind !== 'session' || (!!targetSession && !targetSession.peer))
     ? buildVSCodeServerUrl(vsCodeServerUrl.value, workspaceRoot, vsCodeServerHomeDir.value)
     : null
   const close = () => loc.route(closeFileBrowserPath(loc.path, loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''), true)
@@ -157,13 +172,15 @@ export function FileBrowserView() {
       .then(next => { if (!cancelled) setState(next) })
       .catch(err => { if (!cancelled) setState({ kind: 'error', message: err instanceof Error ? err.message : 'Failed to load files' }) })
     return () => { cancelled = true }
-  }, [target?.kind, target?.id, path])
+  }, [target?.kind, target?.kind === 'project' ? target.slug : target?.id, target?.kind === 'project' ? target.peer : '', path])
 
   const routeTo = (nextPath: string) => {
     if (!target) return
     const search = loc.url.includes('?') ? loc.url.slice(loc.url.indexOf('?')) : ''
     if (target.kind === 'paste') return
-    loc.route(fileBrowserPath(target.id, nextPath, loc.path, search))
+    loc.route(target.kind === 'session'
+      ? fileBrowserPath(target.id, nextPath, loc.path, search)
+      : projectFileBrowserPath(target.slug, target.peer, nextPath, loc.path, search))
   }
   useEffect(() => {
     if (!target) return

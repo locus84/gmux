@@ -593,8 +593,26 @@ body {
   margin-left: auto;
 }
 
+.folder-file-btn,
+.folder-vscode-btn {
+  width: var(--launch-btn-size);
+  min-width: var(--launch-btn-size);
+  height: var(--launch-btn-size);
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.folder-file-btn:hover,
+.folder-vscode-btn:hover { background: var(--bg-selected); color: var(--text); }
+
 .launch-container.folder-launch-btn {
-  margin-left: auto;
   opacity: 0;
   transition: opacity 0.1s;
 }
@@ -814,7 +832,8 @@ body {
 .checkout-state-label { color: var(--status-warning); }
 .checkout-session-count { min-width: 1.5em; text-align: center; }
 .checkout-actions { flex: none; display: flex; align-items: center; padding-right: 0.65em; }
-.checkout-actions .launch-btn {
+.checkout-actions .launch-btn,
+.checkout-remove-btn {
   width: 32px;
   min-width: 32px;
   height: 32px;
@@ -825,6 +844,9 @@ body {
   background: transparent;
   color: var(--text-secondary);
 }
+.checkout-remove-btn { display: inline-flex; align-items: center; justify-content: center; font-size: 16px; cursor: pointer; }
+.checkout-remove-btn:hover,
+.checkout-remove-btn:focus-visible { color: var(--status-error); }
 .checkout-sessions { overflow: hidden; }
 .checkout-sessions .session-item { padding-left: 1.65em; }
 .checkout-inventory-error {
@@ -844,8 +866,18 @@ body {
 .checkout-inventory-error:focus-visible { background: var(--bg-hover); }
 @media (pointer: coarse) {
   .checkout-fold-btn { min-height: 44px; }
-  .checkout-actions .launch-btn { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
 }
+
+.worktree-remove-sheet { width: min(380px, calc(100vw - 24px)); padding: 18px; gap: 10px; }
+.worktree-remove-sheet h2,
+.worktree-remove-sheet p { margin: 0; }
+.worktree-remove-sheet code { overflow-wrap: anywhere; color: var(--text-secondary); }
+.worktree-remove-safety { color: var(--text-muted); font-size: 12px; }
+.worktree-remove-error { color: var(--status-error); font-size: 13px; }
+.worktree-remove-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.worktree-remove-confirm { color: var(--status-error); }
 
 /* ── Host suffix (project headers) ── */
 .host-suffix {
@@ -1698,6 +1730,8 @@ body {
 /* On touch devices (no hover), show interactive buttons permanently */
 @media (hover: none) {
   .launch-container.folder-launch-btn { opacity: 1; }
+  .folder-file-btn,
+  .folder-vscode-btn { width: 44px; min-width: 44px; height: 44px; }
   .session-close-btn { opacity: 1; }
 }
 
@@ -1749,6 +1783,21 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+.home-activity-header .hub-title { margin-right: auto; }
+.mobile-page-refresh {
+  display: none;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  align-items: center;
+  justify-content: center;
+}
+@media (pointer: coarse) {
+  .mobile-page-refresh { display: inline-flex; }
 }
 
 /* Enable-notifications affordance, right-aligned in the Activity header.
@@ -3589,15 +3638,15 @@ body {
     left: 0;
     right: 0;
     bottom: 0;
-    /* Phones: 7-column × 2-row grid. Esc sits above the hamburger; the
-       scroll-end / empty top-right simply fall out of the template (no
-       placeholder elements needed). */
+    /* Typical phones keep the full key set in an 8-column × 2-row grid.
+       Very narrow phones switch to the seven-column layout below so touch
+       targets do not shrink just to retain word-jumps. */
     display: grid;
-    grid-template-columns: repeat(7, 1fr);
+    grid-template-columns: repeat(8, 1fr);
     grid-template-rows: repeat(2, 40px);
     grid-template-areas:
-      'esc  stab tab  wl  au  wr  end'
-      'menu ctrl alt  al  ad  ar  send';
+      'esc  stab tab  wl  au  wr  paste end'
+      'menu ctrl alt  al  ad  ar  attach send';
     /* One knob for spacing: the visual gap between keys. Hitboxes bridge it
        automatically (each .mkey-face extends half of it), so there are no
        dead gaps between buttons no matter what you set this to. */
@@ -3633,7 +3682,8 @@ body {
   .mk-au   { grid-area: au; }
   .mk-ar   { grid-area: ar; }
   .mk-end    { grid-area: end; }
-  .mk-attach { grid-area: end; }
+  .mk-paste  { grid-area: paste; }
+  .mk-attach { grid-area: attach; }
   .mk-send   { grid-area: send; }
   .mobile-attach-input { display: none; }
 
@@ -3722,6 +3772,7 @@ body {
   /* Top layer: glyph + press/armed feedback, lifted above the terminal. */
   .mkey-face {
     position: absolute;
+    white-space: nowrap;
     /* Extend the hit area by half the gap on every side so neighbouring
        faces meet edge-to-edge (the CSS equivalent of hitSlop). The glyph
        stays centred and the visual border (::before) keeps the cell's
@@ -4436,12 +4487,24 @@ body {
    these win; both thresholds are placeholders to fine-tune. Keys are moved
    purely by re-stating grid-template-areas (see .mk-* map). */
 
-/* Single row, word-jumps dropped. */
-@media (pointer: coarse) and (min-width: 600px) {
+/* Preserve seven-column hit targets on the narrowest supported phones. */
+@media (pointer: coarse) and (max-width: 340px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(11, 1fr);
+    grid-template-columns: repeat(7, 1fr);
+    grid-template-areas:
+      'esc  stab tab  au  paste attach end'
+      'menu ctrl alt  al  ad    ar     send';
+  }
+  .mk-wl,
+  .mk-wr { display: none; }
+}
+
+/* Single row, word-jumps dropped. */
+@media (pointer: coarse) and (min-width: 680px) {
+  .mobile-bottom-bar {
+    grid-template-columns: repeat(13, 1fr);
     grid-template-rows: 40px;
-    grid-template-areas: 'menu esc stab tab ctrl alt al au ad ar send';
+    grid-template-areas: 'menu esc stab tab ctrl alt paste attach al au ad ar send';
   }
   /* Word-jumps aren't part of the single-row layout. */
   .mk-wl,
@@ -4468,8 +4531,8 @@ body {
 /* Wider still: fold the word-jumps back in, flanking the arrow cluster. */
 @media (pointer: coarse) and (min-width: 820px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(13, 1fr);
-    grid-template-areas: 'menu esc stab tab ctrl alt wl al au ad ar wr send';
+    grid-template-columns: repeat(15, 1fr);
+    grid-template-areas: 'menu esc stab tab ctrl alt paste attach wl al au ad ar wr send';
   }
   .mk-wl,
   .mk-wr {

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PendingMutation } from './store'
 import {
   _pendingMutations, _rawSessions, _setRawWorld, acknowledgePromotionAnnouncement,
-  activityMap, applyPending, applySessionsSnapshot, backgroundActivity, beginPromotion,
+  activityMap, aggregateSessionDotState, applyPending, applySessionsSnapshot, backgroundActivity, beginPromotion,
   createViewConsumptionTracker, discovered, dismissSession, duplicateConversationFiles,
   familyActivityById, familyDotById, familySelectedId, familySlotById, filteredSessions,
   folders, handleActivity, homePartition, initStore, isSessionActive, isSessionFading,
@@ -1546,6 +1546,28 @@ describe('unreadCount (sidebar-only attention blip)', () => {
     expect(unreadCount.value).toBe(1)
     urlSearch.value = '?filter=elsewhere'
     expect(unreadCount.value).toBe(0)
+  })
+})
+
+describe('aggregateSessionDotState', () => {
+  it('rolls up the highest-priority visible checkout activity', () => {
+    const rows = [
+      makeSession({ id: 'active' }),
+      makeSession({ id: 'waiting', unread: true }),
+      makeSession({ id: 'working', status: { active: true } }),
+    ]
+    expect(aggregateSessionDotState(rows, new Map([['active', 'active']]))).toBe('working')
+  })
+
+  it('suppresses selected attention and unavailable or sleeping rows', () => {
+    const rows = [
+      makeSession({ id: 'selected', unread: true }),
+      makeSession({ id: 'remote', peer: 'box', unread: true }),
+      makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true }),
+    ]
+    expect(aggregateSessionDotState(rows, new Map(), {
+      selectedId: 'selected', peerStatus: new Map([['box', 'offline']]),
+    })).toBe('none')
   })
 })
 

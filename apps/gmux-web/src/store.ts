@@ -496,6 +496,28 @@ export function sessionDotState(
   return 'none'
 }
 
+export function aggregateSessionDotState(
+  sessions: readonly Session[],
+  am: ReadonlyMap<string, 'active' | 'fading'>,
+  options: {
+    selectedId?: string | null
+    resumingId?: string | null
+    peerStatus?: ReadonlyMap<string, string>
+  } = {},
+): DotState {
+  const priority: Record<DotState, number> = {
+    none: 0, fading: 1, active: 2, unread: 3, error: 4, 'active-error': 5, working: 6,
+  }
+  let aggregate: DotState = 'none'
+  for (const session of sessions) {
+    if ((options.peerStatus && isSessionUnavailable(session, options.peerStatus)) || (!session.alive && session.resumable)) continue
+    let state: DotState = options.resumingId === session.id ? 'working' : sessionDotState(session, am)
+    if (options.selectedId === session.id && (state === 'error' || state === 'unread')) state = 'none'
+    if (priority[state] > priority[aggregate]) aggregate = state
+  }
+  return aggregate
+}
+
 export function isSessionUnavailable(
   session: { peer?: string },
   statusByName: ReadonlyMap<string, string>,

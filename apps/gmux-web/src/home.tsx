@@ -13,7 +13,7 @@ import {
 import { SessionRow } from './session-row'
 import { hasSessionSlugCollision, sessionPath } from './routing'
 import { cwdBadge } from './cwd-format'
-import { IconBell, type NotifPermission } from './sidebar'
+import { IconBell, IconRefresh, type NotifPermission } from './sidebar'
 import type { Folder, Session } from './types'
 
 export function Home({
@@ -89,6 +89,9 @@ export function Home({
             permission={notifPermission}
             onRequest={onRequestNotifPermission}
           />
+          <button class="mobile-page-refresh" type="button" aria-label="Refresh app" title="Refresh app" onClick={() => location.reload()}>
+            <IconRefresh />
+          </button>
         </div>
       </header>
       {shown.map(b => (

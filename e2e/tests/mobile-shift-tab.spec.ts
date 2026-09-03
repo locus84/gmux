@@ -156,14 +156,20 @@ test.describe('mobile Shift+Tab keyboard', () => {
         layout.dot.right <= layout.escFace.x || layout.dot.x >= layout.escFace.right ||
         layout.dot.bottom <= layout.escFace.y || layout.dot.y >= layout.escFace.bottom,
       ).toBe(true)
-      if (branch === 'portrait' || branch === 'small') {
+      if (branch === 'small') {
         expect(layout.columns).toBe(7)
+        expect(layout.words[0].display).toBe('none')
+        expect(layout.words[1].display).toBe('none')
+      } else if (branch === 'portrait') {
+        expect(layout.columns).toBe(8)
+        expect(layout.words[0].display).not.toBe('none')
+        expect(layout.words[1].display).not.toBe('none')
       } else if (branch === 'medium') {
-        expect(layout.columns).toBe(11)
+        expect(layout.columns).toBe(13)
         expect(layout.words[0].display).toBe('none')
         expect(layout.words[1].display).toBe('none')
       } else {
-        expect(layout.columns).toBe(13)
+        expect(layout.columns).toBe(15)
         expect(layout.words[0].display).not.toBe('none')
         expect(layout.words[1].display).not.toBe('none')
       }

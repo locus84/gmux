@@ -68,9 +68,10 @@ function dismissAfterGesture(fn: () => void): void {
   setTimeout(fn, 0)
 }
 
-export function SheetBackdrop({ onClose, children }: {
+export function SheetBackdrop({ onClose, children, blurActiveElement = true }: {
   onClose: () => void
   children: ComponentChildren
+  blurActiveElement?: boolean
 }) {
   // Close the keyboard when a sheet opens by blurring the terminal's
   // focused hidden textarea. While it holds focus iOS locks selection to
@@ -78,8 +79,8 @@ export function SheetBackdrop({ onClose, children }: {
   // over everything; blurring releases both. You don't need the keyboard
   // to copy/paste, and dropping it gives the sheet more room.
   useEffect(() => {
-    (document.activeElement as HTMLElement | null)?.blur()
-  }, [])
+    if (blurActiveElement) (document.activeElement as HTMLElement | null)?.blur()
+  }, [blurActiveElement])
 
   return createPortal(
     <div

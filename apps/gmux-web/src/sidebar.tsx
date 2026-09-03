@@ -13,8 +13,12 @@ import { FamilyIcon } from './family-icon'
 import { familyDrawerRoot } from './family-drawer-state'
 import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
 import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
+import { projectFileBrowserPath } from './file-browser'
+import { buildVSCodeServerUrl } from './vscode-server'
 import { LaunchButton } from './launcher'
 import { WorktreeSheet } from './worktree-sheet'
+import { SheetBackdrop } from './sheet'
+import { readCheckoutExpanded, writeCheckoutExpanded } from './checkout-fold'
 import { useArrivalPulse } from './use-arrival-pulse'
 import {
   folders, familySelectedId, sessions,
@@ -24,10 +28,12 @@ import {
   peerStatusByName, isSessionUnavailable, localPeerNames, ownDotState, selectedId,
   familyActivityById, familySlotById, type FamilySlot,
   unreadCount, localHostLabel, unresolvedHosts, duplicateConversationFiles,
+  vsCodeServerUrl, vsCodeServerHomeDir,
   sidebarActivity, sidebarMode, setSidebarMode,
   activeSelectors, removeSelector, setHostFilter,
   aliveOnly, setAliveOnly, tabHref, navigate, sessionStreamWarnings, sessionStreamOmittedTotal, peerStreamOmissions, peerOmittedTotal,
-  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, removeProjectWorktree,
+  aggregateSessionDotState,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
@@ -66,6 +72,20 @@ export const IconSettings = () => (
   </svg>
 )
 
+export const IconVSCode = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.5 2.5 5 7.8l6.5 5.7 2-1V3.5l-2-1Z" />
+    <path d="M5 7.8 2.8 5.7 2 6.3v3l.8.6L5 7.8Z" />
+  </svg>
+)
+
+export const IconFiles = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z" />
+    <path d="M2.5 4.5V3.8a1 1 0 0 1 1-1h2.7l1.1 1.2" />
+  </svg>
+)
+
 export const IconRefresh = () => (
   <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
     <path d="M13 5.2A5.2 5.2 0 0 0 3.4 4" />
@@ -74,6 +94,34 @@ export const IconRefresh = () => (
     <path d="M3 13.5v-2.7h2.7" />
   </svg>
 )
+
+function ProjectFilesButton({ folder, onClick }: { folder: Folder; onClick?: () => void }) {
+  return (
+    <a
+      class="folder-file-btn"
+      href={projectFileBrowserPath(folder.slug, folder.peer)}
+      title={`Browse ${folder.launchCwd || folder.name}`}
+      aria-label={`Browse ${folder.name} files`}
+      onClick={() => onClick?.()}
+    >
+      <IconFiles />
+    </a>
+  )
+}
+
+function VSCodeServerButton({ href, workspacePath }: { href: string; workspacePath: string }) {
+  return (
+    <button
+      class="folder-vscode-btn"
+      type="button"
+      title={`Open ${workspacePath} in VS Code Server`}
+      aria-label={`Open ${workspacePath} in VS Code Server`}
+      onClick={event => { event.preventDefault(); event.stopPropagation(); window.open(href, '_blank', 'noopener,noreferrer') }}
+    >
+      <IconVSCode />
+    </button>
+  )
+}
 
 const IconArrange = () => (
   <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
@@ -443,16 +491,61 @@ function FamilyEntry({
   )
 }
 
-function CheckoutSection({ group, folder, selectedId, children }: {
+function CheckoutSection({ group, folder, selectedId, resumingId, am, peerStatus, children }: {
   group: CheckoutGroup
   folder: Folder
   selectedId: string | null
+  resumingId: string | null
+  am: ReadonlyMap<string, 'active' | 'fading'>
+  peerStatus: ReadonlyMap<string, string>
   children: ComponentChildren
 }) {
-  const [expanded, setExpanded] = useState(group.primary)
+  const foldIdentity = group.path || group.key
+  const [expanded, setExpanded] = useState(() => readCheckoutExpanded(folder.key, foldIdentity))
+  const [removeOpen, setRemoveOpen] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState('')
+  const removeCancelRef = useRef<HTMLButtonElement>(null)
+  const collapsedDot = aggregateSessionDotState(group.sessions, am, { selectedId, resumingId, peerStatus })
+  const collapsedArrival = useArrivalPulse(expanded ? 'none' : collapsedDot)
+  const canRemove = !!group.worktree && !group.primary && !group.fallback
+
   useEffect(() => {
     if (selectedId && group.sessions.some(session => session.id === selectedId)) setExpanded(true)
   }, [selectedId, group.key])
+
+  const closeRemove = () => {
+    if (removing) return
+    setRemoveOpen(false)
+    setRemoveError('')
+  }
+  useEffect(() => {
+    if (!removeOpen) return
+    const focusFrame = requestAnimationFrame(() => removeCancelRef.current?.focus())
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || removing) return
+      event.preventDefault()
+      closeRemove()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      cancelAnimationFrame(focusFrame)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [removeOpen, removing])
+  const confirmRemove = async () => {
+    setRemoving(true)
+    setRemoveError('')
+    try {
+      await removeProjectWorktree(folder.slug, group.path, folder.peer)
+      setRemoveOpen(false)
+    } catch (error) {
+      setRemoveError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
   return (
     <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
       <div class="checkout-header" title={group.path || group.label}>
@@ -460,7 +553,12 @@ function CheckoutSection({ group, folder, selectedId, children }: {
           type="button"
           class="checkout-fold-btn"
           aria-expanded={expanded}
-          onClick={() => setExpanded(value => !value)}
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}${!expanded && collapsedDot !== 'none' ? ', session needs attention' : ''}`}
+          onClick={() => setExpanded(value => {
+            const next = !value
+            writeCheckoutExpanded(folder.key, foldIdentity, next)
+            return next
+          })}
         >
           <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
           <span class="checkout-tree-mark" aria-hidden="true">↳</span>
@@ -468,14 +566,36 @@ function CheckoutSection({ group, folder, selectedId, children }: {
           {group.primary && <span class="checkout-primary-label">default</span>}
           {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
           {!expanded && group.sessions.length > 0 && <span class="checkout-session-count">{group.sessions.length}</span>}
+          {!expanded && collapsedDot !== 'none' && (
+            <span class={`session-dot-indicator ${collapsedDot}${collapsedArrival ? ` ${collapsedArrival}` : ''}`} aria-hidden="true" />
+          )}
         </button>
         {!group.fallback && group.path && (
           <div class="checkout-actions">
             <LaunchButton cwd={group.path} peer={folder.peer} className="checkout-launch-btn" />
+            {canRemove && (
+              <button type="button" class="checkout-remove-btn" aria-label={`Remove worktree ${group.label}`} title="Remove worktree" onClick={() => setRemoveOpen(true)}>×</button>
+            )}
           </div>
         )}
       </div>
       {expanded && <div class="checkout-sessions">{children}</div>}
+      {removeOpen && (
+        <SheetBackdrop onClose={closeRemove} blurActiveElement={false}>
+          <div class="modal-panel worktree-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="worktree-remove-title">
+            <h2 id="worktree-remove-title">Remove worktree?</h2>
+            <p><strong>{group.label}</strong></p>
+            <code>{group.path}</code>
+            <p>The checkout directory will be removed. Its Git branch will remain.</p>
+            <p class="worktree-remove-safety">Removal is blocked if it has changes or ignored files, is locked, or has a live or resumable session.</p>
+            {removeError && <div class="worktree-remove-error" role="alert">{removeError}</div>}
+            <div class="worktree-remove-buttons">
+              <button ref={removeCancelRef} type="button" class="sheet-btn sheet-btn-quiet" aria-disabled={removing} onClick={closeRemove}>Cancel</button>
+              <button type="button" class="sheet-btn worktree-remove-confirm" disabled={removing} onClick={() => void confirmRemove()}>{removing ? 'Removing…' : 'Remove worktree'}</button>
+            </div>
+          </div>
+        </SheetBackdrop>
+      )}
     </div>
   )
 }
@@ -572,6 +692,18 @@ function FolderGroup({
   // sessions agree, per-row markers are noise.
   const folderPeers = new Set(visible.map(s => s.peer ?? ''))
   const mixedHosts = folderPeers.size > 1
+  // A local project folder can contain Local-peer (devcontainer) sessions.
+  // Their paths belong to the container and must not be opened by the
+  // parent's VS Code Server; use only parent-local sessions as fallback.
+  const workspaceSession = visible.find(session => !session.peer && session.alive && (session.workspace_root?.trim() || session.cwd?.trim()))
+    ?? visible.find(session => !session.peer && (session.workspace_root?.trim() || session.cwd?.trim()))
+  const workspacePath = folder.launchCwd?.trim()
+    || workspaceSession?.workspace_root?.trim()
+    || workspaceSession?.cwd?.trim()
+    || ''
+  const codeHref = folder.peer
+    ? null
+    : buildVSCodeServerUrl(vsCodeServerUrl.value, workspacePath, vsCodeServerHomeDir.value)
 
   const headerRef = useRef<HTMLDivElement>(null)
   // Collapsing removes the rows below the header. Because headers are
@@ -616,6 +748,12 @@ function FolderGroup({
             <span class="folder-unresolved-icon" title="Host not found — fix in Settings → Hosts">!</span>
           )}
         </button>
+        {!folder.unresolved && !folder.missing && (
+          <>
+            {folder.launchCwd && <ProjectFilesButton folder={folder} onClick={onClick} />}
+            {codeHref && <VSCodeServerButton href={codeHref} workspacePath={workspacePath} />}
+          </>
+        )}
         {!folder.unresolved && (
           <LaunchButton
             // Project-row "+" always launches in the project's canonical
@@ -640,7 +778,15 @@ function FolderGroup({
             >Worktrees unavailable · Retry</button>
           )}
           {checkoutGroups.map(group => (
-            <CheckoutSection key={group.key} group={group} folder={folder} selectedId={selId}>
+            <CheckoutSection
+              key={group.key}
+              group={group}
+              folder={folder}
+              selectedId={selId}
+              resumingId={resumingId}
+              am={am}
+              peerStatus={peerStatus}
+            >
               {group.sessions.map(s => {
                 const i = displayItems.indexOf(s)
                 const href = tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))

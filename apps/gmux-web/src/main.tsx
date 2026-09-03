@@ -632,6 +632,7 @@ function MobileTerminalBar({
   shiftArmed,
   onMenu,
   onSend,
+  onPaste,
   onAttachFile,
   onToggleCtrl,
   onToggleAlt,
@@ -646,6 +647,7 @@ function MobileTerminalBar({
   shiftArmed: boolean
   onMenu: () => void
   onSend: (data: string) => void
+  onPaste: () => void
   onAttachFile: (file: File) => void
   onToggleCtrl: () => void
   onToggleAlt: () => void
@@ -715,11 +717,11 @@ function MobileTerminalBar({
       <button class="mobile-bottom-action mk-ad" disabled={!canSend} {...repeat(() => sendKey('\x1b[B'), ARROW_REPEAT_MS)} title="Down arrow"><span class="mkey-face"><IconDown /></span></button>
       <button class="mobile-bottom-action mk-ar" disabled={!canSend} {...repeat(() => sendKey('\x1b[C'), ARROW_REPEAT_MS)} title="Right arrow"><span class="mkey-face"><IconRight /></span></button>
       <button class="mobile-bottom-action mk-wr" disabled={!canSend} {...repeat(() => sendWord('\x1b[C'), WORD_REPEAT_MS)} title="Word right"><span class="mkey-face"><IconWordRight /></span></button>
-      {terminalScrolledUp.value ? (
+      <button class="mobile-bottom-action mk-paste" disabled={!canSend} onClick={onPaste} title="Paste clipboard" aria-label="Paste clipboard"><span class="mkey-face">paste</span></button>
+      {terminalScrolledUp.value && (
         <button class="mobile-bottom-action mk-end" onClick={() => terminalScrollToBottom.value?.()} title="Scroll to bottom"><span class="mkey-face"><IconEnd /></span></button>
-      ) : (
-        <button class="mobile-bottom-action mk-attach" disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
       )}
+      <button class="mobile-bottom-action mk-attach" disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
       <input ref={fileInputRef} class="mobile-attach-input" type="file" onChange={handleFileChange} />
       <button class="mobile-bottom-action send-btn mk-send" disabled={!canSend} onClick={() => sendKey('\r')} title={altArmed ? 'Send Alt+Enter' : 'Send'}><span class="mkey-face"><IconSend /></span></button>
     </div>
@@ -902,6 +904,7 @@ function App() {
 
   const terminalInputRef = useRef<((data: string) => void) | null>(null)
   const terminalAttachFileRef = useRef<((file: File) => void) | null>(null)
+  const terminalPasteRef = useRef<(() => void) | null>(null)
   const terminalFocusRef = useRef<(() => void) | null>(null)
 
   // Read signals.
@@ -977,6 +980,9 @@ function App() {
   const handleTerminalAttachFileReady = useCallback((attach: ((file: File) => void) | null) => {
     terminalAttachFileRef.current = attach
   }, [])
+  const handleTerminalPasteReady = useCallback((paste: (() => void) | null) => {
+    terminalPasteRef.current = paste
+  }, [])
   const handleTerminalFocusReady = useCallback((focus: (() => void) | null) => {
     terminalFocusRef.current = focus
     // Auto-focus on mount only off-touch; on touch this would pop the
@@ -985,6 +991,7 @@ function App() {
   }, [])
   const handleMobileInput = useCallback((data: string) => { terminalInputRef.current?.(data) }, [])
   const handleMobileAttachFile = useCallback((file: File) => { terminalAttachFileRef.current?.(file) }, [])
+  const handleMobilePaste = useCallback(() => { terminalPasteRef.current?.() }, [])
   const handleToggleCtrl = useCallback(() => {
     if (!canAttach) return
     setCtrlArmed(armed => !armed)
@@ -1085,6 +1092,7 @@ function App() {
             onModifiersCancelled={handleModifiersCancelled}
             onInputReady={handleTerminalInputReady}
             onAttachFileReady={handleTerminalAttachFileReady}
+            onPasteReady={handleTerminalPasteReady}
             onFocusReady={handleTerminalFocusReady}
           />
         ) : selectedVal && !selectedVal.alive && termOpts && !USE_MOCK ? (
@@ -1115,6 +1123,7 @@ function App() {
             shiftArmed={shiftArmed}
             onMenu={openSidebar}
             onSend={handleMobileInput}
+            onPaste={handleMobilePaste}
             onAttachFile={handleMobileAttachFile}
             onToggleCtrl={handleToggleCtrl}
             onToggleAlt={handleToggleAlt}

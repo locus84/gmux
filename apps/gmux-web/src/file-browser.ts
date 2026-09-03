@@ -34,14 +34,22 @@ export function fileBrowserPath(sessionId: string, path = '', currentPath = loca
   return fileBrowserTargetPath('files', sessionId, path, currentPath, currentSearch)
 }
 
+export function projectFileBrowserPath(projectSlug: string, peer?: string, path = '', currentPath = location.pathname, currentSearch = location.search): string {
+  const target = fileBrowserTargetPath('projectFiles', projectSlug, path, currentPath, currentSearch)
+  const url = new URL(target, 'http://gmux.local')
+  if (peer) url.searchParams.set('projectFilesPeer', peer)
+  return `${url.pathname}?${url.searchParams.toString()}`
+}
+
 export function pasteFileBrowserPath(sessionId: string, name: string, currentPath = location.pathname, currentSearch = location.search): string {
   return fileBrowserTargetPath('pasteFile', sessionId, name, currentPath, currentSearch)
 }
 
-function fileBrowserTargetPath(key: 'files' | 'pasteFile', value: string, path: string, currentPath: string, currentSearch: string): string {
+function fileBrowserTargetPath(key: 'files' | 'projectFiles' | 'pasteFile', value: string, path: string, currentPath: string, currentSearch: string): string {
   const params = new URLSearchParams(currentSearch)
   params.delete('files')
   params.delete('projectFiles')
+  params.delete('projectFilesPeer')
   params.delete('pasteFile')
   params.set(key, value)
   if (path) params.set('filePath', path)
@@ -53,19 +61,24 @@ export function closeFileBrowserPath(currentPath = location.pathname, currentSea
   const params = new URLSearchParams(currentSearch)
   params.delete('files')
   params.delete('projectFiles')
+  params.delete('projectFilesPeer')
   params.delete('pasteFile')
   params.delete('filePath')
   const qs = params.toString()
   return qs ? `${currentPath}?${qs}` : currentPath
 }
 
-export function fileApiPath(kind: 'list' | 'content' | 'raw', sessionId: string, path = ''): string {
+export type FileApiTarget = { sessionId: string } | { projectSlug: string; peer?: string }
+
+export function fileApiPath(kind: 'list' | 'content' | 'raw', target: FileApiTarget, path = ''): string {
   const params = new URLSearchParams()
   if (path) params.set('path', path)
   if (kind === 'raw') params.set('raw', '1')
   const endpoint = kind === 'list' ? 'files' : 'file'
   const qs = params.toString()
-  const base = `/v1/sessions/${encodeURIComponent(sessionId)}/${endpoint}`
+  const base = 'sessionId' in target
+    ? `/v1/sessions/${encodeURIComponent(target.sessionId)}/${endpoint}`
+    : `${target.peer ? `/v1/peers/${encodeURIComponent(target.peer)}` : ''}/v1/projects/${encodeURIComponent(target.projectSlug)}/${endpoint}`
   return `${base}${qs ? `?${qs}` : ''}`
 }
 
