@@ -590,9 +590,12 @@ export function TerminalView({
   useEffect(() => {
     let cancelled = false
     const spec = `${terminalOptions.fontSize}px ${terminalOptions.fontFamily}`
-    document.fonts.load(spec).finally(() => {
-      if (!cancelled) setFontReady(true)
-    })
+    const finish = () => { if (!cancelled) setFontReady(true) }
+    try {
+      document.fonts.load(spec).then(finish, finish)
+    } catch {
+      finish()
+    }
     return () => { cancelled = true }
   }, [terminalOptions.fontFamily, terminalOptions.fontSize])
 
@@ -1178,6 +1181,51 @@ export function TerminalView({
       termIoRef.current = null
     }
   }, [onCtrlConsumed, onAltConsumed, onShiftConsumed, onModifiersCancelled, onInputReady, onAttachFileReady, fontReady])
+
+  // Apply appearance changes without remounting xterm and losing its parser,
+  // selection, or scrollback state. This also makes browser-local UI scaling
+  // take effect while the current terminal remains mounted. terminalOptions
+  // is a memoized computed value; keeping that identity stable avoids effect
+  // churn and redundant viewport measurements.
+  useEffect(() => {
+    const term = termRef.current
+    if (!term || !fontReady) return
+
+    let cancelled = false
+    const spec = `${terminalOptions.fontSize}px ${terminalOptions.fontFamily}`
+    const applyOptions = () => {
+      if (cancelled || termRef.current !== term) return
+
+      term.options.fontFamily = terminalOptions.fontFamily
+      term.options.fontSize = terminalOptions.fontSize
+      term.options.fontWeight = terminalOptions.fontWeight
+      term.options.fontWeightBold = terminalOptions.fontWeightBold
+      term.options.lineHeight = terminalOptions.lineHeight
+      term.options.letterSpacing = terminalOptions.letterSpacing
+      term.options.theme = terminalOptions.theme
+      term.options.cursorStyle = terminalOptions.cursorStyle
+      term.options.cursorBlink = terminalOptions.cursorBlink
+      term.options.cursorInactiveStyle = terminalOptions.cursorInactiveStyle
+      term.options.cursorWidth = terminalOptions.cursorWidth
+      term.options.drawBoldTextInBrightColors = terminalOptions.drawBoldTextInBrightColors
+      term.options.minimumContrastRatio = terminalOptions.minimumContrastRatio
+      term.options.scrollSensitivity = terminalOptions.scrollSensitivity
+      term.options.fastScrollSensitivity = terminalOptions.fastScrollSensitivity
+      term.options.smoothScrollDuration = terminalOptions.smoothScrollDuration
+      term.options.wordSeparator = terminalOptions.wordSeparator
+
+      requestAnimationFrame(() => {
+        if (!cancelled && termRef.current === term) processViewportResize()
+      })
+    }
+    try {
+      document.fonts.load(spec).then(applyOptions, applyOptions)
+    } catch {
+      applyOptions()
+    }
+
+    return () => { cancelled = true }
+  }, [fontReady, processViewportResize, terminalOptions])
 
   // WebSocket connection (reconnects when session.id changes).
   useEffect(() => {
