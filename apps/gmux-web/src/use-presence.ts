@@ -2,14 +2,14 @@
  * Presence hook: WebSocket connection to the daemon for notifications,
  * tab title badge, idle detection, and visibility/focus reporting.
  *
- * Reads selectedId and sessions from the store (signals). The only
+ * Reads selection and unread projections from the store (signals). The only
  * prop-driven input is the notification click callback (needs routing).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { connectPresence } from './presence'
 import type { NotifyMessage, CancelMessage } from './presence'
-import { selectedId, sessions, navigateToSession, projects } from './store'
+import { selectedId, unreadCount, navigateToSession, projects } from './store'
 import type { NotifPermission } from './sidebar'
 import { enableWebPushForProjects, localProjectSlugs, refreshWebPushState } from './push-subscriptions'
 
@@ -132,12 +132,9 @@ export function usePresence(): UsePresenceResult {
 
   // Tab title badge.
   useEffect(() => {
-    const sel = selectedId.value
-    const count = sessions.value.filter(s =>
-      s.id !== sel && s.unread
-    ).length
+    const count = unreadCount.value
     document.title = count > 0 ? `(${count}) gmux` : 'gmux'
-  }, [sessions.value, selectedId.value])
+  }, [unreadCount.value])
 
   const requestNotifPermission = useCallback(async () => {
     await Notification.requestPermission()
