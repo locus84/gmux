@@ -391,7 +391,14 @@ export function createTerminalFileLinkProvider(
             start: { x: startCell.startX + 1, y: startCell.y + 1 },
             end: { x: endCell.endX, y: endCell.y + 1 },
           },
-          activate: () => openFile(context.sessionId, match.path, !!match.pasteImage),
+          // Real desktop clicks are resolved again from the painted buffer by
+        // TerminalView so a TUI redraw cannot activate xterm's stale hover
+        // cache. Synthetic events from the mobile link handshake still use
+        // the provider activation path.
+        activate: event => {
+          if (event.isTrusted) return
+          openFile(context.sessionId, match.path, !!match.pasteImage)
+        },
         }]
       })
       callback(links)

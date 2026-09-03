@@ -20,11 +20,11 @@ import { MOCK_BY_ID } from './mock-data/index'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { createReplayBuffer } from './replay'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
+import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, urlSearch, vsCodeServerUrl } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
-import { createTerminalFileLinkProvider } from './terminal-file-link'
+import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext } from './terminal-file-link'
 import { canSendTerminalInput } from './terminal-input'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { type LinkInfo, linkAtPoint, openLinkAtPoint } from './terminal-link'
@@ -343,6 +343,9 @@ export function TerminalView({
   const termEpochRef = useRef(0)
   // Drop initial-attach input until replay and viewport claim commit.
   const inputClaimedRef = useRef(false)
+  const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const fileOverlayOpenRef = useRef(false)
 
   // True once the terminal's font is downloaded; gates xterm mount.
   // See the preload effect below for why this matters.
@@ -384,6 +387,15 @@ export function TerminalView({
   ctrlArmedRef.current = ctrlArmed
   altArmedRef.current = altArmed
   shiftArmedRef.current = shiftArmed
+  const fileParams = new URLSearchParams(urlSearch.value)
+  fileOverlayOpenRef.current = !!(fileParams.get('files') || fileParams.get('projectFiles') || fileParams.get('pasteFile'))
+  fileHrefRef.current = (sessionId, path, pasteImage) => pasteImage
+    ? pasteFileBrowserPath(sessionId, path)
+    : fileBrowserPath(sessionId, path)
+  openFileRef.current = (sessionId, path, pasteImage) => {
+    termRef.current?.textarea?.blur()
+    navigate(fileHrefRef.current(sessionId, path, pasteImage))
+  }
 
   const queueResize = useCallback((size: TerminalSize) => {
     termIoRef.current?.requestResize(size, termEpochRef.current)
@@ -610,22 +622,19 @@ export function TerminalView({
     searchAddonRef.current = searchAddon
     term.open(containerRef.current)
     const disposeImeResidueGuard = attachImeResidueGuard(term)
+    const getFileLinkContext = (): TerminalFileLinkContext => {
+      const current = sessionRef.current
+      return {
+        sessionId: current.id,
+        root: current.workspace_root?.trim() || current.cwd.trim(),
+        cwd: current.cwd.trim(),
+      }
+    }
     const fileLinkDisposable = term.registerLinkProvider(createTerminalFileLinkProvider(
       term,
-      () => {
-        const current = sessionRef.current
-        return {
-          sessionId: current.id,
-          root: current.workspace_root || current.cwd,
-          cwd: current.cwd,
-        }
-      },
-      (sessionId, path, pasteImage) => pasteImage
-        ? pasteFileBrowserPath(sessionId, path)
-        : fileBrowserPath(sessionId, path),
-      (sessionId, path, pasteImage) => navigate(pasteImage
-        ? pasteFileBrowserPath(sessionId, path)
-        : fileBrowserPath(sessionId, path)),
+      getFileLinkContext,
+      (sessionId, path, pasteImage) => fileHrefRef.current(sessionId, path, pasteImage),
+      (sessionId, path, pasteImage) => openFileRef.current(sessionId, path, pasteImage),
     ))
     // Load after open so the addon can observe wheel/touch intent on
     // terminal.element as well as parser-level output sequences.
@@ -799,6 +808,7 @@ export function TerminalView({
       const tag = (ev.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (containerRef.current?.contains(ev.target as Node)) return
+      if (fileOverlayOpenRef.current) return
       term.focus()
     }
     window.addEventListener('keydown', handleGlobalKeydown, true)
@@ -814,7 +824,15 @@ export function TerminalView({
     // intent from a tap: even when nothing is under the finger, the
     // release must not open a link or toggle the keyboard.
     const longPress = createLongPressRecognizer((x, y) => {
-      const link = linkAtPoint(term, x, y)
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), x, y)
+      const fileLink = fileTarget
+        ? { uri: fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage), label: fileTarget.text }
+        : null
+      const nativeLink = linkAtPoint(term, x, y)
+      // Explicit OSC 8 / web links win when their URI differs from the file
+      // path painted under the pointer. A matching provider link is equivalent
+      // to the direct buffer hit and keeps the fresh direct target.
+      const link = nativeLink && nativeLink.uri !== fileLink?.uri ? nativeLink : fileLink || nativeLink
       try { navigator.vibrate?.(10) } catch { /* unsupported */ }
       // On a link: offer open/copy. On empty space: open the text sheet —
       // the buffer as natively-selectable text, scrolled to the pressed
@@ -977,6 +995,24 @@ export function TerminalView({
         if (touchPanState.moved) { cancelDragScroll(true); startScrollMomentum() }
       }
       if (shouldFocus) {
+        const fileTarget = terminalFileTargetAtPoint(
+          term, getFileLinkContext(), touchPanState.start.x, touchPanState.start.y,
+        )
+        const nativeLink = linkAtPoint(term, touchPanState.start.x, touchPanState.start.y)
+        const fileHref = fileTarget
+          ? fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          : ''
+        if (nativeLink && nativeLink.uri !== fileHref && openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+          ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
+        }
+        if (fileTarget) {
+          ev.preventDefault()
+          cancelDragScroll(true)
+          cancelScrollMomentum()
+          openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          resetTouchPan()
+          return
+        }
         if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
           ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
         }
@@ -993,6 +1029,21 @@ export function TerminalView({
       resetTouchPan()
     }
 
+    // Resolve file links from the painted buffer at click time. xterm may
+    // retain a stale provider result for a redrawn TUI row until hover moves.
+    const handleMouseClickCapture = (ev: MouseEvent) => {
+      if (ev.button !== 0 || ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey || term.hasSelection() || isInteractiveTarget(ev.target)) return
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), ev.clientX, ev.clientY)
+      if (!fileTarget) return
+      const nativeLink = linkAtPoint(term, ev.clientX, ev.clientY)
+      const fileHref = fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+      if (nativeLink && nativeLink.uri !== fileHref) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+    }
+
+    shell?.addEventListener('click', handleMouseClickCapture, true)
     shell?.addEventListener('touchstart', handleTouchStartCapture, { capture: true, passive: false })
     shell?.addEventListener('touchmove', handleTouchMoveCapture, { capture: true, passive: false })
     shell?.addEventListener('touchend', handleTouchEndCapture, { capture: true, passive: false })
@@ -1090,6 +1141,7 @@ export function TerminalView({
         vv.removeEventListener('resize', onVisualViewportResize)
         vv.removeEventListener('resizeend', onVisualViewportResizeEnd)
       }
+      shell?.removeEventListener('click', handleMouseClickCapture, true)
       shell?.removeEventListener('touchstart', handleTouchStartCapture, true)
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)

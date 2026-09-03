@@ -180,7 +180,10 @@ describe('createTerminalFileLinkProvider', () => {
         end: { x: 24, y: 7 },
       },
     })
-    links?.[0].activate({} as MouseEvent, links[0].text)
+    links?.[0].activate({ isTrusted: true } as MouseEvent, links[0].text)
+    expect(openFile).not.toHaveBeenCalled()
+
+    links?.[0].activate({ isTrusted: false } as MouseEvent, links[0].text)
     expect(openFile).toHaveBeenCalledWith('sess-1', '.pi/tmp/result.png', false)
   })
 
