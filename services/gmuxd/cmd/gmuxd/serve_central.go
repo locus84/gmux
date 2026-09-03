@@ -548,6 +548,12 @@ func serveCentral(stderr io.Writer, replace bool) int {
 				return
 			}
 			state := *ownedProjectStateFromCatalog(snap.Projects)
+			if req.Remote == "" {
+				if existing, found := projectMatchingAllPaths(state.Items, rules); found {
+					writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"slug": existing.Slug, "match": existing.Match, "existing": true}})
+					return
+				}
+			}
 			item := projects.Item{Slug: projects.UniqueSlug(slug, state.Items), Match: rules}
 			state.Items = append(state.Items, item)
 			if err := state.Validate(); err != nil {
@@ -559,7 +565,7 @@ func serveCentral(stderr io.Writer, replace bool) int {
 				writeError(w, http.StatusInternalServerError, "internal", "failed to save projects")
 				return
 			}
-			writeJSON(w, map[string]any{"ok": true, "data": item})
+			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"slug": item.Slug, "match": item.Match, "existing": false}})
 		})
 		mux.HandleFunc("GET /v1/projects/{slug}/files", func(w http.ResponseWriter, r *http.Request) {
 			workspaceProjectFilesListHandler(w, r, r.PathValue("slug"), boot.Store)
@@ -1240,6 +1246,33 @@ func (s centralSizer) GetTerminalSize(sessionID string) (uint16, uint16, bool) {
 	return sess.TerminalCols, sess.TerminalRows, true
 }
 
+func projectMatchingAllPaths(items []projects.Item, requested []projects.MatchRule) (projects.Item, bool) {
+	requestedPaths := make([]string, 0, len(requested))
+	for _, rule := range requested {
+		if rule.Path != "" {
+			requestedPaths = append(requestedPaths, projects.NormalizePath(rule.Path))
+		}
+	}
+	if len(requestedPaths) == 0 {
+		return projects.Item{}, false
+	}
+	for _, item := range items {
+		matched := 0
+		for _, want := range requestedPaths {
+			for _, have := range item.Match {
+				if have.Path != "" && projects.NormalizePath(have.Path) == want {
+					matched++
+					break
+				}
+			}
+		}
+		if matched == len(requestedPaths) {
+			return item, true
+		}
+	}
+	return projects.Item{}, false
+}
+
 func handleCentralSessionAction(w http.ResponseWriter, r *http.Request, boot *Bootstrap, fanout *sseFanout, converter *wire.Converter, peerManager *peering.Manager, sessionDirs *sessionmeta.Store, gmuxBin string, notifier *centralNotifyRouter) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 3 {
@@ -1253,6 +1286,12 @@ func handleCentralSessionAction(w http.ResponseWriter, r *http.Request, boot *Bo
 	}
 	if peerManager != nil && action != "" {
 		if peer, originalID := peerManager.FindPeer(sessionID); peer != nil {
+			_, hasLeaf := r.URL.Query()["leaf"]
+			if action == "dismiss" && hasLeaf {
+				writeError(w, http.StatusBadRequest, codeLocalOnly,
+					"leaf-only dismissal must run on the session's owning host; recursive peer dismissal requires --tree")
+				return
+			}
 			if action == "reparent" {
 				writeError(w, http.StatusBadRequest, codeLocalOnly, fmt.Sprintf(
 					"%s is only available for sessions owned by this daemon; run gmux on the owning host", action))
@@ -1516,9 +1555,23 @@ func handleCentralSessionAction(w http.ResponseWriter, r *http.Request, boot *Bo
 			writeError(w, http.StatusMethodNotAllowed, "bad_request", "method not allowed")
 			return
 		}
+		query := r.URL.Query()
+		leafValues, hasLeaf := query["leaf"]
+		if len(query) > 1 || (len(query) > 0 && !hasLeaf) || (hasLeaf && (len(leafValues) != 1 || leafValues[0] != "1")) {
+			writeError(w, http.StatusBadRequest, "bad_request", "leaf must be 1 when provided")
+			return
+		}
+		leafOnly := hasLeaf
 		rows, err := sessionTreeRows(r.Context(), boot.Store, sid)
 		if err != nil {
 			writeError(w, http.StatusNotFound, "not_found", "session not found")
+			return
+		}
+		// Refuse before stopping anything when the known tree is not a leaf.
+		// DismissLeaf repeats this check under the lifecycle mutex to close a
+		// registration race between this preview and the durable mutation.
+		if leafOnly && len(rows) != 1 {
+			writeCentralLifecycleError(w, fmt.Errorf("%w: %s has %d descendants", sessioncoord.ErrSessionHasChildren, sid, len(rows)-1))
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1532,7 +1585,12 @@ func handleCentralSessionAction(w http.ResponseWriter, r *http.Request, boot *Bo
 				return
 			}
 		}
-		if _, err := boot.Coordinator.Dismiss(r.Context(), sid); err != nil {
+		if leafOnly {
+			_, err = boot.Coordinator.DismissLeaf(r.Context(), sid)
+		} else {
+			_, err = boot.Coordinator.Dismiss(r.Context(), sid)
+		}
+		if err != nil {
 			writeCentralLifecycleError(w, err)
 			return
 		}
@@ -1566,6 +1624,8 @@ func writeCentralLifecycleError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "not_resumable", err.Error())
 	case errors.Is(err, sessioncoord.ErrConvergencePending):
 		writeError(w, http.StatusServiceUnavailable, "convergence_pending", err.Error())
+	case errors.Is(err, sessioncoord.ErrSessionHasChildren):
+		writeError(w, http.StatusConflict, "has_children", err.Error())
 	case errors.Is(err, sessioncoord.ErrLifecycleOpInFlight), errors.Is(err, sessioncoord.ErrSubtreeBusy), errors.Is(err, sessioncoord.ErrStopSuperseded):
 		writeError(w, http.StatusConflict, "busy", err.Error())
 	case errors.Is(err, context.DeadlineExceeded):

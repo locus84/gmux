@@ -9,6 +9,57 @@ import (
 	"testing"
 )
 
+func TestCmdDismissUsesLeafScopeUnlessTreeConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantQuery string
+		tree            bool
+	}{
+		{name: "leaf", wantQuery: "leaf=1"},
+		{name: "tree", tree: true, wantQuery: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Alive: false}})
+			d.on(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+			})
+			if code := cmdDismiss("1va8lvdv", tc.tree); code != 0 {
+				t.Fatalf("cmdDismiss exit=%d", code)
+			}
+			request := d.lastRequest(t)
+			if request.path != "/v1/sessions/1va8lvdv/dismiss" || request.query != tc.wantQuery {
+				t.Fatalf("request=%+v", request)
+			}
+		})
+	}
+}
+
+func TestCmdDismissRefusesUnverifiableRemoteLeafScope(t *testing.T) {
+	d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Peer: "laptop", Alive: false}})
+	code := 0
+	stderr := captureStderr(t, func() { code = cmdDismiss("1va8lvdv@laptop", false) })
+	if code == 0 || !strings.Contains(stderr, "--tree") {
+		t.Fatalf("cmdDismiss: exit=%d stderr=%q", code, stderr)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.requests) != 0 {
+		t.Fatalf("remote leaf refusal sent requests: %+v", d.requests)
+	}
+}
+
+func TestCmdDismissExplainsDescendantOptIn(t *testing.T) {
+	d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Alive: false}})
+	d.on(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"has_children","message":"session has 2 descendants"}}`))
+	})
+	code := 0
+	stderr := captureStderr(t, func() { code = cmdDismiss("1va8lvdv", false) })
+	if code == 0 || !strings.Contains(stderr, "--tree") {
+		t.Fatalf("cmdDismiss: exit=%d stderr=%q", code, stderr)
+	}
+}
+
 // TestMatchSession covers the liberal reference grammar: full ID, slug, and
 // unique prefixes of either. The full ID printed by `gmux ls` must resolve.
 func TestMatchSession(t *testing.T) {

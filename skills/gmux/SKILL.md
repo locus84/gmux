@@ -58,6 +58,28 @@ PROMPT
 
 Short static prompts may remain single-quoted positional arguments. Prompt text can also come from a file: `gmux agent prompt a1b2c3d4 < /tmp/instructions.md`.
 
+## Isolated agent worktrees
+
+Before creating an agent checkout, run `gmux worktree ps --json` in the target
+repository and reuse a matching branch, path, or live session. Create at most
+one worktree per logical task; retries and follow-ups stay in that session.
+
+```bash
+gmux worktree ps --json
+result=$(gmux worktree create fix-login --base origin/main --agent pi \
+  --prompt 'Implement and test the login fix.' --json)
+id=$(printf '%s' "$result" | jq -r '.session_id')
+path=$(printf '%s' "$result" | jq -r '.path')
+```
+
+A worktree isolates tracked files, not databases, ports, caches, credentials,
+or external services. Verify its status, commits, and output before removal.
+Worktree removal is intentionally conservative; use the web project controls or
+`git worktree remove` only after review. Dismiss only worker sessions you own:
+`gmux dismiss "$id"`; if that worker owns descendants (including hidden ones),
+inspect them first and use `gmux dismiss "$id" --tree` only when the full
+family is disposable.
+
 ## Waiting and observation
 
 ```bash
@@ -82,6 +104,8 @@ This returns after at most 250 seconds if the session has not settled, while the
 ## Families and attention
 
 Successful observation with `wait`, `tail`, or `agent logs` consumes the result.
+Use `gmux dismiss <id>` to stop and hide a finished leaf session; it refuses
+families unless recursive scope is explicitly confirmed with `--tree`.
 Use `gmux promote <id>` when a worker needs an independent family and subagent
 budget; use `gmux reparent <id> <parent-id>` to restructure the family edge.
 

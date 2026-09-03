@@ -34,7 +34,11 @@ Sessions (local by default; address a peer with <id>@<peer>):
   gmux wait <id>... [--timeout|-t N] block until turns end; print reports
   gmux promote <id>                 make a session a family root
   gmux reparent <id> <parent-id>    move a session under a new parent
-  gmux kill <id>                    terminate a session
+  gmux kill <id>                    terminate but retain a session
+  gmux dismiss <id> [--tree]        terminate and hide a finished session
+
+Projects (local only):
+  gmux project add <path>           add or find a project by directory
 
 Git worktrees (local only):
   gmux worktree current [--json]    show the enclosing worktree
@@ -89,6 +93,13 @@ unrecognized name.
 // one-liners in the synopsis. The agent namespace has its own pages in
 // printAgentUsage, and daemon help is served by the gmuxd binary itself.
 var verbHelpPages = map[string]string{
+	"project": `gmux project: manage local projects
+
+  gmux project add <path>
+
+Adds the canonical directory as a project, or returns the existing project
+when that path is already registered. Project mutations are local-only.
+`,
 	"worktree": `gmux worktree: create and inspect local Git worktrees
 
   gmux worktree current [--json]
@@ -233,6 +244,20 @@ successful read marks each session's result consumed.
 
 Exit codes: 0 completed/matched, 2 intentionally interrupted, 1 failure or
 timeout. A local signal says the observed agent or sessions remain active and exits 128+N.
+`,
+
+	"dismiss": `gmux dismiss: terminate and hide a retained session
+
+  gmux dismiss <id>
+  gmux dismiss <id> --tree
+
+Without --tree, dismiss refuses a session that owns descendants, including
+already-hidden descendants. --tree explicitly confirms recursive dismissal of
+the full family. Any live members in the chosen scope are stopped first.
+Leaf-only safety cannot be negotiated with older peer daemons, so a peer target
+must be dismissed on its owning host or explicitly passed with --tree. Dismissal hides durable rows and
+removes sidebar placement while retaining conversation identity and scrollback.
+A surviving runner that registers again can make its session visible again.
 `,
 
 	"kill": `gmux kill: terminate a session

@@ -8,7 +8,10 @@ import (
 	"testing"
 
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/config"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/peering"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionmeta"
 	central "github.com/gmuxapp/gmux/services/gmuxd/internal/snapshot/central"
 )
 
@@ -24,6 +27,55 @@ func launchedFromExport(t *testing.T, store *centralstore.Store, id centralstore
 		}
 	}
 	return ""
+}
+
+func TestPeerSessionDismissRefusesEveryLeafParameterSpelling(t *testing.T) {
+	pm := peering.NewProjectionManager([]config.PeerConfig{{Name: "box", URL: "http://127.0.0.1:1"}}, "self", nil, peering.EventHooks{})
+	for _, query := range []string{"?leaf=1", "?leaf=0", "?leaf=true", "?leaf"} {
+		recorder := httptest.NewRecorder()
+		handleCentralSessionAction(recorder, httptest.NewRequest(http.MethodPost, "/v1/sessions/abc@box/dismiss"+query, nil), nil, newSSEFanout(), nil, pm, nil, "", nil)
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), codeLocalOnly) {
+			t.Fatalf("query=%q response=%d %s", query, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestSessionDismissHTTPLeafScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		wantStatus  int
+		wantCode    string
+	}{
+		{name: "recursive default", wantStatus: http.StatusOK},
+		{name: "leaf refuses descendants", query: "?leaf=1", wantStatus: http.StatusConflict, wantCode: "has_children"},
+		{name: "invalid leaf", query: "?leaf=0", wantStatus: http.StatusBadRequest, wantCode: "bad_request"},
+		{name: "unknown query", query: "?other=1", wantStatus: http.StatusBadRequest, wantCode: "bad_request"},
+		{name: "duplicate leaf", query: "?leaf=1&leaf=1", wantStatus: http.StatusBadRequest, wantCode: "bad_request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, err := centralstore.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, _, err := store.InsertSession(ctx, centralstore.NewSession{ID: "parent", Adapter: "shell", Command: []string{"sh"}, CreatedAt: 1}); err != nil {
+				t.Fatal(err)
+			}
+			parent := centralstore.SessionID("parent")
+			if _, _, err := store.InsertSession(ctx, centralstore.NewSession{ID: "child", ParentSessionID: &parent, Adapter: "shell", Command: []string{"sh"}, CreatedAt: 2}); err != nil {
+				t.Fatal(err)
+			}
+			registry := sessioncoord.NewRegistry()
+			coord := sessioncoord.New(registry, nil, store, nil, nil)
+			boot := &Bootstrap{Store: store, Registry: registry, Coordinator: coord, Composer: central.New(store, nil, nil)}
+			recorder := httptest.NewRecorder()
+			handleCentralSessionAction(recorder, httptest.NewRequest(http.MethodPost, "/v1/sessions/parent/dismiss"+tc.query, nil), boot, newSSEFanout(), nil, nil, sessionmeta.New(t.TempDir()), "", nil)
+			if recorder.Code != tc.wantStatus || tc.wantCode != "" && !strings.Contains(recorder.Body.String(), tc.wantCode) {
+				t.Fatalf("response=%d %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
 }
 
 func TestSessionReparentHTTPValidation(t *testing.T) {

@@ -462,6 +462,49 @@ func cmdKill(ref string) int {
 	return 0
 }
 
+// cmdDismiss hides a retained session after stopping it if needed. The
+// default is leaf-only; --tree makes recursive family scope explicit at the
+// command boundary.
+func cmdDismiss(ref string, tree bool) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	if sess.Peer != "" && !tree {
+		fmt.Fprintf(os.Stderr, "gmux: leaf-only dismissal cannot be verified across daemon versions; run gmux on %s or explicitly use --tree\n", sess.Peer)
+		return 1
+	}
+	endpoint := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/dismiss"
+	if !tree {
+		endpoint += "?leaf=1"
+	}
+	resp, err := gmuxdClient().Post(endpoint, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		message := extractMessage(body)
+		if message == "" {
+			message = resp.Status
+		}
+		if errorCode(body) == "has_children" {
+			message += "; rerun with --tree to dismiss the full family"
+		}
+		fmt.Fprintln(os.Stderr, "gmux:", message)
+		return 1
+	}
+	if tree {
+		fmt.Printf("dismissed session tree %s\n", displayID(sess))
+	} else {
+		fmt.Printf("dismissed %s\n", displayID(sess))
+	}
+	return 0
+}
+
 func cmdPromote(ref string) int {
 	return cmdReparentMutation(ref, "", true)
 }

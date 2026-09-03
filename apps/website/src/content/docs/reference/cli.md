@@ -10,7 +10,7 @@ sidebar:
 ## Overview
 
 **`gmux`** — the command you use. It runs commands in managed sessions and
-drives them (list, attach, tail, send, wait, kill), drives agent sessions
+drives them (list, attach, tail, send, wait, kill, dismiss), drives agent sessions
 (`gmux agent`), plus daemon control and pairing. It auto-starts the daemon when needed.
 
 **`gmuxd`** — the daemon process. Serves the web UI, session history, and
@@ -783,6 +783,20 @@ session dead — the same path as the UI's kill button.
 gmux kill a3f20187
 ```
 
+### `gmux dismiss <id> [--tree]`
+
+Stop and hide a retained session while preserving its conversation identity
+and scrollback. Without `--tree`, the command is leaf-only and refuses a
+session that owns descendants, including already-hidden descendants. `--tree`
+explicitly confirms that the complete family may be stopped and recursively
+dismissed. For a peer target, run leaf-only dismissal on the owning host or use
+`--tree` explicitly; older peer daemons cannot negotiate the leaf-only guard.
+
+```bash
+gmux dismiss a3f20187
+gmux dismiss a3f20187 --tree
+```
+
 ### `gmux promote <id>`
 
 Make a local session a root by clearing its current `parent_session_id`. This
@@ -821,6 +835,19 @@ your dotfiles don't set them. Today the session runs a fallback terminal
 editor: `$GMUX_EDIT_FALLBACK` if set (may include flags, e.g. `vim -u NONE`),
 otherwise the first of `nano`, `vim`, `vi` on PATH. `edit` takes at most one
 path and no flags.
+
+## Projects
+
+### `gmux project add <path>`
+
+Add a local directory to the daemon-owned project catalog. The path is resolved
+through symlinks before registration. Repeating the command for the same
+canonical path returns the existing project instead of creating a duplicate.
+
+```bash
+gmux project add .
+gmux project add ~/WorkSpace/gmux
+```
 
 ## UI, pairing, and the daemon
 

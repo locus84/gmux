@@ -62,6 +62,8 @@ func main() {
 		os.Exit(cmdList(cmd.all, cmd.json))
 	case modeKill:
 		os.Exit(cmdKill(cmd.ref))
+	case modeDismiss:
+		os.Exit(cmdDismiss(cmd.ref, cmd.dismissTree))
 	case modeTail:
 		os.Exit(cmdTail(cmd.ref, cmd.tailLines))
 	case modeAttach:
@@ -74,6 +76,8 @@ func main() {
 		os.Exit(cmdWait(cmd.waitRefs, cmd.timeout, cmd.forText, cmd.forRegex, cmd.quiet))
 	case modeWorktree:
 		os.Exit(cmdWorktree(cmd))
+	case modeProject:
+		os.Exit(cmdProject(cmd))
 	case modePromote:
 		os.Exit(cmdPromote(cmd.ref))
 	case modeReparent:

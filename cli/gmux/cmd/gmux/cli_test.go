@@ -92,6 +92,24 @@ func TestParseCLI(t *testing.T) {
 					t.Errorf("ref = %q", c.ref)
 				}
 			}},
+		{name: "dismiss leaf", args: []string{"dismiss", "abc"}, wantMode: modeDismiss,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || c.dismissTree {
+					t.Errorf("dismiss command=%#v", c)
+				}
+			}},
+		{name: "dismiss tree", args: []string{"dismiss", "abc", "--tree"}, wantMode: modeDismiss,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || !c.dismissTree {
+					t.Errorf("dismiss command=%#v", c)
+				}
+			}},
+		{name: "project add", args: []string{"project", "add", "."}, wantMode: modeProject,
+			check: func(t *testing.T, c *command) {
+				if c.projectSub != "add" || c.projectPath != "." {
+					t.Errorf("project command=%#v", c)
+				}
+			}},
 		{name: "promote", args: []string{"promote", "abc"}, wantMode: modePromote,
 			check: func(t *testing.T, c *command) {
 				if c.ref != "abc" {
@@ -328,7 +346,7 @@ func TestHelpAliases(t *testing.T) {
 		{[]string{"attach", "--help"}, "attach"},
 		{[]string{"kill", "?"}, "kill"},
 		{[]string{"promote", "--help"}, "promote"},
-		{[]string{"promote", "abc", "--help"}, "promote"},       // flagless verbs answer here too
+		{[]string{"promote", "abc", "--help"}, "promote"}, // flagless verbs answer here too
 		{[]string{"reparent", "abc", "def", "--help"}, "reparent"},
 		{[]string{"help", "reparent"}, "reparent"},
 		{[]string{"edit", "--help"}, "edit"},
@@ -439,15 +457,21 @@ func TestUsageErrorsCarryTheirTopic(t *testing.T) {
 
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
-		{"-d"},                     // detach without command
-		{"-d", "ls"},               // detach only pairs with --
-		{"--"},                     // run with no command
-		{"open", "extra"},          // open takes no args
-		{"attach"},                 // missing id
-		{"attach", "a", "b"},       // too many
-		{"tail"},                   // missing id
-		{"tail", "-n", "0", "abc"}, // non-positive count
-		{"wait"},                   // missing id
+		{"-d"},                           // detach without command
+		{"-d", "ls"},                     // detach only pairs with --
+		{"--"},                           // run with no command
+		{"open", "extra"},                // open takes no args
+		{"attach"},                       // missing id
+		{"attach", "a", "b"},             // too many
+		{"dismiss"},                      // missing id
+		{"dismiss", "a", "b"},            // too many
+		{"project"},                      // missing subcommand
+		{"project", "unknown"},           // unknown subcommand
+		{"project", "add"},               // missing path
+		{"project", "add", ".", "extra"}, // too many paths
+		{"tail"},                         // missing id
+		{"tail", "-n", "0", "abc"},       // non-positive count
+		{"wait"},                         // missing id
 		{"wait", "abc", "--for-text", "a", "--for-regex", "b"}, // mutually exclusive
 		{"wait", "abc", "def", "--for-text", "a"},              // predicates require one id
 		{"wait", "abc", "def", "--for-regex", "a"},             // predicates require one id
@@ -491,6 +515,8 @@ func TestParseCLIMigrationShim(t *testing.T) {
 		{[]string{"--no-attach", "x"}, "gmux -d"},
 		{[]string{"--host=laptop"}, "@<peer>"},
 		{[]string{"pytest", "-q"}, "gmux -- pytest"},
+		{[]string{"workspace", "add", "."}, "gmux project add"},
+		{[]string{"session", "dismiss", "abc"}, "gmux dismiss"},
 		// send's two removed semantic flags have a named replacement one
 		// rename away, so "unknown flag" is the least actionable of the
 		// available errors: name the verb that replaced them.

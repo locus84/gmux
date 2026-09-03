@@ -47,6 +47,14 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
    `gmux read` experiment are superseded before release; consumption remains an
    observation side effect rather than a mutation verb.
 
+   **Local distribution amendment (2026-09-02):** `dismiss` joins the
+   top-level session verbs. `gmux dismiss <id>` is leaf-only; a session that
+   owns descendants requires `--tree`, making recursive family scope explicit
+   at the CLI boundary. `project` is a namespace group for daemon-owned project
+   catalog operations; `gmux project add <path>` adds or returns a matching
+   local project. The retired `session dismiss` and `workspace add` spellings
+   are not restored.
+
 6. **`gmux daemon …` is the canonical front; `gmuxd` keeps its verbs for
    backwards-compatible ops.** `gmux daemon start|stop|restart|status|
    log-path`, `gmux auth`, and `gmux remote` are the documented surface

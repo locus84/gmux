@@ -22,10 +22,12 @@ const (
 	modeAttach                 // gmux attach <id>
 	modeTail                   // gmux tail <id>
 	modeKill                   // gmux kill <id>
+	modeDismiss                // gmux dismiss <id> [--tree]
 	modeSend                   // gmux send <id> <text> [keys...]
 	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
 	modeWait                   // gmux wait <id>...
 	modeWorktree               // gmux worktree <current|ps|create>
+	modeProject                // gmux project add <path>
 	modePromote                // gmux promote <id>
 	modeReparent               // gmux reparent <id> <parent-id>
 	modeAgent                  // gmux agent prompt|cancel|output <id>
@@ -82,8 +84,9 @@ type command struct {
 	agentModel  string  // --new only: model selector for the launch
 	agentName   string  // --new only: session display name for the launch
 
-	// reparent
-	parentRef string
+	// dismiss/reparent
+	dismissTree bool
+	parentRef   string
 
 	// help
 	helpTopic string // "agent", "agent prompt", ... ("" = full usage)
@@ -93,6 +96,10 @@ type command struct {
 	forText  string // --for-text: wait for substring in output
 	forRegex string // --for-regex: wait for regex match in output
 	quiet    bool   // --quiet: synchronize only, print no result
+
+	// project
+	projectSub  string
+	projectPath string
 
 	// worktree
 	worktreeSub      string
@@ -125,8 +132,8 @@ type command struct {
 // under `gmux <group> <verb>` without adding top-level verbs. Consumption has
 // no verb at all: it is a side effect of observing a result.
 var reservedVerbs = []string{
-	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "worktree", "promote", "reparent", "agent", "edit", "daemon", "auth", "remote", "version", "help",
+	"open", "ls", "attach", "tail", "kill", "dismiss", "send", "send-keys",
+	"wait", "worktree", "project", "promote", "reparent", "agent", "edit", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -214,6 +221,8 @@ func parseCLI(args []string) (*command, error) {
 		return dispatchVerb("kill", rest, func(a []string) (*command, error) {
 			return parseRefOnly(modeKill, "kill", a)
 		})
+	case "dismiss":
+		return dispatchVerb("dismiss", rest, parseDismiss)
 	case "tail":
 		return dispatchVerb("tail", rest, parseTail)
 	case "send":
@@ -224,6 +233,8 @@ func parseCLI(args []string) (*command, error) {
 		return dispatchVerb("wait", rest, parseWait)
 	case "worktree":
 		return dispatchVerb("worktree", rest, parseWorktree)
+	case "project":
+		return dispatchVerb("project", rest, parseProject)
 	case "promote":
 		return dispatchVerb("promote", rest, parsePromote)
 	case "reparent":
@@ -305,6 +316,12 @@ func parseCLI(args []string) (*command, error) {
 		return nil, &usageError{topic: "agent", err: fmt.Errorf(
 			"unknown command %q; agent commands are namespaced: gmux agent %s ... (%s)", head, head, runHint)}
 	}
+	if head == "workspace" {
+		return nil, fmt.Errorf("the workspace command was replaced by the project namespace; use: gmux project add <path>")
+	}
+	if head == "session" {
+		return nil, fmt.Errorf("session operations are top-level verbs; use: gmux dismiss <id>")
+	}
 	if v := didYouMean(head); v != "" {
 		return nil, fmt.Errorf("unknown command %q; did you mean %q? (%s)", head, v, runHint)
 	}
@@ -344,6 +361,37 @@ func parseLs(args []string) (*command, error) {
 		return nil, errors.New("ls takes no positional arguments")
 	}
 	return c, nil
+}
+
+func parseDismiss(args []string) (*command, error) {
+	c := &command{mode: modeDismiss}
+	fs := newFlagSet("dismiss")
+	fs.BoolVar(&c.dismissTree, "tree", false, "dismiss the full descendant tree")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return nil, err
+	}
+	if len(pos) != 1 || pos[0] == "" {
+		return nil, errors.New("dismiss requires exactly one session id")
+	}
+	c.ref = pos[0]
+	return c, nil
+}
+
+func parseProject(args []string) (*command, error) {
+	if len(args) > 1 && isHelpToken(args[1]) {
+		return &command{mode: modeHelp, helpTopic: "project"}, nil
+	}
+	if len(args) == 0 {
+		return nil, errors.New("project requires one of: add")
+	}
+	if args[0] != "add" {
+		return nil, fmt.Errorf("unknown project command %q", args[0])
+	}
+	if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
+		return nil, errors.New("project add requires exactly one path")
+	}
+	return &command{mode: modeProject, projectSub: "add", projectPath: args[1]}, nil
 }
 
 func parsePromote(args []string) (*command, error) {

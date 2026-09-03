@@ -16,6 +16,10 @@ import (
 // suffices for UI busy-retry mapping.
 var ErrSubtreeBusy = fmt.Errorf("%w: in the subtree", ErrLifecycleOpInFlight)
 
+// ErrSessionHasChildren marks a leaf-only dismissal that found descendants.
+// Callers must explicitly opt into recursive family dismissal.
+var ErrSessionHasChildren = fmt.Errorf("session has descendants")
+
 // Dismiss dismisses the session's entire launch subtree in one durable
 // transaction (ADR 0026 §6: hidden, not forgotten). The whole operation —
 // subtree read, liveness/claim/convergence checks, and the store commit —
@@ -38,6 +42,18 @@ var ErrSubtreeBusy = fmt.Errorf("%w: in the subtree", ErrLifecycleOpInFlight)
 // It returns the IDs that were durably dismissed. A registration arriving
 // after the commit clears that session's dismissal by design.
 func (c *Coordinator) Dismiss(ctx context.Context, root centralstore.SessionID) ([]centralstore.SessionID, error) {
+	return c.dismiss(ctx, root, false)
+}
+
+// DismissLeaf dismisses root only when it has no current descendants. The
+// descendant check runs under the same lifecycle mutex as registration and
+// the durable commit, so a child cannot appear between authorization and
+// mutation. Use Dismiss for an explicitly confirmed recursive operation.
+func (c *Coordinator) DismissLeaf(ctx context.Context, root centralstore.SessionID) ([]centralstore.SessionID, error) {
+	return c.dismiss(ctx, root, true)
+}
+
+func (c *Coordinator) dismiss(ctx context.Context, root centralstore.SessionID, requireLeaf bool) ([]centralstore.SessionID, error) {
 	if c.beforeDismissLock != nil {
 		c.beforeDismissLock()
 	}
@@ -71,6 +87,10 @@ func (c *Coordinator) Dismiss(ctx context.Context, root centralstore.SessionID) 
 				members = append(members, k)
 			}
 		}
+	}
+	if requireLeaf && len(members) != 1 {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s has %d descendants", ErrSessionHasChildren, root, len(members)-1)
 	}
 	memberSet := make(map[centralstore.SessionID]bool, len(members))
 	for _, id := range members {

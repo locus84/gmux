@@ -63,6 +63,23 @@ func TestDismissDeadSubtreeCommitsAndPublishes(t *testing.T) {
 	}
 }
 
+func TestDismissLeafRefusesDescendantsWithoutMutating(t *testing.T) {
+	dur := newFakeDurable(0)
+	dur.listSessions = func() ([]centralstore.Session, error) { return treeSessions(), nil }
+	sink := &fakeDirtySink{}
+	coord := newDismissCoord(t, dur, sink)
+
+	if _, err := coord.DismissLeaf(context.Background(), "151zemtf"); !errors.Is(err, ErrSessionHasChildren) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(dur.dismissCalls) != 0 || sink.count() != 0 {
+		t.Fatalf("leaf refusal mutated state: calls=%v published=%d", dur.dismissCalls, sink.count())
+	}
+	if dismissed, err := coord.DismissLeaf(context.Background(), "1108gm0e"); err != nil || !reflect.DeepEqual(dismissed, []centralstore.SessionID{"1108gm0e"}) {
+		t.Fatalf("leaf dismissal: dismissed=%v err=%v", dismissed, err)
+	}
+}
+
 func TestDismissBlockedByLiveSubtreeMember(t *testing.T) {
 	dur := newFakeDurable(0)
 	dur.listSessions = func() ([]centralstore.Session, error) { return treeSessions("1k41uwyr"), nil }

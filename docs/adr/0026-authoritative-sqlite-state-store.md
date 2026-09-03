@@ -128,6 +128,13 @@ Dismissal:
 - retains the session row, conversation identity, parent and launch provenance, and scrollback;
 - recursively dismisses descendants after UI confirmation makes that scope clear.
 
+**Local CLI amendment (2026-09-02):** `gmux dismiss <id>` asks the daemon for
+an atomic leaf-only dismissal and refuses when the session currently owns
+children. `gmux dismiss <id> --tree` makes recursive scope explicit at the CLI
+boundary. The daemon repeats the leaf check under the
+lifecycle mutex, so registration cannot add a descendant between authorization
+and the durable mutation.
+
 There is no default destructive “forget completely” operation. Adapter reconciliation eventually removes sessions that are no longer resumable.
 
 Every live local runner must be visible. Registering a genuinely new, previously dismissed, or surviving runner clears its dismissal. A session without current placement is assigned by the normal project matcher and appended using ordinary ordering rules. Re-registration after daemon restart preserves existing visible placement and ordering, making restart invisible apart from the client's reconnecting state.
