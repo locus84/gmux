@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { acceleratedScrollRows, decayScrollVelocity, shouldFocusTerminalFromTouch, terminalTouchMoved } from './terminal-touch'
+import { acceleratedScrollRows, decayScrollVelocity, shouldBlurTerminalAfterKeyboardClose, shouldFocusTerminalFromTouch, terminalTouchMoved } from './terminal-touch'
 
 const start = {
   x: 100,
@@ -7,6 +7,16 @@ const start = {
   scrollLeft: 0,
   scrollTop: 0,
 }
+
+describe('terminal soft keyboard lifecycle', () => {
+  it('blurs only the half-focused textarea after a touch keyboard closes', () => {
+    expect(shouldBlurTerminalAfterKeyboardClose(true, false, true, true)).toBe(true)
+    expect(shouldBlurTerminalAfterKeyboardClose(false, false, true, true)).toBe(false)
+    expect(shouldBlurTerminalAfterKeyboardClose(true, true, true, true)).toBe(false)
+    expect(shouldBlurTerminalAfterKeyboardClose(true, false, false, true)).toBe(false)
+    expect(shouldBlurTerminalAfterKeyboardClose(true, false, true, false)).toBe(false)
+  })
+})
 
 describe('terminal touch focus classification', () => {
   it('allows a stationary tap to focus the terminal input', () => {

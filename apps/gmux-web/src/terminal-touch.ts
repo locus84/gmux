@@ -17,6 +17,15 @@ export function acceleratedScrollRows({
   return { rows, remainder: rawRows - rows, exactRows }
 }
 
+export function shouldBlurTerminalAfterKeyboardClose(
+  wasOpen: boolean,
+  open: boolean,
+  touchDevice: boolean,
+  textareaFocused: boolean,
+): boolean {
+  return touchDevice && wasOpen && !open && textareaFocused
+}
+
 export function decayScrollVelocity(velocity: number, elapsedMs: number): number {
   return velocity * Math.pow(0.90, Math.max(0, elapsedMs) / (1000 / 60))
 }

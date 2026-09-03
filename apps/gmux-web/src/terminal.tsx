@@ -4,6 +4,7 @@ import { ImageAddon } from '@xterm/addon-image'
 import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { Terminal } from '@xterm/xterm'
+import { effect } from '@preact/signals'
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
 import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
@@ -19,7 +20,7 @@ import { MOCK_BY_ID } from './mock-data/index'
 import { refreshAtlasWhenIconFontLoads } from './nerd-font'
 import { createReplayBuffer } from './replay'
 import type { ResolvedTerminalOptions } from './settings-schema'
-import { navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
+import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, vsCodeServerUrl } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
@@ -32,7 +33,7 @@ import { pressedBufferRow, readTerminalText } from './terminal-text'
 import { TerminalTextSheet } from './terminal-text-sheet'
 import { pushError } from './toasts'
 import { isTouchDevice } from './touch'
-import { acceleratedScrollRows, decayScrollVelocity, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
+import { acceleratedScrollRows, decayScrollVelocity, shouldBlurTerminalAfterKeyboardClose, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import type { Session } from './types'
 import { resolveTerminalWebUrl } from './vscode-server'
 import { loadWebglRenderer } from './webgl-renderer'
@@ -750,6 +751,23 @@ export function TerminalView({
     const disposeMobileHandler = attachMobileInputHandler(
       term, containerRef.current!, sendRawInput, sendMobileReplacement,
     )
+    let keyboardWasOpen = keyboardOpen.value
+    const disposeKeyboardCloseBlur = effect(() => {
+      const open = keyboardOpen.value
+      if (shouldBlurTerminalAfterKeyboardClose(
+        keyboardWasOpen,
+        open,
+        isTouchDevice(),
+        document.activeElement === term.textarea,
+      )) {
+        // Mobile browsers can dismiss the soft keyboard while leaving
+        // xterm's hidden textarea focused. Blur that half-focused textarea so
+        // the next drag cannot reopen the keyboard; a deliberate tap focuses
+        // it again through the touchend path.
+        term.textarea?.blur()
+      }
+      keyboardWasOpen = open
+    })
 
     // OSC 52 clipboard: applications (e.g. pi /copy) write
     //   ESC ] 52 ; <selection> ; <base64-payload> BEL
@@ -997,15 +1015,30 @@ export function TerminalView({
 
     let resizeFrame: number | null = null
     let lastViewportPixels = getResizeSignalPixels(shell, vv)
+    let keyboardSettleTimers: number[] = []
 
     const flushViewportResize = () => {
       resizeFrame = null
+      lastViewportPixels = getResizeSignalPixels(shell, vv)
       processViewportResize()
     }
 
     const scheduleViewportResize = () => {
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
       resizeFrame = requestAnimationFrame(flushViewportResize)
+    }
+
+    const clearKeyboardSettleTimers = () => {
+      for (const timer of keyboardSettleTimers) clearTimeout(timer)
+      keyboardSettleTimers = []
+    }
+
+    const scheduleKeyboardSettleResize = () => {
+      clearKeyboardSettleTimers()
+      // visualViewport can resize before mobile keyboard CSS/layout has
+      // finished animating. Re-measure after the usual animation stages so
+      // xterm and the PTY settle on the actual terminal height.
+      keyboardSettleTimers = [120, 280, 500].map(delay => window.setTimeout(scheduleViewportResize, delay))
     }
 
     const onViewportResize = () => {
@@ -1028,18 +1061,35 @@ export function TerminalView({
     const shellObserver = new ResizeObserver(() => onViewportResize())
     if (shell) shellObserver.observe(shell)
 
+    const onVisualViewportResize = () => {
+      onViewportResize()
+      scheduleKeyboardSettleResize()
+    }
+
+    const onVisualViewportResizeEnd = () => {
+      clearKeyboardSettleTimers()
+      scheduleViewportResize()
+    }
+
     // Also listen on window/visualViewport for zoom and soft keyboard.
     window.addEventListener('resize', onViewportResize)
-    if (vv) vv.addEventListener('resize', onViewportResize)
+    if (vv) {
+      vv.addEventListener('resize', onVisualViewportResize)
+      vv.addEventListener('resizeend', onVisualViewportResizeEnd)
+    }
 
     return () => {
       shellObserver.disconnect()
+      clearKeyboardSettleTimers()
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
       longPress.cancel()
       disposed.current = true
       window.removeEventListener('keydown', handleGlobalKeydown, true)
       window.removeEventListener('resize', onViewportResize)
-      if (vv) vv.removeEventListener('resize', onViewportResize)
+      if (vv) {
+        vv.removeEventListener('resize', onVisualViewportResize)
+        vv.removeEventListener('resizeend', onVisualViewportResizeEnd)
+      }
       shell?.removeEventListener('touchstart', handleTouchStartCapture, true)
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)
@@ -1047,6 +1097,7 @@ export function TerminalView({
       clearTouchPan()
       disposePasteHandler()
       disposeMobileHandler()
+      disposeKeyboardCloseBlur()
       disposeImeResidueGuard()
       fileLinkDisposable.dispose()
       osc52Disposable.dispose()
