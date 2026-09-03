@@ -264,9 +264,9 @@ function SessionItem({
     >
       {unavailable
         ? <svg class="session-unavailable-icon" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><title>Peer unavailable</title><path d="M2 2 L10 10 M10 2 L2 10" /></svg>
-        : sleeping
+        : sleeping && dotState === 'none'
         ? <svg class="session-sleep-icon" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><title>Resumable</title><path d="M7 1h4l-4 4h4" /><path d="M1 5h5l-5 6h5" /></svg>
-        : <span class={`session-dot-indicator ${dotState}${arrival ? ` ${arrival}` : ''}`} />
+        : <span class={`session-dot-indicator ${dotState}${arrival ? ` ${arrival}` : ''}`} title={sleeping ? 'Unread · resumable' : undefined} />
       }
       {showHostMarker && session.peer && <DevcontainerMarker peer={session.peer} />}
       <div class="session-content">

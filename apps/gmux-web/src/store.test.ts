@@ -1559,15 +1559,20 @@ describe('aggregateSessionDotState', () => {
     expect(aggregateSessionDotState(rows, new Map([['active', 'active']]))).toBe('working')
   })
 
-  it('suppresses selected attention and unavailable or sleeping rows', () => {
+  it('suppresses selected attention, unavailable rows, and quiet sleeping rows', () => {
     const rows = [
       makeSession({ id: 'selected', unread: true }),
       makeSession({ id: 'remote', peer: 'box', unread: true }),
-      makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true }),
+      makeSession({ id: 'sleeping', alive: false, resumable: true }),
     ]
     expect(aggregateSessionDotState(rows, new Map(), {
       selectedId: 'selected', peerStatus: new Map([['box', 'offline']]),
     })).toBe('none')
+  })
+
+  it('keeps unread retained sessions traceable through a collapsed checkout', () => {
+    const rows = [makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true })]
+    expect(aggregateSessionDotState(rows, new Map())).toBe('unread')
   })
 })
 

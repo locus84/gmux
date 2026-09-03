@@ -510,9 +510,13 @@ export function aggregateSessionDotState(
   }
   let aggregate: DotState = 'none'
   for (const session of sessions) {
-    if ((options.peerStatus && isSessionUnavailable(session, options.peerStatus)) || (!session.alive && session.resumable)) continue
+    if (options.peerStatus && isSessionUnavailable(session, options.peerStatus)) continue
     let state: DotState = options.resumingId === session.id ? 'working' : sessionDotState(session, am)
     if (options.selectedId === session.id && (state === 'error' || state === 'unread')) state = 'none'
+    // A quiet retained session renders its resumable icon. If it carries
+    // unread/error attention, that state must still roll up to a collapsed
+    // checkout so the global badge always has a visible trail.
+    if (!session.alive && session.resumable && (state === 'none' || state === 'active' || state === 'fading')) continue
     if (priority[state] > priority[aggregate]) aggregate = state
   }
   return aggregate
