@@ -1200,9 +1200,9 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Helper to connect a WS client.
+	// Helper to connect a browser WS client.
 	dial := func() *websocket.Conn {
-		conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
+		conn, _, err := websocket.Dial(ctx, "ws://localhost/?client=browser", &websocket.DialOptions{
 			HTTPClient: &http.Client{
 				Transport: &http.Transport{
 					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -1265,6 +1265,27 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	// This should trigger a genuine SIGWINCH because the PTY is at 79 cols.
 	conn2 := dial()
 	defer conn2.Close(websocket.StatusNormalClosure, "")
+
+	// Browser checkpoint geometry must expose exactly the runner's hidden
+	// one-column shrink. The web reconnect guard deliberately relies on this
+	// contract before reasserting the logical 80x25 size.
+	typ, data, err := conn2.Read(ctx)
+	if err != nil {
+		t.Fatalf("read checkpoint metadata: %v", err)
+	}
+	if typ != websocket.MessageText {
+		t.Fatalf("checkpoint metadata type = %v, want text", typ)
+	}
+	var checkpoint terminalCheckpointMetadata
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		t.Fatalf("decode checkpoint metadata: %v", err)
+	}
+	if checkpoint.Cols != 79 || checkpoint.Rows != 25 {
+		t.Fatalf("checkpoint size = %dx%d, want hidden shrink 79x25", checkpoint.Cols, checkpoint.Rows)
+	}
+	if typ, _, err = conn2.Read(ctx); err != nil || typ != websocket.MessageBinary {
+		t.Fatalf("read checkpoint frame: type=%v err=%v", typ, err)
+	}
 
 	go func() {
 		for {

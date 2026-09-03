@@ -22,6 +22,7 @@ import { createReplayBuffer } from './replay'
 import type { ResolvedTerminalOptions } from './settings-schema'
 import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, urlSearch, vsCodeServerUrl } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
+import { fetchAuthoritativeReconnectSize, shouldReassertReconnectSize } from './terminal-connection'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
 import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext } from './terminal-file-link'
@@ -1291,6 +1292,7 @@ export function TerminalView({
       let attachPhase: 'replay' | 'claiming' | 'claimed' = isFirstConnect ? 'replay' : 'claimed'
       const postClaimWrites: Uint8Array[] = []
       let claimFallbackTimer: ReturnType<typeof setTimeout> | null = null
+      let reconnectSizePromise: Promise<TerminalSize | null> | null = null
       const finishPostClaimWrite = () => {
         if (claimFallbackTimer !== null) clearTimeout(claimFallbackTimer)
         claimFallbackTimer = null
@@ -1307,6 +1309,9 @@ export function TerminalView({
           sessionRef.current.terminal_cols,
           ptySizeRef.current?.cols,
         )
+        const declaredCheckpointSize = checkpointCols && checkpointMargins
+          ? { cols: checkpointCols, rows: checkpointMargins.rows }
+          : null
         if (checkpointSize) {
           setPtySize(checkpointSize); ptySizeRef.current = checkpointSize
         }
@@ -1314,7 +1319,32 @@ export function TerminalView({
           if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
           scrollAnchorRef.current?.follow()
           if (!claiming) {
+            const logicalSize = reconnectSizePromise
+            const localSession = !sessionRef.current.peer
+            if (!logicalSize || !localSession) {
+              setTermLoading(false)
+              return
+            }
+            // The checkpoint is the runner's current physical geometry. Only
+            // write to the shared PTY when it proves the hidden reconnect
+            // shrink (logical cols - 1 at the same row count). This avoids
+            // stealing ownership from another viewer on ordinary reconnects.
+            // Do not hold the replay overlay on an independent HTTP read.
             setTermLoading(false)
+            void logicalSize.then((size) => {
+              if (connectionRef.current !== connection
+                || connection.ws.readyState !== WebSocket.OPEN
+                || termEpochRef.current !== epoch) return
+              if (size && shouldReassertReconnectSize(
+                declaredCheckpointSize,
+                size,
+                ptySizeRef.current,
+                localSession,
+                resizeEchoGateRef.current.awaitingEcho != null,
+              )) {
+                applyOwnedResize(size, true, true)
+              }
+            })
             return
           }
 
@@ -1405,19 +1435,17 @@ export function TerminalView({
         if (isFirstConnect) return
         inputClaimedRef.current = true
 
-        // Reconnect: re-sync ptySize from session metadata in case a
-        // terminal_resize WS event was missed during the drop. Reconnects
-        // deliberately never reclaim the viewport.
+        // Start a fresh logical-size read, but apply it only after the
+        // checkpoint replay commits. The checkpoint then provides positive
+        // evidence of the runner's hidden one-column reconnect shrink.
         resetResizeEchoGate()
         const sess = sessionRef.current
-        if (sess.terminal_cols && sess.terminal_rows) {
-          const cached = ptySizeRef.current
-          if (!cached || cached.cols !== sess.terminal_cols || cached.rows !== sess.terminal_rows) {
-            const size = { cols: sess.terminal_cols, rows: sess.terminal_rows }
-            setPtySize(size); ptySizeRef.current = size
-            queueResize(size)
-          }
-        }
+        const fallbackSize = sess.terminal_cols && sess.terminal_rows
+          ? { cols: sess.terminal_cols, rows: sess.terminal_rows }
+          : null
+        reconnectSizePromise = sess.peer
+          ? Promise.resolve(null)
+          : fetchAuthoritativeReconnectSize(session.id).then(size => size ?? fallbackSize)
       }
 
       ws.onmessage = (ev) => {
