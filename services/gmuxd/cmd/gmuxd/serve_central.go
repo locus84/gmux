@@ -561,6 +561,12 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": item})
 		})
+		mux.HandleFunc("GET /v1/projects/{slug}/files", func(w http.ResponseWriter, r *http.Request) {
+			workspaceProjectFilesListHandler(w, r, r.PathValue("slug"), boot.Store)
+		})
+		mux.HandleFunc("GET /v1/projects/{slug}/file", func(w http.ResponseWriter, r *http.Request) {
+			workspaceProjectFilesContentHandler(w, r, r.PathValue("slug"), boot.Store)
+		})
 		mux.HandleFunc("GET /v1/projects/{slug}/worktrees", func(w http.ResponseWriter, r *http.Request) {
 			projectWorktreesHandler(w, r, r.PathValue("slug"), boot.Store)
 		})
@@ -739,7 +745,10 @@ func serveCentral(stderr io.Writer, replace bool) int {
 				writeError(w, http.StatusBadRequest, "bad_request", "session_id and socket_path required")
 				return
 			}
-			if _, err := boot.Coordinator.Register(r.Context(), sessioncoord.RegisterRequest{Endpoint: req.SocketPath, AssertedID: centralstore.SessionID(req.SessionID), ActiveSubagentReservation: req.ActiveSubagentReservation}); err != nil {
+			worktreeLifecycleMu.RLock()
+			_, registerErr := boot.Coordinator.Register(r.Context(), sessioncoord.RegisterRequest{Endpoint: req.SocketPath, AssertedID: centralstore.SessionID(req.SessionID), ActiveSubagentReservation: req.ActiveSubagentReservation})
+			worktreeLifecycleMu.RUnlock()
+			if err := registerErr; err != nil {
 				var limit *sessioncoord.SubagentLimitError
 				if errors.As(err, &limit) {
 					writeError(w, http.StatusTooManyRequests, codeSubagentLimitReached, formatSubagentLimitMessage(limit))
@@ -865,19 +874,33 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			if cwd == "" {
 				cwd = os.Getenv("HOME")
 			}
-			if !projects.IsDir(cwd) {
-				writeError(w, http.StatusUnprocessableEntity, "cwd_missing", fmt.Sprintf("working directory %q does not exist", cwd))
-				return
-			}
 			if gmuxBin == "" {
 				writeError(w, http.StatusInternalServerError, "gmux_not_found", "gmux not found (install gmux alongside gmuxd)")
 				return
 			}
-			pid, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
+
+			// Reserve before fork and retain the token for the runner lifetime.
+			// This closes the spawn-to-registration gap; after registration the
+			// durable session supplies the actionable dismissal guard.
+			worktreeLifecycleMu.Lock()
+			if !projects.IsDir(cwd) {
+				worktreeLifecycleMu.Unlock()
+				writeError(w, http.StatusUnprocessableEntity, "cwd_missing", fmt.Sprintf("working directory %q does not exist", cwd))
+				return
+			}
+			launchToken := reserveWorktreeLaunch(cwd)
+			worktreeLifecycleMu.Unlock()
+
+			pid, wait, err := launchGmux(gmuxBin, req.Command, cwd, "", 0, 0)
 			if err != nil {
+				releaseWorktreeLaunch(launchToken)
 				writeError(w, http.StatusInternalServerError, "launch_failed", err.Error())
 				return
 			}
+			go func() {
+				<-wait
+				releaseWorktreeLaunch(launchToken)
+			}()
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"pid": pid}})
 		})
 		mux.HandleFunc("GET /v1/sessions/{id}/files", func(w http.ResponseWriter, r *http.Request) {

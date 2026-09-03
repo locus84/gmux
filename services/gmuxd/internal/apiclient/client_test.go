@@ -327,11 +327,12 @@ func TestForwardLaunch_InvalidJSON(t *testing.T) {
 
 // ── ForwardPath ───────────────────────────────────────────────────
 
-func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
-	var gotPath, gotMethod string
+func TestForwardPath_PreservesMethodPathQueryAndBody(t *testing.T) {
+	var gotPath, gotQuery, gotMethod string
 	var gotBody []byte
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
 		gotMethod = r.Method
 		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
@@ -341,7 +342,7 @@ func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
 
 	c := New(ts.URL, WithBearerToken("tok"))
 	req := httptest.NewRequest(http.MethodPatch,
-		"/v1/peers/tower/v1/projects/gmux/sessions",
+		"/v1/peers/tower/v1/projects/gmux/sessions?path=src%2Fapi&raw=1",
 		strings.NewReader(`{"sessions":["a","b"]}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -350,6 +351,9 @@ func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
 
 	if gotPath != "/v1/projects/gmux/sessions" {
 		t.Errorf("path = %q, want /v1/projects/gmux/sessions", gotPath)
+	}
+	if gotQuery != "path=src%2Fapi&raw=1" {
+		t.Errorf("query = %q, want path and raw", gotQuery)
 	}
 	if gotMethod != http.MethodPatch {
 		t.Errorf("method = %q, want PATCH", gotMethod)

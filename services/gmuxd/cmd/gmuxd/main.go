@@ -149,12 +149,12 @@ func launcherStates(ls []adapter.Launcher) []string {
 // Directives are delivered as CLI flags so the daemon↔runner
 // contract is greppable and shows up in `ps`. This code path does not
 // use the runner's legacy private resume-environment fallback.
-func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, error) {
+func launchGmux(gmuxBin string, command []string, cwd, resumeID string, initialCols, initialRows uint16) (int, <-chan error, error) {
 	result, err := launchRunnerProcess(context.Background(), runnerLaunchRequest{GmuxBin: gmuxBin, Command: command, CWD: cwd, ResumeID: resumeID, InitialCols: initialCols, Rows: initialRows})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return result.PID, nil
+	return result.PID, result.Wait, nil
 }
 
 // resolveResumeDir picks the directory to (re)launch a runner in for a
@@ -707,6 +707,13 @@ func isAllowedPeerProxyPath(method, sub string) bool {
 		len(parts) == 4 &&
 		parts[0] == "v1" && parts[1] == "projects" &&
 		parts[2] != "" && parts[3] == "worktrees" {
+		return true
+	}
+	// Read project-root files on the daemon that owns the filesystem.
+	if method == http.MethodGet &&
+		len(parts) == 4 &&
+		parts[0] == "v1" && parts[1] == "projects" &&
+		parts[2] != "" && (parts[3] == "files" || parts[3] == "file") {
 		return true
 	}
 	// Create a project on a peer: POST v1/projects/add.

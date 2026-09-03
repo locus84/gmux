@@ -262,6 +262,9 @@ func (c *Client) ForwardAction(w http.ResponseWriter, r *http.Request, sessionID
 // project-management writes (and other host-scoped state) to the
 // session's owning host (ADR 0002).
 func (c *Client) ForwardPath(w http.ResponseWriter, r *http.Request, path string) {
+	if raw := r.URL.RawQuery; raw != "" {
+		path += "?" + raw
+	}
 	c.proxyHTTP(w, r, path)
 }
 

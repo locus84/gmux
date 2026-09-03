@@ -25,6 +25,51 @@ func testSessionStore(root string) fakeWorkspaceSessions {
 	return fakeWorkspaceSessions{"sess-files": {ID: "sess-files", CWD: root, WorkspaceRoot: root}}
 }
 
+func TestWorkspaceProjectFilesUseOwnedProjectRoot(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("project root\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := centralstore.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, _, err := store.ReplaceProjectCatalog(ctx, []centralstore.ProjectEntrySpec{{
+		Owned: &centralstore.OwnedProjectSpec{Slug: "demo", Rules: []centralstore.MatchRule{{Path: root}}},
+	}}, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/projects/demo/file?path=README.md", nil)
+	rr := httptest.NewRecorder()
+	workspaceProjectFilesContentHandler(rr, req, "demo", store)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "project root") {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/missing/files", nil)
+	rr = httptest.NewRecorder()
+	workspaceProjectFilesListHandler(rr, req, "missing", store)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	if _, _, err := store.ReplaceProjectCatalog(ctx, []centralstore.ProjectEntrySpec{{
+		Owned: &centralstore.OwnedProjectSpec{Slug: "multi", Rules: []centralstore.MatchRule{{Path: root}, {Path: t.TempDir()}}},
+	}}, 2); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/multi/files", nil)
+	rr = httptest.NewRecorder()
+	workspaceProjectFilesListHandler(rr, req, "multi", store)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "README.md") {
+		t.Fatalf("multi-root canonical browse status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestWorkspaceFilesListAndContent(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# hello\n"), 0o644); err != nil {
@@ -67,6 +112,39 @@ func TestWorkspaceFilesListAndContent(t *testing.T) {
 	}
 	if body.Data.Content != "# hello\n" || body.Data.Path != "README.md" {
 		t.Fatalf("unexpected content: %#v", body.Data)
+	}
+}
+
+func TestOpenWorkspaceResolvedPathRejectsPostValidationSymlinkSwap(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	inside := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(inside, []byte("inside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/file?path=target.txt", nil)
+	_, rootReal, _, resolved, err := resolveWorkspaceFilePath(req, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(inside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), inside); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	file, err := openWorkspaceResolvedPath(rootReal, resolved)
+	if err == nil {
+		file.Close()
+		t.Fatal("post-validation symlink swap unexpectedly opened")
+	}
+	rr := httptest.NewRecorder()
+	writeWorkspaceFileError(rr, err)
+	if rr.Code != http.StatusForbidden || !strings.Contains(rr.Body.String(), "outside_root") {
+		t.Fatalf("swap status = %d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -79,6 +79,24 @@ func workspaceSessionFilesContentHandler(w http.ResponseWriter, r *http.Request,
 	serveWorkspaceFilesContent(w, r, root)
 }
 
+func workspaceProjectFilesListHandler(w http.ResponseWriter, r *http.Request, slug string, store *centralstore.Store) {
+	root, err := workspaceRootForProject(r.Context(), slug, store)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	serveWorkspaceFilesList(w, r, root)
+}
+
+func workspaceProjectFilesContentHandler(w http.ResponseWriter, r *http.Request, slug string, store *centralstore.Store) {
+	root, err := workspaceRootForProject(r.Context(), slug, store)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	serveWorkspaceFilesContent(w, r, root)
+}
+
 func validSessionTempImageID(sessionID string) bool {
 	if sessionID == "" || filepath.Base(sessionID) != sessionID || sessionID == "." || sessionID == ".." {
 		return false
@@ -189,13 +207,27 @@ func workspaceRootForSession(ctx context.Context, sessionID string, sessions wor
 	return root, nil
 }
 
+func workspaceRootForProject(ctx context.Context, slug string, store *centralstore.Store) (string, error) {
+	// Project browsing is rooted only in the owning daemon's durable catalog.
+	// Falling back to a stamped session is unsafe here: Local-peer
+	// (devcontainer) sessions are intentionally placed in the parent project,
+	// but their /workspaces paths belong to the container filesystem.
+	return projectFilesystemRoot(ctx, slug, store, false)
+}
+
 func serveWorkspaceFilesList(w http.ResponseWriter, r *http.Request, rootHint string) {
-	root, rel, abs, err := resolveWorkspaceFilePath(r, rootHint)
+	root, rootReal, rel, abs, err := resolveWorkspaceFilePath(r, rootHint)
 	if err != nil {
 		writeWorkspaceFileError(w, err)
 		return
 	}
-	info, err := os.Stat(abs)
+	dir, err := openWorkspaceResolvedPath(rootReal, abs)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	defer dir.Close()
+	info, err := dir.Stat()
 	if err != nil {
 		writeWorkspaceStatError(w, err)
 		return
@@ -205,7 +237,7 @@ func serveWorkspaceFilesList(w http.ResponseWriter, r *http.Request, rootHint st
 		return
 	}
 
-	entries, err := os.ReadDir(abs)
+	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		writeWorkspaceStatError(w, err)
 		return
@@ -235,7 +267,7 @@ func serveWorkspaceFilesList(w http.ResponseWriter, r *http.Request, rootHint st
 		isSymlink := info.Mode()&os.ModeSymlink != 0
 		if isSymlink {
 			typ = "symlink"
-			if target, err := filepath.EvalSymlinks(filepath.Join(abs, ent.Name())); err == nil {
+			if target, err := filepath.EvalSymlinks(filepath.Join(abs, ent.Name())); err == nil && pathWithinRoot(rootReal, target) {
 				if st, statErr := os.Stat(target); statErr == nil && st.IsDir() {
 					typ = "dir"
 				}
@@ -331,19 +363,12 @@ func isWorkspaceImageMime(mimeType string) bool {
 	}
 }
 
-func serveWorkspaceFileRaw(w http.ResponseWriter, r *http.Request, abs string, info os.FileInfo) {
+func serveWorkspaceFileRaw(w http.ResponseWriter, r *http.Request, abs string, info os.FileInfo, f *os.File) {
 	limit := workspacePreviewLimitForPath(abs)
 	if info.Size() > limit {
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large", fmt.Sprintf("file exceeds %d byte preview limit", limit))
 		return
 	}
-
-	f, err := os.Open(abs)
-	if err != nil {
-		writeWorkspaceStatError(w, err)
-		return
-	}
-	defer f.Close()
 
 	head := make([]byte, 512)
 	n, _ := io.ReadFull(f, head)
@@ -367,12 +392,18 @@ func serveWorkspaceFileRaw(w http.ResponseWriter, r *http.Request, abs string, i
 }
 
 func serveWorkspaceFilesContent(w http.ResponseWriter, r *http.Request, rootHint string) {
-	root, rel, abs, err := resolveWorkspaceFilePath(r, rootHint)
+	root, rootReal, rel, abs, err := resolveWorkspaceFilePath(r, rootHint)
 	if err != nil {
 		writeWorkspaceFileError(w, err)
 		return
 	}
-	info, err := os.Stat(abs)
+	f, err := openWorkspaceResolvedPath(rootReal, abs)
+	if err != nil {
+		writeWorkspaceFileError(w, err)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		writeWorkspaceStatError(w, err)
 		return
@@ -382,7 +413,7 @@ func serveWorkspaceFilesContent(w http.ResponseWriter, r *http.Request, rootHint
 		return
 	}
 	if r.URL.Query().Get("raw") == "1" {
-		serveWorkspaceFileRaw(w, r, abs, info)
+		serveWorkspaceFileRaw(w, r, abs, info, f)
 		return
 	}
 
@@ -392,12 +423,6 @@ func serveWorkspaceFilesContent(w http.ResponseWriter, r *http.Request, rootHint
 		return
 	}
 
-	f, err := os.Open(abs)
-	if err != nil {
-		writeWorkspaceStatError(w, err)
-		return
-	}
-	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", "failed to read file")
@@ -448,34 +473,55 @@ type workspacePathError struct {
 
 func (e workspacePathError) Error() string { return e.message }
 
-func resolveWorkspaceFilePath(r *http.Request, rootRaw string) (rootDisplay, rel, abs string, err error) {
+func resolveWorkspaceFilePath(r *http.Request, rootRaw string) (rootDisplay, rootReal, rel, abs string, err error) {
 	rootRaw = strings.TrimSpace(rootRaw)
 	if rootRaw == "" {
-		return "", "", "", workspacePathError{http.StatusBadRequest, "bad_request", "workspace root is required"}
+		return "", "", "", "", workspacePathError{http.StatusBadRequest, "bad_request", "workspace root is required"}
 	}
 	root := paths.NormalizePath(rootRaw)
 	if !filepath.IsAbs(root) {
-		return "", "", "", workspacePathError{http.StatusBadRequest, "bad_root", "root must resolve to an absolute path"}
+		return "", "", "", "", workspacePathError{http.StatusBadRequest, "bad_root", "root must resolve to an absolute path"}
 	}
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
-		return "", "", "", workspacePathError{http.StatusBadRequest, "bad_root", "invalid root"}
+		return "", "", "", "", workspacePathError{http.StatusBadRequest, "bad_root", "invalid root"}
 	}
-	rootReal, err := filepath.EvalSymlinks(rootAbs)
+	rootReal, err = filepath.EvalSymlinks(rootAbs)
 	if err != nil {
-		return "", "", "", workspacePathError{http.StatusNotFound, "root_not_found", "root does not exist"}
+		return "", "", "", "", workspacePathError{http.StatusNotFound, "root_not_found", "root does not exist"}
 	}
 
 	rel = normalizeWorkspaceRel(r.URL.Query().Get("path"))
 	candidate := filepath.Join(rootReal, filepath.FromSlash(rel))
 	candidateReal, err := filepath.EvalSymlinks(candidate)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if !pathWithinRoot(rootReal, candidateReal) {
-		return "", "", "", workspacePathError{http.StatusForbidden, "outside_root", "path escapes workspace root"}
+		return "", "", "", "", workspacePathError{http.StatusForbidden, "outside_root", "path escapes workspace root"}
 	}
-	return rootRaw, filepath.ToSlash(rel), candidateReal, nil
+	return rootRaw, rootReal, filepath.ToSlash(rel), candidateReal, nil
+}
+
+// OpenRoot resolves each component relative to an already-open root and
+// refuses symlink escapes even if a path is replaced after validation.
+func openWorkspaceResolvedPath(rootReal, abs string) (*os.File, error) {
+	rel, err := filepath.Rel(rootReal, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, workspacePathError{http.StatusForbidden, "outside_root", "path escapes workspace root"}
+	}
+	root, err := os.OpenRoot(rootReal)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	file, err := root.Open(rel)
+	if err != nil && strings.Contains(err.Error(), "path escapes from parent") {
+		// os.Root deliberately keeps its escape sentinel private; preserve the
+		// API's typed 403 contract when that guard catches a TOCTOU swap.
+		return nil, workspacePathError{http.StatusForbidden, "outside_root", "path escapes workspace root"}
+	}
+	return file, err
 }
 
 func normalizeWorkspaceRel(raw string) string {

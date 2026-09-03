@@ -225,6 +225,21 @@ func TestProjectWorktreesHandlerRejectsMultipleProjectRoots(t *testing.T) {
 	}
 }
 
+func TestPendingWorktreeLaunchReservationTracksContainingCheckout(t *testing.T) {
+	worktreeLifecycleMu.Lock()
+	token := reserveWorktreeLaunch("/repo/linked/src")
+	defer func() {
+		delete(pendingWorktreeLaunches, token)
+		worktreeLifecycleMu.Unlock()
+	}()
+	if !hasPendingWorktreeLaunch("/repo/linked") {
+		t.Fatal("containing worktree did not see pending launch")
+	}
+	if hasPendingWorktreeLaunch("/repo/other") {
+		t.Fatal("unrelated worktree saw pending launch")
+	}
+}
+
 func projectStoreForRoot(t *testing.T, slug, root string) *centralstore.Store {
 	t.Helper()
 	return projectStoreForRoots(t, slug, root)

@@ -23,7 +23,38 @@ const projectWorktreeRequestLimit = 16 * 1024
 // worktreeLifecycleMu prevents local launch/resume registration from racing a
 // worktree safety check and removal. Peer launches are guarded by their owning
 // daemon after forwarding.
-var worktreeLifecycleMu sync.RWMutex
+var (
+	// mutationMu serializes create/delete Git operations. lifecycleMu is
+	// narrower: it closes only the registration/removal safety boundary, so
+	// ordinary registration never waits behind worktree creation.
+	worktreeMutationMu       sync.Mutex
+	worktreeLifecycleMu      sync.RWMutex
+	pendingWorktreeLaunchSeq uint64
+	pendingWorktreeLaunches  = map[uint64]string{}
+)
+
+// Call with worktreeLifecycleMu held for writing.
+func reserveWorktreeLaunch(cwd string) uint64 {
+	pendingWorktreeLaunchSeq++
+	pendingWorktreeLaunches[pendingWorktreeLaunchSeq] = canonicalFilesystemPath(cwd)
+	return pendingWorktreeLaunchSeq
+}
+
+func releaseWorktreeLaunch(token uint64) {
+	worktreeLifecycleMu.Lock()
+	delete(pendingWorktreeLaunches, token)
+	worktreeLifecycleMu.Unlock()
+}
+
+// Call with worktreeLifecycleMu held for reading or writing.
+func hasPendingWorktreeLaunch(target string) bool {
+	for _, cwd := range pendingWorktreeLaunches {
+		if pathInsideWorktree(target, cwd) {
+			return true
+		}
+	}
+	return false
+}
 
 type projectWorktree struct {
 	workspace.Worktree
@@ -42,7 +73,7 @@ func projectWorktreesHandler(w http.ResponseWriter, r *http.Request, slug string
 		return
 	}
 
-	root, err := projectWorktreeRoot(r.Context(), slug, sessions)
+	root, err := projectFilesystemRoot(r.Context(), slug, sessions, true)
 	if err != nil {
 		writeWorkspaceFileError(w, err)
 		return
@@ -119,9 +150,9 @@ func projectWorktreeCreateHandler(w http.ResponseWriter, r *http.Request, slug s
 		return
 	}
 
-	worktreeLifecycleMu.Lock()
-	defer worktreeLifecycleMu.Unlock()
-	root, err := projectWorktreeRoot(r.Context(), slug, sessions)
+	worktreeMutationMu.Lock()
+	defer worktreeMutationMu.Unlock()
+	root, err := projectFilesystemRoot(r.Context(), slug, sessions, true)
 	if err != nil {
 		writeWorkspaceFileError(w, err)
 		return
@@ -170,10 +201,12 @@ func projectWorktreeDeleteHandler(w http.ResponseWriter, r *http.Request, slug s
 		return
 	}
 
+	worktreeMutationMu.Lock()
+	defer worktreeMutationMu.Unlock()
 	worktreeLifecycleMu.Lock()
 	defer worktreeLifecycleMu.Unlock()
 
-	root, err := projectWorktreeRoot(r.Context(), slug, sessions)
+	root, err := projectFilesystemRoot(r.Context(), slug, sessions, true)
 	if err != nil {
 		writeWorkspaceFileError(w, err)
 		return
@@ -246,6 +279,13 @@ func projectWorktreeDeleteHandler(w http.ResponseWriter, r *http.Request, slug s
 			return
 		}
 	}
+	// A web launch reservation begins before fork and lasts until the runner
+	// exits. Normally the durable row above gives the actionable dismissal
+	// error; this guard covers only the spawn-to-registration gap.
+	if hasPendingWorktreeLaunch(target) {
+		writeError(w, http.StatusConflict, "conflict", "worktree has a session launch in progress")
+		return
+	}
 	dirty, err := workspace.WorktreeDirtyContext(ctx, target)
 	if err != nil {
 		writeProjectWorktreeCommandError(w, ctx, err)
@@ -307,7 +347,10 @@ func canonicalFilesystemPath(path string) string {
 	return paths.NormalizePath(paths.CanonicalizePath(paths.NormalizePath(path)))
 }
 
-func projectWorktreeRoot(ctx context.Context, slug string, sessions *centralstore.Store) (string, error) {
+// projectFilesystemRoot returns the catalog's canonical first path for file
+// browsing and launching. Worktree operations pass requireSingle because Git
+// mutation is ambiguous when one project matches multiple repositories.
+func projectFilesystemRoot(ctx context.Context, slug string, sessions *centralstore.Store, requireSingle bool) (string, error) {
 	catalog, err := sessions.ListProjectCatalog(ctx)
 	if err != nil {
 		return "", workspacePathError{http.StatusInternalServerError, "internal", "failed to load projects"}
@@ -317,20 +360,25 @@ func projectWorktreeRoot(ctx context.Context, slug string, sessions *centralstor
 			continue
 		}
 		if project.Kind != centralstore.ProjectEntryOwned {
-			return "", workspacePathError{http.StatusBadRequest, "bad_request", "remote project worktrees must be managed on the owning host"}
+			return "", workspacePathError{http.StatusBadRequest, "bad_request", "remote project filesystem actions must be routed to the owning host"}
 		}
 		roots := make(map[string]struct{})
+		firstRoot := ""
 		for _, rule := range project.Rules {
 			if root := paths.NormalizePath(strings.TrimSpace(rule.Path)); root != "" {
+				if firstRoot == "" {
+					firstRoot = root
+				}
 				roots[root] = struct{}{}
 			}
 		}
-		if len(roots) != 1 {
-			return "", workspacePathError{http.StatusBadRequest, "bad_request", "projects must have exactly one path root to manage worktrees"}
+		if len(roots) == 0 {
+			return "", workspacePathError{http.StatusBadRequest, "no_workspace_root", "project has no path rule"}
 		}
-		for root := range roots {
-			return root, nil
+		if requireSingle && len(roots) != 1 {
+			return "", workspacePathError{http.StatusBadRequest, "bad_request", "projects must have exactly one path root for worktree operations"}
 		}
+		return firstRoot, nil
 	}
 	return "", workspacePathError{http.StatusNotFound, "not_found", "project not found"}
 }
