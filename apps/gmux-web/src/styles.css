@@ -3659,7 +3659,7 @@ body {
     grid-template-rows: repeat(2, 40px);
     grid-template-areas:
       'esc  stab tab  wl  au  wr  paste end'
-      'menu ctrl alt  al  ad  ar  attach send';
+      'menu ctrl alt  al  ad  ar  send  send';
     /* One knob for spacing: the visual gap between keys. Hitboxes bridge it
        automatically (each .mkey-face extends half of it), so there are no
        dead gaps between buttons no matter what you set this to. */
@@ -3696,7 +3696,10 @@ body {
   .mk-ar   { grid-area: ar; }
   .mk-end    { grid-area: end; }
   .mk-paste  { grid-area: paste; }
-  .mk-attach { grid-area: attach; }
+  /* Portrait preserves the original top-right swap: attach while at the
+     bottom, replaced by End while scrolled. Double-width Send fills row two. */
+  .mk-attach { grid-area: end; }
+  .mk-attach.scroll-end-visible { display: none; }
   .mk-send   { grid-area: send; }
   .mobile-attach-input { display: none; }
 
@@ -4505,8 +4508,8 @@ body {
   .mobile-bottom-bar {
     grid-template-columns: repeat(7, 1fr);
     grid-template-areas:
-      'esc  stab tab  au  paste attach end'
-      'menu ctrl alt  al  ad    ar     send';
+      'esc  stab tab  au  paste paste end'
+      'menu ctrl alt  al  ad    ar    send';
   }
   .mk-wl,
   .mk-wr { display: none; }
@@ -4523,6 +4526,12 @@ body {
   .mk-wl,
   .mk-wr {
     display: none;
+  }
+  /* Wide bars keep attach independent while End floats above the row. */
+  .mk-attach,
+  .mk-attach.scroll-end-visible {
+    display: flex;
+    grid-area: attach;
   }
   /* Scroll-end floats above the top-right of the row instead of taking a
      column. Unlike the in-row keys (which the terminal slides under), it

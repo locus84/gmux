@@ -721,7 +721,7 @@ function MobileTerminalBar({
       {terminalScrolledUp.value && (
         <button class="mobile-bottom-action mk-end" onClick={() => terminalScrollToBottom.value?.()} title="Scroll to bottom"><span class="mkey-face"><IconEnd /></span></button>
       )}
-      <button class="mobile-bottom-action mk-attach" disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
+      <button class={`mobile-bottom-action mk-attach${terminalScrolledUp.value ? ' scroll-end-visible' : ''}`} disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
       <input ref={fileInputRef} class="mobile-attach-input" type="file" onChange={handleFileChange} />
       <button class="mobile-bottom-action send-btn mk-send" disabled={!canSend} onClick={() => sendKey('\r')} title={altArmed ? 'Send Alt+Enter' : 'Send'}><span class="mkey-face"><IconSend /></span></button>
     </div>
