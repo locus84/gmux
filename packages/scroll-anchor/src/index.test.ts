@@ -143,6 +143,20 @@ describe('ScrollAnchorAddon', () => {
     expect(h.scrollToBottom).not.toHaveBeenCalled()
   })
 
+  it('keeps a host-intercepted touch scroll anchored during an active redraw', () => {
+    const h = makeHarness()
+    h.setBuffer(20, 20)
+    h.csi('?h', [2026])
+
+    h.addon.scrollLinesFromUser(-8)
+    h.setBuffer(12, 25)
+    h.csi('?l', [2026])
+    h.parsed()
+
+    expect(h.addon.mode).toBe('anchored')
+    expect(h.scrollToBottom).not.toHaveBeenCalled()
+  })
+
   it('anchors when the user wheels up in an open block and never re-pins', () => {
     const h = makeHarness()
     h.setBuffer(20, 20)
