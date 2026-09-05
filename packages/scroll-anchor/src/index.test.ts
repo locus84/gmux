@@ -54,6 +54,10 @@ function makeHarness() {
     viewportY = baseY
     emitScroll()
   })
+  const scrollLines = vi.fn((lines: number) => {
+    viewportY = Math.max(0, Math.min(viewportY + lines, baseY))
+    emitScroll()
+  })
   const disposable = (set: Set<() => void>, cb: () => void) => ({ dispose: () => set.delete(cb) })
   const active = {
     get type() { return type },
@@ -70,6 +74,7 @@ function makeHarness() {
     buffer: { active },
     scrollToLine,
     scrollToBottom,
+    scrollLines,
     onScroll(cb: () => void) { scrollListeners.add(cb); return disposable(scrollListeners, cb) },
     onWriteParsed(cb: () => void) { writeListeners.add(cb); return disposable(writeListeners, cb) },
     parser: {
@@ -88,6 +93,7 @@ function makeHarness() {
     lines,
     scrollToLine,
     scrollToBottom,
+    scrollLines,
     setBuffer(vy: number, by: number) { viewportY = vy; baseY = by },
     armIntent(event = 'wheel') { element.dispatchEvent(new Event(event)) },
     userScroll(line: number, event = 'wheel') {
@@ -124,6 +130,17 @@ describe('ScrollAnchorAddon', () => {
     h.parsed()
     expect(h.addon.mode).toBe('following')
     expect(h.scrollToBottom).toHaveBeenCalledTimes(1)
+  })
+
+  it('anchors a host-intercepted touch scroll and exposes the moved viewport', () => {
+    const h = makeHarness()
+    h.setBuffer(20, 20)
+
+    h.addon.scrollLinesFromUser(-5)
+
+    expect(h.scrollLines).toHaveBeenCalledWith(-5)
+    expect(h.addon.mode).toBe('anchored')
+    expect(h.scrollToBottom).not.toHaveBeenCalled()
   })
 
   it('anchors when the user wheels up in an open block and never re-pins', () => {

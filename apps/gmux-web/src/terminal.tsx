@@ -874,7 +874,7 @@ export function TerminalView({
       touchPanState.dragScrollFrame = null
       const rows = touchPanState.pendingDragRows
       touchPanState.pendingDragRows = 0
-      if (rows !== 0) term.scrollLines(rows)
+      if (rows !== 0) scrollAnchor.scrollLinesFromUser(rows)
     }
     const queueDragScroll = (rows: number) => {
       if (!rows) return
@@ -884,7 +884,7 @@ export function TerminalView({
     const cancelDragScroll = (flush = false) => {
       if (touchPanState.dragScrollFrame !== null) cancelAnimationFrame(touchPanState.dragScrollFrame)
       touchPanState.dragScrollFrame = null
-      if (flush && touchPanState.pendingDragRows) term.scrollLines(touchPanState.pendingDragRows)
+      if (flush && touchPanState.pendingDragRows) scrollAnchor.scrollLinesFromUser(touchPanState.pendingDragRows)
       touchPanState.pendingDragRows = 0
     }
     const cancelScrollMomentum = () => {
@@ -908,7 +908,7 @@ export function TerminalView({
         const rawRows = remainder + velocity * elapsed
         const rows = rawRows > 0 ? Math.floor(rawRows) : Math.ceil(rawRows)
         remainder = rawRows - rows
-        if (rows) term.scrollLines(rows)
+        if (rows) scrollAnchor.scrollLinesFromUser(rows)
         velocity = decayScrollVelocity(velocity, elapsed)
         if (Math.abs(velocity) >= 0.006) touchPanState.momentumFrame = requestAnimationFrame(tick)
         else touchPanState.momentumFrame = null

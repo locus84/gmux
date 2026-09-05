@@ -103,13 +103,7 @@ export class ScrollAnchorAddon implements ITerminalAddon {
     if (this.terminal) throw new Error('ScrollAnchorAddon is already active')
     this.terminal = terminal
 
-    const armUserIntent = () => {
-      if (this.isAlternate()) return
-      // Fresh input supersedes any addon scroll that produced no onScroll.
-      this.pendingProgrammaticScrolls = 0
-      this.userIntent = true
-      this.scheduleIntentExpiry()
-    }
+    const armUserIntent = () => this.armUserIntent()
     terminal.element?.addEventListener('wheel', armUserIntent, { capture: true, passive: true })
     terminal.element?.addEventListener('touchmove', armUserIntent, { capture: true, passive: true })
     this.disposables.push({ dispose: () => {
@@ -139,6 +133,13 @@ export class ScrollAnchorAddon implements ITerminalAddon {
     this.disposables.push(terminal.onWriteParsed(() => this.afterWriteParsed()))
   }
 
+  /** Scroll on behalf of a touch gesture intercepted by a host ancestor. */
+  scrollLinesFromUser(lines: number): void {
+    if (!this.terminal || lines === 0) return
+    this.armUserIntent()
+    this.terminal.scrollLines(lines)
+  }
+
   follow(): void {
     this.clearUserIntent()
     this.cancelWipeResolution()
@@ -165,6 +166,14 @@ export class ScrollAnchorAddon implements ITerminalAddon {
     this.terminal = null
     this.modeEmitter.dispose()
     this.busyEmitter.dispose()
+  }
+
+  private armUserIntent(): void {
+    if (this.isAlternate()) return
+    // Fresh input supersedes any addon scroll that produced no onScroll.
+    this.pendingProgrammaticScrolls = 0
+    this.userIntent = true
+    this.scheduleIntentExpiry()
   }
 
   private handleScroll(): void {
