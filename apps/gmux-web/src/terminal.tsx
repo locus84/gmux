@@ -1287,6 +1287,7 @@ export function TerminalView({
       let checkpointAlt: boolean | null = null
       let checkpointMargins: CheckpointMargins | null = null
       let checkpointCols: number | undefined
+      let checkpointRawReplay = false
       // Keep post-checkpoint bytes out of TerminalIO until the initial replay
       // has committed and xterm has claimed the browser geometry.
       let attachPhase: 'replay' | 'claiming' | 'claimed' = isFirstConnect ? 'replay' : 'claimed'
@@ -1335,7 +1336,7 @@ export function TerminalView({
               if (connectionRef.current !== connection
                 || connection.ws.readyState !== WebSocket.OPEN
                 || termEpochRef.current !== epoch) return
-              if (size && shouldReassertReconnectSize(
+              if (!checkpointRawReplay && size && shouldReassertReconnectSize(
                 declaredCheckpointSize,
                 size,
                 ptySizeRef.current,
@@ -1460,6 +1461,7 @@ export function TerminalView({
             // Use it to initialize ptySize if we don't have one yet.
             if (msg.type === 'terminal_checkpoint') {
               checkpointAlt = msg.active_buffer === 'alternate'
+              checkpointRawReplay = msg.raw_replay === true
               checkpointCols = Number.isInteger(msg.cols) && msg.cols > 0 ? msg.cols : undefined
               if (Number.isInteger(msg.scroll_top) && Number.isInteger(msg.scroll_bottom) && Number.isInteger(msg.rows)) {
                 checkpointMargins = { top: msg.scroll_top, bottom: msg.scroll_bottom, rows: msg.rows }
