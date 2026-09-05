@@ -1,6 +1,6 @@
-# ADR 0009: Verb-first CLI, explicit run syntax, and a frozen top-level namespace
+# ADR 0009: Verb-first CLI, explicit run syntax, and a criterion for top-level verbs
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-15
 **Supersedes (in part):** the flag-based action surface of ADR 0005 (the
 *transport* decision in 0005 stands; only the user-facing flag grammar changes)
@@ -38,15 +38,22 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
    Power users who want terseness alias `gm='gmux --'` — which is shorter
    than the old shorthand and lives in their shell, not the tool.
 
-5. **The top-level verb namespace is deliberately closed and small.**
-   Functionality grows under **namespace groups**, not new top-level
-   verbs:
-   - `gmux daemon start|stop|restart|status|log-path` — daemon process
-     lifecycle (was the `gmuxd` verbs).
-   - future groups (e.g. `gmux peer …`) as needed.
-   `auth` and `remote` remain top-level (rare, deliberate, setup-time).
-   Adding a new top-level verb is a breaking change requiring a major
-   bump.
+5. **Top-level verbs are operations on sessions addressed by id.** This
+   criterion keeps common operations composable with the standard addressing,
+   exit taxonomy, and daemon auto-start contract. `promote` and `reparent`
+   therefore belong beside `wait`, `tail`, and `kill`. Namespace groups are
+   reserved for non-session domains (`agent`, `daemon`) and setup (`auth`,
+   `remote`). The unreleased `gmux session promote|demote|reparent` group and
+   `gmux read` experiment are superseded before release; consumption remains an
+   observation side effect rather than a mutation verb.
+
+   **Local distribution amendment (2026-09-02):** `dismiss` joins the
+   top-level session verbs. `gmux dismiss <id>` is leaf-only; a session that
+   owns descendants requires `--tree`, making recursive family scope explicit
+   at the CLI boundary. `project` is a namespace group for daemon-owned project
+   catalog operations; `gmux project add <path>` adds or returns a matching
+   local project. The retired `session dismiss` and `workspace add` spellings
+   are not restored.
 
 6. **`gmux daemon …` is the canonical front; `gmuxd` keeps its verbs for
    backwards-compatible ops.** `gmux daemon start|stop|restart|status|
@@ -73,7 +80,7 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
    that infra already invokes.)
 
 7. **Daemon auto-start is intent-driven.** Session verbs (`open`, `ls`,
-   `attach`, `tail`, `send`, `wait`, `kill`, and `gmux -- <cmd>`)
+   `attach`, `tail`, `send`, `wait`, `kill`, `promote`, `reparent`, and `gmux -- <cmd>`)
    auto-start `gmuxd` when it is down — the daemon is a *stateful broker*
    that rehydrates dead sessions from disk, so even `ls`/`tail` on a cold
    machine have something to serve. `gmux daemon status` and bare `gmux`
@@ -163,19 +170,65 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
      tmux-style `-F`/`--format` is deferred (addable under the
      frozen-namespace policy).
 
+> **Amended (2026-07-27):** this decision's field list was never accurate and
+> drifted further as the domain language settled; the shipped output is
+> authoritative and is recorded here so scripts stop being written against a
+> schema that does not exist.
+>
+> - **`kind` is `adapter`.** The rename landed with the adapter plugin model;
+>   `UBIQUITOUS_LANGUAGE.md` already lists `kind` as "the old wire field name".
+> - **There is no `idle` field or column.** Idleness is a *turn* property read
+>   through `gmux wait` / `Status.Active` (ADR 0027 §8, §11), not a property of
+>   a row in a session list. A list is a snapshot of what exists; liveness in it
+>   is `alive` only.
+> - **Human columns are `ID  STATUS  ADAPTER  TITLE  (cwd)`**, where `STATUS` is
+>   `alive`/`dead` and `TITLE` falls back to the joined command when the adapter
+>   derived no title. There is no separate `command` or `age` column, and no
+>   `peer` column under `--all`: the peer is folded into the ID as `<id>@<peer>`
+>   so a copy-pasted cell stays addressable.
+> - **`--all` includes peers, not dead sessions.** Dead sessions are always
+>   listed (that is how `exit_code` is read); `--all` widens the *host* scope.
+> - **`--json` emits** `ref, id, adapter, alive` always. `ref` is the
+>   authoritative directly reusable address: `id` locally and `id@peer`
+>   remotely. Peer names use lowercase alphanumeric hyphen-separated slug
+>   grammar and cannot contain `@`. Optional fields are `peer, cwd, pid, title,
+>   slug, runner_version, parent_session_id, socket_path, command, started_at,
+>   exited_at, exit_code`; unknown values are omitted, never `null`.
+>   `runner_version` is diagnostic, not capability negotiation, and binary
+>   hashes stay out of this CLI projection. `parent_session_id` and
+>   `socket_path` postdate this ADR.
+> - The top level is `[]`, never `null`, and both renderings are alive-first,
+>   newest-first with `ref` as the deterministic timestamp tie-breaker.
+>   Timestamps are RFC 3339 (fractional seconds allowed); `command` is argv;
+>   absent `exit_code` means unknown. Peer projections can omit newer optional
+>   fields. Consumers must ignore additive unknown keys. Existing key types,
+>   absence rules, owner scope, and meanings remain stable for 2.x.
+> - **`alive` is runner liveness only**, never activity/idleness, success,
+>   health, resumability, or semantic capability. Action results and stable
+>   errors remain authoritative. No derived UI `state` is mirrored into the
+>   list schema.
+
 13. **`gmux wait` waits for agent idle, bounded by `--timeout`.**
     `gmux wait <id>` blocks until the session goes **idle** (agent turn
-    end) or exits; `--timeout <secs>` bounds it (exit 0 idle, 2 died,
-    3 timeout). Cross-peer `wait` returns "not supported across peers
-    yet" (ADR 0005 deferral).
+    end) or exits; `--timeout <secs>` bounds it. Exit codes were
+    originally wait-specific (0 idle, 2 died, 3 timeout) and were
+    replaced by ADR 0027 §8's global taxonomy: **0** the turn completed,
+    **2** it was intentionally interrupted, **1** everything else (a
+    failed turn, a death, a timeout, misuse). ADR 0027 §11 also makes
+    the wait conditionally result-bearing. Cross-peer `wait` returns
+    "not supported across peers yet" (ADR 0005 deferral).
 
     Output-condition variants (`--for-text` / `--for-regex` — "block
-    until this text appears") were designed but **deferred**: the only
-    sound implementation matches where the bytes are, i.e. a gmuxd
-    endpoint, not client-side scrollback polling. Tracked as a
-    follow-up ([#313](https://github.com/gmuxapp/gmux/issues/313)).
-    Until then, shell "wait for output" is served by running the command
-    through the blocking piped form (`gmux -- <cmd>`).
+    until this text appears") were designed but initially **deferred**:
+    the only sound implementation matches where the bytes are, i.e. a
+    gmuxd endpoint, not client-side scrollback polling. Since
+    implemented server-side
+    ([#313](https://github.com/gmuxapp/gmux/issues/313)): gmuxd's wait
+    handler polls the on-disk scrollback tee and matches per rendered
+    (ANSI-stripped) line, so shell sessions are supported too (exit 0
+    matched, 1 the session exited first or the timeout elapsed —
+    originally 2 and 3, see ADR 0027 §8). Predicate waits print no
+    agent result.
 
 ## Considered alternatives
 
@@ -219,3 +272,157 @@ For 2.0 we unify on a single **verb-first** grammar fronted by the
 - `--host` is dropped. `<id>@<peer>` is the **sole** way to address a
   peer session, which simplifies `matchSession` (the `host` parameter
   and the `--host`/`@suffix` reconciliation branch both go away).
+
+## Amendment (2026-07-06): `send --wait` composes send and wait
+
+`gmux send` gains a `--wait` behavior modifier (with `--timeout N`):
+deliver the input and block until the turn it triggers completes, with
+`gmux wait`'s exit codes — originally (0 idle, 2 died, 3 timeout), now
+ADR 0027 §8's global 0/1/2 taxonomy, through the same mapping so an
+interrupted turn cannot exit 0 here while `gmux wait` exits 2. Raw
+`send --wait` prints no result.
+
+This exists because the obvious composition `gmux send <id> … &&
+gmux wait <id>` is inherently racy: `wait`'s initial snapshot can
+observe the previous turn's idle state before the send-induced
+`Working=true` has propagated into gmuxd's store ([#218]). The fix is
+ordering — subscribe before delivering the input, then require a fresh
+working→idle transition — which only one actor can guarantee, so the
+two verbs must fuse for this use case. It lands as a flag, not a new
+top-level verb (`send-wait` would breach decision 5), and server-side
+(`POST …/input?wait=idle`), keeping idle-detection rules in gmuxd per
+ADR 0005 and the `wait` design in decision 13.
+
+Consequences for `send`'s grammar: to keep `send`'s trailing content
+fully verbatim (its whole point — arbitrary text, including tokens that
+start with a dash), the new flags are parsed **only before the session
+ref**. The ref is the first non-flag token; everything after it is
+literal, so `gmux send abc -v` still sends `-v` and no `--` guard is
+needed for dash-leading text. To wait, the flag precedes the id:
+`gmux send --wait abc 'do it' Enter`. A `--` before the ref is accepted
+as an explicit end-of-flags marker. This applies decision 9's
+verbatim-content rule (flags-then-`--`-then-verbatim, as in `gmux --
+<cmd>`) rather than parsing flags amongst the content, which would have
+taxed the common case with a guard. Under `--wait`, non-submitting
+input (no `\r`) is rejected — it would never start a turn, so the wait
+could only time out.
+
+[#218]: https://github.com/gmuxapp/gmux/issues/218
+
+## Amendment (2026-07-12): `send --follow-up` / `--steering` — adapter-aware submit
+
+> **Superseded (2026-07-26) by [ADR 0027](0027-semantic-agent-cli-and-result-bearing-wait.md):** both flags were removed before release and `gmux send` is unconditionally raw; semantic submission moves to the `gmux agent` namespace, and `adapter.PromptSubmitter` becomes `adapter.AgentActionEncoder`.
+
+`gmux send` gains two mutually-exclusive behavior modifiers that
+auto-append the session adapter's *submit* keystroke ([#385]):
+`--follow-up` for the queued submit (delivered after the agent's
+current turn; pi: `Alt+Enter`) and `--steering` for the immediate one
+(delivered into the current turn; pi: `Enter`). This keeps submission
+explicit (decision 10) while removing the need to know per-adapter key
+encodings — the follow-up distinction is undiscoverable, and pi's
+`Alt+Enter` (ESC CR) isn't even expressible as a `send` key token.
+
+The mapping is an adapter capability (`adapter.PromptSubmitter`),
+resolved CLI-side from the session's adapter name; adapters that don't
+distinguish the modes fall back to `Enter` for both (shells; agents
+like claude/codex whose `Enter` submits when idle and queues when
+busy). Nothing changes on the wire — the daemon still receives raw
+bytes. pi's follow-up is encoded as Kitty CSI-u Alt+Enter
+(`\x1b[13;3u`) rather than legacy ESC CR, because pi parses CSI-u
+under either negotiated keyboard protocol while ESC CR misparses as
+shift+enter (no submit) on sessions started in the foreground of a
+Kitty-protocol terminal; gmuxd's `--wait` input-must-submit guard
+recognizes the CSI-u Enter alongside `\r`.
+
+Grammar consequences: like `--wait`, the flags are recognized **only
+before the session ref** (the verbatim-content rule above). Because
+the flag owns submission, combining it with trailing key tokens is a
+usage error — `--follow-up … Enter` would double-submit. The flags
+compose with `--wait`; on pi the queued follow-up is processed within
+the same agent loop before idle is reported, so `--wait --follow-up`
+blocks until the queued prompt's reply, per the issue's contract.
+
+[#385]: https://github.com/gmuxapp/gmux/issues/385
+
+## Amendment (2026-07-12): `tail` defaults to the conversation transcript
+
+> **Superseded (2026-07-27) by [ADR 0027](0027-semantic-agent-cli-and-result-bearing-wait.md):** the view was right, the verb was wrong. `gmux tail` reverts to decision 13a's unconditional raw PTY view (`-n` in lines, no `--raw`/`-e`/`-r` — the flags are refused by name), and the conversation-markdown view moves to `gmux agent logs <id> [-n N]` (`-n` in messages) inside the semantic namespace. Making one verb's *output shape* depend on the session's adapter meant a script could not know what it would get without first knowing what was running; the three reading questions now have three commands. 13a's ban on a top-level `logs` verb stands — `agent logs` is namespace growth under decision 9, not a new bare verb. Server-side the transcript read (`?tail=N`) is unchanged, but its non-renderer answer is now 422 `unsupported_adapter` instead of 404 `no_conversation`, because no fallback keys on that code any more.
+
+`gmux tail` (decision 13a) changes its default view for sessions whose
+adapter persists a structured conversation file (pi's JSONL; the
+adapter capability is `ConversationRenderer`): it prints clean markdown
+reconstructed from that file — the actual user/assistant exchange with
+compact tool-call lines — instead of the emulator-rendered PTY
+scrollback, which for agent TUIs is box-drawing, spinners, and
+viewport-truncated redraws ([#384]). Sessions without a renderable
+conversation (shells, deleted conversations, no messages yet, adapters
+without the capability) keep the PTY output, so scripts against shell
+sessions see no change. The capability takes the opaque adapter-scoped
+conversation ref of ADR 0022; for file adapters the ref is the
+transcript's path, but that stays the adapter's private convention.
+
+Grammar consequences, per the behavior-modifier-flag pattern (no new
+verbs):
+
+- **`--raw` forces the PTY scrollback view** — the pre-change default
+  output. `-e` remains an alias. 13a described `--raw`/`-e` as
+  "preserve ANSI escapes", but that had already been vestigial since
+  the broker began rendering `?tail=N` through a terminal emulator
+  (which strips escapes server-side); both flags' *observable*
+  behavior — plain-text PTY output — is unchanged.
+- **`-n` counts messages in the conversation view**, lines in the PTY
+  view. One knob, unit follows the view.
+- Still snapshot-only; no `-f` (13a stands). A live conversation
+  stream is ADR 0021's `session/load` + `session/update` territory.
+
+Server-side this is `GET /v1/sessions/{id}/conversation?tail=N` on
+gmuxd (ADR 0005: the CLI routes through the daemon; peer sessions
+forward to the owning host, where the conversation lives). The
+endpoint answers 404 `no_conversation` when there is nothing to
+render, which is the CLI's signal to fall back to scrollback — also
+the path taken against older daemons that lack the endpoint entirely.
+The daemon stays content-free (ADR 0011): the adapter re-reads the
+stored conversation per request; nothing is cached or stored.
+
+[#384]: https://github.com/gmuxapp/gmux/issues/384
+
+## Amendment (2026-07-06): `edit` joins the top-level namespace
+
+`gmux edit [file]` is added as a top-level verb. It cannot live under a
+namespace group because its primary use is `EDITOR="gmux edit"` — the
+string a third-party program execs must be a single terse invocation.
+
+This amends decision 5's "adding a new top-level verb is a breaking
+change requiring a major bump" in practice: the namespace remains
+*deliberately small and closed to casual growth*, but first-class
+session/tab types (of which the editor is the first; more are expected)
+warrant top-level verbs when the verb is itself an external interface
+contract like `$EDITOR`. Each such addition still requires an explicit
+amendment here.
+
+## Amendment (2026-07-26): `agent` is a namespace group
+
+`gmux agent prompt|cancel|output` (ADR 0027) is added as a **namespace
+group**, which is exactly the growth path decision 5 prescribes ("future
+groups (e.g. `gmux peer …`) as needed") — not a new top-level verb, so
+the frozen-verb rule is untouched: `agent` alone is a usage error, and
+every capability lives behind a sub-verb.
+
+It is also the first group whose sub-verbs take flags, so `gmux help
+agent [verb]` (and `--help` on any of them) prints per-verb help. That
+narrows decision 9's "per-verb help is intentionally not implemented"
+to the flagless verbs it was written for; the generic `gmux help <verb>`
+remains lenient and prints the full usage for everything else.
+
+`send` stays raw and adapter-blind (its semantic `--steering`/
+`--follow-up` flags are gone); intent-carrying submission is `agent`'s
+job. The two are permanently separate surfaces, not layers of one.
+
+## Amendment (2026-08-17): session-operation criterion
+
+Decision 5 now uses the session-operation criterion above rather than a frozen
+list. This supersedes earlier “closed namespace” wording and the unreleased
+`session` group/read command. `promote` and `reparent` are top-level because
+they operate on one addressed session and share the normal local-only,
+auto-start, and exit-code contracts. `agent` remains a namespace because it is
+a semantic-agent domain, not a generic session mutation.

@@ -3,10 +3,13 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"time"
 
+	"github.com/gmuxapp/gmux/packages/adapter"
+	"github.com/gmuxapp/gmux/packages/adapter/adapters"
 	"github.com/gmuxapp/gmux/packages/paths"
 )
 
@@ -15,61 +18,80 @@ import (
 // backend logic but excluded from MarshalJSON).
 type Session struct {
 	// ── API-visible fields ──
-	ID            string            `json:"id"`
+	ID string `json:"id"`
 
 	// Peer identifies which gmuxd instance owns this session.
-	// Empty = local. Non-empty = the peer name (manual peer in peers.json, or a discovered peer).
-	Peer string `json:"peer,omitempty"`
-	CreatedAt     string            `json:"created_at,omitempty"`
-	Command       []string          `json:"command,omitempty"`
-	Cwd           string            `json:"cwd,omitempty"`
-	Kind          string            `json:"kind"`
+	// Empty = local. Non-empty = the peer name (manual peer in state.db, or a discovered peer).
+	Peer      string   `json:"peer,omitempty"`
+	CreatedAt string   `json:"created_at,omitempty"`
+	Command   []string `json:"command,omitempty"`
+	Cwd       string   `json:"cwd,omitempty"`
+	// Adapter holds the adapter name ("pi", "claude", "shell", ...).
+	Adapter       string            `json:"adapter"`
 	WorkspaceRoot string            `json:"workspace_root,omitempty"`
 	Remotes       map[string]string `json:"remotes,omitempty"`
-	Alive         bool              `json:"alive"`
-	Pid           int               `json:"pid,omitempty"`
-	ExitCode      *int              `json:"exit_code,omitempty"`
-	StartedAt     string            `json:"started_at,omitempty"`
-	ExitedAt      string            `json:"exited_at,omitempty"`
-	Title         string            `json:"title,omitempty"`
-	Subtitle      string            `json:"subtitle,omitempty"`
-	Status        *Status           `json:"status"`
-	Unread        bool              `json:"unread"`
+	// ParentSessionID is the session this one was spawned from (e.g.
+	// `gmux edit` invoked as $EDITOR inside an existing session). The
+	// UI uses it to place the child next to its parent in the sidebar.
+	ParentSessionID       string  `json:"parent_session_id,omitempty"`
+	LaunchedFromSessionID string  `json:"launched_from_session_id,omitempty"`
+	Alive                 bool    `json:"alive"`
+	Pid                   int     `json:"pid,omitempty"`
+	ExitCode              *int    `json:"exit_code,omitempty"`
+	StartedAt             string  `json:"started_at,omitempty"`
+	ExitedAt              string  `json:"exited_at,omitempty"`
+	Title                 string  `json:"title,omitempty"`
+	Subtitle              string  `json:"subtitle,omitempty"`
+	Status                *Status `json:"status"`
+	Unread                bool    `json:"unread"`
+	UnreadToken           string  `json:"unread_token"`
 
-	// LastActivityAt timestamps the most recent noteworthy state
-	// transition for this session, used by the UI to surface
-	// recently-relevant sessions (the home dashboard's "Recent"
-	// section, sort keys, etc.). RFC3339, set by the owning daemon.
+	// LastOutputAt timestamps the last time this session produced
+	// *unseen* output — the read→unread transition. Used by the UI as
+	// the activity-feed sort key so a session floats up the moment the
+	// agent (or shell/editor) produces something the user hasn't looked
+	// at. RFC3339, set by the owning daemon.
 	//
 	// Bumped on (and only on):
-	//   - alive: true → false  (the session exited)
 	//   - unread: false → true  (new output the user hasn't seen)
-	//   - status.working: false → true  (adapter started a task)
-	//   - status.error: false → true  (status went into error)
 	//
-	// Not bumped on: new session creation (the first follow-up
-	// transition does it), title/cwd/slug/stamp changes, status
-	// label-only updates, sessionmeta rehydrate at startup.
+	// Deliberately NOT bumped by the user's own input: status.active
+	// false→true happens when you send / start a task, and reshuffling
+	// the session you just acted on is exactly the jitter we avoid.
+	// Exit and error aren't bumped either — in practice they arrive with
+	// output that already trips unread, and the status dot covers the
+	// rare silent case, so keeping the key output-only keeps it honest.
+	//
+	// Not bumped on: new session creation (the first unread transition
+	// does it), title/cwd/slug/stamp changes, no-op status updates,
+	// sessionmeta rehydrate at startup.
+	//
+	// A future last_input_at could track the user side (last send /
+	// interaction) for an IM-style "recently used" ordering; not today.
 	//
 	// Peer sessions arrive over the wire with this already set by
 	// the owning daemon; UpsertRemote preserves it as-received.
-	LastActivityAt string `json:"last_activity_at,omitempty"`
-	Resumable     bool              `json:"resumable,omitempty"`
-	SocketPath    string            `json:"socket_path,omitempty"`
-	TerminalCols  uint16            `json:"terminal_cols,omitempty"`
-	TerminalRows  uint16            `json:"terminal_rows,omitempty"`
+	LastOutputAt string `json:"last_output_at,omitempty"`
+	Resumable    bool   `json:"resumable,omitempty"`
+	SocketPath   string `json:"socket_path,omitempty"`
+	TerminalCols uint16 `json:"terminal_cols,omitempty"`
+	TerminalRows uint16 `json:"terminal_rows,omitempty"`
 	// Slug is a human-readable stable identifier derived from the
-	// adapter's session file slug. Used for URL routing (the frontend
-	// falls back to id[:8] when empty) and for matching dead sessions
-	// to project membership arrays. Unique within (kind, peer).
+	// adapter's conversation-derived slug. Used for URL routing (the frontend
+	// falls back to the session id when empty). It is display-only and unique
+	// within (adapter, peer).
 	Slug string `json:"slug,omitempty"`
 
-	// SessionFile is the conversation file this runner authoritatively
-	// writes, as reported by the agent hook (session → file; ADR 0011).
-	// Two live sessions may carry the same SessionFile when the same
+	// ConversationRef is the opaque, adapter-scoped ref of the conversation
+	// this runner authoritatively writes, as reported by the agent hook
+	// (session → conversation; ADR 0011). The daemon never interprets it —
+	// only the owning adapter does (today's file-backed adapters use the
+	// transcript's absolute path; a DB-backed adapter may use a row key).
+	// Two live sessions may carry the same ConversationRef when the same
 	// conversation is resumed in more than one tab; the frontend groups
 	// by this to warn about a conversation open in multiple runners.
-	SessionFile string `json:"session_file,omitempty"`
+	// The wire/persisted key stays "conversation_file" for compatibility.
+	ConversationRef string `json:"conversation_file,omitempty"`
 
 	// RunnerVersion is the version string of the gmux runner binary that
 	// launched this session. Set by the runner at startup. The frontend
@@ -109,66 +131,89 @@ type Session struct {
 	// can never be observed stale.
 	ProjectSlug  string `json:"project_slug,omitempty"`
 	ProjectIndex int    `json:"project_index,omitempty"`
+
+	// conversationID and conversationAncestors are described once when a
+	// local runner binds a conversation ref (prepareConversationLineage) and
+	// drive lineage takeover. The daemon treats the ref itself as opaque
+	// (ADR 0022); identity comes from the adapter's DescribeConversation.
+	// Both are unexported: in-memory matching state, never marshaled.
+	conversationID        string
+	conversationAncestors []string
 }
 
 // MarshalJSON serializes a Session for the frontend API, excluding internal
 // fields (ShellTitle, AdapterTitle) that are resolved into Title before sending.
 func (s Session) MarshalJSON() ([]byte, error) {
 	type wire struct {
-		ID            string            `json:"id"`
-		Peer          string            `json:"peer,omitempty"`
-		CreatedAt     string            `json:"created_at,omitempty"`
-		Command       []string          `json:"command,omitempty"`
-		Cwd           string            `json:"cwd,omitempty"`
-		Kind          string            `json:"kind"`
-		WorkspaceRoot string            `json:"workspace_root,omitempty"`
-		Remotes       map[string]string `json:"remotes,omitempty"`
-		Alive         bool              `json:"alive"`
-		Pid           int               `json:"pid,omitempty"`
-		ExitCode      *int              `json:"exit_code,omitempty"`
-		StartedAt     string            `json:"started_at,omitempty"`
-		ExitedAt      string            `json:"exited_at,omitempty"`
-		Title         string            `json:"title,omitempty"`
-		Subtitle      string            `json:"subtitle,omitempty"`
-		Status        *Status           `json:"status"`
-		Unread        bool              `json:"unread"`
-		Resumable     bool              `json:"resumable,omitempty"`
-		SocketPath    string            `json:"socket_path,omitempty"`
-		TerminalCols  uint16            `json:"terminal_cols,omitempty"`
-		TerminalRows  uint16            `json:"terminal_rows,omitempty"`
-		Slug          string            `json:"slug,omitempty"`
-		SessionFile   string            `json:"session_file,omitempty"`
-		RunnerVersion string            `json:"runner_version,omitempty"`
-		BinaryHash    string            `json:"binary_hash,omitempty"`
-		ProjectSlug   string            `json:"project_slug,omitempty"`
-		ProjectIndex  int               `json:"project_index,omitempty"`
-		LastActivityAt string           `json:"last_activity_at,omitempty"`
+		ID                    string            `json:"id"`
+		Peer                  string            `json:"peer,omitempty"`
+		CreatedAt             string            `json:"created_at,omitempty"`
+		Command               []string          `json:"command,omitempty"`
+		Cwd                   string            `json:"cwd,omitempty"`
+		Adapter               string            `json:"adapter"`
+		WorkspaceRoot         string            `json:"workspace_root,omitempty"`
+		Remotes               map[string]string `json:"remotes,omitempty"`
+		ParentSessionID       string            `json:"parent_session_id,omitempty"`
+		LaunchedFromSessionID string            `json:"launched_from_session_id,omitempty"`
+		Alive                 bool              `json:"alive"`
+		Pid                   int               `json:"pid,omitempty"`
+		ExitCode              *int              `json:"exit_code,omitempty"`
+		StartedAt             string            `json:"started_at,omitempty"`
+		ExitedAt              string            `json:"exited_at,omitempty"`
+		Title                 string            `json:"title,omitempty"`
+		Subtitle              string            `json:"subtitle,omitempty"`
+		Status                *Status           `json:"status"`
+		Unread                bool              `json:"unread"`
+		UnreadToken           string            `json:"unread_token"`
+		Resumable             bool              `json:"resumable,omitempty"`
+		SocketPath            string            `json:"socket_path,omitempty"`
+		TerminalCols          uint16            `json:"terminal_cols,omitempty"`
+		TerminalRows          uint16            `json:"terminal_rows,omitempty"`
+		Slug                  string            `json:"slug,omitempty"`
+		ConversationRef       string            `json:"conversation_file,omitempty"`
+		RunnerVersion         string            `json:"runner_version,omitempty"`
+		BinaryHash            string            `json:"binary_hash,omitempty"`
+		ProjectSlug           string            `json:"project_slug,omitempty"`
+		ProjectIndex          int               `json:"project_index,omitempty"`
+		LastOutputAt          string            `json:"last_output_at,omitempty"`
 	}
 	return json.Marshal(wire{
 		ID: s.ID, Peer: s.Peer, CreatedAt: s.CreatedAt, Command: s.Command,
-		Cwd: s.Cwd, Kind: s.Kind, WorkspaceRoot: s.WorkspaceRoot,
-		Remotes: s.Remotes, Alive: s.Alive, Pid: s.Pid,
+		Cwd: s.Cwd, Adapter: s.Adapter, WorkspaceRoot: s.WorkspaceRoot,
+		Remotes: s.Remotes, ParentSessionID: s.ParentSessionID,
+		LaunchedFromSessionID: s.LaunchedFromSessionID,
+		Alive:                 s.Alive, Pid: s.Pid,
 		ExitCode: s.ExitCode, StartedAt: s.StartedAt, ExitedAt: s.ExitedAt,
 		Title: s.Title, Subtitle: s.Subtitle, Status: s.Status,
-		Unread: s.Unread, Resumable: s.Resumable,
+		Unread: s.Unread, UnreadToken: s.UnreadToken, Resumable: s.Resumable,
 		SocketPath: s.SocketPath, TerminalCols: s.TerminalCols,
 		TerminalRows: s.TerminalRows, Slug: s.Slug,
-		SessionFile:   s.SessionFile,
-		RunnerVersion: s.RunnerVersion, BinaryHash: s.BinaryHash,
+		ConversationRef: s.ConversationRef,
+		RunnerVersion:   s.RunnerVersion, BinaryHash: s.BinaryHash,
 		ProjectSlug: s.ProjectSlug, ProjectIndex: s.ProjectIndex,
-		LastActivityAt: s.LastActivityAt,
+		LastOutputAt: s.LastOutputAt,
 	})
 }
 
-// Status is the application-reported status.
+// Status is the application-reported status. Carries only granular
+// booleans; display text is derived in the frontend.
 type Status struct {
-	Label   string `json:"label"`
-	Working bool   `json:"working"`
-	Error   bool   `json:"error,omitempty"`
+	Active      bool `json:"active"`
+	Error       bool `json:"error,omitempty"`
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
+// Event types on the store's subscriber bus. Only EventSessionUpsert
+// carries a Session payload; consumers must dispatch on Type, not on
+// Session == nil (an activity pulse is not a removal).
+const (
+	EventSessionUpsert   = "session-upsert"   // state change; Session present
+	EventSessionRemove   = "session-remove"   // session dropped from the store
+	EventSessionActivity = "session-activity" // transient output pulse; no Session
+)
+
 type Event struct {
-	Type string `json:"type"` // "session-upsert" | "session-remove"
+	Type string `json:"type"` // EventSessionUpsert | EventSessionRemove | EventSessionActivity
 	ID   string `json:"id"`
 
 	// Present for session-upsert
@@ -184,20 +229,43 @@ type Store struct {
 	sessions       map[string]Session
 	subscribers    map[*subscriber]struct{}
 	commandTitlers map[string]func([]string) string
+	// activitySeed, when set, supplies a durable last-activity floor
+	// (RFC3339) for a session that arrives with no LastOutputAt —
+	// the rehydrate/re-register case after a daemon restart, where the
+	// in-memory stamp was never persisted. Returns "" when no seed is
+	// available. See SetActivitySeed.
+	activitySeed func(Session) string
+
+	lineageMu    sync.Mutex
+	lineageByRef map[string]lineageEntry // key: adapter\x00ref (refs are unique only within an adapter, ADR 0022)
 }
 
 func New() *Store {
 	return &Store{
-		sessions:    make(map[string]Session),
-		subscribers: make(map[*subscriber]struct{}),
+		sessions:     make(map[string]Session),
+		subscribers:  make(map[*subscriber]struct{}),
+		lineageByRef: make(map[string]lineageEntry),
 	}
 }
 
-// SetCommandTitlers configures per-kind functions that derive a display
+// SetCommandTitlers configures per-adapter functions that derive a display
 // title from a command array. Used as the fallback when no adapter or
 // shell title is set (e.g. "codex" instead of "codex resume <id>").
 func (s *Store) SetCommandTitlers(titlers map[string]func([]string) string) {
 	s.commandTitlers = titlers
+}
+
+// SetActivitySeed installs a hook that reseeds LastOutputAt from a
+// durable on-disk activity proxy (conversation-file / scrollback mtime)
+// when a locally-owned session is upserted with an empty stamp. This
+// recovers "last activity" across a daemon restart: an alive session's
+// LastOutputAt is never persisted, so on re-register it would
+// otherwise reset to (effectively) creation time. The hook is applied
+// only as a seed/floor — a session that already carries a stamp (a live
+// value, or a persisted one restored from sessionmeta) is never
+// overwritten. seed may return "" to decline.
+func (s *Store) SetActivitySeed(seed func(Session) string) {
+	s.activitySeed = seed
 }
 
 func (s *Store) List() []Session {
@@ -219,18 +287,18 @@ func (s *Store) Get(id string) (Session, bool) {
 }
 
 // HasLocalSlug reports whether the store already contains a local
-// (non-peer) session with the given (kind, slug). Slug is identity
+// (non-peer) session with the given (adapter, slug). Slug is identity
 // for sidebar purposes (see UBIQUITOUS_LANGUAGE.md), so this is the
 // right check when deciding whether a project-tracked session is
 // already represented, regardless of which instance ID it carries.
-func (s *Store) HasLocalSlug(kind, slug string) bool {
+func (s *Store) HasLocalSlug(adapter, slug string) bool {
 	if slug == "" {
 		return false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, sess := range s.sessions {
-		if sess.Peer == "" && sess.Kind == kind && sess.Slug == slug {
+		if sess.Peer == "" && sess.Adapter == adapter && sess.Slug == slug {
 			return true
 		}
 	}
@@ -246,12 +314,12 @@ func (s *Store) resolveTitle(sess Session) string {
 		return sess.ShellTitle
 	}
 	// Ask the adapter for a command title if it implements CommandTitler.
-	if fn := s.commandTitlers[sess.Kind]; fn != nil && len(sess.Command) > 0 {
+	if fn := s.commandTitlers[sess.Adapter]; fn != nil && len(sess.Command) > 0 {
 		return fn(sess.Command)
 	}
-	// Default: use the adapter kind as the title (e.g. "codex", "claude").
-	if sess.Kind != "" {
-		return sess.Kind
+	// Default: use the adapter name as the title (e.g. "codex", "claude").
+	if sess.Adapter != "" {
+		return sess.Adapter
 	}
 	return sess.Title
 }
@@ -268,7 +336,7 @@ func (s *Store) Upsert(sess Session) {
 // arriving in the SSE payload already. The spoke intentionally keeps
 // its internal ShellTitle/AdapterTitle fields off the wire, so the
 // hub never has enough information to re-resolve correctly and would
-// otherwise overwrite a correct Title with the adapter Kind fallback.
+// otherwise overwrite a correct Title with the adapter-name fallback.
 //
 // Canonicalization, duplicate-slug handling, unique-slug
 // numbering, and event broadcast all still run; only the title and
@@ -278,25 +346,50 @@ func (s *Store) UpsertRemote(sess Session) {
 }
 
 // upsertCommon is the shared body of Upsert and UpsertRemote.
-// bumpLocally controls whether LastActivityAt is recomputed from
+// bumpLocally controls whether LastOutputAt is recomputed from
 // the prev→next transition: true for locally-owned sessions, false
 // for peer payloads (where the owning daemon already stamped it).
 func (s *Store) upsertCommon(sess Session, bumpLocally bool) {
 	sess.Cwd = paths.CanonicalizePath(sess.Cwd)
 	sess.WorkspaceRoot = paths.CanonicalizePath(sess.WorkspaceRoot)
+	// Compute the activity seed BEFORE taking the lock. The hook stats
+	// an adapter-supplied path that may live on a remote/FUSE filesystem;
+	// a hung stat under s.mu would stall the whole store (all reads, the
+	// SSE snapshot fan-out), not just this upsert. It's only relevant when
+	// the incoming stamp is empty (the rehydrate/fresh case), and it's
+	// applied under the lock only if the stamp is still empty after
+	// carry-forward — so it stays a pure floor.
+	var seed string
+	if bumpLocally && sess.LastOutputAt == "" && s.activitySeed != nil {
+		seed = s.activitySeed(sess)
+	}
+
+	// Describing adapter conversations can be expensive. Do it before taking
+	// the store mutex, and only once per local conversation ref; peer
+	// snapshots arrive frequently and their refs belong to another host.
+	s.prepareConversationLineage(&sess)
+
 	s.mu.Lock()
 	prev, hadPrev := s.sessions[sess.ID]
 	if bumpLocally {
-		if shouldBumpActivity(snapshotActivity(prev), hadPrev, snapshotActivity(sess)) {
-			sess.LastActivityAt = nowRFC3339()
-		} else if hadPrev && sess.LastActivityAt == "" {
+		if bumpsOutput(prev, sess, hadPrev) {
+			sess.LastOutputAt = nowRFC3339()
+		} else if hadPrev && sess.LastOutputAt == "" {
 			// Preserve the previously stamped timestamp across
 			// no-bump Upserts. Adapters call Upsert with fresh
 			// Session structs built from runner state, which never
-			// includes LastActivityAt; without this carry-forward,
+			// includes LastOutputAt; without this carry-forward,
 			// a routine title/cwd refresh would silently zero out
 			// the field and drop the session from Recent.
-			sess.LastActivityAt = prev.LastActivityAt
+			sess.LastOutputAt = prev.LastOutputAt
+		}
+		// Reseed from a durable on-disk proxy when we still have no
+		// stamp — the alive-across-restart case, where neither a live
+		// value nor a persisted one exists. Gated on empty so it acts
+		// purely as a floor and never clobbers a newer value; and only
+		// on locally-owned sessions (peers carry the owner's stamp).
+		if sess.LastOutputAt == "" && seed != "" {
+			sess.LastOutputAt = seed
 		}
 	}
 	removed, skip, unchanged := s.commitLocked(prev, hadPrev, &sess)
@@ -305,15 +398,15 @@ func (s *Store) upsertCommon(sess Session, bumpLocally bool) {
 }
 
 // commitLocked finalizes sess into the store and reports what the write
-// did. It resolves duplicate slugs (which may evict shadowed sessions),
-// assigns a unique slug, and stores the result. The caller must hold
+// did. It resolves conversation takeovers (which may evict shadowed
+// sessions), assigns a unique display/URL slug, and stores the result. The caller must hold
 // s.mu.
 //
 // Returns:
-//   - removed: ids evicted by duplicate-slug resolution (a live session
-//     shadows a dead one with the same slug).
-//   - skip: the write was dropped entirely (a dead session shadowed by a
-//     live one); nothing was stored.
+//   - removed: ids evicted by conversation-lineage takeover (a live session
+//     shadows a dead conversation it resumes).
+//   - skip: the write was dropped entirely (a dead conversation shadowed by a
+//     live session that owns it); nothing was stored.
 //   - unchanged: the stored session is byte-identical to prev, so this
 //     was a no-op that must NOT broadcast session-upsert.
 //
@@ -327,7 +420,7 @@ func (s *Store) upsertCommon(sess Session, bumpLocally bool) {
 // and unique-slug renumbering), not the caller's raw input, is what
 // makes the comparison correct. See ADR 0001.
 func (s *Store) commitLocked(prev Session, hadPrev bool, sess *Session) (removed []string, skip, unchanged bool) {
-	removed, skip = s.resolveDuplicateSlugsLocked(*sess)
+	removed, skip = s.resolveConversationTakeoverLocked(*sess)
 	if skip {
 		return removed, true, false
 	}
@@ -342,13 +435,13 @@ func (s *Store) commitLocked(prev Session, hadPrev bool, sess *Session) (removed
 // unless the write was skipped or a no-op. Caller must NOT hold s.mu.
 func (s *Store) broadcastCommit(sess Session, removed []string, skip, unchanged bool) {
 	for _, id := range removed {
-		s.broadcast(Event{Type: "session-remove", ID: id})
+		s.broadcast(Event{Type: EventSessionRemove, ID: id})
 	}
 	if skip || unchanged {
 		return
 	}
 	s.broadcast(Event{
-		Type:    "session-upsert",
+		Type:    EventSessionUpsert,
 		ID:      sess.ID,
 		Session: &sess,
 	})
@@ -359,26 +452,54 @@ func (s *Store) broadcastCommit(sess Session, removed []string, skip, unchanged 
 // (e.g. the file monitor and the SSE subscriber goroutines).
 // Returns false if the session doesn't exist.
 func (s *Store) Update(id string, fn func(*Session)) bool {
-	s.mu.Lock()
-	prev, ok := s.sessions[id]
-	if !ok {
+	// A new conversation bind needs adapter I/O (DescribeConversation) that
+	// must not run under s.mu. Rather than dropping the lock mid-update —
+	// which could write a stale copy back over a concurrent dismiss or
+	// update — warm the lineage cache OUTSIDE the critical section and
+	// retry the whole update from fresh state. The loop is bounded: the
+	// cache records failures too, so the second pass always hits it.
+	// describedRef guards the unlock-describe-retry so it runs at most once
+	// per distinct ref this call: termination is independent of whether the
+	// describe succeeded or was cached (a transient describe failure is not
+	// cached, so a cache-presence gate would livelock here).
+	describedRef := ""
+	for {
+		s.mu.Lock()
+		prev, ok := s.sessions[id]
+		if !ok {
+			s.mu.Unlock()
+			return false
+		}
+		// prev is a by-value copy from the map, so prev.Unread is
+		// unaffected by fn mutating sess — no pre-snapshot needed for a
+		// plain bool (unlike the old Status-pointer path).
+		sess := prev
+		fn(&sess)
+		sess.Cwd = paths.CanonicalizePath(sess.Cwd)
+		sess.WorkspaceRoot = paths.CanonicalizePath(sess.WorkspaceRoot)
+		sess.Title = s.resolveTitle(sess)
+		sess.Resumable = !sess.Alive && len(sess.Command) > 0
+		if bumpsOutput(prev, sess, true) {
+			sess.LastOutputAt = nowRFC3339()
+		}
+		if sess.Peer == "" && sess.ConversationRef != "" && sess.ConversationRef != prev.ConversationRef {
+			if describedRef != sess.ConversationRef {
+				s.mu.Unlock()
+				s.prepareConversationLineage(&sess)
+				describedRef = sess.ConversationRef
+				continue
+			}
+			// Second pass for this ref: re-apply the lineage onto the
+			// fresh copy (cache hit when the describe succeeded; a
+			// re-describe of a still-missing ref just yields empty again
+			// and we proceed — no loop).
+			s.prepareConversationLineage(&sess)
+		}
+		removed, skip, unchanged := s.commitLocked(prev, true, &sess)
 		s.mu.Unlock()
-		return false
+		s.broadcastCommit(sess, removed, skip, unchanged)
+		return true
 	}
-	prevSnap := snapshotActivity(prev)
-	sess := prev
-	fn(&sess)
-	sess.Cwd = paths.CanonicalizePath(sess.Cwd)
-	sess.WorkspaceRoot = paths.CanonicalizePath(sess.WorkspaceRoot)
-	sess.Title = s.resolveTitle(sess)
-	sess.Resumable = !sess.Alive && len(sess.Command) > 0
-	if shouldBumpActivity(prevSnap, true, snapshotActivity(sess)) {
-		sess.LastActivityAt = nowRFC3339()
-	}
-	removed, skip, unchanged := s.commitLocked(prev, true, &sess)
-	s.mu.Unlock()
-	s.broadcastCommit(sess, removed, skip, unchanged)
-	return true
 }
 
 // GetTerminalSize returns the current terminal dimensions for a session.
@@ -415,36 +536,121 @@ func (s *Store) SetTerminalSize(id string, cols, rows uint16) bool {
 	s.mu.Unlock()
 
 	s.broadcast(Event{
-		Type:    "session-upsert",
+		Type:    EventSessionUpsert,
 		ID:      sess.ID,
 		Session: &sess,
 	})
 	return true
 }
 
-// resolveDuplicateSlugsLocked deduplicates sessions that share a Slug
-// within the same (kind, peer) scope. When a live session arrives and
-// a dead session with the same slug exists, the dead one is removed.
-// When a dead session arrives and a live one exists, the dead one is
-// skipped.
-func (s *Store) resolveDuplicateSlugsLocked(sess Session) (removed []string, skip bool) {
-	if sess.Slug == "" {
+// lineageKey scopes the lineage cache to a single adapter: opaque refs are
+// unique only within an adapter (ADR 0022), so two adapters that happen to
+// use the same ref string must not share a cache entry.
+func lineageKey(adapterName, ref string) string {
+	return adapterName + "\x00" + ref
+}
+
+// prepareConversationLineage describes the bound conversation at bind time,
+// outside the store mutex. Its per-ref cache means recurring writes (notably
+// peer snapshots) never re-describe. Peer (including Local-peer) refs are
+// owned by another daemon, so they deliberately get no local takeover
+// behavior. The ref is opaque to the daemon (ADR 0022): both the
+// conversation's own ID and its ancestors come from the adapter.
+func (s *Store) prepareConversationLineage(sess *Session) {
+	if sess.Peer != "" || sess.ConversationRef == "" {
+		return
+	}
+	key := lineageKey(sess.Adapter, sess.ConversationRef)
+	s.lineageMu.Lock()
+	defer s.lineageMu.Unlock()
+	if cached, known := s.lineageByRef[key]; known {
+		sess.conversationID = cached.id
+		sess.conversationAncestors = cached.ancestors
+		return
+	}
+	// A describe FAILURE (ref absent/unreadable — e.g. a resumed transcript
+	// not yet on disk at first bind) is NOT cached: caching it would poison
+	// the ref permanently and silently defeat takeover once the file lands.
+	// A successful describe is stable (ancestors never disappear) and cached.
+	var entry lineageEntry
+	cache := false
+	if a := adapters.FindByAdapter(sess.Adapter); a != nil {
+		if describer, ok := a.(adapter.ConversationDescriber); ok {
+			if info, err := describer.DescribeConversation(sess.ConversationRef); err == nil {
+				entry = lineageEntry{id: info.ID, ancestors: info.AncestorIDs}
+				cache = true
+			}
+		}
+	} else {
+		cache = true // no describer for this adapter: nothing to learn later
+	}
+	if cache {
+		s.lineageByRef[key] = entry
+	}
+	sess.conversationID = entry.id
+	sess.conversationAncestors = entry.ancestors
+}
+
+// lineageEntry caches what the adapter said about a conversation ref.
+type lineageEntry struct {
+	id        string
+	ancestors []string
+}
+
+// conversationLineage is the set of conversation IDs a session's bound
+// conversation covers: its own ID plus every ancestor it was resumed from.
+// Empty when the adapter could not describe the ref — ref equality still
+// applies then.
+func conversationLineage(sess *Session) map[string]struct{} {
+	lineage := make(map[string]struct{}, len(sess.conversationAncestors)+1)
+	if sess.conversationID != "" {
+		lineage[sess.conversationID] = struct{}{}
+	}
+	for _, id := range sess.conversationAncestors {
+		lineage[id] = struct{}{}
+	}
+	return lineage
+}
+
+// coversConversation reports whether owner's bound conversation is, or
+// descends from, other's: same opaque ref (adapter-scoped equality is
+// daemon-legal even without a describe), or other's conversation ID is in
+// owner's lineage.
+func coversConversation(owner, other *Session) bool {
+	if owner.ConversationRef == other.ConversationRef {
+		return true
+	}
+	if other.conversationID == "" {
+		return false
+	}
+	_, owns := conversationLineage(owner)[other.conversationID]
+	return owns
+}
+
+// resolveConversationTakeoverLocked applies continuity only to local
+// sessions bound to conversation refs. Within one adapter/peer scope, a live
+// binder evicts dead rows whose conversation it covers (same ref, or an
+// ancestor per the adapter's lineage); a dead write is skipped when a live
+// row covers its conversation. Live rows always coexist. The caller must
+// hold s.mu.
+func (s *Store) resolveConversationTakeoverLocked(sess Session) (removed []string, skip bool) {
+	if sess.Peer != "" || sess.ConversationRef == "" {
 		return nil, false
 	}
 	for id, other := range s.sessions {
-		if id == sess.ID || other.Slug != sess.Slug {
-			continue
-		}
-		// Same (kind, peer) scope check.
-		if other.Kind != sess.Kind || other.Peer != sess.Peer {
+		if id == sess.ID || other.Adapter != sess.Adapter || other.Peer != sess.Peer || other.ConversationRef == "" {
 			continue
 		}
 		switch {
 		case sess.Alive && !other.Alive:
-			delete(s.sessions, id)
-			removed = append(removed, id)
+			if coversConversation(&sess, &other) {
+				delete(s.sessions, id)
+				removed = append(removed, id)
+			}
 		case !sess.Alive && other.Alive:
-			return removed, true
+			if coversConversation(&other, &sess) {
+				return removed, true
+			}
 		}
 	}
 	return removed, false
@@ -460,7 +666,7 @@ func (s *Store) Remove(id string) bool {
 
 	if ok {
 		s.broadcast(Event{
-			Type: "session-remove",
+			Type: EventSessionRemove,
 			ID:   id,
 		})
 	}
@@ -494,6 +700,74 @@ func (s *Store) Reconcile(assignFn func(Session) (slug string, index int)) {
 	}
 }
 
+// RemoveDeadByConversationRef retires every locally-owned, dead session
+// of the given adapter whose ConversationRef matches ref, broadcasting
+// session-remove for each and returning the removed IDs. Used when the
+// conversations index reports a conversation has disappeared: meta.json
+// mirrors conversation existence (ADR 0016), so the backing conversation
+// going away retires the sidebar entry.
+//
+// Guards, all load-bearing:
+//   - Adapter match: refs are only unique within an adapter (ADR 0022:
+//     opaque, adapter-scoped), so adapter A reporting ref "x" deleted must
+//     never retire adapter B's session that happens to carry the same
+//     ref string.
+//   - !Alive: a live runner may still be writing this conversation; its
+//     record is authoritative and must not be torn down here.
+//   - Peer == "": peer-owned records are re-received from the spoke; the
+//     hub doesn't own their lifecycle.
+//   - all matches: the conversation→session mapping is N:1 (a conversation
+//     can be resumed in several runners), so every dead match is retired.
+//
+// Refs are compared by canonicalRef: exact equality, except that refs
+// which are rooted paths (today's file-backed adapters) are compared
+// after filepath.Clean so a cosmetic difference (trailing slash, "./")
+// between the source-reported ref and the hook-reported ConversationRef
+// doesn't defeat the match. Opaque refs are never normalized — an
+// adapter may legitimately use "a/../b" and "b" as distinct locators.
+// Symlinks are not resolved: the file is already gone, so EvalSymlinks
+// couldn't run, and both paths derive from the same real $HOME in
+// practice.
+func (s *Store) RemoveDeadByConversationRef(adapterName, ref string) []string {
+	if adapterName == "" || ref == "" {
+		return nil
+	}
+	target := canonicalRef(ref)
+	s.mu.Lock()
+	var removed []string
+	for id, sess := range s.sessions {
+		if sess.Adapter != adapterName || sess.Peer != "" || sess.Alive || sess.ConversationRef == "" {
+			continue
+		}
+		if canonicalRef(sess.ConversationRef) != target {
+			continue
+		}
+		delete(s.sessions, id)
+		removed = append(removed, id)
+	}
+	s.mu.Unlock()
+
+	for _, id := range removed {
+		s.broadcast(Event{Type: EventSessionRemove, ID: id})
+	}
+	return removed
+}
+
+// canonicalRef returns the comparison form of a conversation ref (ADR
+// 0022). Refs are opaque, so the daemon must not interpret them — with
+// one narrow, deliberate exception: a ref that is a rooted path is a
+// file-backed adapter's transcript path, where the hook-reported and
+// watcher-reported spellings can differ cosmetically ("./", trailing
+// slash), so those are compared after filepath.Clean. Anything else is
+// returned verbatim: normalizing an opaque ref could conflate locators
+// the adapter considers distinct (e.g. "a/../b" vs "b").
+func canonicalRef(ref string) string {
+	if filepath.IsAbs(ref) {
+		return filepath.Clean(ref)
+	}
+	return ref
+}
+
 // RemoveByPeer removes all sessions belonging to a peer and broadcasts
 // removal events. Returns the IDs that were removed.
 func (s *Store) RemoveByPeer(peer string) []string {
@@ -508,7 +782,7 @@ func (s *Store) RemoveByPeer(peer string) []string {
 	s.mu.Unlock()
 
 	for _, id := range removed {
-		s.broadcast(Event{Type: "session-remove", ID: id})
+		s.broadcast(Event{Type: EventSessionRemove, ID: id})
 	}
 	return removed
 }
@@ -565,8 +839,8 @@ func NowUnix() float64 {
 	return float64(time.Now().UnixNano()) / float64(time.Second)
 }
 
-// ensureUniqueSlug appends "-2", "-3" suffixes to the session's
-// Slug when another session in the same (kind, peer) scope already
+// ensureUniqueSlug keeps display/URL slugs distinct by appending "-2",
+// "-3" suffixes when another session in the same (adapter, peer) scope already
 // uses that key. Sessions without a Slug (fresh launches before
 // file attribution) are left alone; the frontend falls back to the
 // session ID prefix for URL routing.
@@ -580,7 +854,7 @@ func (s *Store) ensureUniqueSlug(sess *Session) {
 	for i := 2; ; i++ {
 		conflict := false
 		for _, existing := range s.sessions {
-			if existing.ID != sess.ID && existing.Kind == sess.Kind && existing.Peer == sess.Peer && existing.Slug == sess.Slug {
+			if existing.ID != sess.ID && existing.Adapter == sess.Adapter && existing.Peer == sess.Peer && existing.Slug == sess.Slug {
 				conflict = true
 				break
 			}
@@ -592,53 +866,14 @@ func (s *Store) ensureUniqueSlug(sess *Session) {
 	}
 }
 
-
-// activitySnapshot captures the four scalar bits that determine
-// whether a session transition bumps LastActivityAt. Snapshotting
-// upfront (rather than dereferencing Session.Status during the
-// comparison) is load-bearing: Update callers do `sess := prev`
-// before running their mutator, which shallow-copies the Session
-// but leaves prev.Status and sess.Status pointing at the same
-// Status struct. A mutator that writes through that pointer
-// (e.g. `sess.Status.Working = true`) would silently mutate prev
-// too, hiding the transition from the bump check. Capturing the
-// booleans before fn runs sidesteps the aliasing entirely.
-type activitySnapshot struct {
-	alive, unread, working, errored bool
-}
-
-func snapshotActivity(s Session) activitySnapshot {
-	return activitySnapshot{
-		alive:   s.Alive,
-		unread:  s.Unread,
-		working: s.Status != nil && s.Status.Working,
-		errored: s.Status != nil && s.Status.Error,
-	}
-}
-
-// shouldBumpActivity reports whether the prev→next session transition
-// is noteworthy enough to refresh LastActivityAt. See the field's
-// docstring for the exact bump set. Brand-new sessions (hadPrev=false)
-// never bump: their first follow-up transition does, which avoids
-// timestamping every sessionmeta-rehydrated dead session at daemon
-// startup.
-func shouldBumpActivity(prev activitySnapshot, hadPrev bool, next activitySnapshot) bool {
-	if !hadPrev {
-		return false
-	}
-	if prev.alive && !next.alive {
-		return true
-	}
-	if !prev.unread && next.unread {
-		return true
-	}
-	if !prev.working && next.working {
-		return true
-	}
-	if !prev.errored && next.errored {
-		return true
-	}
-	return false
+// bumpsOutput reports whether a prev→next transition is new unseen
+// output (read → unread) — the sole trigger that stamps LastOutputAt.
+// Intentionally output-only: the user's own input (active false→true),
+// exit, and error do NOT bump (see the LastOutputAt docstring). New
+// sessions (hadPrev=false) never bump; their first unread transition
+// does, so a batch of dead sessions rehydrated at startup stays unstamped.
+func bumpsOutput(prev, next Session, hadPrev bool) bool {
+	return hadPrev && !prev.Unread && next.Unread
 }
 
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }

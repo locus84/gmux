@@ -10,10 +10,15 @@ package config
 import (
 	"fmt"
 	"log"
+	"math"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -23,12 +28,19 @@ type Config struct {
 	// Port is the TCP port for the HTTP listener (default 8790).
 	Port int `toml:"port"`
 
-	Tailscale TailscaleConfig `toml:"tailscale"`
-	Discovery DiscoveryConfig `toml:"discovery"`
+	// WebDir, when set, serves frontend assets from this directory instead
+	// of the embedded build. The directory must contain index.html.
+	WebDir string `toml:"web_dir"`
+
+	Agent         AgentConfig         `toml:"agent"`
+	Tailscale     TailscaleConfig     `toml:"tailscale"`
+	Discovery     DiscoveryConfig     `toml:"discovery"`
+	Sessions      SessionsConfig      `toml:"sessions"`
+	Notifications NotificationsConfig `toml:"notifications"`
 
 	// NOTE: there is no `[[peers]]` array (removed in ADR 0007). Manually
-	// added peers are now runtime state in peers.json (see internal/
-	// peerstore), managed via the "Connect to host" flow.
+	// added peers are now runtime state in state.db, managed via the
+	// "Connect to host" flow.
 }
 
 // PeerConfig describes a remote gmuxd spoke to subscribe to. It is no
@@ -36,7 +48,7 @@ type Config struct {
 // peerstore construct it directly.
 type PeerConfig struct {
 	// Name is a URL-safe slug used as the namespace prefix for session IDs
-	// (e.g. sessions become "sess-abc@name") and in URL routing (/@name/).
+	// (e.g. sessions become "1j6y9mx6@name") and in URL routing (/@name/).
 	Name string
 
 	// URL is the base HTTP URL of the remote gmuxd (e.g. "http://172.17.0.2:8790").
@@ -62,7 +74,7 @@ type PeerConfig struct {
 // Peer sources (see PeerConfig.Source).
 const (
 	SourceDevcontainer = "devcontainer" // auto-discovered Docker devcontainer
-	SourceManual       = "manual"       // added via peers.json / POST /v1/peers
+	SourceManual       = "manual"       // added via state.db / POST /v1/peers
 )
 
 // DiscoveryConfig controls automatic peer discovery.
@@ -75,6 +87,85 @@ type DiscoveryConfig struct {
 	// insecure to auto-connect; tailnet peers are now added manually via
 	// "Connect to host".
 	Devcontainers bool `toml:"devcontainers"`
+}
+
+// SessionsConfig controls retention of dead sessions and their scrollback cache.
+type SessionsConfig struct {
+	RetentionDays     int `toml:"retention_days"`
+	RetentionMax      int `toml:"retention_max"`
+	ScrollbackCacheMB int `toml:"scrollback_cache_mb"`
+}
+
+// AgentConfig is the semantic-agent subsystem: what `gmux agent …` and the web
+// launch flow may do on this host. It is deliberately not part of [sessions],
+// which owns retention and storage: this budget counts semantic agents only,
+// so shell and process children are never charged against it.
+type AgentConfig struct {
+	// MaxSubagentsByDepth is the per-behavioral-root budget at each descendant
+	// depth. False disables admission checks while retaining accounting.
+	MaxSubagentsByDepth SubagentDepthLimits `toml:"max_subagents_by_depth"`
+}
+
+// NotificationsConfig controls external notification sinks.
+type NotificationsConfig struct {
+	Ntfy NtfyConfig `toml:"ntfy"`
+}
+
+// SubagentDepthLimits accepts either an integer array or false in TOML.
+type SubagentDepthLimits struct {
+	Disabled bool
+	Values   []int
+}
+
+func (l *SubagentDepthLimits) UnmarshalTOML(value any) error {
+	switch v := value.(type) {
+	case bool:
+		if v {
+			return fmt.Errorf("expected an array like [-1, 8] or false")
+		}
+		l.Disabled, l.Values = true, nil
+		return nil
+	case []any:
+		values := make([]int, len(v))
+		for i, raw := range v {
+			n, ok := raw.(int64)
+			if !ok {
+				return fmt.Errorf("entry %d must be an integer", i)
+			}
+			values[i] = int(n)
+		}
+		l.Disabled, l.Values = false, values
+		return nil
+	default:
+		return fmt.Errorf("expected an array like [-1, 8] or false")
+	}
+}
+
+// Duration is a TOML string duration such as "5s".
+type Duration time.Duration
+
+// UnmarshalText implements encoding.TextUnmarshaler for TOML strings.
+func (d *Duration) UnmarshalText(text []byte) error {
+	parsed, err := time.ParseDuration(string(text))
+	if err != nil {
+		return err
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// NtfyConfig controls best-effort publishing to an ntfy topic.
+type NtfyConfig struct {
+	Enabled   bool     `toml:"enabled"`
+	ServerURL string   `toml:"server_url"`
+	Topic     string   `toml:"topic"`
+	Token     string   `toml:"token"`
+	Username  string   `toml:"username"`
+	Password  string   `toml:"password"`
+	Priority  int      `toml:"priority"`
+	Tags      []string `toml:"tags"`
+	ClickURL  string   `toml:"click_url"`
+	Timeout   Duration `toml:"timeout"`
 }
 
 // TailscaleConfig controls the optional tailscale (tsnet) listener.
@@ -90,6 +181,11 @@ type TailscaleConfig struct {
 	// (e.g. "user@github"). The node owner is always auto-whitelisted at runtime.
 	// Entries are matched against the peer's UserProfile.LoginName.
 	Allow []string `toml:"allow"`
+
+	// RequireToken keeps gmux's bearer/cookie token as an inner auth gate on
+	// the Tailscale listener after the peer identity allow-list check. Disable
+	// only when the tailnet identity gate is the desired trust boundary.
+	RequireToken bool `toml:"require_token"`
 }
 
 // Load reads the config file. Returns defaults if the file doesn't exist.
@@ -128,9 +224,13 @@ func Load() (Config, error) {
 				log.Printf("config: %s: ignoring deprecated tailscale.hostname (removed in ADR 0007); the node name is now derived from the OS hostname and owned by tailscale. Remove it to silence this warning.", path)
 			case key == "discovery.tailscale":
 				log.Printf("config: %s: ignoring deprecated discovery.tailscale (removed in ADR 0008); tailscale autodiscovery was removed, add tailnet peers via \"Connect to host\". Remove it to silence this warning.", path)
+			case key == "max_subagents_by_depth":
+				// Moved under [agent] before it ever shipped. Name the new home
+				// rather than silently reverting the host to defaults.
+				return Config{}, fmt.Errorf("config: %s: max_subagents_by_depth moved under [agent]; write it as\n\n[agent]\nmax_subagents_by_depth = …", path)
 			case key == "peers" || strings.HasPrefix(key, "peers."):
 				if !warnedPeers {
-					log.Printf("config: %s: ignoring deprecated [[peers]] (removed in ADR 0007); add peers at runtime via \"Connect to host\" in Settings (stored in peers.json). Remove it to silence this warning.", path)
+					log.Printf("config: %s: ignoring deprecated [[peers]] (removed in ADR 0007); add peers at runtime via \"Connect to host\" in Settings (stored in state.db). Remove it to silence this warning.", path)
 					warnedPeers = true
 				}
 			default:
@@ -159,21 +259,149 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// tagNameRe matches valid Tailscale ACL tag names: they must start with
+// a letter and contain only lowercase letters, digits, and hyphens.
+// https://tailscale.com/kb/1068/tags
+var (
+	tagNameRe   = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+	ntfyTopicRe = regexp.MustCompile(`^[-_A-Za-z0-9]{1,64}$`)
+	ntfyTagRe   = regexp.MustCompile(`^[A-Za-z0-9_+-]{1,64}$`)
+)
+
 func validate(cfg Config) error {
 	// Port range.
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return fmt.Errorf("port %d is out of range (1-65535)", cfg.Port)
 	}
-
-	// Tailscale: allow list entries must look like login names.
-	// An empty allow list is fine — the node owner is auto-whitelisted at runtime.
-	for _, entry := range cfg.Tailscale.Allow {
-		if !strings.Contains(entry, "@") {
-			return fmt.Errorf("tailscale.allow entry %q doesn't look like a login name (expected format: user@provider)", entry)
+	if !cfg.Agent.MaxSubagentsByDepth.Disabled {
+		limits := cfg.Agent.MaxSubagentsByDepth.Values
+		if len(limits) == 0 || len(limits) > 8 {
+			return fmt.Errorf("agent.max_subagents_by_depth must contain between 1 and 8 entries")
+		}
+		for i, limit := range limits {
+			if limit == -1 && i == 0 {
+				continue
+			}
+			if limit < 0 || limit > 1024 {
+				return fmt.Errorf("agent.max_subagents_by_depth entry %d must be between 0 and 1024; only the first entry may be -1", i)
+			}
 		}
 	}
 
+	maxRetentionDays := effectiveIntMax(math.MaxInt64 / int64(24*time.Hour))
+	if cfg.Sessions.RetentionDays < 0 || int64(cfg.Sessions.RetentionDays) > maxRetentionDays {
+		return fmt.Errorf("sessions.retention_days must be between 0 and %d", maxRetentionDays)
+	}
+	if cfg.Sessions.RetentionMax < 0 {
+		return fmt.Errorf("sessions.retention_max must be non-negative")
+	}
+	maxScrollbackCacheMB := effectiveIntMax(int64(math.MaxInt64 >> 20))
+	if cfg.Sessions.ScrollbackCacheMB < 0 || int64(cfg.Sessions.ScrollbackCacheMB) > maxScrollbackCacheMB {
+		return fmt.Errorf("sessions.scrollback_cache_mb must be between 0 and %d", maxScrollbackCacheMB)
+	}
+
+	// Tailscale: allow list entries must look like login names or device
+	// tags. Tagged devices have no user identity, so they are allowed by
+	// tag (e.g. "tag:gmux") instead of login name.
+	// An empty allow list is fine — the node owner is auto-whitelisted at runtime.
+	for _, entry := range cfg.Tailscale.Allow {
+		if strings.HasPrefix(entry, "tag:") {
+			if !tagNameRe.MatchString(strings.TrimPrefix(entry, "tag:")) {
+				return fmt.Errorf("tailscale.allow entry %q is not a valid device tag (expected format: tag:name, where name starts with a letter and contains only lowercase letters, digits, and hyphens)", entry)
+			}
+			continue
+		}
+		if !strings.Contains(entry, "@") {
+			return fmt.Errorf("tailscale.allow entry %q doesn't look like a login name or device tag (expected format: user@provider or tag:name)", entry)
+		}
+	}
+
+	if err := validateNtfy(cfg.Notifications.Ntfy); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateNtfy(cfg NtfyConfig) error {
+	server, err := parseNtfyURL("notifications.ntfy.server_url", cfg.ServerURL, false)
+	if err != nil {
+		return err
+	}
+	if cfg.Topic != "" && !ntfyTopicRe.MatchString(cfg.Topic) {
+		return fmt.Errorf("notifications.ntfy.topic must contain 1-64 letters, digits, hyphens, or underscores")
+	}
+	if cfg.Enabled && cfg.Topic == "" {
+		return fmt.Errorf("notifications.ntfy.topic is required when enabled")
+	}
+	if cfg.Token != "" && (cfg.Username != "" || cfg.Password != "") {
+		return fmt.Errorf("notifications.ntfy.token cannot be combined with username/password")
+	}
+	if (cfg.Username == "") != (cfg.Password == "") {
+		return fmt.Errorf("notifications.ntfy.username and password must be set together")
+	}
+	if server.Scheme == "http" && (cfg.Token != "" || cfg.Password != "") {
+		return fmt.Errorf("notifications.ntfy credentials require HTTPS")
+	}
+	if cfg.Priority < 1 || cfg.Priority > 5 {
+		return fmt.Errorf("notifications.ntfy.priority must be between 1 and 5")
+	}
+	if len(cfg.Tags) > 8 {
+		return fmt.Errorf("notifications.ntfy.tags must contain at most 8 tags")
+	}
+	for _, tag := range cfg.Tags {
+		if !ntfyTagRe.MatchString(tag) {
+			return fmt.Errorf("notifications.ntfy.tags must contain only 1-64 letters, digits, plus, hyphen, or underscore characters")
+		}
+	}
+	if cfg.ClickURL != "" {
+		if _, err := parseNtfyURL("notifications.ntfy.click_url", cfg.ClickURL, true); err != nil {
+			return err
+		}
+		if len(cfg.ClickURL) > 2048 {
+			return fmt.Errorf("notifications.ntfy.click_url must be at most 2048 bytes")
+		}
+	}
+	timeout := time.Duration(cfg.Timeout)
+	if timeout < time.Second || timeout > 30*time.Second {
+		return fmt.Errorf("notifications.ntfy.timeout must be between 1s and 30s")
+	}
+	if cfg.Enabled && runtime.GOOS != "windows" {
+		info, err := os.Stat(Path())
+		if err != nil {
+			return fmt.Errorf("notifications.ntfy: checking host.toml permissions: %w", err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("notifications.ntfy requires host.toml permissions 0600 or stricter")
+		}
+	}
+	return nil
+}
+
+func parseNtfyURL(field, raw string, allowPath bool) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("%s must be an absolute HTTP(S) URL", field)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("%s must use HTTP or HTTPS", field)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("%s must not contain userinfo, query, or fragment", field)
+	}
+	if !allowPath && u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("%s must not contain a path", field)
+	}
+	return u, nil
+}
+
+// effectiveIntMax returns the largest value that both fits in an int and does
+// not exceed the limit imposed by the value's later runtime conversion.
+func effectiveIntMax(conversionMax int64) int64 {
+	intMax := int64(^uint(0) >> 1)
+	if conversionMax < intMax {
+		return conversionMax
+	}
+	return intMax
 }
 
 // validateListen checks that the listen address is safe to bind to.
@@ -230,9 +458,27 @@ func isPrivateOrCGNAT(ip net.IP) bool {
 func defaults() Config {
 	return Config{
 		Port: 8790,
+		Agent: AgentConfig{
+			MaxSubagentsByDepth: SubagentDepthLimits{
+				Values: []int{-1, 8},
+			},
+		},
+		Tailscale: TailscaleConfig{
+			RequireToken: true,
+		},
 		Discovery: DiscoveryConfig{
 			Devcontainers: true,
 		},
+		Sessions: SessionsConfig{
+			RetentionDays:     30,
+			RetentionMax:      200,
+			ScrollbackCacheMB: 256,
+		},
+		Notifications: NotificationsConfig{Ntfy: NtfyConfig{
+			ServerURL: "https://ntfy.sh",
+			Priority:  3,
+			Timeout:   Duration(5 * time.Second),
+		}},
 	}
 }
 
@@ -264,4 +510,3 @@ func Dir() string {
 func Path() string {
 	return filepath.Join(Dir(), "host.toml")
 }
-

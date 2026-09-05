@@ -2,13 +2,16 @@ package discovery
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
 
@@ -21,9 +24,9 @@ import (
 //
 // The scenario:
 //
-//  1. A previous gmuxd persisted session sess-survivor and exited.
+//  1. A previous gmuxd persisted session 19n9hnyp and exited.
 //  2. The runner stayed up; its socket is still bound and serving.
-//  3. The new gmuxd loads sess-survivor via Sweep → store now has
+//  3. The new gmuxd loads 19n9hnyp via Sweep → store now has
 //     Alive=false, SocketPath set, plus historical/attribution
 //     fields (slug, created_at, ...) we must not lose.
 //  4. The first Scan() tick must see the live socket, call Register,
@@ -43,7 +46,7 @@ func TestScanReregistersDeadButAliveRunnerAfterDaemonRestart(t *testing.T) {
 	sockDir := t.TempDir()
 	t.Setenv("GMUX_SOCKET_DIR", sockDir)
 
-	const id = "sess-survivor"
+	const id = "19n9hnyp"
 	sockPath := filepath.Join(sockDir, id+".sock")
 
 	const createdAt = "2026-01-02T03:04:05Z"
@@ -58,11 +61,11 @@ func TestScanReregistersDeadButAliveRunnerAfterDaemonRestart(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(store.Session{
-			ID:    id,
-			Kind:  "shell",
-			Cwd:   "/home/user/proj",
-			Alive: true,
-			Pid:   12345,
+			ID:      id,
+			Adapter: "shell",
+			Cwd:     "/home/user/proj",
+			Alive:   true,
+			Pid:     12345,
 			// Empty Slug here mirrors what an adapter-less /meta would
 			// return; the post-attribution slug in the store must win.
 		})
@@ -78,7 +81,7 @@ func TestScanReregistersDeadButAliveRunnerAfterDaemonRestart(t *testing.T) {
 	sessions := store.New()
 	sessions.Upsert(store.Session{
 		ID:           id,
-		Kind:         "shell",
+		Adapter:      "shell",
 		Cwd:          "/home/user/proj",
 		SocketPath:   sockPath,
 		Alive:        false,
@@ -91,7 +94,7 @@ func TestScanReregistersDeadButAliveRunnerAfterDaemonRestart(t *testing.T) {
 	subs := NewSubscriptions(sessions)
 	t.Cleanup(func() { subs.UnsubscribeAll() })
 
-	Scan(sessions, subs, nil, nil)
+	Scan(sessions, subs, nil)
 
 	got, ok := sessions.Get(id)
 	if !ok {
@@ -129,7 +132,7 @@ func TestScanSkipsTrackedAliveSubscribedSession(t *testing.T) {
 	sockDir := t.TempDir()
 	t.Setenv("GMUX_SOCKET_DIR", sockDir)
 
-	const id = "sess-already-current"
+	const id = "1nsy81nt"
 	sockPath := filepath.Join(sockDir, id+".sock")
 
 	// Hold /events open so the subscription goroutine stays
@@ -149,7 +152,7 @@ func TestScanSkipsTrackedAliveSubscribedSession(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
 		metaCalls.Add(1)
-		_ = json.NewEncoder(w).Encode(store.Session{ID: id, Kind: "shell", Alive: true})
+		_ = json.NewEncoder(w).Encode(store.Session{ID: id, Adapter: "shell", Alive: true})
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -167,7 +170,7 @@ func TestScanSkipsTrackedAliveSubscribedSession(t *testing.T) {
 	sessions := store.New()
 	sessions.Upsert(store.Session{
 		ID:         id,
-		Kind:       "shell",
+		Adapter:    "shell",
 		Alive:      true,
 		SocketPath: sockPath,
 	})
@@ -191,7 +194,7 @@ func TestScanSkipsTrackedAliveSubscribedSession(t *testing.T) {
 		t.Fatalf("unexpected /meta traffic before Scan: metaCalls=%d", n)
 	}
 
-	Scan(sessions, subs, nil, nil)
+	Scan(sessions, subs, nil)
 
 	if n := metaCalls.Load(); n != 0 {
 		t.Errorf("/meta called %d times during Scan; want 0 — Phase 1 must skip tracked-alive-subscribed sockets", n)
@@ -220,7 +223,7 @@ func TestScanReregistersOnTransientSubscriptionDrop(t *testing.T) {
 	sockDir := t.TempDir()
 	t.Setenv("GMUX_SOCKET_DIR", sockDir)
 
-	const id = "sess-blipped"
+	const id = "1b4j9kv3"
 	sockPath := filepath.Join(sockDir, id+".sock")
 
 	ln, err := net.Listen("unix", sockPath)
@@ -231,7 +234,7 @@ func TestScanReregistersOnTransientSubscriptionDrop(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
 		metaCalls.Add(1)
-		_ = json.NewEncoder(w).Encode(store.Session{ID: id, Kind: "shell", Alive: true, Pid: 99})
+		_ = json.NewEncoder(w).Encode(store.Session{ID: id, Adapter: "shell", Alive: true, Pid: 99})
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		// Close immediately so the daemon-side subscription drops.
@@ -246,7 +249,7 @@ func TestScanReregistersOnTransientSubscriptionDrop(t *testing.T) {
 	sessions := store.New()
 	sessions.Upsert(store.Session{
 		ID:         id,
-		Kind:       "shell",
+		Adapter:    "shell",
 		Alive:      true,
 		SocketPath: sockPath,
 	})
@@ -258,7 +261,7 @@ func TestScanReregistersOnTransientSubscriptionDrop(t *testing.T) {
 	// window, which dials /meta once and Subscribes once.
 	// Re-subscription is the load-bearing effect; the /meta call
 	// is the observable side effect we can count on.
-	Scan(sessions, subs, nil, nil)
+	Scan(sessions, subs, nil)
 
 	if n := metaCalls.Load(); n != 1 {
 		t.Errorf("/meta called %d times; want 1 (Phase 1 must reconcile alive-but-unsubscribed sessions via Register)", n)
@@ -272,4 +275,278 @@ func TestScanReregistersOnTransientSubscriptionDrop(t *testing.T) {
 	}
 }
 
+// serveMetaJSON starts a fake runner on a Unix socket whose /meta
+// returns the given raw JSON body verbatim, so tests can exercise
+// queryMeta against wire shapes a store.Session round-trip could
+// never produce (e.g. pre-v2 key names).
+func serveMetaJSON(t *testing.T, body string) (socketPath string) {
+	t.Helper()
+	sockPath := filepath.Join(t.TempDir(), "runner.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	srv := &http.Server{Handler: mux}
+	done := make(chan struct{})
+	go func() { _ = srv.Serve(ln); close(done) }()
+	t.Cleanup(func() { _ = srv.Close(); <-done })
+	return sockPath
+}
 
+// TestQueryMetaLegacyPreV2Keys covers queryMeta's legacy-read shim:
+// long-lived pre-v2 runners survive a daemon upgrade and still report
+// "kind" / "session_file" in /meta, so the new daemon must map them to
+// the renamed fields. TODO(v2.1): drop alongside the shim.
+func TestQueryMetaLegacyPreV2Keys(t *testing.T) {
+	sock := serveMetaJSON(t, `{
+		"id": "1j1q7fsx",
+		"kind": "pi",
+		"session_file": "/home/u/.pi/agent/sessions/x/conv.jsonl",
+		"alive": true
+	}`)
+
+	sess, err := queryMeta(sock)
+	if err != nil {
+		t.Fatalf("queryMeta: %v", err)
+	}
+	if sess.Adapter != "pi" {
+		t.Errorf("Adapter = %q, want %q (legacy \"kind\" fallback)", sess.Adapter, "pi")
+	}
+	if want := "/home/u/.pi/agent/sessions/x/conv.jsonl"; sess.ConversationRef != want {
+		t.Errorf("ConversationRef = %q, want %q (legacy \"session_file\" fallback)", sess.ConversationRef, want)
+	}
+}
+
+// TestQueryMetaNewKeysWinOverLegacy pins the shim's precedence: the
+// fallback only fills fields the new keys left empty. A payload
+// carrying both (never emitted by a real runner, but the invariant
+// that keeps the shim safe to leave in place) must resolve to the new
+// keys' values.
+func TestQueryMetaNewKeysWinOverLegacy(t *testing.T) {
+	sock := serveMetaJSON(t, `{
+		"id": "1x06u5o6",
+		"adapter": "claude",
+		"kind": "pi",
+		"conversation_file": "/new/conv.jsonl",
+		"session_file": "/old/conv.jsonl",
+		"alive": true
+	}`)
+
+	sess, err := queryMeta(sock)
+	if err != nil {
+		t.Fatalf("queryMeta: %v", err)
+	}
+	if sess.Adapter != "claude" {
+		t.Errorf("Adapter = %q, want %q (new key must win)", sess.Adapter, "claude")
+	}
+	if sess.ConversationRef != "/new/conv.jsonl" {
+		t.Errorf("ConversationRef = %q, want /new/conv.jsonl (new key must win)", sess.ConversationRef)
+	}
+}
+
+// serveAliveRunner binds a fake runner at sockPath whose /meta reports
+// the given session id as alive. /events is left unregistered (404) so
+// the subscription goroutine exits quickly; these tests assert on the
+// Scan→Register→Upsert seam, not SSE behavior.
+func serveAliveRunner(t *testing.T, sockPath, id string) {
+	t.Helper()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(store.Session{ID: id, Adapter: "shell", Alive: true, Pid: 1})
+	})
+	srv := &http.Server{Handler: mux}
+	done := make(chan struct{})
+	go func() { _ = srv.Serve(ln); close(done) }()
+	t.Cleanup(func() { _ = srv.Close(); <-done })
+}
+
+// TestScanDiscoversRunnersInPrimaryAndLegacyDirs pins the upgrade
+// contract of the XDG_RUNTIME_DIR → state-dir socket move: runners
+// outlive gmuxd upgrades, so a runner that bound its socket in the old
+// default ($XDG_RUNTIME_DIR/gmux/sessions) must stay discoverable —
+// and attachable via its stored absolute SocketPath — alongside
+// runners in the new default (StateDir()/run/sessions). Without the
+// legacy scan, every pre-upgrade session would go dark on daemon
+// upgrade exactly the way the logind-teardown incident stranded them.
+func TestScanDiscoversRunnersInPrimaryAndLegacyDirs(t *testing.T) {
+	// Route every SessionSocketDir/LegacySessionSocketDirs branch into
+	// isolated temp dirs: no GMUX_SOCKET_DIR override (that disables
+	// the legacy scan by design), fresh XDG dirs, and a fresh TMPDIR so
+	// the per-uid temp fallback can't pick up real sockets on the host.
+	t.Setenv("GMUX_SOCKET_DIR", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
+
+	primary := paths.SessionSocketDir()
+	legacy := paths.LegacySessionSocketDirs()[0]
+	for _, dir := range []string{primary, legacy} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	newSock := filepath.Join(primary, "1vx41244.sock")
+	oldSock := filepath.Join(legacy, "10aobhpt.sock")
+	serveAliveRunner(t, newSock, "1vx41244")
+	serveAliveRunner(t, oldSock, "10aobhpt")
+
+	sessions := store.New()
+	subs := NewSubscriptions(sessions)
+	t.Cleanup(func() { subs.UnsubscribeAll() })
+
+	Scan(sessions, subs, nil)
+
+	for id, wantSock := range map[string]string{"1vx41244": newSock, "10aobhpt": oldSock} {
+		got, ok := sessions.Get(id)
+		if !ok {
+			t.Fatalf("session %s missing from store after Scan", id)
+		}
+		if !got.Alive {
+			t.Errorf("%s: Alive = false, want true", id)
+		}
+		if got.SocketPath != wantSock {
+			t.Errorf("%s: SocketPath = %q, want %q (must keep the dir it bound in)", id, got.SocketPath, wantSock)
+		}
+	}
+}
+
+// TestRegisterRejectsInvalidSessionID pins the fatal-registration
+// seam behind the convIndex-rehydrate resume bug: a runner that
+// binds a socket under an id that is not a well-formed 8-character base36
+// (e.g. a rehydrated agent session keyed by its conversation UUID)
+// must be rejected with ErrInvalidSessionID, not silently accepted
+// and not confused with a transient gateway error. The runner keys
+// off this to exit rather than linger as an orphan.
+func TestRegisterRejectsInvalidSessionID(t *testing.T) {
+	sockDir := t.TempDir()
+	t.Setenv("GMUX_SOCKET_DIR", sockDir)
+
+	// The runner reports a bare UUID as its id — exactly what a
+	// convIndex-rehydrated agent session would carry.
+	const badID = "019e03b3-1111-2222-3333-444455556666"
+	sockPath := filepath.Join(sockDir, badID+".sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(store.Session{ID: badID, Adapter: "pi", Alive: true})
+	})
+	srv := &http.Server{Handler: mux}
+	done := make(chan struct{})
+	go func() { _ = srv.Serve(ln); close(done) }()
+	t.Cleanup(func() { _ = srv.Close(); <-done })
+
+	sessions := store.New()
+	subs := NewSubscriptions(sessions)
+	t.Cleanup(func() { subs.UnsubscribeAll() })
+
+	err = Register(sessions, subs, sockPath, nil)
+	if !errors.Is(err, ErrInvalidSessionID) {
+		t.Fatalf("Register err = %v, want ErrInvalidSessionID", err)
+	}
+	if _, ok := sessions.Get(badID); ok {
+		t.Errorf("invalid-id session was added to the store; must be rejected")
+	}
+}
+
+// TestScanForcedDeathPreservesClosedTurnStatus pins the ADR 0023
+// invariant (docs/adr/0023-unified-turn-model.md §4 "Turn-state-at-
+// death") for the stale-socket sweep: a session whose runner vanished
+// (socket gone, no live subscription) but whose turn had already
+// CLOSED must keep its Status{Active:false} so a post-death `gmux
+// wait` resolves "idle" — the same verdict a live wait watching the
+// clean exit would return. Phase 2 previously hard-cleared Status to
+// nil, which terminalReason maps to "died": the verdict became
+// timing-dependent on how the death was detected.
+func TestScanForcedDeathPreservesClosedTurnStatus(t *testing.T) {
+	sockDir := t.TempDir()
+	t.Setenv("GMUX_SOCKET_DIR", sockDir)
+
+	const id = "1yfdxhm6"
+	// Socket path that does NOT exist: Phase 1 discovers no sockets,
+	// Phase 2 stats this path, fails, and force-marks the session dead.
+	sockPath := filepath.Join(sockDir, id+".sock")
+
+	sessions := store.New()
+	sessions.Upsert(store.Session{
+		ID:         id,
+		Adapter:    "shell",
+		Alive:      true,
+		SocketPath: sockPath,
+		StartedAt:  "2026-01-02T03:04:05Z",
+		Status:     &store.Status{Active: false},
+	})
+
+	subs := NewSubscriptions(sessions)
+	t.Cleanup(func() { subs.UnsubscribeAll() })
+
+	Scan(sessions, subs, nil)
+
+	got, ok := sessions.Get(id)
+	if !ok {
+		t.Fatalf("session %s missing after Scan", id)
+	}
+	if got.Alive {
+		t.Fatalf("Alive = true, want false (stale socket must force death)")
+	}
+	if got.Status == nil {
+		t.Fatalf("Status = nil after forced death; want preserved closed turn (ADR 0023): a cleanly-exited session reaped via stale socket must still resolve 'idle'")
+	}
+	if got.Status.Active {
+		t.Errorf("Status.Active = true, want false (closed turn must be preserved)")
+	}
+}
+
+// TestScanForcedDeathPreservesOpenTurnStatus is the mid-turn crash
+// counterpart: a session that died with its turn still OPEN
+// (Active:true) must keep that evidence so `gmux wait` resolves
+// "died" rather than losing the open-turn state to a nil Status.
+func TestScanForcedDeathPreservesOpenTurnStatus(t *testing.T) {
+	sockDir := t.TempDir()
+	t.Setenv("GMUX_SOCKET_DIR", sockDir)
+
+	const id = "15mdn1vv"
+	sockPath := filepath.Join(sockDir, id+".sock")
+
+	sessions := store.New()
+	sessions.Upsert(store.Session{
+		ID:         id,
+		Adapter:    "shell",
+		Alive:      true,
+		SocketPath: sockPath,
+		StartedAt:  "2026-01-02T03:04:05Z",
+		Status:     &store.Status{Active: true},
+	})
+
+	subs := NewSubscriptions(sessions)
+	t.Cleanup(func() { subs.UnsubscribeAll() })
+
+	Scan(sessions, subs, nil)
+
+	got, ok := sessions.Get(id)
+	if !ok {
+		t.Fatalf("session %s missing after Scan", id)
+	}
+	if got.Alive {
+		t.Fatalf("Alive = true, want false (stale socket must force death)")
+	}
+	if got.Status == nil {
+		t.Fatalf("Status = nil after forced death; want preserved open turn (ADR 0023): a mid-turn crash must keep Active=true to resolve 'died'")
+	}
+	if !got.Status.Active {
+		t.Errorf("Status.Active = false, want true (open turn evidence must be preserved)")
+	}
+}

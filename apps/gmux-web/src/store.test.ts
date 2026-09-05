@@ -1,26 +1,30 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
-import {
-  sessions, sessionsLoaded, worldLoaded, projects, upsertSession, removeSession,
-  markSessionRead, dismissSession, reorderSessions,
-  handleActivity, isSessionActive, isSessionFading, activityMap,
-  sessionStaleness, peers, peerAppearance, peerStatusByName,
-  isSessionUnavailable, urlPath, urlSearch, filteredSessions, selectedId,
-  navigateToSession, setNavigate,
-  applyPending, _rawSessions, _rawWorld, _setRawWorld, _pendingMutations,
-  toUISession, localHostLabel, parseConnectURL, unreadCount, discovered,
-  view, duplicateSessionFiles,
-} from './store'
 import { SessionSchema } from '@gmux/protocol'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PendingMutation } from './store'
-import type { Session } from './types'
-import type { ProjectItem } from './types'
+import {
+  _pendingMutations, _rawSessions, _setRawWorld, acknowledgePromotionAnnouncement,
+  activityMap, aggregateSessionDotState, applyPending, applySessionsSnapshot, backgroundActivity, beginPromotion,
+  createViewConsumptionTracker, discovered, dismissSession, duplicateConversationFiles,
+  familyActivityById, familyDotById, familySelectedId, familySlotById, filteredSessions,
+  folders, handleActivity, homePartition, initStore, isSessionActive, isSessionFading,
+  isSessionUnavailable, killSession, localHostLabel, markSessionRead, navigate,
+  navigateToSession, ownDotState, parseConnectURL, peerAppearance, peerOmittedTotal, peerStatusByName, peerStreamOmissions, peers,
+  projects, promoteSession, promotionAnnouncements, promotionPending,
+  PROMOTION_PENDING_TTL_MS, reconcilePromotionPending, removeSession, reorderSessions,
+  reparentSession, resumeSession, selectedFamilyChild, selectedId, sessions, sessionsLoaded,
+  sessionStaleness, setAliveOnly, setFilterSelectors, setHostFilter, setNavigate,
+  setSidebarMode, settlePromotion, sidebarActivity, sidebarMode, sidebarSessions, tabHref,
+  toUISession, unreadCount, upsertSession, urlHash, urlPath, urlSearch, view, worldLoaded,
+} from './store'
+import { toasts } from './toasts'
+import type { ProjectItem, Session } from './types'
 
 function makeSession(overrides: Partial<Session> & { id: string }): Session {
   return {
     created_at: '2026-01-01T00:00:00Z',
     command: ['/bin/sh'],
     cwd: '/home/user',
-    kind: 'shell',
+    adapter: 'shell',
     alive: true,
     pid: 1,
     exit_code: null,
@@ -42,32 +46,369 @@ beforeEach(() => {
   _rawSessions.value = []
   _setRawWorld({ projects: [], peers: [] })
   _pendingMutations.value = []
+  promotionPending.value = new Map()
+  promotionAnnouncements.value = new Map()
   sessionsLoaded.value = false
   worldLoaded.value = false
   urlPath.value = '/'
   urlSearch.value = ''
+  urlHash.value = ''
+  sidebarMode.value = 'projects'
+})
+
+describe('postAction surfaces backend failures as error toasts', () => {
+  beforeEach(() => { toasts.value = [] })
+  afterEach(() => { vi.unstubAllGlobals(); toasts.value = [] })
+
+  it('parses the structured error contract and labels the action', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve(JSON.stringify({
+        ok: false, error: { code: 'not_resumable', message: 'session is not resumable' },
+      })),
+    }))
+    await resumeSession('s1')
+    expect(toasts.value).toHaveLength(1)
+    expect(toasts.value[0]).toMatchObject({ kind: 'error', message: 'Resume failed: session is not resumable' })
+  })
+
+  it('falls back to the status line when the body is not the structured shape', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 500, statusText: 'Internal Server Error',
+      text: () => Promise.resolve(''),
+    }))
+    await killSession('s1')
+    expect(toasts.value[0].message).toBe('Kill failed: Internal Server Error')
+  })
+
+  it('does NOT toast a network reject (connectivity is owned by the reconnecting pill)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    await resumeSession('s1')
+    expect(toasts.value).toHaveLength(0)
+  })
+
+  it('pushes nothing on success', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(''),
+    }))
+    await killSession('s1')
+    expect(toasts.value).toHaveLength(0)
+  })
+
+  it('resolves the success boolean and never rejects (callers branch, not catch)', async () => {
+    // handleResume clears its "resuming…" spinner off this boolean; a
+    // rejection-based contract would leave the spinner stuck for the
+    // fallback timeout since postAction swallows all throws.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 500, statusText: 'Internal Server Error',
+      text: () => Promise.resolve(''),
+    }))
+    await expect(resumeSession('s1')).resolves.toBe(false)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(''),
+    }))
+    await expect(resumeSession('s1')).resolves.toBe(true)
+  })
+})
+
+describe('optimistic dismiss retracts on failure', () => {
+  beforeEach(() => { toasts.value = []; _pendingMutations.value = [] })
+  afterEach(() => { vi.unstubAllGlobals(); toasts.value = []; _pendingMutations.value = [] })
+
+  it('hides the row, then retracts immediately when the server rejects', async () => {
+    _rawSessions.value = [makeSession({ id: 's1' })]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 404, statusText: 'Not Found',
+      text: () => Promise.resolve(JSON.stringify({ error: { message: 'no such session' } })),
+    }))
+    await dismissSession('s1')
+    // Toast surfaced AND the optimistic mutation was retracted (not left
+    // to linger until the TTL), so the session is visible again now.
+    expect(toasts.value[0].message).toBe('Dismiss failed: no such session')
+    expect(_pendingMutations.value).toHaveLength(0)
+    expect(sessions.value.some(s => s.id === 's1')).toBe(true)
+  })
+
+  it('keeps the optimistic dismissal when the server accepts', async () => {
+    _rawSessions.value = [makeSession({ id: 's1' })]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(''),
+    }))
+    await dismissSession('s1')
+    expect(toasts.value).toHaveLength(0)
+    // Mutation stands until the next snapshot confirms removal.
+    expect(_pendingMutations.value).toHaveLength(1)
+    expect(sessions.value.some(s => s.id === 's1')).toBe(false)
+  })
+})
+
+describe('reorder failures are surfaced, never silent', () => {
+  beforeEach(() => { toasts.value = []; _pendingMutations.value = [] })
+  afterEach(() => { vi.unstubAllGlobals(); toasts.value = []; _pendingMutations.value = [] })
+
+  it('toasts when the server rejects a local reorder', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 500, statusText: 'Internal Server Error',
+      text: () => Promise.resolve(JSON.stringify({ error: { message: 'failed to save projects' } })),
+    }))
+    await reorderSessions('gmux', ['y', 'x'])
+    expect(toasts.value[0]).toMatchObject({
+      kind: 'error', message: 'Reorder failed: failed to save projects',
+    })
+    // No overlay to retract: the UI still shows the server's order, which
+    // after a rejection is still the truth.
+    expect(_pendingMutations.value).toHaveLength(0)
+  })
+
+  it('toasts when a peer reorder is rejected', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 502, statusText: 'Bad Gateway',
+      text: () => Promise.resolve(''),
+    }))
+    await reorderSessions('gmux', ['y', 'x'], 'tower')
+    expect(toasts.value[0].message).toBe('Reorder failed: Bad Gateway')
+  })
+
+  it('stays silent on a network reject (owned by the reconnecting pill)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+    await reorderSessions('gmux', ['y', 'x'])
+    expect(toasts.value).toHaveLength(0)
+    expect(_pendingMutations.value).toHaveLength(0)
+  })
 })
 
 describe('filteredSessions reactivity to the URL query string', () => {
   it('recomputes when urlSearch flips, without an SSE session update', () => {
     _rawSessions.value = [
-      makeSession({ id: 'a', cwd: '/home/user/projects/alpha' }),
-      makeSession({ id: 'b', cwd: '/home/user/projects/beta' }),
+      makeSession({ id: 'a', project_slug: 'alpha' }),
+      makeSession({ id: 'b', project_slug: 'beta', peer: 'server' }),
     ]
     // No query: all sessions pass through.
     expect(filteredSessions.value.map(s => s.id)).toEqual(['a', 'b'])
 
-    // Flip only the query signal (no sessions.value change): filter applies.
-    urlSearch.value = '?project=alpha'
+    // Flip only the query signal (no sessions.value change): the
+    // ?filter= selectors apply.
+    urlSearch.value = '?filter=alpha'
     expect(filteredSessions.value.map(s => s.id)).toEqual(['a'])
 
-    // cwd prefix filter, again query-only.
-    urlSearch.value = '?cwd=/home/user/projects/beta'
+    // Host-wide selector, again query-only.
+    urlSearch.value = '?filter=*@server'
     expect(filteredSessions.value.map(s => s.id)).toEqual(['b'])
+
+    // Union of selectors.
+    urlSearch.value = '?filter=alpha,*@server'
+    expect(filteredSessions.value.map(s => s.id)).toEqual(['a', 'b'])
 
     // Clearing the query restores the full list.
     urlSearch.value = ''
     expect(filteredSessions.value.map(s => s.id)).toEqual(['a', 'b'])
+  })
+})
+
+describe('filter never evicts the selected session', () => {
+  beforeEach(() => {
+    _setRawWorld({
+      projects: [
+        { slug: 'alpha', match: [{ path: '/a' }] },
+        { slug: 'beta', match: [{ path: '/b' }] },
+      ],
+      peers: [],
+    })
+    _rawSessions.value = [
+      makeSession({ id: 'a', cwd: '/a', adapter: 'shell', slug: 'aa', project_slug: 'alpha' }),
+      makeSession({ id: 'b', cwd: '/b', adapter: 'shell', slug: 'bb', project_slug: 'beta' }),
+    ]
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    urlPath.value = '/beta/shell/bb'
+  })
+
+  it('routing is filter-blind: a filter excluding the open session keeps the session view', () => {
+    expect(view.value).toEqual({ kind: 'session', sessionId: 'b' })
+    // Narrow the tab to the *other* project: the terminal must stay put,
+    // not fall back to the hub/home.
+    urlSearch.value = '?filter=alpha'
+    expect(view.value).toEqual({ kind: 'session', sessionId: 'b' })
+    expect(selectedId.value).toBe('b')
+  })
+
+  it('sidebar pins the selected session into the list past the filter', () => {
+    urlSearch.value = '?filter=alpha'
+    // filteredSessions drops the out-of-scope session...
+    expect(filteredSessions.value.map(s => s.id)).toEqual(['a'])
+    // ...but the sidebar presentation set keeps the selected one.
+    expect(sidebarSessions.value.map(s => s.id).sort()).toEqual(['a', 'b'])
+    // ...and its folder is therefore rendered.
+    expect(folders.value.some(f => f.slug === 'beta')).toBe(true)
+  })
+
+  it('no pin when nothing is selected (equals the filtered set)', () => {
+    urlPath.value = '/'
+    urlSearch.value = '?filter=alpha'
+    expect(selectedId.value).toBeNull()
+    expect(sidebarSessions.value.map(s => s.id)).toEqual(['a'])
+  })
+})
+
+describe('sidebar views share one membership (Projects == Activity)', () => {
+  const ids = (buckets: { sessions: { id: string }[] }[]) =>
+    buckets.flatMap(b => b.sessions).map(s => s.id).sort()
+  const folderIds = () => folders.value.flatMap(f => f.sessions.map(s => s.id)).sort()
+
+  beforeEach(() => {
+    _setRawWorld({ projects: [{ slug: 'proj', match: [{ path: '/p' }] }], peers: [] })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    urlPath.value = '/'
+    urlSearch.value = ''
+    setAliveOnly(false)
+  })
+  afterEach(() => setAliveOnly(false))
+
+  it('hides agent and process children from both views and selects their root row', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'root', cwd: '/p', adapter: 'pi', slug: 'root', project_slug: 'proj', semantic_agent: true, alive: false, resumable: false }),
+      makeSession({ id: 'child', cwd: '/other', adapter: 'pi', slug: 'child', project_slug: 'proj', semantic_agent: true, parent_session_id: 'root' }),
+      makeSession({ id: 'helper', cwd: '/p', adapter: 'shell', slug: 'helper', project_slug: 'proj', parent_session_id: 'root' }),
+    ]
+    urlPath.value = '/proj/pi/child'
+    expect(folderIds()).toEqual(['root'])
+    expect(ids(sidebarActivity.value)).toEqual(['root'])
+    expect(familySelectedId.value).toBe('root')
+  })
+
+  it('projects normalized peer family facts as one viewer-visible root row', () => {
+    _setRawWorld({
+      projects: [{ slug: 'proj', peer: 'tower' }],
+      peers: [{ name: 'tower', url: '', status: 'connected', session_count: 2 }],
+    })
+    const now = new Date().toISOString()
+    _rawSessions.value = [
+      makeSession({ id: 'root@tower', peer: 'tower', cwd: '/p', adapter: 'pi', slug: 'root', project_slug: 'proj', semantic_agent: true, last_output_at: now }),
+      makeSession({ id: 'child@tower', peer: 'tower', cwd: '/p', adapter: 'pi', slug: 'child', project_slug: 'proj', semantic_agent: true, parent_session_id: 'root@tower', last_output_at: now }),
+    ]
+    expect(folderIds()).toEqual(['root@tower'])
+    expect(ids(sidebarActivity.value)).toEqual(['root@tower'])
+    expect(homePartition.value.flatMap(bucket => bucket.sessions.map(s => s.id))).toEqual(['root@tower'])
+  })
+
+  it('temporarily places an unstamped root from its relevant child folder', () => {
+    const root = makeSession({ id: 'root', cwd: '/p', adapter: 'pi', slug: 'root', semantic_agent: true, alive: false, resumable: false })
+    const child = makeSession({ id: 'child', cwd: '/p', adapter: 'pi', slug: 'child', project_slug: 'proj', semantic_agent: true, parent_session_id: 'root', alive: true })
+    _rawSessions.value = [root, child]
+
+    expect(folders.value.map(folder => [folder.slug, ...folder.sessions.map(s => s.id)])).toEqual([['proj', 'root']])
+    expect(ids(sidebarActivity.value)).toEqual(['root'])
+    expect(_rawSessions.value.find(s => s.id === 'root')?.project_slug).toBeUndefined()
+
+    _rawSessions.value = [{ ...root, project_slug: 'proj' }, child]
+    expect(folders.value.map(folder => [folder.slug, ...folder.sessions.map(s => s.id)])).toEqual([['proj', 'root']])
+    expect(ids(sidebarActivity.value)).toEqual(['root'])
+    expect(folders.value[0]?.sessions[0]?.project_slug).toBe('proj')
+  })
+
+  it('keeps a dead root visible while a live child makes its family relevant', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'root', cwd: '/p', adapter: 'pi', slug: 'root', project_slug: 'proj', semantic_agent: true, alive: false, resumable: false }),
+      makeSession({ id: 'child', cwd: '/p', adapter: 'pi', slug: 'child', project_slug: 'proj', semantic_agent: true, parent_session_id: 'root', alive: true }),
+    ]
+    expect(folderIds()).toEqual(['root'])
+    expect(ids(sidebarActivity.value)).toEqual(['root'])
+  })
+
+  it('resolves family edges against the full snapshot under a tab filter', () => {
+    _setRawWorld({ projects: [
+      { slug: 'root-project', match: [{ path: '/root' }] },
+      { slug: 'child-project', match: [{ path: '/child' }] },
+    ], peers: [] })
+    _rawSessions.value = [
+      makeSession({ id: 'root', cwd: '/root', adapter: 'pi', slug: 'root', project_slug: 'root-project', semantic_agent: true, alive: false, resumable: false }),
+      makeSession({ id: 'child', cwd: '/child', adapter: 'pi', slug: 'child', project_slug: 'child-project', semantic_agent: true, parent_session_id: 'root', alive: true }),
+    ]
+    urlSearch.value = '?filter=child-project'
+    expect(folderIds()).toEqual(['root'])
+  })
+
+  it('keeps malformed cycle members reachable in the sidebar and Home', () => {
+    const now = new Date().toISOString()
+    _rawSessions.value = [
+      makeSession({ id: 'a', cwd: '/p', adapter: 'pi', slug: 'a', project_slug: 'proj', semantic_agent: true, parent_session_id: 'b', last_output_at: now }),
+      makeSession({ id: 'b', cwd: '/p', adapter: 'pi', slug: 'b', project_slug: 'proj', semantic_agent: true, parent_session_id: 'a', last_output_at: now }),
+    ]
+    expect(folderIds()).toEqual(['a', 'b'])
+    expect(homePartition.value.flatMap(bucket => bucket.sessions.map(s => s.id)).sort()).toEqual(['a', 'b'])
+  })
+
+  it('groups process children only under resolved agent parents', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'agent-parent', cwd: '/p', adapter: 'pi', project_slug: 'proj', semantic_agent: true }),
+      makeSession({ id: 'shell-child', cwd: '/p', adapter: 'shell', project_slug: 'proj', parent_session_id: 'agent-parent' }),
+      makeSession({ id: 'shell-parent', cwd: '/p', adapter: 'shell', project_slug: 'proj' }),
+      makeSession({ id: 'agent-under-shell', cwd: '/p', adapter: 'pi', project_slug: 'proj', semantic_agent: true, parent_session_id: 'shell-parent' }),
+      makeSession({ id: 'orphan', cwd: '/p', adapter: 'pi', project_slug: 'proj', semantic_agent: true, parent_session_id: 'missing' }),
+    ]
+    expect(folderIds()).toEqual(['agent-parent', 'agent-under-shell', 'orphan', 'shell-parent'])
+    expect(ids(sidebarActivity.value)).toEqual(folderIds())
+  })
+
+  it('Activity lists exactly the sessions the folders do (alive, resumable, dead-selected)', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'live', cwd: '/p', adapter: 'shell', slug: 'lv', alive: true, project_slug: 'proj' }),
+      makeSession({ id: 'resumable', cwd: '/p', adapter: 'shell', slug: 'rs', alive: false, resumable: true, project_slug: 'proj' }),
+    ]
+    // No selection: folders and Activity agree.
+    expect(ids(sidebarActivity.value)).toEqual(folderIds())
+    expect(ids(sidebarActivity.value)).toEqual(['live', 'resumable'])
+  })
+
+  it('keeps Activity aligned with Projects while recovered sessions are unstamped', () => {
+    // gmuxd emits recovered sessions before its asynchronous project
+    // stamping pass completes. They are sidebar-eligible but cannot be
+    // placed in a project folder yet, so neither view should render them.
+    _rawSessions.value = [
+      makeSession({ id: 'recovered', cwd: '/p', adapter: 'shell', slug: 'rc', alive: true }),
+    ]
+    expect(sidebarSessions.value.map(s => s.id)).toEqual(['recovered'])
+    expect(folderIds()).toEqual([])
+    expect(ids(sidebarActivity.value)).toEqual([])
+
+    // The later sessions snapshot carries the stamp and both views
+    // repopulate from the same membership in the same update.
+    _rawSessions.value = [
+      makeSession({ id: 'recovered', cwd: '/p', adapter: 'shell', slug: 'rc', alive: true, project_slug: 'proj' }),
+    ]
+    expect(folderIds()).toEqual(['recovered'])
+    expect(ids(sidebarActivity.value)).toEqual(['recovered'])
+  })
+
+  it('keeps a resumable-dead session reachable in Activity (Finding 1)', () => {
+    // The original bug: Activity ran through partitionForHome, which
+    // dropped dead sessions, so a resumable corpse open in the terminal
+    // had no Activity row. partitionByDay day-buckets it like anything
+    // else (dead included), so both views agree on membership.
+    _rawSessions.value = [
+      makeSession({ id: 'live', cwd: '/p', adapter: 'shell', slug: 'lv', alive: true, last_output_at: new Date().toISOString(), project_slug: 'proj' }),
+      makeSession({ id: 'corpse', cwd: '/p', adapter: 'shell', slug: 'cp', alive: false, resumable: true, project_slug: 'proj' }),
+    ]
+    expect(ids(sidebarActivity.value)).toEqual(folderIds())
+    expect(ids(sidebarActivity.value)).toEqual(['corpse', 'live'])
+  })
+
+  it('alive-only narrows both views identically (but keeps the selected)', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'live', cwd: '/p', adapter: 'shell', slug: 'lv', alive: true, project_slug: 'proj' }),
+      makeSession({ id: 'resumable', cwd: '/p', adapter: 'shell', slug: 'rs', alive: false, resumable: true, project_slug: 'proj' }),
+    ]
+    setAliveOnly(true)
+    expect(ids(sidebarActivity.value)).toEqual(folderIds())
+    expect(ids(sidebarActivity.value)).toEqual(['live'])
+    // Selecting the resumable one keeps it visible in both despite alive-only.
+    urlPath.value = '/proj/shell/rs'
+    expect(selectedId.value).toBe('resumable')
+    expect(folderIds()).toEqual(['live', 'resumable'])
+    expect(ids(sidebarActivity.value)).toEqual(['live', 'resumable'])
   })
 })
 
@@ -79,7 +420,7 @@ describe('filteredSessions reactivity to the URL query string', () => {
 describe('toUISession project stamp passthrough', () => {
   it('preserves project_slug and project_index from the wire', () => {
     const ui = toUISession({
-      id: 'sess-1', alive: true,
+      id: '1vshk4fu', alive: true,
       project_slug: 'gmux', project_index: 3,
     } as any)
     expect(ui.project_slug).toBe('gmux')
@@ -91,7 +432,7 @@ describe('toUISession project stamp passthrough', () => {
     // falsy in JS. Guards against future ||-coercion regressions on
     // this field.
     const ui = toUISession({
-      id: 'sess-1', alive: true,
+      id: '1vshk4fu', alive: true,
       project_slug: 'gmux', project_index: 0,
     } as any)
     expect(ui.project_index).toBe(0)
@@ -99,25 +440,47 @@ describe('toUISession project stamp passthrough', () => {
 
   it('leaves stamps undefined when the wire omits them', () => {
     const ui = toUISession({
-      id: 'sess-1', alive: true,
+      id: '1vshk4fu', alive: true,
     } as any)
     expect(ui.project_slug).toBeUndefined()
   })
 
-  it('passes last_activity_at through from the wire', () => {
+  it('passes last_output_at through from the wire', () => {
     // The owning daemon stamps this; the UI uses it for the home
     // dashboard's Recent section sort. Pure passthrough at the
     // boundary; no client-side derivation.
     const ui = toUISession({
-      id: 'sess-1', alive: true,
-      last_activity_at: '2026-01-15T08:00:00Z',
+      id: '1vshk4fu', alive: true,
+      last_output_at: '2026-01-15T08:00:00Z',
     } as any)
-    expect(ui.last_activity_at).toBe('2026-01-15T08:00:00Z')
+    expect(ui.last_output_at).toBe('2026-01-15T08:00:00Z')
   })
 
-  it('leaves last_activity_at undefined when the wire omits it', () => {
-    const ui = toUISession({ id: 'sess-1', alive: true } as any)
-    expect(ui.last_activity_at).toBeUndefined()
+  it('leaves last_output_at undefined when the wire omits it', () => {
+    const ui = toUISession({ id: '1vshk4fu', alive: true } as any)
+    expect(ui.last_output_at).toBeUndefined()
+  })
+
+  it('normalizes durable active-at-death for local and peer UI rows', () => {
+    const local = toUISession({ id: 'local', alive: false, status: { active: true, error: true } } as any)
+    const peer = toUISession({ id: 'remote@peer', peer: 'peer', alive: false, status: { active: true } } as any)
+    expect(local.status).toEqual({ active: false, error: true })
+    expect(peer.status?.active).toBe(false)
+  })
+
+  it('preserves active and active-error for alive local and peer UI rows', () => {
+    const local = toUISession({ id: 'local', alive: true, status: { active: true } } as any)
+    const peer = toUISession({
+      id: 'remote@peer', peer: 'peer', alive: true, status: { active: true, error: true },
+    } as any)
+    expect(local.status).toEqual({ active: true })
+    expect(peer.status).toEqual({ active: true, error: true })
+  })
+
+  it('normalizes status.active to boolean for malformed missing alive input', () => {
+    const ui = toUISession({ id: 'legacy', status: { active: true, error: true } } as any)
+    expect(ui.status).toEqual({ active: false, error: true })
+    expect(typeof ui.status?.active).toBe('boolean')
   })
 
   it('treats empty-string project_slug as unstamped', () => {
@@ -126,7 +489,7 @@ describe('toUISession project stamp passthrough', () => {
     // as no stamp; normalize at the boundary so consumers never
     // see the difference.
     const ui = toUISession({
-      id: 'sess-1', alive: true, project_slug: '',
+      id: '1vshk4fu', alive: true, project_slug: '',
     } as any)
     expect(ui.project_slug).toBeUndefined()
   })
@@ -135,19 +498,19 @@ describe('toUISession project stamp passthrough', () => {
 describe('upsertSession', () => {
   it('inserts a new session and returns true', () => {
     const isNew = upsertSession({
-      id: 'sess-1', alive: true, cwd: '/home/user',
-      command: ['/bin/sh'], kind: 'shell',
+      id: '1vshk4fu', alive: true, cwd: '/home/user',
+      command: ['/bin/sh'], adapter: 'shell',
     } as any)
     expect(isNew).toBe(true)
     expect(sessions.value).toHaveLength(1)
-    expect(sessions.value[0].id).toBe('sess-1')
+    expect(sessions.value[0].id).toBe('1vshk4fu')
   })
 
   it('updates an existing session and returns false', () => {
-    _rawSessions.value = [makeSession({ id: 'sess-1', title: 'old' })]
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', title: 'old' })]
     const isNew = upsertSession({
-      id: 'sess-1', alive: true, title: 'new',
-      cwd: '/home/user', command: ['/bin/sh'], kind: 'shell',
+      id: '1vshk4fu', alive: true, title: 'new',
+      cwd: '/home/user', command: ['/bin/sh'], adapter: 'shell',
     } as any)
     expect(isNew).toBe(false)
     expect(sessions.value).toHaveLength(1)
@@ -156,12 +519,12 @@ describe('upsertSession', () => {
 
   it('preserves other sessions during update', () => {
     _rawSessions.value = [
-      makeSession({ id: 'sess-1', title: 'first' }),
-      makeSession({ id: 'sess-2', title: 'second' }),
+      makeSession({ id: '1vshk4fu', title: 'first' }),
+      makeSession({ id: '155mk8b7', title: 'second' }),
     ]
     upsertSession({
-      id: 'sess-1', alive: false, title: 'updated',
-      cwd: '/home/user', command: ['/bin/sh'], kind: 'shell',
+      id: '1vshk4fu', alive: false, title: 'updated',
+      cwd: '/home/user', command: ['/bin/sh'], adapter: 'shell',
     } as any)
     expect(sessions.value).toHaveLength(2)
     expect(sessions.value[0].title).toBe('updated')
@@ -176,21 +539,21 @@ describe('upsertSession', () => {
     sessionsLoaded.value = true
     worldLoaded.value = true
     _rawSessions.value = [
-      makeSession({ id: 'sess-1', cwd: '/dev/project', kind: 'pi', slug: 'fix-auth' }),
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth' }),
     ]
     // Simulate the session being selected via URL.
     urlPath.value = '/myproject/pi/fix-auth'
-    expect(selectedId.value).toBe('sess-1')
+    expect(selectedId.value).toBe('1vshk4fu')
 
     // SSE upserts with a new slug (e.g., /new changed the active file).
     upsertSession({
-      id: 'sess-1', alive: true, cwd: '/dev/project', kind: 'pi',
+      id: '1vshk4fu', alive: true, cwd: '/dev/project', adapter: 'pi',
       slug: 'refactor-login', command: ['pi'], title: 'pi',
     } as any)
 
     // URL should be atomically rewritten; session stays selected.
     expect(urlPath.value).toBe('/myproject/pi/refactor-login')
-    expect(selectedId.value).toBe('sess-1')
+    expect(selectedId.value).toBe('1vshk4fu')
   })
 
   it('does not rewrite URL when a non-selected session slug changes', () => {
@@ -201,21 +564,397 @@ describe('upsertSession', () => {
     sessionsLoaded.value = true
     worldLoaded.value = true
     _rawSessions.value = [
-      makeSession({ id: 'sess-1', cwd: '/dev/project', kind: 'pi', slug: 'fix-auth' }),
-      makeSession({ id: 'sess-2', cwd: '/dev/project', kind: 'pi', slug: 'old-slug' }),
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth' }),
+      makeSession({ id: '155mk8b7', cwd: '/dev/project', adapter: 'pi', slug: 'old-slug' }),
     ]
     urlPath.value = '/myproject/pi/fix-auth'
-    expect(selectedId.value).toBe('sess-1')
+    expect(selectedId.value).toBe('1vshk4fu')
 
-    // sess-2's slug changes, but it's not the selected session.
+    // 155mk8b7's slug changes, but it's not the selected session.
     upsertSession({
-      id: 'sess-2', alive: true, cwd: '/dev/project', kind: 'pi',
+      id: '155mk8b7', alive: true, cwd: '/dev/project', adapter: 'pi',
       slug: 'new-slug', command: ['pi'], title: 'pi',
     } as any)
 
     // URL should be unchanged.
     expect(urlPath.value).toBe('/myproject/pi/fix-auth')
-    expect(selectedId.value).toBe('sess-1')
+    expect(selectedId.value).toBe('1vshk4fu')
+  })
+})
+
+describe('applySessionsSnapshot: /resume keeps the terminal mounted', () => {
+  // Regression for the /resume boot-to-project bug (and the same class of
+  // rename bug, #348/#360). A pi /resume keeps the gmux session id but
+  // swaps the active conversation, so the title-derived slug changes. The
+  // daemon re-pushes the *entire* session list (protocol 2 / ADR 0001),
+  // which the client applies wholesale via applySessionsSnapshot.
+  //
+  // These drive the real production entry point (not the extracted helper
+  // in isolation) and assert the observable that actually regressed: the
+  // resolved `view` must stay on the session, with the URL rewritten in
+  // place — not fall back to the project hub. Testing the seam, not just
+  // the helper, is deliberate: the original regression was precisely that
+  // the rewrite logic existed but nothing on the live path called it.
+  const testProjects: ProjectItem[] = [
+    { slug: 'myproject', match: [{ path: '/dev/project' }] },
+  ]
+  const navCalls: Array<[string, boolean | undefined]> = []
+  beforeEach(() => {
+    navCalls.length = 0
+    setNavigate((url, replace) => { navCalls.push([url, replace]) })
+    _setRawWorld({ projects: testProjects })
+    _rawSessions.value = [
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth' }),
+    ]
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    urlPath.value = '/myproject/pi/fix-auth'
+  })
+
+  it('rewrites the URL and keeps the session view when the selected slug changes', () => {
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+
+    // Snapshot: same id, resumed slug, brand-new array (the wire shape).
+    applySessionsSnapshot([
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'refactor-login' }),
+    ])
+
+    expect(urlPath.value).toBe('/myproject/pi/refactor-login')
+    // The user stays on the terminal — no boot to the project hub.
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+    // Address bar synced via replaceState (replace=true), so back/forward
+    // history isn't polluted.
+    expect(navCalls).toContainEqual(['/myproject/pi/refactor-login', true])
+  })
+
+  it('atomically switches the selected row to its full ID and carries route state when a duplicate slug arrives', () => {
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+    urlSearch.value = '?filter=myproject'
+    urlHash.value = '#terminal'
+    sidebarMode.value = 'activity'
+
+    applySessionsSnapshot([
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth', alive: true }),
+      makeSession({ id: '1eha7rdu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth', alive: false }),
+    ])
+
+    expect(urlPath.value).toBe('/myproject/pi/~1vshk4fu')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+    expect(navCalls).toContainEqual([
+      '/myproject/pi/~1vshk4fu?filter=myproject&sidebar=activity#terminal', true,
+    ])
+  })
+
+  it('preserves the tab filter across a slug-rewrite navigation', () => {
+    // Regression: the canonicalization rewrite used to navigate with the
+    // bare path, stripping ?filter= (and ?sidebar=) from a pinned tab.
+    urlSearch.value = '?filter=myproject'
+    sidebarMode.value = 'activity'
+
+    applySessionsSnapshot([
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'refactor-login' }),
+    ])
+
+    expect(navCalls).toContainEqual(
+      ['/myproject/pi/refactor-login?filter=myproject&sidebar=activity', true],
+    )
+  })
+
+  it('leaves the URL untouched when the selected slug is unchanged', () => {
+    applySessionsSnapshot([
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth', title: 'now working' }),
+    ])
+
+    expect(urlPath.value).toBe('/myproject/pi/fix-auth')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+    expect(navCalls).toEqual([])
+  })
+
+  it('does not rewrite when a non-selected session changes slug', () => {
+    _rawSessions.value = [
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth' }),
+      makeSession({ id: '155mk8b7', cwd: '/dev/project', adapter: 'pi', slug: 'old' }),
+    ]
+
+    applySessionsSnapshot([
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth' }),
+      makeSession({ id: '155mk8b7', cwd: '/dev/project', adapter: 'pi', slug: 'new' }),
+    ])
+
+    expect(urlPath.value).toBe('/myproject/pi/fix-auth')
+    expect(navCalls).toEqual([])
+  })
+
+  it('boots home only when the selected session is genuinely gone', () => {
+    // A snapshot that drops the session (killed) — distinct from a slug
+    // change — should fall through to the normal commit and let the view
+    // resolve home (project hubs are retired).
+    applySessionsSnapshot([])
+
+    expect(view.value).toEqual({ kind: 'home' })
+  })
+
+  it('still commits the snapshot (loaded flags flip) when nothing is selected', () => {
+    urlPath.value = '/'
+    sessionsLoaded.value = false
+    applySessionsSnapshot([
+      makeSession({ id: '12ak7jhz', cwd: '/dev/project', adapter: 'pi', slug: 'x' }),
+    ])
+    expect(sessionsLoaded.value).toBe(true)
+    expect(sessions.value.map(s => s.id)).toContain('12ak7jhz')
+    expect(navCalls).toEqual([])
+  })
+})
+
+describe('promote/demote pending request ownership', () => {
+  it('settles only the matching request token, including across sessions', () => {
+    const sessionA = beginPromotion('session-a', 'promote', null)
+    const sessionB = beginPromotion('session-b', 'demote', 'root')
+
+    settlePromotion('session-a', sessionB)
+    expect(promotionPending.value.get('session-a')?.seq).toBe(sessionA)
+    expect(promotionPending.value.get('session-b')?.seq).toBe(sessionB)
+
+    settlePromotion('session-a', sessionA)
+    expect(promotionPending.value.has('session-a')).toBe(false)
+    expect(promotionPending.value.has('session-b')).toBe(true)
+  })
+
+  it('does not let an older request clear a newer request for one session', () => {
+    const first = beginPromotion('session', 'promote', null)
+    const second = beginPromotion('session', 'promote', null)
+
+    settlePromotion('session', first)
+    expect(promotionPending.value.get('session')?.seq).toBe(second)
+    settlePromotion('session', second)
+    expect(promotionPending.value.has('session')).toBe(false)
+  })
+
+  it('reconciles an unmounted session target and reversal without a stale guard', () => {
+    const root = makeSession({ id: 'root', semantic_agent: true, project_slug: 'p' })
+    const child = makeSession({ id: 'child', parent_session_id: 'root', project_slug: 'p' })
+    _setRawWorld({ projects: [{ slug: 'p', match: [{ path: '/p' }] }] })
+    _rawSessions.value = [root, child]
+    const seq = beginPromotion('child', 'promote', null)
+
+    // A is not selected/mounted; the central snapshot boundary still consumes it.
+    reconcilePromotionPending([root, { ...child, parent_session_id: undefined }])
+    expect(promotionPending.value.has('child')).toBe(false)
+    expect(promotionAnnouncements.value.get('child')).toMatchObject({ seq, kind: 'promote' })
+
+    // An external demote after that success must not recreate or wedge A.
+    reconcilePromotionPending([root, { ...child, parent_session_id: 'root' }])
+    expect(promotionPending.value.has('child')).toBe(false)
+    expect(promotionAnnouncements.value.get('child')?.message).toBe('Promoted to root.')
+    acknowledgePromotionAnnouncement('child', seq)
+    expect(promotionAnnouncements.value.get('child')?.seq).toBe(seq)
+  })
+
+  it('reconciles demote success and clears deletion/terminal transitions silently', () => {
+    const root = makeSession({ id: 'root', semantic_agent: true, project_slug: 'p' })
+    const child = makeSession({ id: 'child', launched_from_session_id: 'root', project_slug: 'p' })
+    _setRawWorld({ projects: [{ slug: 'p', match: [{ path: '/p' }] }] })
+
+    _rawSessions.value = [root, child]
+    const demoteSeq = beginPromotion('child', 'demote', 'root')
+    reconcilePromotionPending([{ ...root }, { ...child, parent_session_id: 'root' }])
+    expect(promotionPending.value.has('child')).toBe(false)
+    expect(promotionAnnouncements.value.get('child')).toMatchObject({ seq: demoteSeq, kind: 'demote', message: 'Returned to family.' })
+
+    promotionAnnouncements.value = new Map()
+    _rawSessions.value = [root, child]
+    const deletedSeq = beginPromotion('child', 'demote', 'root')
+    reconcilePromotionPending([root])
+    expect(deletedSeq).toBeTypeOf('number')
+    expect(promotionPending.value.has('child')).toBe(false)
+    expect(promotionAnnouncements.value.has('child')).toBe(false)
+
+    _rawSessions.value = [root, child]
+    const terminalSeq = beginPromotion('child', 'demote', 'root')
+    reconcilePromotionPending([{ ...child, parent_session_id: undefined }])
+    expect(terminalSeq).toBeTypeOf('number')
+    expect(promotionPending.value.has('child')).toBe(false)
+    expect(promotionAnnouncements.value.has('child')).toBe(false)
+  })
+
+  it('clears a hung request at the explicit final safety deadline', () => {
+    vi.useFakeTimers()
+    try {
+      beginPromotion('hung', 'promote', null)
+      expect(promotionPending.value.has('hung')).toBe(true)
+      vi.advanceTimersByTime(PROMOTION_PENDING_TTL_MS)
+      expect(promotionPending.value.has('hung')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('promote/demote: endpoint wiring and failure surfacing', () => {
+  beforeEach(() => { toasts.value = [] })
+  afterEach(() => { vi.unstubAllGlobals(); toasts.value = [] })
+
+  it('posts both mutations to the reparent endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: 'OK', text: () => Promise.resolve(''),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(promoteSession('kid1')).resolves.toBe(true)
+    expect(fetchMock).toHaveBeenCalledWith('/v1/sessions/kid1/reparent', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"parent_session_id":null}',
+    })
+    await expect(reparentSession('kid1', 'root', 'Return to family')).resolves.toBe(true)
+    expect(fetchMock).toHaveBeenCalledWith('/v1/sessions/kid1/reparent', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"parent_session_id":"root"}',
+    })
+    expect(toasts.value).toHaveLength(0)
+  })
+
+  it('toasts the daemon message on rejection (e.g. local_only for a raced peer)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 400, statusText: 'Bad Request',
+      text: () => Promise.resolve(JSON.stringify({
+        ok: false, error: { code: 'local_only', message: 'promote is only available for sessions owned by this daemon; run gmux on the owning host' },
+      })),
+    }))
+    await expect(promoteSession('peer-kid')).resolves.toBe(false)
+    expect(toasts.value[0]).toMatchObject({
+      kind: 'error',
+      message: 'Promote failed: promote is only available for sessions owned by this daemon; run gmux on the owning host',
+    })
+    // No optimistic overlay exists for promotion, so there is nothing to
+    // retract and the sidebar keeps showing the server's truth throughout.
+    expect(_pendingMutations.value).toHaveLength(0)
+  })
+
+  it('demote failures label the action in the user\u2019s words', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 404, statusText: 'Not Found',
+      text: () => Promise.resolve(JSON.stringify({ error: { message: 'session not found' } })),
+    }))
+    await expect(reparentSession('ghost', 'root', 'Return to family')).resolves.toBe(false)
+    expect(toasts.value[0].message).toBe('Return to family failed: session not found')
+  })
+
+  it('stays silent on a network reject (connectivity is the pill\u2019s story)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+    await expect(promoteSession('kid1')).resolves.toBe(false)
+    expect(toasts.value).toHaveLength(0)
+  })
+})
+
+describe('promotion snapshots preserve the selected session\u2019s routing', () => {
+  // Promotion changes which project a session presents under: an
+  // unpromoted child routes through its root's project, a promoted one
+  // through its own project_slug. The authoritative SSE snapshot must
+  // therefore land together with a URL rewrite (commitWithSlugRewrite),
+  // or the old URL stops resolving and the router boots the user home —
+  // the "false root state" failure mode. These pin the seam for both
+  // directions with the worst case: the child's own project differs
+  // from the root's.
+  const navCalls: Array<[string, boolean | undefined]> = []
+  const rootSession = () => makeSession({
+    id: '1aaaaaaa', cwd: '/dev/alpha', adapter: 'pi', slug: 'orchestrator',
+    semantic_agent: true, project_slug: 'alpha',
+  })
+  const childSession = (promoted: boolean) => makeSession({
+    id: '1bbbbbbb', cwd: '/dev/beta', adapter: 'pi', slug: 'worker',
+    semantic_agent: true, launched_from_session_id: '1aaaaaaa',
+    project_slug: 'beta', parent_session_id: promoted ? undefined : '1aaaaaaa',
+  })
+  beforeEach(() => {
+    navCalls.length = 0
+    setNavigate((url, replace) => { navCalls.push([url, replace]) })
+    _setRawWorld({ projects: [
+      { slug: 'alpha', match: [{ path: '/dev/alpha' }] },
+      { slug: 'beta', match: [{ path: '/dev/beta' }] },
+    ] })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+  })
+  afterEach(() => { setNavigate(() => {/* no-op */}) })
+
+  it('promote: URL moves from the root\u2019s project to the child\u2019s own, view stays put', () => {
+    _rawSessions.value = [rootSession(), childSession(false)]
+    urlPath.value = '/alpha/pi/worker'
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+
+    applySessionsSnapshot([rootSession(), childSession(true)])
+
+    expect(urlPath.value).toBe('/beta/pi/worker')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+    expect(navCalls).toContainEqual(['/beta/pi/worker', true])
+  })
+
+  it('demote: URL rejoins the root\u2019s project, view stays put', () => {
+    _rawSessions.value = [rootSession(), childSession(true)]
+    urlPath.value = '/beta/pi/worker'
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+
+    applySessionsSnapshot([rootSession(), childSession(false)])
+
+    expect(urlPath.value).toBe('/alpha/pi/worker')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+    expect(navCalls).toContainEqual(['/alpha/pi/worker', true])
+  })
+
+  it('promoting a NON-selected session never touches the URL', () => {
+    _rawSessions.value = [rootSession(), childSession(false)]
+    urlPath.value = '/alpha/pi/orchestrator'
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1aaaaaaa' })
+
+    applySessionsSnapshot([rootSession(), childSession(true)])
+
+    expect(urlPath.value).toBe('/alpha/pi/orchestrator')
+    expect(navCalls).toEqual([])
+  })
+
+  it('promote into a slug collision: the selected child switches to its ~id URL', () => {
+    // Project beta already holds a pi session slugged `worker`. Promoting the
+    // selected child (same adapter, same slug) into beta makes the plain slug
+    // ambiguous, so the canonical URL must switch to the exact-id form in the
+    // same snapshot commit — not resolve to the wrong session or fall home.
+    const squatter = makeSession({
+      id: '1ccccccc', cwd: '/dev/beta', adapter: 'pi', slug: 'worker', project_slug: 'beta',
+    })
+    _rawSessions.value = [rootSession(), childSession(false), squatter]
+    urlPath.value = '/alpha/pi/worker'
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+
+    applySessionsSnapshot([rootSession(), childSession(true), squatter])
+
+    expect(urlPath.value).toBe('/beta/pi/~1bbbbbbb')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1bbbbbbb' })
+    expect(navCalls).toContainEqual(['/beta/pi/~1bbbbbbb', true])
+  })
+
+  it('a NON-selected promotion that collides moves the selected session to its ~id URL', () => {
+    // Viewing the beta squatter; someone promotes the child into beta with
+    // the same adapter+slug. The squatter's plain-slug URL becomes ambiguous
+    // and must be rewritten to its exact-id form, view preserved.
+    const squatter = makeSession({
+      id: '1ccccccc', cwd: '/dev/beta', adapter: 'pi', slug: 'worker', project_slug: 'beta',
+    })
+    _rawSessions.value = [rootSession(), childSession(false), squatter]
+    urlPath.value = '/beta/pi/worker'
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1ccccccc' })
+
+    applySessionsSnapshot([rootSession(), childSession(true), squatter])
+
+    expect(urlPath.value).toBe('/beta/pi/~1ccccccc')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1ccccccc' })
+  })
+
+  it('promote reprojects the sidebar: the child earns its own folder row', () => {
+    _rawSessions.value = [rootSession(), childSession(false)]
+    const before = folders.value
+    expect(before.find(f => f.slug === 'beta')?.sessions ?? []).toHaveLength(0)
+
+    applySessionsSnapshot([rootSession(), childSession(true)])
+
+    const after = folders.value
+    expect(after.find(f => f.slug === 'beta')?.sessions.map(s => s.id)).toEqual(['1bbbbbbb'])
+    expect(after.find(f => f.slug === 'alpha')?.sessions.map(s => s.id)).toEqual(['1aaaaaaa'])
   })
 })
 
@@ -231,7 +970,7 @@ describe('deep-link refresh: snapshot ordering race (#308-adjacent)', () => {
   it('does not resolve a session URL to home before the world loads', () => {
     urlPath.value = '/myproject/pi/fix-auth'
     _rawSessions.value = [
-      makeSession({ id: 'sess-1', cwd: '/dev/project', kind: 'pi', slug: 'fix-auth', project_slug: 'myproject' }),
+      makeSession({ id: '1vshk4fu', cwd: '/dev/project', adapter: 'pi', slug: 'fix-auth', project_slug: 'myproject' }),
     ]
     // Sessions snapshot arrived; world has not (projects still empty).
     sessionsLoaded.value = true
@@ -245,23 +984,23 @@ describe('deep-link refresh: snapshot ordering race (#308-adjacent)', () => {
     _setRawWorld({ projects: [{ slug: 'myproject', match: [{ path: '/dev/project' }] }] })
     worldLoaded.value = true
 
-    expect(view.value).toEqual({ kind: 'session', sessionId: 'sess-1' })
-    expect(selectedId.value).toBe('sess-1')
+    expect(view.value).toEqual({ kind: 'session', sessionId: '1vshk4fu' })
+    expect(selectedId.value).toBe('1vshk4fu')
   })
 })
 
 describe('removeSession', () => {
   it('removes the session with the given id', () => {
     _rawSessions.value = [
-      makeSession({ id: 'sess-1' }),
-      makeSession({ id: 'sess-2' }),
+      makeSession({ id: '1vshk4fu' }),
+      makeSession({ id: '155mk8b7' }),
     ]
-    removeSession('sess-1')
-    expect(sessions.value.map(s => s.id)).toEqual(['sess-2'])
+    removeSession('1vshk4fu')
+    expect(sessions.value.map(s => s.id)).toEqual(['155mk8b7'])
   })
 
   it('is a no-op for unknown ids', () => {
-    _rawSessions.value = [makeSession({ id: 'sess-1' })]
+    _rawSessions.value = [makeSession({ id: '1vshk4fu' })]
     removeSession('ghost')
     expect(sessions.value).toHaveLength(1)
   })
@@ -273,35 +1012,89 @@ describe('markSessionRead', () => {
   afterEach(() => { vi.restoreAllMocks() })
 
   it('clears unread flag on the target session', () => {
-    _rawSessions.value = [makeSession({ id: 'sess-1', unread: true })]
-    markSessionRead('sess-1')
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', unread: true })]
+    markSessionRead('1vshk4fu')
     expect(sessions.value[0].unread).toBe(false)
   })
 
-  it('clears error flag from status', () => {
+  it('preserves durable error while clearing unread', () => {
     _rawSessions.value = [makeSession({
-      id: 'sess-1',
-      status: { label: 'failed', working: false, error: true },
+      id: '1vshk4fu', unread: true, unread_token: 'turn-1',
+      status: { active: false, error: true },
     })]
-    markSessionRead('sess-1')
-    expect(sessions.value[0].status?.error).toBe(false)
-    expect(sessions.value[0].status?.label).toBe('failed')
+    markSessionRead('1vshk4fu')
+    expect(sessions.value[0].unread).toBe(false)
+    expect(sessions.value[0].status?.error).toBe(true)
   })
 
   it('does not touch other sessions', () => {
     _rawSessions.value = [
-      makeSession({ id: 'sess-1', unread: true }),
-      makeSession({ id: 'sess-2', unread: true }),
+      makeSession({ id: '1vshk4fu', unread: true }),
+      makeSession({ id: '155mk8b7', unread: true }),
     ]
-    markSessionRead('sess-1')
+    markSessionRead('1vshk4fu')
     expect(sessions.value[0].unread).toBe(false)
     expect(sessions.value[1].unread).toBe(true)
   })
 
-  it('posts to the server', () => {
-    _rawSessions.value = [makeSession({ id: 'sess-1', unread: true })]
-    markSessionRead('sess-1')
-    expect(fetch).toHaveBeenCalledWith('/v1/sessions/sess-1/read', { method: 'POST' })
+  it('posts the observed unread generation to the server', () => {
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', unread: true, unread_token: 'token-7' })]
+    markSessionRead('1vshk4fu')
+    expect(fetch).toHaveBeenCalledWith('/v1/sessions/1vshk4fu/read?token=token-7', { method: 'POST' })
+  })
+
+  it('does not let a delayed view acknowledgement mask a newer completion', () => {
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', unread: true, unread_token: 'token-7' })]
+    markSessionRead('1vshk4fu')
+    expect(sessions.value[0].unread).toBe(false)
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', unread: true, unread_token: 'token-8' })]
+    expect(sessions.value[0].unread).toBe(true)
+    expect(fetch).toHaveBeenCalledWith('/v1/sessions/1vshk4fu/read?token=token-7', { method: 'POST' })
+  })
+})
+
+describe('focused view consumption', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('sets completion unread while open and clears only on the next interaction', () => {
+    const tracker = createViewConsumptionTracker()
+    const open = makeSession({ id: 'child', unread: false })
+    expect(tracker.selection('child', open)).toBeNull()
+
+    const completed = makeSession({ id: 'child', unread: true, unread_token: 'turn-1', alive: false })
+    // Snapshot update for the same open session must not consume it.
+    expect(tracker.selection('child', completed)).toBeNull()
+    expect(tracker.interaction('child', completed)).toEqual({ id: 'child', token: 'turn-1' })
+  })
+
+  it('retains the exact viewed completion across a delayed acknowledgement', () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }))
+    const tracker = createViewConsumptionTracker()
+    const turn1 = makeSession({ id: 'child', unread: true, unread_token: 'turn-1' })
+    const observed = tracker.interaction('child', turn1)
+    expect(observed).toEqual({ id: 'child', token: 'turn-1' })
+
+    // N+1 arrives after the interaction observed N but before /read is issued.
+    _rawSessions.value = [makeSession({ id: 'child', unread: true, unread_token: 'turn-2' })]
+    if (observed) markSessionRead(observed.id, observed.token)
+
+    expect(fetch).toHaveBeenCalledWith('/v1/sessions/child/read?token=turn-1', { method: 'POST' })
+    expect(sessions.value[0].unread).toBe(true)
+  })
+
+  it('consumes unread that already exists when entering a session', () => {
+    const tracker = createViewConsumptionTracker()
+    expect(tracker.selection('child', makeSession({ id: 'child', unread: true, unread_token: 'turn-1' })))
+      .toEqual({ id: 'child', token: 'turn-1' })
+  })
+
+  it('does not observe acknowledged durable error as consumable', () => {
+    const tracker = createViewConsumptionTracker()
+    const acknowledgedError = makeSession({
+      id: 'child', unread: false, unread_token: 'turn-1', status: { active: false, error: true },
+    })
+    expect(tracker.selection('child', acknowledgedError)).toBeNull()
+    expect(tracker.interaction('child', acknowledgedError)).toBeNull()
   })
 })
 
@@ -316,31 +1109,31 @@ describe('activity tracking', () => {
   })
 
   it('marks a session as active immediately', () => {
-    handleActivity('sess-1')
-    expect(isSessionActive('sess-1')).toBe(true)
-    expect(isSessionFading('sess-1')).toBe(false)
+    handleActivity('1vshk4fu')
+    expect(isSessionActive('1vshk4fu')).toBe(true)
+    expect(isSessionFading('1vshk4fu')).toBe(false)
   })
 
   it('transitions to fading after the active window', () => {
-    handleActivity('sess-1')
+    handleActivity('1vshk4fu')
     vi.advanceTimersByTime(3000)
-    expect(isSessionActive('sess-1')).toBe(false)
-    expect(isSessionFading('sess-1')).toBe(true)
+    expect(isSessionActive('1vshk4fu')).toBe(false)
+    expect(isSessionFading('1vshk4fu')).toBe(true)
   })
 
   it('clears completely after fade-out', () => {
-    handleActivity('sess-1')
+    handleActivity('1vshk4fu')
     vi.advanceTimersByTime(3000 + 800)
-    expect(isSessionActive('sess-1')).toBe(false)
-    expect(isSessionFading('sess-1')).toBe(false)
+    expect(isSessionActive('1vshk4fu')).toBe(false)
+    expect(isSessionFading('1vshk4fu')).toBe(false)
   })
 
   it('resets the timer when activity fires again', () => {
-    handleActivity('sess-1')
+    handleActivity('1vshk4fu')
     vi.advanceTimersByTime(2000) // still active
-    handleActivity('sess-1')     // reset
+    handleActivity('1vshk4fu')     // reset
     vi.advanceTimersByTime(2000) // 2s since reset, still active
-    expect(isSessionActive('sess-1')).toBe(true)
+    expect(isSessionActive('1vshk4fu')).toBe(true)
   })
 })
 
@@ -439,21 +1232,24 @@ describe('navigateToSession', () => {
   })
 
   it('returns false and does not navigate when projects have not loaded', () => {
-    _rawSessions.value = [makeSession({ id: 'sess-1', cwd: '/dev/p' })]
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', cwd: '/dev/p' })]
     // projects left empty: simulates the snapshot.sessions-vs-snapshot.world
     // race where sessions arrive before projects.
-    expect(navigateToSession('sess-1')).toBe(false)
+    expect(navigateToSession('1vshk4fu')).toBe(false)
     expect(navigateMock).not.toHaveBeenCalled()
   })
 
-  it('returns true and dispatches the project-prefixed URL once both are loaded', () => {
+  it('returns true and dispatches the exact-ID URL with applicable route context once loaded', () => {
     _setRawWorld({ projects: [{ slug: 'myproject', match: [{ path: '/dev/p' }] }] })
-    _rawSessions.value = [makeSession({ id: 'sess-1', cwd: '/dev/p', kind: 'shell' })]
-    expect(navigateToSession('sess-1', true)).toBe(true)
+    _rawSessions.value = [makeSession({ id: '1vshk4fu', cwd: '/dev/p', adapter: 'shell' })]
+    urlSearch.value = '?filter=myproject&mock=&host=server'
+    sidebarMode.value = 'activity'
+    expect(navigateToSession('1vshk4fu', true)).toBe(true)
     expect(navigateMock).toHaveBeenCalledTimes(1)
-    const [url, replace] = navigateMock.mock.calls[0]
-    expect(url).toMatch(/^\/myproject\/shell\//)
-    expect(replace).toBe(true)
+    expect(navigateMock).toHaveBeenCalledWith(
+      '/myproject/shell/~1vshk4fu?filter=myproject&sidebar=activity&mock=&host=server',
+      true,
+    )
   })
 
   it('routes peer-owned sessions through /@<peer>/<slug>/...', () => {
@@ -465,7 +1261,7 @@ describe('navigateToSession', () => {
     _setRawWorld({ projects: [] })
     _rawSessions.value = [makeSession({
       id: 'remote-1',
-      kind: 'shell',
+      adapter: 'shell',
       slug: 'remote-1-slug',
       peer: 'workstation',
       project_slug: 'gmux',
@@ -677,34 +1473,643 @@ describe('unreadCount (sidebar-only attention blip)', () => {
     expect(unreadCount.value).toBe(0)
   })
 
-  it('counts alive + unread sessions stamped into a folder', () => {
+  it('counts live and retained-dead unread sessions stamped into a folder', () => {
     _rawSessions.value = [
-      makeSession({ id: 'a', cwd: '/work', alive: true, unread: true, project_slug: 'proj' }),
-      makeSession({ id: 'b', cwd: '/work', alive: true, unread: false, project_slug: 'proj' }),
-      makeSession({ id: 'c', cwd: '/work', alive: false, unread: true, project_slug: 'proj' }),
+      makeSession({ id: 'a', cwd: '/work', alive: true, unread: true, semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'b', cwd: '/work', alive: true, unread: false, semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'c', cwd: '/work', alive: false, resumable: true, unread: true, semantic_agent: true, project_slug: 'proj' }),
+    ]
+    expect(unreadCount.value).toBe(2)
+  })
+
+  it('keeps unread on a standalone process because its row is visible', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'shell', cwd: '/work', adapter: 'shell', unread: true, project_slug: 'proj' }),
     ]
     expect(unreadCount.value).toBe(1)
   })
 
   it('excludes the currently-selected session', () => {
     _rawSessions.value = [
-      makeSession({ id: 'a', cwd: '/work', kind: 'shell', slug: 'aa', alive: true, unread: true, project_slug: 'proj' }),
-      makeSession({ id: 'b', cwd: '/work', kind: 'shell', slug: 'bb', alive: true, unread: true, project_slug: 'proj' }),
+      makeSession({ id: 'a', cwd: '/work', adapter: 'pi', slug: 'aa', alive: true, unread: true, semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'b', cwd: '/work', adapter: 'pi', slug: 'bb', alive: true, unread: true, semantic_agent: true, project_slug: 'proj' }),
     ]
     expect(unreadCount.value).toBe(2)
-    urlPath.value = '/proj/shell/aa'
+    urlPath.value = '/proj/pi/aa'
     expect(selectedId.value).toBe('a')
     expect(unreadCount.value).toBe(1)
   })
 
-  it('ignores the ?project=/?cwd= view filter (global signal)', () => {
+  it('counts live and retained-dead unread family children toward their folder-visible root', () => {
     _rawSessions.value = [
-      makeSession({ id: 'a', cwd: '/work', alive: true, unread: true, project_slug: 'proj' }),
+      makeSession({ id: 'root', cwd: '/work', adapter: 'pi', semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'child', cwd: '/work', adapter: 'pi', semantic_agent: true, parent_session_id: 'root', alive: true, unread: true }),
+      makeSession({ id: 'proc', cwd: '/work', parent_session_id: 'root', alive: true, unread: true }),
+      makeSession({ id: 'dead-child', cwd: '/work', adapter: 'pi', semantic_agent: true, parent_session_id: 'root', alive: false, unread: true }),
     ]
-    // A cwd filter that excludes the unread session from the visible
-    // sidebar must not zero out the global blip.
-    urlSearch.value = '?cwd=/elsewhere'
+    // Children have no folder row of their own; the root row stands in for
+    // unread agents. Process output remains consumable but is not agent
+    // attention, so the unread process does not light the family or badge.
+    expect(unreadCount.value).toBe(2)
+  })
+
+  it('excludes the selected child from its root roll-up', () => {
+    _rawSessions.value = [
+      makeSession({ id: 'root', cwd: '/work', adapter: 'pi', slug: 'rooty', semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'child', cwd: '/work', adapter: 'pi', slug: 'kiddo', semantic_agent: true, parent_session_id: 'root', alive: true, unread: true }),
+      makeSession({ id: 'sibling', cwd: '/work', adapter: 'pi', slug: 'sib', semantic_agent: true, parent_session_id: 'root', alive: true, unread: true }),
+    ]
+    expect(unreadCount.value).toBe(2)
+    urlPath.value = '/proj/pi/kiddo'
+    expect(selectedId.value).toBe('child')
+    // You're looking at `child`; its sibling still pings.
     expect(unreadCount.value).toBe(1)
+  })
+
+  it('is scoped to the tab\u2019s ?filter= selectors', () => {
+    // A pinned tab must not blink for sessions outside its scope
+    // (another tab or a notification covers those), and must still
+    // blink for in-scope ones.
+    _setRawWorld({
+      projects: [
+        { slug: 'proj', match: [{ path: '/work' }] },
+        { slug: 'other', match: [{ path: '/other' }] },
+      ],
+      peers: [],
+    })
+    _rawSessions.value = [
+      makeSession({ id: 'in', cwd: '/work', alive: true, unread: true, semantic_agent: true, project_slug: 'proj' }),
+      makeSession({ id: 'out', cwd: '/other', alive: true, unread: true, semantic_agent: true, project_slug: 'other' }),
+    ]
+    expect(unreadCount.value).toBe(2)
+    urlSearch.value = '?filter=proj'
+    expect(unreadCount.value).toBe(1)
+    urlSearch.value = '?filter=elsewhere'
+    expect(unreadCount.value).toBe(0)
+  })
+})
+
+describe('aggregateSessionDotState', () => {
+  it('rolls up the highest-priority visible checkout activity', () => {
+    const rows = [
+      makeSession({ id: 'active' }),
+      makeSession({ id: 'waiting', unread: true }),
+      makeSession({ id: 'working', status: { active: true } }),
+    ]
+    expect(aggregateSessionDotState(rows, new Map([['active', 'active']]))).toBe('working')
+  })
+
+  it('suppresses selected attention, unavailable rows, and quiet sleeping rows', () => {
+    const rows = [
+      makeSession({ id: 'selected', unread: true }),
+      makeSession({ id: 'remote', peer: 'box', unread: true }),
+      makeSession({ id: 'sleeping', alive: false, resumable: true }),
+    ]
+    expect(aggregateSessionDotState(rows, new Map(), {
+      selectedId: 'selected', peerStatus: new Map([['box', 'offline']]),
+    })).toBe('none')
+  })
+
+  it('keeps unread retained sessions traceable through a collapsed checkout', () => {
+    const rows = [makeSession({ id: 'sleeping', alive: false, resumable: true, unread: true })]
+    expect(aggregateSessionDotState(rows, new Map())).toBe('unread')
+  })
+})
+
+describe('familyDotById (family-aggregated row dot)', () => {
+  beforeEach(() => {
+    _rawSessions.value = []
+    _setRawWorld({ projects: [{ slug: 'proj', match: [{ path: '/work' }] }], peers: [] })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    urlPath.value = '/'
+    activityMap.value = new Map()
+  })
+
+  const pi = (id: string, extra: Partial<Session> = {}) => makeSession({
+    id, cwd: '/work', adapter: 'pi', semantic_agent: true, project_slug: 'proj', ...extra,
+  })
+
+  it('rolls the highest-precedence member state up to the presentation root', () => {
+    _rawSessions.value = [
+      pi('root'),
+      pi('working-child', { parent_session_id: 'root', status: { active: true } }),
+      pi('unread-child', { parent_session_id: 'root', unread: true }),
+      makeSession({ id: 'proc', cwd: '/work', parent_session_id: 'root', status: { active: true, error: true } }),
+    ]
+    // Process state never becomes an agent-style root dot; the active agent
+    // wins over the waiting agent, while the process gets a `$` summary.
+    expect(familyDotById.value.get('root')).toBe('working')
+    expect(familyDotById.value.get('working-child')).toBeUndefined()
+  })
+
+  it('keeps waiting-error attention above an active sibling', () => {
+    _rawSessions.value = [
+      pi('root'),
+      pi('working-child', { parent_session_id: 'root', status: { active: true } }),
+      pi('failed-child', { parent_session_id: 'root', unread: true, status: { active: false, error: true } }),
+    ]
+    // Aggregate precedence is attention-oriented even though each child's own
+    // state still derives current activity before ordinary waiting.
+    expect(familyDotById.value.get('root')).toBe('error')
+  })
+
+  it('keeps standalone sessions at their own dot state', () => {
+    _rawSessions.value = [pi('solo', { unread: true })]
+    expect(familyDotById.value.get('solo')).toBe('unread')
+  })
+
+  it('keeps dead sessions out of the mobile background summary', () => {
+    _rawSessions.value = [pi('dead', { alive: false, unread: true, status: { active: false, error: true } })]
+    expect(backgroundActivity.value).toBe('none')
+  })
+
+  it('lets a never-viewed dead child surface unread on the root', () => {
+    // Unread is not alive-gated in sessionDotState, and the roll-up
+    // follows the same vocabulary: unseen output pings until viewed.
+    _rawSessions.value = [
+      pi('root'),
+      pi('dead-child', { parent_session_id: 'root', alive: false, unread: true }),
+    ]
+    expect(familyDotById.value.get('root')).toBe('unread')
+  })
+
+  it('mutes only the selected member, not its siblings', () => {
+    _rawSessions.value = [
+      pi('root', { slug: 'rooty' }),
+      pi('a', { slug: 'aa', parent_session_id: 'root', unread: true }),
+      pi('b', { slug: 'bb', parent_session_id: 'root', unread: true }),
+    ]
+    expect(familyDotById.value.get('root')).toBe('unread')
+    urlPath.value = '/proj/pi/aa'
+    expect(selectedId.value).toBe('a')
+    // `a` is muted (you're looking at it) but `b` still pings the root row.
+    expect(familyDotById.value.get('root')).toBe('unread')
+    _rawSessions.value = _rawSessions.value.map(s => s.id === 'b' ? { ...s, unread: false } : s)
+    expect(familyDotById.value.get('root')).toBe('none')
+  })
+})
+
+describe('sidebar family entry derivations', () => {
+  beforeEach(() => {
+    _rawSessions.value = []
+    _setRawWorld({ projects: [{ slug: 'proj', match: [{ path: '/work' }] }], peers: [] })
+    sessionsLoaded.value = true
+    worldLoaded.value = true
+    urlPath.value = '/'
+    activityMap.value = new Map()
+  })
+
+  const agent = (id: string, extra: Partial<Session> = {}) => makeSession({
+    id, cwd: '/work', adapter: 'pi', semantic_agent: true, project_slug: 'proj', ...extra,
+  })
+  const proc = (id: string, parent: string, extra: Partial<Session> = {}) => makeSession({
+    id, cwd: '/work', adapter: 'shell', parent_session_id: parent, project_slug: 'proj', ...extra,
+  })
+
+  describe('familyActivityById (live activity counts)', () => {
+    it('buckets every descendant once, by dot precedence, kind-split for working', () => {
+      _rawSessions.value = [
+        agent('root', { status: { active: true } }),
+        agent('kid', { parent_session_id: 'root', status: { active: true } }),
+        agent('grandkid', { parent_session_id: 'kid', status: { active: true } }),
+        // Error wins over its own unread; working wins over unread.
+        agent('boom', { parent_session_id: 'root', status: { active: false, error: true }, unread: true }),
+        agent('waiting', { parent_session_id: 'root', unread: true }),
+        proc('p1', 'root', { status: { active: true } }),
+        proc('p2', 'grandkid', { status: { active: true }, unread: true }),
+      ]
+      expect(familyActivityById.value.get('root')).toEqual({
+        error: 1, waiting: 1, active: 2, running: 2,
+      })
+      // The root's own working state is never in its family's counts.
+      expect(familyActivityById.value.get('kid')).toBeUndefined()
+    })
+
+    it('counts the same with the alive-only filter on or off', () => {
+      _rawSessions.value = [
+        agent('root'),
+        agent('live', { parent_session_id: 'root', unread: true }),
+        agent('dead', { parent_session_id: 'root', unread: true, alive: false, resumable: true }),
+      ]
+      expect(familyActivityById.value.get('root')?.waiting).toBe(2)
+      // The standard family numbers are a fact about the family, not
+      // the viewport: the toggle hides rows, and the panel one click
+      // away shows the hidden member regardless, so the count stands.
+      setAliveOnly(true)
+      expect(familyActivityById.value.get('root')?.waiting).toBe(2)
+      setAliveOnly(false)
+    })
+
+    it('omits idle families entirely (no line, no entry)', () => {
+      _rawSessions.value = [
+        agent('root'),
+        agent('kid', { parent_session_id: 'root' }),
+        proc('p', 'root'),
+      ]
+      expect(familyActivityById.value.has('root')).toBe(false)
+    })
+
+    it('ignores acknowledged durable error while dead unread still waits', () => {
+      // The wire invariant projects dead historical activity to inactive.
+      _rawSessions.value = [
+        agent('root'),
+        agent('gone', { parent_session_id: 'root', alive: false, status: { active: false, error: true } }),
+        agent('unseen', { parent_session_id: 'root', alive: false, unread: true }),
+      ]
+      expect(familyActivityById.value.get('root')).toEqual({
+        error: 0, waiting: 1, active: 0, running: 0,
+      })
+    })
+
+    it('holds the same numbers whichever member the slot row names', () => {
+      _rawSessions.value = [
+        agent('root'),
+        agent('a', { slug: 'aa', parent_session_id: 'root', unread: true }),
+        agent('b', { slug: 'bb', parent_session_id: 'root', unread: true }),
+      ]
+      expect(familyActivityById.value.get('root')?.waiting).toBe(2)
+      // Viewing 'a' names it on the slot row; the count does not budge.
+      // A summary may include what is separately visible — the panel's
+      // tally counts the rows below it too — and subtracting the slot
+      // made this number wobble with which member you last visited.
+      urlPath.value = '/proj/pi/aa'
+      expect(familyActivityById.value.get('root')?.waiting).toBe(2)
+      _rawSessions.value = _rawSessions.value.map(s =>
+        s.id === 'a' ? { ...s, unread: false, status: { active: true } } : s)
+      expect(familyActivityById.value.get('root')).toEqual({
+        error: 0, waiting: 1, active: 1, running: 0,
+      })
+    })
+
+    it('keeps deriving complete family facts while a member is selected', () => {
+      _rawSessions.value = [
+        agent('root', { slug: 'rooty' }),
+        agent('a', { slug: 'aa', parent_session_id: 'root', unread: true }),
+      ]
+      urlPath.value = '/proj/pi/aa'
+      expect(familySlotById.value.get('root')?.session.id).toBe('a')
+      expect(familyActivityById.value.get('root')?.waiting).toBe(1)
+    })
+
+    it('gives a promoted descendant its own counts, not its old family\u2019s', () => {
+      _rawSessions.value = [
+        agent('root'),
+        agent('kid', { parent_session_id: undefined, launched_from_session_id: 'root' }),
+        proc('p', 'kid', { status: { active: true } }),
+      ]
+      expect(familyActivityById.value.has('root')).toBe(false)
+      expect(familyActivityById.value.get('kid')?.running).toBe(1)
+    })
+  })
+
+  describe('root-dot semantics', () => {
+    it('shows the root\u2019s own status, never the family roll-up', () => {
+      _rawSessions.value = [
+        agent('root', { unread: true }),
+        agent('kid', { parent_session_id: 'root', status: { active: true, error: true } }),
+      ]
+      const root = sessions.value.find(s => s.id === 'root')!
+      // Active-error remains current active status; the row dot stays root-own.
+      expect(familyDotById.value.get('root')).toBe('active-error')
+      expect(ownDotState(root, activityMap.value, selectedId.value)).toBe('unread')
+    })
+
+    it('mutes the root\u2019s own attention while the root is selected', () => {
+      _rawSessions.value = [agent('root', { slug: 'rooty', unread: true }), agent('kid', { parent_session_id: 'root' })]
+      const root = () => sessions.value.find(s => s.id === 'root')!
+      expect(ownDotState(root(), activityMap.value, selectedId.value)).toBe('unread')
+      urlPath.value = '/proj/pi/rooty'
+      expect(selectedId.value).toBe('root')
+      expect(ownDotState(root(), activityMap.value, selectedId.value)).toBe('none')
+    })
+
+    it('applies the family-drawer selection rule to waiting, waiting-error, and active-error', () => {
+      urlPath.value = '/proj/pi/rooty'
+      for (const [extra, expected] of [
+        [{ unread: true }, 'none'],
+        [{ unread: true, status: { active: false, error: true } }, 'none'],
+        [{ unread: true, status: { active: true, error: true } }, 'active-error'],
+      ] as const) {
+        _rawSessions.value = [agent('root', { slug: 'rooty', ...extra })]
+        const root = sessions.value.find(s => s.id === 'root')!
+        expect(ownDotState(root, activityMap.value, selectedId.value)).toBe(expected)
+      }
+    })
+  })
+
+  describe('familySlotById (the selected family’s one member row)', () => {
+    const slot = (rootId: string) => familySlotById.value.get(rootId)
+    const family = () => [
+      agent('root', { slug: 'rooty' }),
+      agent('kid', { slug: 'kiddo', parent_session_id: 'root' }),
+      agent('elsewhere', { slug: 'far' }),
+    ]
+
+    it('shows exactly the selected member, marked as current', () => {
+      _rawSessions.value = family()
+      urlPath.value = '/proj/pi/kiddo'
+      expect(slot('root')?.session.id).toBe('kid')
+    })
+
+    it('shows no member while the root is selected', () => {
+      _rawSessions.value = family()
+      urlPath.value = '/proj/pi/rooty'
+      expect(familySlotById.value.size).toBe(0)
+    })
+
+    it('drops the member immediately when selection leaves the family', () => {
+      _rawSessions.value = family()
+      urlPath.value = '/proj/pi/kiddo'
+      expect(slot('root')?.session.id).toBe('kid')
+      urlPath.value = '/proj/pi/far'
+      expect(familySlotById.value.size).toBe(0)
+      urlPath.value = '/proj/pi/rooty'
+      expect(familySlotById.value.size).toBe(0)
+    })
+
+    it('switches directly to the newly selected sibling', () => {
+      _rawSessions.value = [
+        agent('root', { slug: 'rooty' }),
+        agent('a', { slug: 'aa', parent_session_id: 'root' }),
+        agent('b', { slug: 'bb', parent_session_id: 'root' }),
+      ]
+      urlPath.value = '/proj/pi/aa'
+      expect(slot('root')?.session.id).toBe('a')
+      urlPath.value = '/proj/pi/bb'
+      expect(slot('root')?.session.id).toBe('b')
+    })
+  })
+
+  describe('selectedFamilyChild (selected-child projection)', () => {
+    it('is null when nothing or a root is selected', () => {
+      _rawSessions.value = [agent('root', { slug: 'rooty' }), agent('kid', { slug: 'kiddo', parent_session_id: 'root' })]
+      expect(selectedFamilyChild.value).toBeNull()
+      urlPath.value = '/proj/pi/rooty'
+      expect(selectedFamilyChild.value).toBeNull()
+    })
+
+    it('reports the child, its root row, and the ancestor trail', () => {
+      _rawSessions.value = [
+        agent('root', { slug: 'rooty', title: 'orchestrator' }),
+        agent('kid', { slug: 'kiddo', parent_session_id: 'root', title: 'implement' }),
+        agent('grandkid', { slug: 'grandkiddo', parent_session_id: 'kid', title: 'refactor' }),
+      ]
+      urlPath.value = '/proj/pi/grandkiddo'
+      const projection = selectedFamilyChild.value!
+      expect(projection.session.id).toBe('grandkid')
+      expect(projection.rootId).toBe('root')
+      // Root first, immediate parent last — the sidebar renders the
+      // trail as a hover title on the child row.
+      expect(projection.ancestors.map(a => a.id)).toEqual(['root', 'kid'])
+    })
+
+    it('follows a selected process child too', () => {
+      _rawSessions.value = [agent('root'), proc('p', 'root', { slug: 'pp', title: 'pnpm test' })]
+      urlPath.value = '/proj/shell/pp'
+      expect(selectedFamilyChild.value?.session.id).toBe('p')
+      expect(selectedFamilyChild.value?.rootId).toBe('root')
+    })
+
+    it('is null for a promoted child (it owns a sidebar row of its own)', () => {
+      _rawSessions.value = [
+        agent('root', { slug: 'rooty' }),
+        agent('kid', { slug: 'kiddo', parent_session_id: undefined, launched_from_session_id: 'root' }),
+      ]
+      urlPath.value = '/proj/pi/kiddo'
+      expect(selectedId.value).toBe('kid')
+      expect(selectedFamilyChild.value).toBeNull()
+      expect(familySelectedId.value).toBe('kid')
+    })
+
+    it('keeps the sidebar row selection on the root while a child is selected', () => {
+      _rawSessions.value = [
+        agent('root', { slug: 'rooty' }),
+        agent('kid', { slug: 'kiddo', parent_session_id: 'root' }),
+      ]
+      urlPath.value = '/proj/pi/kiddo'
+      expect(familySelectedId.value).toBe('root')
+      expect(selectedFamilyChild.value?.session.id).toBe('kid')
+    })
+  })
+})
+
+describe('tab-identity params (?filter=, ?sidebar=)', () => {
+  let navigateMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    navigateMock = vi.fn()
+    setNavigate(navigateMock)
+    urlPath.value = '/'
+    urlSearch.value = ''
+  })
+  afterEach(() => {
+    setNavigate(() => {/* no-op */})
+  })
+
+  it('setSidebarMode mirrors the signal into the URL, omitting the default', () => {
+    // The default state leaves a clean URL: no ?sidebar=projects.
+    urlSearch.value = '?filter=gmux&sidebar=activity'
+    sidebarMode.value = 'activity'
+    setSidebarMode('projects')
+    expect(sidebarMode.value).toBe('projects')
+    expect(navigateMock).toHaveBeenLastCalledWith('/?filter=gmux', true)
+
+    urlSearch.value = '?filter=gmux'
+    setSidebarMode('activity')
+    expect(sidebarMode.value).toBe('activity')
+    expect(navigateMock).toHaveBeenLastCalledWith('/?filter=gmux&sidebar=activity', true)
+  })
+
+  it('setSidebarMode preserves non-tab params (?settings)', () => {
+    urlSearch.value = '?settings=hosts'
+    setSidebarMode('activity')
+    expect(navigateMock).toHaveBeenLastCalledWith('/?settings=hosts&sidebar=activity', true)
+  })
+
+  it('navigate stamps the sidebar mode from the signal, not the URL', () => {
+    // A stale URL param (e.g. an old history entry) never wins: the
+    // signal is the source of truth for every navigation.
+    urlSearch.value = '?sidebar=activity'
+    sidebarMode.value = 'projects'
+    navigate('/gmux/pi/x', true)
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x', true)
+
+    urlSearch.value = ''
+    sidebarMode.value = 'activity'
+    navigate('/gmux/pi/x')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?sidebar=activity', undefined)
+  })
+
+  it('navigate carries ?filter= from the current URL by default', () => {
+    urlSearch.value = '?filter=gmux%40server'
+    navigate('/gmux/pi/x')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?filter=gmux%40server', undefined)
+  })
+
+  it('setFilterSelectors clears the param when the list empties', () => {
+    urlSearch.value = '?filter=gmux&sidebar=activity'
+    sidebarMode.value = 'activity'
+    setFilterSelectors([])
+    expect(navigateMock).toHaveBeenLastCalledWith('/?sidebar=activity', true)
+  })
+
+  it('tabHref uses the same carry contract as navigate', () => {
+    urlSearch.value = '?filter=gmux&settings=hosts'
+    sidebarMode.value = 'activity'
+    // Filter and sidebar identify the tab; transient settings state drops.
+    expect(tabHref('/gmux/pi/x')).toBe('/gmux/pi/x?filter=gmux&sidebar=activity')
+    sidebarMode.value = 'projects'
+    urlSearch.value = ''
+    expect(tabHref('/gmux/pi/x')).toBe('/gmux/pi/x')
+  })
+
+  it('carries mock boot context so an SPA destination remains reloadable', () => {
+    urlSearch.value = '?mock=&host=server&filter=gmux&settings=hosts'
+    expect(tabHref('/gmux/pi/~1vshk4fu')).toBe(
+      '/gmux/pi/~1vshk4fu?filter=gmux&mock=&host=server',
+    )
+    // Explicit target values win over the current mock context.
+    expect(tabHref('/gmux/pi/~1vshk4fu?mock=target&host=laptop')).toBe(
+      '/gmux/pi/~1vshk4fu?mock=target&host=laptop&filter=gmux',
+    )
+  })
+
+  it('setHostFilter replaces host-wide selectors but keeps project selectors', () => {
+    urlSearch.value = '?filter=gmux,*@laptop'
+    setHostFilter('server')
+    expect(navigateMock).toHaveBeenLastCalledWith('/?filter=gmux%2C*%40server', true)
+
+    urlSearch.value = '?filter=gmux,*@server'
+    setHostFilter(null)
+    expect(navigateMock).toHaveBeenLastCalledWith('/?filter=gmux', true)
+  })
+
+  it('setFilterSelectors preserves non-tab params (?settings, ?mock)', () => {
+    // Regression: targeting the bare path dropped every non-tab param,
+    // so a filter edit silently closed the settings modal / left mock mode.
+    urlSearch.value = '?mock=&settings=hosts&filter=old'
+    setFilterSelectors([{ project: 'gmux', host: '*' }])
+    expect(navigateMock).toHaveBeenLastCalledWith('/?mock=&settings=hosts&filter=gmux', true)
+  })
+
+  it('keeps hash fragments out of query data and preserves them on same-view edits', () => {
+    urlSearch.value = '?filter=gmux'
+    navigate('/gmux/pi/x?settings=hosts#terminal', true)
+    expect(navigateMock).toHaveBeenLastCalledWith(
+      '/gmux/pi/x?settings=hosts&filter=gmux#terminal', true,
+    )
+
+    urlPath.value = '/gmux/pi/x'
+    urlHash.value = '#stale'
+    // Hash-only navigation can update the browser before `hashchange` runs;
+    // rewrite seams must prefer the live fragment over the signal snapshot.
+    vi.stubGlobal('location', { hash: '#terminal' })
+    try {
+      setFilterSelectors([])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x#terminal', true)
+    // Apply the router's resulting location signals before the next edit.
+    urlSearch.value = ''
+    urlHash.value = '#terminal'
+    setSidebarMode('activity')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?sidebar=activity#terminal', true)
+  })
+
+  it('homePartition participates in the tab scope', () => {
+    _setRawWorld({ projects: [{ slug: 'proj', match: [{ path: '/work' }] }], peers: [] })
+    _rawSessions.value = [
+      makeSession({ id: 'in', cwd: '/work', alive: true, unread: true, project_slug: 'proj' }),
+      makeSession({ id: 'out', alive: true, unread: true, project_slug: 'other', peer: 'server' }),
+    ]
+    urlSearch.value = '?filter=proj'
+    expect(homePartition.value.flatMap(b => b.sessions.map(s => s.id))).toEqual(['in'])
+  })
+})
+
+describe('sidebar-mode deep-link seed', () => {
+  it('seeds activity from the initial document URL before repair starts', async () => {
+    vi.stubGlobal('location', { pathname: '/', search: '?sidebar=activity', hash: '' })
+    vi.resetModules()
+    try {
+      const freshStore = await import('./store')
+      expect(freshStore.sidebarMode.value).toBe('activity')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('sidebar-mode repair effect (initStore)', () => {
+  // The commit's core invariant: after boot the sidebarMode signal is
+  // authoritative and the URL is a mirror. A history entry stamped with
+  // a stale ?sidebar (Back/Forward, old bookmark) must be rewritten in
+  // place — never adopted into the signal. Mutation-proof: inverting
+  // the repair direction (sidebarMode.value = urlMode) fails this test.
+  let navigateMock: ReturnType<typeof vi.fn>
+  let cleanup: (() => void) | null = null
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false }))
+    class FakeEventSource {
+      addEventListener() { /* no-op */ }
+      close() { /* no-op */ }
+    }
+    vi.stubGlobal('EventSource', FakeEventSource)
+    navigateMock = vi.fn()
+    setNavigate(navigateMock)
+  })
+  afterEach(() => {
+    cleanup?.()
+    cleanup = null
+    setNavigate(() => {/* no-op */})
+    vi.unstubAllGlobals()
+  })
+
+  it('rewrites a stale ?sidebar entry in place; the signal never adopts from the URL', () => {
+    cleanup = initStore()
+    // Simulate Back onto an entry stamped with the old mode while the
+    // tab is in projects mode. Non-tab params must survive the repair.
+    urlPath.value = '/gmux/pi/x'
+    urlSearch.value = '?sidebar=activity&settings=hosts'
+
+    expect(sidebarMode.value).toBe('projects')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?settings=hosts', true)
+
+    // Convergence: once the router applies the repaired URL, the effect
+    // re-runs and does nothing further.
+    navigateMock.mockClear()
+    urlSearch.value = '?settings=hosts'
+    expect(navigateMock).not.toHaveBeenCalled()
+  })
+
+  it('repairs in the other direction too (activity signal, bare URL)', () => {
+    cleanup = initStore()
+    sidebarMode.value = 'activity'
+    navigateMock.mockClear()
+    urlPath.value = '/gmux/pi/x'
+    urlSearch.value = '?filter=gmux'
+    expect(sidebarMode.value).toBe('activity')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?filter=gmux&sidebar=activity', true)
+  })
+
+  it('dispatches exactly one replacement for an explicit mode toggle', () => {
+    cleanup = initStore()
+    navigateMock.mockClear()
+    setSidebarMode('activity')
+    expect(navigateMock).toHaveBeenCalledTimes(1)
+    expect(navigateMock).toHaveBeenCalledWith('/?sidebar=activity', true)
+  })
+
+  it('canonicalizes malformed and repeated sidebar params in place', () => {
+    cleanup = initStore()
+    navigateMock.mockClear()
+    urlPath.value = '/gmux/pi/x'
+    urlSearch.value = '?sidebar=bogus&sidebar=activity&settings=hosts'
+    expect(sidebarMode.value).toBe('projects')
+    expect(navigateMock).toHaveBeenLastCalledWith('/gmux/pi/x?settings=hosts', true)
   })
 })
 
@@ -763,45 +2168,72 @@ describe('pending mutations overlay', () => {
   describe('applyPending (pure function)', () => {
     it('returns raw unchanged when there are no mutations', () => {
       const sess = [makeSession({ id: 'a' })]
-      const projs: ProjectItem[] = [{ slug: 'p', match: [] }]
-      const out = applyPending(sess, projs, [])
-      expect(out.sessions).toBe(sess)
-      expect(out.projects).toBe(projs)
+      expect(applyPending(sess, [])).toBe(sess)
     })
 
-    it('mark-read clears unread and status.error on the targeted session', () => {
+    it('mark-read clears unread and preserves durable error on the targeted session', () => {
       const sess = [
-        makeSession({ id: 'a', unread: true, status: { label: 'oops', working: false, error: true } }),
+        makeSession({ id: 'a', unread: true, status: { active: false, error: true } }),
         makeSession({ id: 'b', unread: true }),
       ]
-      const m: PendingMutation = { kind: 'mark-read', id: 'a', at: 0 }
-      const out = applyPending(sess, [], [m])
-      expect(out.sessions[0].unread).toBe(false)
-      expect(out.sessions[0].status?.error).toBe(false)
-      expect(out.sessions[0].status?.label).toBe('oops')
+      const m: PendingMutation = { kind: 'mark-read', id: 'a', token: '', at: 0 }
+      const out = applyPending(sess, [m])
+      expect(out[0].unread).toBe(false)
+      expect(out[0].status?.error).toBe(true)
       // Untouched session keeps its flags.
-      expect(out.sessions[1].unread).toBe(true)
+      expect(out[1].unread).toBe(true)
+    })
+
+    it('applies a mark-read per session in one pass, whatever the pile', () => {
+      // "Mark all read" stacks one mutation per family member, and this
+      // overlay is replayed on every recompute in the app until the
+      // server echoes them back. A pass per mutation made that cost
+      // mutations x sessions.
+      const sess = Array.from({ length: 200 }, (_, i) =>
+        makeSession({ id: `s${i}`, unread: true, unread_token: `t${i}` }))
+      const pending: PendingMutation[] = sess.map(s => (
+        { kind: 'mark-read', id: s.id, token: s.unread_token ?? '', at: 0 }))
+      const out = applyPending(sess, pending)
+      expect(out.every(s => !s.unread)).toBe(true)
+      expect(out).toHaveLength(200)
+    })
+
+    it('honours each token separately when several are in flight for one session', () => {
+      // The token binds a mark to the state it was issued against, so a
+      // session that spoke again escapes the older mark rather than
+      // being silenced by it.
+      const sess = [makeSession({ id: 'a', unread: true, unread_token: 'new' })]
+      const out = applyPending(sess, [
+        { kind: 'mark-read', id: 'a', token: 'stale', at: 0 },
+        { kind: 'mark-read', id: 'a', token: 'new', at: 0 },
+      ])
+      expect(out[0].unread).toBe(false)
+      const stillUnread = applyPending(sess, [{ kind: 'mark-read', id: 'a', token: 'stale', at: 0 }])
+      expect(stillUnread[0].unread).toBe(true)
+    })
+
+    it('dismissal wins over a mark-read for the same session, either order', () => {
+      const sess = [makeSession({ id: 'a', unread: true, unread_token: '' })]
+      const read: PendingMutation = { kind: 'mark-read', id: 'a', token: '', at: 0 }
+      const gone: PendingMutation = { kind: 'dismiss', id: 'a', at: 0 }
+      expect(applyPending(sess, [read, gone])).toEqual([])
+      expect(applyPending(sess, [gone, read])).toEqual([])
     })
 
     it('dismiss removes the targeted session', () => {
       const sess = [makeSession({ id: 'a' }), makeSession({ id: 'b' })]
-      const out = applyPending(sess, [], [{ kind: 'dismiss', id: 'a', at: 0 }])
-      expect(out.sessions.map(s => s.id)).toEqual(['b'])
-    })
-
-    it('reorder replaces a project sessions array', () => {
-      const projs: ProjectItem[] = [{ slug: 'p', match: [], sessions: ['x', 'y'] }]
-      const out = applyPending([], projs, [{ kind: 'reorder', slug: 'p', sessions: ['y', 'x'], at: 0 }])
-      expect(out.projects[0].sessions).toEqual(['y', 'x'])
+      const out = applyPending(sess, [{ kind: 'dismiss', id: 'a', at: 0 }])
+      expect(out.map(s => s.id)).toEqual(['b'])
     })
 
     it('stacks multiple mutations in order', () => {
-      const projs: ProjectItem[] = [{ slug: 'p', match: [], sessions: ['x'] }]
-      const out = applyPending([], projs, [
-        { kind: 'reorder', slug: 'p', sessions: ['a', 'b'], at: 0 },
-        { kind: 'reorder', slug: 'p', sessions: ['b', 'a'], at: 0 },
+      const sess = [makeSession({ id: 'a', unread: true }), makeSession({ id: 'b' })]
+      const out = applyPending(sess, [
+        { kind: 'mark-read', id: 'a', token: '', at: 0 },
+        { kind: 'dismiss', id: 'b', at: 0 },
       ])
-      expect(out.projects[0].sessions).toEqual(['b', 'a'])
+      expect(out.map(s => s.id)).toEqual(['a'])
+      expect(out[0].unread).toBe(false)
     })
   })
 
@@ -820,14 +2252,6 @@ describe('pending mutations overlay', () => {
       dismissSession('a')
       expect(sessions.value.map(s => s.id)).toEqual(['b'])
       expect(_rawSessions.value.map(s => s.id)).toEqual(['a', 'b'])
-    })
-
-    it('reorderSessions reflects via the projects overlay', () => {
-      _setRawWorld({ projects: [{ slug: 'p', match: [], sessions: ['x', 'y'] }] })
-      reorderSessions('p', ['y', 'x'])
-      expect(projects.value[0].sessions).toEqual(['y', 'x'])
-      // Raw is untouched.
-      expect(_rawWorld.value.projects[0].sessions).toEqual(['x', 'y'])
     })
 
     it('reorderSessions for a local project hits /v1/projects/{slug}/sessions', () => {
@@ -849,13 +2273,15 @@ describe('pending mutations overlay', () => {
       )
     })
 
-    it('peer reorder does not add a local optimistic overlay', () => {
-      // The local pending-mutations overlay is keyed by local project
-      // slug; applying it to a peer reorder would clobber the peer
-      // folder's session order with the viewer's local-projects view.
-      const before = _pendingMutations.value.length
-      reorderSessions('gmux', ['y', 'x'], 'tower')
-      expect(_pendingMutations.value.length).toBe(before)
+    it('reorder adds no optimistic overlay, local or peer', () => {
+      // Order reaches the UI only as server-stamped project_index, so
+      // there is no local array an overlay could pre-write: the owning
+      // daemon's echo is the only thing that moves a row.
+      _setRawWorld({ projects: [{ slug: 'p', match: [], sessions: ['x', 'y'] }] })
+      reorderSessions('p', ['y', 'x'])
+      reorderSessions('p', ['y', 'x'], 'tower')
+      expect(_pendingMutations.value).toHaveLength(0)
+      expect(projects.value[0].sessions).toEqual(['x', 'y'])
     })
   })
 
@@ -874,14 +2300,6 @@ describe('pending mutations overlay', () => {
       dismissSession('a')
       expect(_pendingMutations.value).toHaveLength(1)
       _rawSessions.value = []
-      expect(_pendingMutations.value).toHaveLength(0)
-    })
-
-    it('drops a reorder mutation once raw matches the requested order', () => {
-      _setRawWorld({ projects: [{ slug: 'p', match: [], sessions: ['x', 'y'] }] })
-      reorderSessions('p', ['y', 'x'])
-      expect(_pendingMutations.value).toHaveLength(1)
-      _setRawWorld({ projects: [{ slug: 'p', match: [], sessions: ['y', 'x'] }] })
       expect(_pendingMutations.value).toHaveLength(0)
     })
 
@@ -933,25 +2351,78 @@ describe('parseConnectURL', () => {
   })
 })
 
-describe('session_file (duplicate-open warning)', () => {
-  it('carries session_file from the wire through to the UI session', () => {
+describe('family wire mapping', () => {
+  it('preserves current parent, launch provenance, and semantic capability', () => {
+    const parsed = SessionSchema.parse({
+      id: 'child', alive: true, parent_session_id: 'root',
+      launched_from_session_id: 'launcher', semantic_agent: true,
+    })
+    expect(toUISession(parsed)).toMatchObject({
+      parent_session_id: 'root', launched_from_session_id: 'launcher', semantic_agent: true,
+    })
+  })
+})
+
+describe('conversation_file (duplicate-open warning)', () => {
+  it('carries conversation_file from the wire through to the UI session', () => {
     // Guards the two gaps that silently disabled the warning: the protocol
-    // Zod schema must keep session_file (not strip it), and toUISession must
+    // Zod schema must keep conversation_file (not strip it), and toUISession must
     // map it through.
-    const parsed = SessionSchema.parse({ id: 'a', alive: true, session_file: '/conv.jsonl' })
-    expect(parsed.session_file).toBe('/conv.jsonl')
-    expect(toUISession(parsed).session_file).toBe('/conv.jsonl')
+    const parsed = SessionSchema.parse({ id: 'a', alive: true, conversation_file: '/conv.jsonl' })
+    expect(parsed.conversation_file).toBe('/conv.jsonl')
+    expect(toUISession(parsed).conversation_file).toBe('/conv.jsonl')
   })
 
   it('flags a conversation that is live in more than one tab', () => {
     _rawSessions.value = [
-      makeSession({ id: 'a', alive: true, session_file: '/conv.jsonl' }),
-      makeSession({ id: 'b', alive: true, session_file: '/conv.jsonl' }),
-      makeSession({ id: 'c', alive: true, session_file: '/other.jsonl' }),
-      makeSession({ id: 'd', alive: false, session_file: '/conv.jsonl' }), // dead doesn't count
+      makeSession({ id: 'a', alive: true, conversation_file: '/conv.jsonl' }),
+      makeSession({ id: 'b', alive: true, conversation_file: '/conv.jsonl' }),
+      makeSession({ id: 'c', alive: true, conversation_file: '/other.jsonl' }),
+      makeSession({ id: 'd', alive: false, conversation_file: '/conv.jsonl' }), // dead doesn't count
     ]
-    const dups = duplicateSessionFiles.value
+    const dups = duplicateConversationFiles.value
     expect(dups.has('/conv.jsonl')).toBe(true)
     expect(dups.has('/other.jsonl')).toBe(false)
+  })
+})
+
+describe('peerStreamOmissions', () => {
+  afterEach(() => { _setRawWorld({ peers: [] }) })
+
+  it('surfaces per-peer upstream omission counts and their total', () => {
+    _setRawWorld({ peers: [
+      { name: 'complete', url: '', status: 'connected', session_count: 3 },
+      { name: 'lossy', url: '', status: 'connected', session_count: 1, sessions_omitted: 6287, sessions_omitted_codes: { transaction_limit: 256, diagnostics_suppressed: 6031 } },
+      { name: 'big-row', url: '', status: 'connected', session_count: 2, sessions_omitted: 1, sessions_omitted_codes: { row_too_large: 1 } },
+    ] })
+    expect(peerStreamOmissions.value).toEqual([
+      { peer: 'lossy', count: 6287 },
+      { peer: 'big-row', count: 1 },
+    ])
+    expect(peerOmittedTotal.value).toBe(6288)
+  })
+
+  it('rejects absent, zero, negative, and non-integer counts', () => {
+    _setRawWorld({ peers: [
+      { name: 'a', url: '', status: 'connected', session_count: 0 },
+      { name: 'b', url: '', status: 'connected', session_count: 0, sessions_omitted: 0 },
+      { name: 'c', url: '', status: 'connected', session_count: 0, sessions_omitted: -4 },
+      { name: 'd', url: '', status: 'connected', session_count: 0, sessions_omitted: 1.5 },
+      { name: 'e', url: '', status: 'connected', session_count: 0, sessions_omitted: Number.MAX_SAFE_INTEGER + 2 },
+    ] })
+    expect(peerStreamOmissions.value).toEqual([])
+    expect(peerOmittedTotal.value).toBe(0)
+  })
+
+  it('clears when a later world snapshot drops the marker', () => {
+    _setRawWorld({ peers: [
+      { name: 'lossy', url: '', status: 'connected', session_count: 1, sessions_omitted: 2 },
+    ] })
+    expect(peerOmittedTotal.value).toBe(2)
+    _setRawWorld({ peers: [
+      { name: 'lossy', url: '', status: 'connected', session_count: 1 },
+    ] })
+    expect(peerOmittedTotal.value).toBe(0)
+    expect(peerStreamOmissions.value).toEqual([])
   })
 })

@@ -1,102 +1,115 @@
-# Runner hook protocol: tool-neutral authoritative session events
+# Runner hook protocol: authoritative agent activity
 
-**Status:** Stable · **Related:** ADR 0011, `cli/gmux/internal/ptyserver`
+**Status:** Stable · **Related:** ADR 0011, ADR 0015, ADR 0029, ADR 0030
 
-The contract an agent implements to report its session state to the gmux runner
-authoritatively. Tool-neutral: the runner makes no per-adapter assumptions in
-`handleHookEvent`. pi's extension (`agentext/pi-ext.mjs`) is the reference; the
-protocol is not pi-specific.
+The runner exposes an owner-only Unix socket in `GMUX_SESSION_SOCK`. An agent
+adapter posts fire-and-forget JSON to `POST /hook/event`. Events are translated
+at the adapter's typed API boundary; the runner never parses adapter-native
+conversation files or events.
 
-Per ADR 0011, live state is runner-owned. An agent reports its own facts (held
-file, turn phase) rather than the daemon inferring them from fs scans/scrollback
-— and a hook even catches a cache-served `/resume` that reads no file. The
-runner only **relays** these facts; the one bit of state it keeps is a snapshot
-replayed to `/events` (so a restarted daemon re-learns attribution), never used
-to guess.
-
-## Transport
-
-- Runner exports `GMUX_SESSION_SOCK` (its Unix socket) to the agent env.
-- Agent POSTs JSON to `POST /hook/event`, **fire-and-forget**: a failed POST
-  must never surface into the agent; the next event re-establishes truth.
-- Socket is owner-only (0o700).
-
-## Event schema
-
-One JSON object per event, discriminated by `op`. Unknown ops/values are ignored
-(forward-compatible); zero-value fields are no-ops.
+## Events
 
 ```jsonc
-// op "session" — authoritative bind. Sent on startup and on every rebind
-// (switch/new/resume/fork).
-{
-  "op":     "session",
-  "path":   "/abs/path/to/conversation-file",  // required
-  "id":     "session-id",                       // optional; slugified for the URL if no slug
-  "slug":   "human-title",                      // optional; explicit URL-safe slug, preferred over id
-  "name":   "human title",                      // optional; sets the adapter title
-  "cwd":    "/project/dir",                      // optional; accepted, not yet applied
-  "reason": "startup|new|resume|fork|activity"  // optional; informational
-}
+{ "op": "ready" }
 
-// op "turn" — agent loop boundary.
-{ "op": "turn", "phase": "start" }                            // → working
-{ "op": "turn", "phase": "end", "outcome": "completed",       // see vocabulary
-  "title": "human title" }                                    // optional
+{ "op": "session", "path": "/opaque/conversation/ref", "id": "native-id",
+  "slug": "title", "name": "title", "cwd": "/work",
+  "reason": "startup|new|resume|fork|activity" }
+
+{ "op": "turn", "phase": "start", "turn_seq": 7,
+  "trigger": "verbatim user text up to the source cap",
+  "source_bytes": 42, "previous_exchanges": 3 }
+{ "op": "turn", "phase": "iteration", "turn_seq": 7 }
+{ "op": "turn", "phase": "steered", "turn_seq": 7,
+  "text": "verbatim additional user instruction", "source_bytes": 39 }
+{ "op": "turn", "phase": "end", "turn_seq": 7,
+  "outcome": "completed|interrupted|error",
+  "output": "terminal or terminal-partial assistant prose",
+  "truncated": false, "diagnostic": "short failure reason", "title": "title" }
 ```
 
-### Field reference
+`turn_seq` is source-asserted and monotonic within one extension incarnation.
+For pi, the logical activity opens on the first `agent_start` and closes only on
+`agent_settled`; retried `agent_end` events do not close it. Every completed
+assistant `message_end` is an iteration, including tool-use and recovered
+attempts. A user message entering the running loop is a `steered` event and a
+visible exchange boundary. It does **not** settle the activity or resolve a
+wait.
 
-| Field     | Op       | Meaning |
-|-----------|----------|---------|
-| `path`    | session  | Absolute path of the held conversation file. |
-| `id`      | session  | Session identity; slugified into the URL when no `slug`. |
-| `slug`    | session  | Explicit URL-safe slug; preferred over `id` (e.g. codex's UUID slugifies badly). |
-| `name`    | session  | Display title at bind time. |
-| `cwd`     | session  | Project dir. Accepted for forward-compat but not applied — the runner knows the launch cwd. |
-| `reason`  | session  | Why the bind happened; informational. |
-| `phase`   | turn     | `"start"` or `"end"`. |
-| `outcome` | turn end | Normalized terminal state — see below. |
-| `title`   | turn end | Display title at turn end. |
+`output` is prose from the activity's latest assistant response. For a
+non-completed outcome it is partial and consumers must label it as such. An
+absent output means there was no terminal prose. It is never reconstructed as a
+completed result by the runner or daemon.
 
-### Outcome vocabulary
+## Turn frame
 
-Stable and agent-agnostic; each hook normalizes its native state into one. The
-outcome→sidebar mapping is gmux policy in the runner (`applyTurnEnd`), not the
-agent's concern.
+The runner retains one generation-local frame and replays it to `/events`:
 
-| Outcome     | Meaning                          | Sidebar              |
-|-------------|----------------------------------|----------------------|
-| `completed` | Agent finished its own turn.     | idle + **unread**    |
-| `aborted`   | User interrupted (Esc).          | idle                 |
-| `error`     | Agent gave up.                   | idle + **error**     |
+```jsonc
+{
+  "seq": 12,
+  "current": {
+    "turn_seq": 7,
+    "previous_exchanges": 3,
+    "exchanges": [
+      { "ordinal": 1, "user": "first request", "source_bytes": 13, "iterations": 3 },
+      { "ordinal": 2, "user": "follow-up", "source_bytes": 9, "iterations": 1 }
+    ],
+    "omitted_exchanges": 0,
+    "omitted_bytes": 0
+  },
+  "last": {
+    "turn_seq": 6,
+    "outcome": "completed",
+    "previous_exchanges": 2,
+    "exchanges": [{ "ordinal": 1, "user": "request", "source_bytes": 7, "iterations": 4 }],
+    "output": "answer"
+  }
+}
+```
 
-## The runner does NOT, for hooked sessions
+A turn start or close is transported atomically with its status edge under the
+`turn_frame` key. Mid-activity frame changes use `event: turn_frame`. Replay
+uses the same coupled shape, so a consumer observes an edge with its frame or
+neither. A conversation rebind clears current, last, and conversation-local outcome
+metadata before publishing the new ref.
 
-Parse the conversation file, infer status from PTY/scrollback, apply per-adapter
-heuristics in `handleHookEvent`, or use the `session_file` snapshot for anything
-but `/events` replay.
+The frame is bounded and never persisted. pi caps terminal prose at 256 KiB and
+each live user boundary at 8 KiB, both at a UTF-8 boundary and with an ellipsis
+when cut. The runner retains the newest 65 user boundaries (anchor plus 64
+additional instructions) and carries exact omitted exchange and byte counts.
+The daemon runner-SSE scanner accepts 8 MiB lines; the hook endpoint accepts
+4 MiB events. A display overflow can degrade text only: it never drops the
+source close, outcome, `turn_seq`, or terminal output. Historical `agent logs`
+reads full native content rather than this frame.
 
-## Implementing for a new agent
+`source_bytes` is the original UTF-8 byte length before capping;
+`previous_exchanges` is the native branch count before the activity; and
+`ordinal` is monotonic within the activity even when old boundaries are evicted.
+Together these permit exact omission accounting, persistence reconciliation,
+and presentation-only abbreviation without text ownership claims.
 
-1. **Load the hook** via the seam matching how the agent loads extensions
-   (below). Both are ephemeral, scoped to the launch, and no-op without
-   `GMUX_SESSION_SOCK`.
-2. Report a `session` event on every bind.
-3. Report `turn` start/end, normalizing to the outcome vocabulary.
+No delivery IDs, text normalization, pending correlation, or ownership claims
+exist on this wire. Additional user-boundary events are report material only.
 
-### Injection seams
+## Readiness and delivery
 
-- **`SessionExtender`** (pi): the runner materializes the embedded pi extension
-  and splices `pi -e <path>` into the argv.
-- **`SessionHookCommand`** (codex): the runner injects a `gmux __codex-hook`
-  command hook via the agent's config-override flags (`-c hooks.<Event>=...`),
-  with the gmux binary itself as the hook program. It also carries the per-hook
-  `trusted_hash` codex computes so only gmux's own hooks are trusted (never the
-  global `--dangerously-bypass-hook-trust`). Version-gated; older codex falls
-  back to daemon metadata attribution, and a hash mismatch degrades to the same
-  fallback rather than broadening trust.
-- **`SessionHookCommand`** (claude): Claude Code takes hooks through settings,
-  so the runner splices `--settings <inline-json>` (a `gmux __claude-hook`
-  command hook). That layer merges with the user's settings and hook arrays
-  concatenate, so gmux's hooks add to rather than clobber the user's.
+`ready` means the agent's composer and semantic input handlers are installed.
+`POST /prompt` and `POST /cancel` wait for it and require
+`X-Gmux-Expect-Incarnation`; a mismatch is refused before any bytes are written.
+Prompt delivery uses one ordered PTY write and a reservation released only by a
+fresh inactive-to-active source edge. Raw `/input` remains unconditional and
+outside these guarantees.
+
+## Outcome vocabulary
+
+| Outcome | Meaning |
+|---|---|
+| `completed` | Agent settled normally. |
+| `interrupted` | Work was intentionally stopped. |
+| `error` | Agent could not settle successfully. |
+
+A late duplicate end cannot overwrite a closed outcome. Process exit after a
+source close likewise cannot overwrite completed/interrupted/error. Loss while
+an activity is open is projected by the daemon as an activity failure; semantic
+reports never expose runner residency vocabulary.

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/gmuxapp/gmux/packages/paths"
 )
 
 // version is set at build time via -ldflags "-X main.version=..."
@@ -14,20 +17,37 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 2 && os.Args[1] == "__detached-target" {
+		os.Exit(runDetachedTarget(os.Args[2:]))
+	}
 	log.SetPrefix("gmux: ")
 	log.SetFlags(0)
 
+	// Consume _GMXINTERNAL_HANDSHAKE_FD before anything can fork: a lazily-read
+	// env var leaks into the session's environment and makes any nested
+	// gmux close an arbitrary fd of its own (see handshake.go).
+	captureHandshakeFD()
+
 	cmd, err := parseCLI(os.Args[1:])
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gmux:", err)
-		fmt.Fprintln(os.Stderr)
-		printUsage(os.Stderr)
-		os.Exit(2)
+		// The error plus a one-line pointer at the right help page — never
+		// the page itself, so repeated mistakes don't flood the output.
+		topic := ""
+		var ue *usageError
+		if errors.As(err, &ue) {
+			topic = ue.topic
+		}
+		fmt.Fprintf(os.Stderr, "gmux: %v\n%s\n", err, helpHint(topic))
+		// 1, not 2: under the global taxonomy (ADR 0027 §8) 2 means an
+		// intentional interruption, and a mistyped command line is an error
+		// like any other. Runtime usage errors already exit 1, so parse-time
+		// and runtime usage failures now agree.
+		os.Exit(exitUsage)
 	}
 
 	switch cmd.mode {
 	case modeHelp:
-		printUsage(os.Stdout)
+		printHelpTopic(os.Stdout, cmd.helpTopic)
 	case modeVersion:
 		fmt.Println(version)
 	case modeOpen:
@@ -42,18 +62,34 @@ func main() {
 		os.Exit(cmdList(cmd.all, cmd.json))
 	case modeKill:
 		os.Exit(cmdKill(cmd.ref))
+	case modeDismiss:
+		os.Exit(cmdDismiss(cmd.ref, cmd.dismissTree))
 	case modeTail:
-		os.Exit(cmdTail(cmd.ref, cmd.tailLines, cmd.raw))
+		os.Exit(cmdTail(cmd.ref, cmd.tailLines))
 	case modeAttach:
 		os.Exit(cmdAttach(cmd.ref))
 	case modeSend:
-		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys))
+		os.Exit(cmdSend(cmd.ref, cmd.sendText, cmd.sendKeys, cmd.sendWait, cmd.timeout))
 	case modeSendKeys:
 		os.Exit(cmdSendKeys(cmd.ref, cmd.keys, cmd.keysLiteral))
 	case modeWait:
-		os.Exit(cmdWait(cmd.ref, cmd.timeout))
+		os.Exit(cmdWait(cmd.waitRefs, cmd.timeout, cmd.forText, cmd.forRegex, cmd.quiet))
+	case modeWorktree:
+		os.Exit(cmdWorktree(cmd))
+	case modeProject:
+		os.Exit(cmdProject(cmd))
+	case modePromote:
+		os.Exit(cmdPromote(cmd.ref))
+	case modeReparent:
+		os.Exit(cmdReparent(cmd.ref, cmd.parentRef))
+	case modeAgent:
+		os.Exit(cmdAgent(cmd))
+	case modeEdit:
+		runEdit(cmd.editFile)
+	case modeEditChild:
+		os.Exit(editChild(cmd.editFile))
 	case modeDaemon:
-		os.Exit(execGmuxd(cmd.daemonSub))
+		os.Exit(execGmuxd(cmd.daemonArgs...))
 	case modeAuth:
 		os.Exit(execGmuxd("auth"))
 	case modeRemote:
@@ -116,7 +152,7 @@ func openUI() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	if !ready {
-		log.Fatalf("gmuxd is not running (check %s/gmuxd.log for errors)", os.TempDir())
+		log.Fatalf("gmuxd is not running (check %s for errors)", paths.DaemonLogPath())
 	}
 
 	// Parse health response for TCP address and auth token.

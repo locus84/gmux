@@ -1,7 +1,9 @@
 package adapters
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,16 +12,18 @@ import (
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
+	"github.com/gmuxapp/gmux/packages/adapter/filewatch"
 	"github.com/gmuxapp/gmux/packages/paths"
 )
 
 // Compile-time interface checks.
 var (
-	_ adapter.Launchable      = (*Claude)(nil)
-	_ adapter.SessionFiler    = (*Claude)(nil)
-	_ adapter.FileMonitor     = (*Claude)(nil)
-	_ adapter.FileAttributor  = (*Claude)(nil)
-	_ adapter.Resumer         = (*Claude)(nil)
+	_ adapter.ConversationSource    = (*Claude)(nil)
+	_ adapter.ConversationProber    = (*Claude)(nil)
+	_ adapter.Launchable            = (*Claude)(nil)
+	_ adapter.ConversationDescriber = (*Claude)(nil)
+	_ adapter.ConversationOpener    = (*Claude)(nil)
+	_ adapter.Resumer               = (*Claude)(nil)
 )
 
 func init() {
@@ -27,8 +31,8 @@ func init() {
 }
 
 // Claude is the adapter for Claude Code (claude CLI).
-// Session files are JSONL in ~/.claude/projects/<encoded-cwd>/.
-// Status is driven by the JSONL session file (FileMonitor), not PTY output.
+// Conversation files are JSONL in ~/.claude/projects/<encoded-cwd>/.
+// Status is driven by the agent hook (see claude_hook.go), not PTY output.
 type Claude struct{}
 
 func NewClaude() *Claude { return &Claude{} }
@@ -56,6 +60,11 @@ func (c *Claude) Match(cmd []string) bool {
 // Env returns no extra environment variables.
 func (c *Claude) Env(_ adapter.EnvContext) []string { return nil }
 
+// SupportsACPDrive reports that the Claude harness has an ACP drive mode
+// (ADR 0033): semantic control is delivered by the ACP runner, so terminal
+// refusals name the mode boundary rather than a missing capability.
+func (c *Claude) SupportsACPDrive() bool { return true }
+
 func (c *Claude) Launchers() []adapter.Launcher {
 	return []adapter.Launcher{{
 		ID:          "claude",
@@ -65,20 +74,23 @@ func (c *Claude) Launchers() []adapter.Launcher {
 	}}
 }
 
-// Monitor is a no-op — status is driven by FileMonitor.ParseNewLines.
-func (c *Claude) Monitor(_ []byte) *adapter.Event {
-	return nil
-}
+// --- Conversation storage (file-backed: refs are absolute JSONL paths) ---
 
-// --- SessionFiler ---
-
-// SessionRootDir returns Claude Code's per-project sessions directory.
-func (c *Claude) SessionRootDir() string {
+// ConversationRootDir returns Claude Code's per-project sessions directory.
+func (c *Claude) ConversationRootDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
 	return filepath.Join(home, ".claude", "projects")
+}
+
+// ConversationGone anchors deletion detection on ConversationRootDir
+// (~/.claude/projects): if that tree is present, a missing transcript
+// was deleted; if it's absent, the storage is unavailable. Refs are
+// conversation-file paths for claude.
+func (c *Claude) ConversationGone(ref string) (gone bool, ok bool) {
+	return adapter.ConversationGoneAtRoot(ref, c.ConversationRootDir())
 }
 
 // encodeClaudeCwd encodes a working directory into Claude Code's directory
@@ -91,9 +103,9 @@ func encodeClaudeCwd(cwd string) string {
 
 var claudeCwdReplacer = strings.NewReplacer("/", "-", ".", "-")
 
-// SessionDir returns Claude Code's session directory for a given cwd.
-func (c *Claude) SessionDir(cwd string) string {
-	root := c.SessionRootDir()
+// ConversationDir returns Claude Code's session directory for a given cwd.
+func (c *Claude) ConversationDir(cwd string) string {
+	root := c.ConversationRootDir()
 	if root == "" {
 		return ""
 	}
@@ -101,7 +113,7 @@ func (c *Claude) SessionDir(cwd string) string {
 }
 
 // claudeFirstLine is the JSON shape of the first meaningful line in a
-// Claude Code session file (type "user").
+// Claude Code conversation file (type "user").
 type claudeFirstLine struct {
 	Type      string `json:"type"`
 	SessionID string `json:"sessionId"`
@@ -113,10 +125,12 @@ type claudeFirstLine struct {
 	} `json:"message"`
 }
 
-// ParseSessionFile reads a Claude Code JSONL session file and returns
-// display metadata.
-// Title priority: custom-title line > first user message text > "(new)".
-func (c *Claude) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
+// DescribeConversation reads a Claude Code JSONL conversation file (the ref
+// is the absolute file path) and returns display metadata.
+// Title priority: custom-title line > first user message text > "" (no
+// conversation-derived title yet; callers fall back to cwd/adapter).
+func (c *Claude) DescribeConversation(ref string) (*adapter.ConversationInfo, error) {
+	path := ref
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -127,12 +141,31 @@ func (c *Claude) ParseSessionFile(path string) (*adapter.SessionFileInfo, error)
 		return nil, errEmpty
 	}
 
+	// A resumed Claude transcript has a new UUID filename, while replayed
+	// history retains the original per-line sessionId. Keep every valid ID in
+	// first-appearance order; malformed values must not create a false link.
+	ownID := claudeConversationIDFromPath(path)
+	lineSessionIDs := make([]string, 0)
+	seenLineSessionIDs := make(map[string]struct{})
+
 	// Find the first user line for session metadata.
 	var firstUser *claudeFirstLine
 	var customTitle string
 	messageCount := 0
 
 	for _, line := range lines {
+		var session struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal([]byte(line), &session); err == nil {
+			if id, ok := validClaudeConversationID(session.SessionID); ok && id != ownID {
+				if _, exists := seenLineSessionIDs[id]; !exists {
+					seenLineSessionIDs[id] = struct{}{}
+					lineSessionIDs = append(lineSessionIDs, id)
+				}
+			}
+		}
+
 		if line == "" {
 			continue
 		}
@@ -179,23 +212,26 @@ func (c *Claude) ParseSessionFile(path string) (*adapter.SessionFileInfo, error)
 		}
 
 		created, _ := time.Parse(time.RFC3339Nano, header.Timestamp)
-		return &adapter.SessionFileInfo{
+		return &adapter.ConversationInfo{
 			ID:           header.SessionID,
-			Title:        "(new)",
+			Title:        "", // header only, no messages yet
 			Created:      created,
+			LastActivity: fileLastActivity(path),
 			MessageCount: messageCount,
-			FilePath:     path,
+			Ref:          path,
+			AncestorIDs:  claudeAncestorIDs(nil, ownID, lineSessionIDs),
 		}, nil
 	}
 
 	created, _ := time.Parse(time.RFC3339Nano, firstUser.Timestamp)
 
-	info := &adapter.SessionFileInfo{
+	info := &adapter.ConversationInfo{
 		ID:           firstUser.SessionID,
 		Cwd:          firstUser.Cwd,
 		Created:      created,
+		LastActivity: fileLastActivity(path),
 		MessageCount: messageCount,
-		FilePath:     path,
+		Ref:          path,
 	}
 
 	firstUserText := extractClaudeUserText(firstUser.Message.Content)
@@ -206,151 +242,100 @@ func (c *Claude) ParseSessionFile(path string) (*adapter.SessionFileInfo, error)
 	case firstUserText != "":
 		info.Title = truncateTitle(firstUserText, 80)
 	default:
-		info.Title = "(new)"
+		info.Title = "" // no custom title and no message yet
 	}
 
-	// Slug from the first user message (immutable), not custom-title
-	// (which the user can change). Falls back to display title.
-	if firstUserText != "" {
-		info.Slug = adapter.Slugify(truncateTitle(firstUserText, 80))
-	} else {
-		info.Slug = adapter.Slugify(info.Title)
-	}
+	// Slug from the resolved title, custom-title included. Slug is the
+	// session's mutable display name (UBIQUITOUS_LANGUAGE.md), not identity
+	// — the immutable Tool ID is — so a /rename moves the slug with it,
+	// matching pi and the hook path (claudeTitleSlug already slugs
+	// session_title when the payload carries it).
+	info.Slug = adapter.Slugify(info.Title)
+	info.AncestorIDs = claudeAncestorIDs(firstUser.Message.Content, ownID, lineSessionIDs)
 
 	return info, nil
 }
 
-// --- FileMonitor ---
-
-// ParseNewLines receives lines appended to an attributed session file
-// and returns events for meaningful changes.
-//
-// Signals:
-//   - custom-title → title update
-//   - type:"user" → working (assistant will respond)
-//   - type:"assistant" → status from stop_reason + content analysis:
-//       stop_reason=null + tool_use  → working (tool loop continues)
-//       stop_reason=null + text only → idle (final response, no stop_reason on streaming)
-//       stop_reason="end_turn"       → idle (normal completion)
-//       stop_reason="stop_sequence"  → idle (user pressed Esc)
-//       thinking-only                → intermediate, ignored
-func (c *Claude) ParseNewLines(lines []string, _ string) []adapter.Event {
-	var events []adapter.Event
-	cwdEmitted := false
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		var peek struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal([]byte(line), &peek); err != nil {
-			continue
-		}
-
-		switch peek.Type {
-		case "custom-title":
-			var ct struct {
-				CustomTitle string `json:"customTitle"`
-			}
-			if err := json.Unmarshal([]byte(line), &ct); err == nil && ct.CustomTitle != "" {
-				events = append(events, adapter.Event{
-					Title: strings.TrimSpace(ct.CustomTitle),
-				})
-			}
-
-		case "user":
-			// User submitted a message — assistant will start working.
-			// Title comes from ParseSessionFile on attribution, not here.
-			// The cwd on the first user line is the canonical project directory.
-			var userLine struct {
-				Cwd string `json:"cwd"`
-			}
-			if !cwdEmitted {
-				if err := json.Unmarshal([]byte(line), &userLine); err == nil && userLine.Cwd != "" {
-					events = append(events, adapter.Event{Cwd: userLine.Cwd})
-					cwdEmitted = true
-				}
-			}
-			events = append(events, adapter.Event{
-				Status: &adapter.Status{Working: true},
-			})
-
-		case "assistant":
-			var msg struct {
-				Message struct {
-					StopReason *string `json:"stop_reason"`
-					Content    []struct {
-						Type string `json:"type"`
-					} `json:"content"`
-				} `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(line), &msg); err != nil {
-				continue
-			}
-
-			hasToolUse := false
-			hasText := false
-			for _, block := range msg.Message.Content {
-				switch block.Type {
-				case "tool_use":
-					hasToolUse = true
-				case "text":
-					hasText = true
-				}
-			}
-
-			switch {
-			case hasToolUse:
-				// Tool use = still working (will get tool result, then continue).
-				// Re-assert working so recovery from transient states works.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{Working: true},
-				})
-			case hasText:
-				// Text with no tool_use = turn complete (end_turn, stop_sequence,
-				// or streaming null stop_reason). All mean idle.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{},
-					Unread: adapter.BoolPtr(true),
-				})
-			// thinking-only = intermediate, no event.
-			}
-		}
-	}
-	return events
-}
-
-// --- FileAttributor ---
-
-// AttributeFile matches a file to a session using metadata (cwd + timestamp
-// proximity). Claude uses per-cwd directories, so this is usually trivial —
-// but multiple concurrent sessions in the same project can share a dir.
-func (c *Claude) AttributeFile(filePath string, candidates []adapter.FileCandidate) string {
-	info, err := c.ParseSessionFile(filePath)
-	if err != nil {
-		return ""
-	}
-	return attributeByMetadata(info, candidates)
-}
-
 // --- Resumer ---
 
-// ResumeCommand returns the command to resume a Claude Code session.
-func (c *Claude) ResumeCommand(info *adapter.SessionFileInfo) []string {
+// ResumeCommand returns the command to resume a Claude Code session, or nil
+// when the conversation has no user messages worth resuming.
+func (c *Claude) ResumeCommand(info *adapter.ConversationInfo) []string {
+	if info == nil || info.MessageCount == 0 {
+		return nil
+	}
 	return []string{"claude", "--resume", info.ID}
 }
 
-// CanResume checks if a session file has user messages worth resuming.
-func (c *Claude) CanResume(path string) bool {
-	info, err := c.ParseSessionFile(path)
-	if err != nil {
-		return false
-	}
-	return info.MessageCount > 0
+// OpenConversation streams the raw JSONL transcript at ref.
+func (c *Claude) OpenConversation(ref string) (io.ReadCloser, error) {
+	return os.Open(ref)
 }
 
 // --- Helpers ---
+
+var (
+	claudeUUIDPattern         = regexp.MustCompile(`(?i)^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`)
+	claudeSessionStartPattern = regexp.MustCompile(`(?i)# session-start -- ([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.jsonl`)
+)
+
+// claudeConversationIDFromPath returns the canonical UUID filename stem, if any.
+func claudeConversationIDFromPath(path string) string {
+	id, _ := validClaudeConversationID(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	return id
+}
+
+func validClaudeConversationID(id string) (string, bool) {
+	if !claudeUUIDPattern.MatchString(id) {
+		return "", false
+	}
+	return strings.ToLower(id), true
+}
+
+// claudeAncestorIDs derives resume lineage from the replayed per-line session
+// IDs. The `# session-start -- <uuid>.jsonl` marker in the first user message
+// is used ONLY to order the result (lead with it) — never as an independent
+// source: that text is user-authorable, so trusting it alone would let a
+// crafted first prompt forge an ancestor edge and drive a false takeover of an
+// unrelated dead conversation (ADR 0024 §2 — a false link must be impossible;
+// only a missed link is acceptable). Claude stamps every replayed line with
+// the genuine ancestor's sessionId, so a real resume is always corroborated.
+func claudeAncestorIDs(firstUserContent json.RawMessage, ownID string, lineSessionIDs []string) []string {
+	ancestors := make([]string, 0, len(lineSessionIDs)+1)
+	seen := make(map[string]struct{})
+	add := func(id string) {
+		if id == "" || id == ownID {
+			return
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			ancestors = append(ancestors, id)
+		}
+	}
+
+	// Line IDs are the trusted source. The marker only promotes a
+	// corroborated ID to the front; an uncorroborated marker contributes
+	// nothing.
+	lineSet := make(map[string]struct{}, len(lineSessionIDs))
+	for _, id := range lineSessionIDs {
+		lineSet[id] = struct{}{}
+	}
+	content := extractClaudeUserText(firstUserContent)
+	if match := claudeSessionStartPattern.FindStringSubmatch(content); len(match) == 2 {
+		if id, ok := validClaudeConversationID(match[1]); ok {
+			if _, corroborated := lineSet[id]; corroborated {
+				add(id)
+			}
+		}
+	}
+	for _, id := range lineSessionIDs {
+		add(id)
+	}
+	if len(ancestors) == 0 {
+		return nil
+	}
+	return ancestors
+}
 
 // extractClaudeUserText extracts the first text block from a Claude Code
 // user message content field. Content can be a string or array of blocks.
@@ -393,4 +378,20 @@ func cleanClaudeUserText(s string) string {
 		return ""
 	}
 	return s
+}
+
+// --- ConversationSource ---
+
+func (c *Claude) SnapshotConversations(sink adapter.ConversationSink) {
+	filewatch.Snapshot(c.ConversationRootDir(), ".jsonl", sink.Upsert)
+}
+
+func (c *Claude) WatchConversations(ctx context.Context, sink adapter.ConversationSink) error {
+	return filewatch.Watch(ctx, c.ConversationRootDir(), ".jsonl", func(e filewatch.Event) {
+		if e.Removed {
+			sink.Remove(e.Path)
+		} else {
+			sink.Upsert(e.Path)
+		}
+	})
 }

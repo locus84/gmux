@@ -18,6 +18,7 @@ export {
   type Keybind,
   DEFAULT_THEME_COLORS,
   buildTerminalOptions,
+  resolveUiScale,
   normalizeThemeColors,
 } from './settings-schema'
 

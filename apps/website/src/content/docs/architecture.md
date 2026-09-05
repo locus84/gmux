@@ -10,10 +10,10 @@ description: "Runtime structure: runner, daemon, and embedded web UI."
 One per session. It:
 
 - Launches the child process under a PTY
-- Owns the live session state (title, status, working flag)
+- Owns the live session state (title, status, active flag)
 - Persists PTY output to an on-disk scrollback file for session replay on reconnect
 - Exposes the session on a Unix socket (metadata, events, terminal attach)
-- Runs adapter logic over child output
+- Runs the session's adapter: agents report authoritative state (conversation binding, turn phase, title) to the runner via a tool-neutral hook protocol; OSC title parsing over child output remains for everything else
 
 `gmux` is the source of truth for a live session.
 
@@ -21,17 +21,17 @@ One per session. It:
 
 One per machine. It:
 
-- Discovers live runner sockets (`/tmp/gmux-sessions/*.sock`)
+- Discovers live runner sockets (`~/.local/state/gmux/run/sessions/*.sock`) — runners register themselves on startup; a periodic socket scan is the fallback
 - Subscribes to runner events for live updates
-- Watches adapter session files (e.g. pi's JSONL conversations)
+- Maintains a conversations index fed by adapter-owned conversation sources (e.g. pi's JSONL conversation files), used for discovery and resume
 - Serves the REST API, SSE event stream, and WebSocket proxy
 - Serves the embedded web frontend as a SPA
 - Manages session launch, kill, dismiss, and resume
 - Optionally connects to other gmuxd instances (peers) and aggregates their sessions into a single UI (see [Multi-Machine](/multi-machine/))
 
-`gmuxd` is stateless — if it restarts, it rediscovers running sessions. On startup it hashes the `gmux` binary it ships with; sessions running a different build are marked **stale** so the UI can flag them.
+All daemon-owned structured state — sessions, projects, peers — lives in a single SQLite database (`~/.local/state/gmux/state.db`, ADR 0026). Dead sessions survive daemon restarts because they are rows in the database, not ephemeral in-memory entries. Scrollback for dead sessions is treated as an evictable cache on disk (ADR 0016). On startup gmuxd rediscovers surviving runner sockets, merges their live state into the database, and hashes the `gmux` binary it ships with; sessions running a different build are marked **stale** so the UI can flag them.
 
-`gmux` auto-starts `gmuxd` if it isn't already running. If a daemon from an older version is detected, `gmux` automatically replaces it so the child process always talks to a compatible daemon.
+`gmux` auto-starts `gmuxd` if it isn't already running. If a daemon from an older version is detected, `gmux` automatically replaces it so the child process always talks to a compatible daemon. `gmuxd run` refuses to replace a healthy same-version daemon (exits 0 "already running"); use `gmuxd restart` (or `gmuxd run --replace`) to replace it deliberately.
 
 Configuration lives in `~/.config/gmux/host.toml`. See [Configuration](/configuration) for the full file layout, or [Security](/security) and [Remote Access](/remote-access) for details on those topics.
 
@@ -85,7 +85,7 @@ Two distinct mechanisms back replay, and they should not be conflated:
 
 ## API surface
 
-Served by `gmuxd` on a Unix socket (local IPC) and a TCP listener (default `127.0.0.1:8790`, token-authenticated):
+Served by `gmuxd` on a Unix socket (local IPC) and a TCP listener (default `127.0.0.1:8790`, token-authenticated; cookie-authed mutations and WebSocket upgrades additionally enforce same-origin — see [Security](/security)). This is a non-exhaustive overview of the main endpoints:
 
 | Endpoint | Purpose |
 |---|---|
@@ -96,9 +96,16 @@ Served by `gmuxd` on a Unix socket (local IPC) and a TCP listener (default `127.
 | `GET /v1/frontend-config` | User settings + theme (from JSONC files) |
 | `POST /v1/launch` | Launch a new session |
 | `POST /v1/sessions/{id}/kill` | Kill a session |
-| `POST /v1/sessions/{id}/dismiss` | Kill + remove |
+| `POST /v1/sessions/{id}/dismiss` | Stop and dismiss the session and every session it launched |
 | `POST /v1/sessions/{id}/resume` | Resume a resumable session |
-| `GET /v1/events` | SSE: `snapshot.sessions`, `snapshot.world`, `session-activity` (ADR 0001) |
+| `GET /v1/sessions/{id}/scrollback` | Plain-text terminal tail (works for dead sessions) |
+| `POST /v1/sessions/{id}/{input,read,wait,...}` | Other session actions (input injection, mark read, wait-for-idle, …) |
+| `POST /v1/sessions/{id}/prompt` | Semantic agent prompt: mode `prompt`/`follow_up`/`steer`, transparent resume, admission + fused wait (ADR 0027; local sessions only) |
+| `POST /v1/sessions/{id}/cancel` | Semantic agent interrupt; live active session only, never resumes (ADR 0027) |
+| `GET /v1/conversations/{adapter}/{slug}` | Conversation lookup for resume |
+| `POST /v1/peers` / `DELETE /v1/peers/{name}` | Add / remove a peer host |
+| `POST /v1/register` / `POST /v1/deregister` | Runner registration fast path |
+| `GET /v1/events?session_stream=3` | SSE: bounded atomic `snapshot.sessions.{begin,batch,ready}`, row diagnostics, `snapshot.world`, `session-activity` (ADR 0001); unversioned requests temporarily retain legacy `snapshot.sessions` |
 | `/v1/peers/{peer}/...` | Forward an allowlisted write to a peer (ADR 0002) |
 | `GET /v1/health` | Daemon health, version, launchers, peer status |
 | `WS /ws/{id}` | Terminal WebSocket proxy |

@@ -68,37 +68,72 @@ func TestSessionSocketDir(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to XDG_RUNTIME_DIR", func(t *testing.T) {
+	t.Run("defaults to state dir, ignoring XDG_RUNTIME_DIR", func(t *testing.T) {
 		t.Setenv("GMUX_SOCKET_DIR", "")
+		// logind/elogind tear down $XDG_RUNTIME_DIR on last logout, so it
+		// must never be the socket home for login-outliving runners.
 		t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-		want := "/run/user/1000/gmux/sessions"
+		t.Setenv("XDG_STATE_HOME", "/home/u/.local/state")
+		want := "/home/u/.local/state/gmux/run/sessions"
 		if got := SessionSocketDir(); got != want {
 			t.Errorf("SessionSocketDir() = %q, want %q", got, want)
 		}
-	})
-
-	t.Run("per-uid temp dir when no XDG_RUNTIME_DIR", func(t *testing.T) {
-		t.Setenv("GMUX_SOCKET_DIR", "")
-		t.Setenv("XDG_RUNTIME_DIR", "")
-		got := SessionSocketDir()
-		want := filepath.Join(os.TempDir(), fmt.Sprintf("gmux-sessions-%d", os.Getuid()))
-		if got != want {
-			t.Errorf("SessionSocketDir() = %q, want %q", got, want)
-		}
-		// Must not be the old world-shared path.
-		if got == "/tmp/gmux-sessions" {
+		// Must not be the old world-shared path either.
+		if got := SessionSocketDir(); got == "/tmp/gmux-sessions" {
 			t.Errorf("SessionSocketDir() must not default to the shared /tmp/gmux-sessions")
 		}
 	})
 }
 
+func TestLegacySessionSocketDirs(t *testing.T) {
+	t.Run("empty when GMUX_SOCKET_DIR is set", func(t *testing.T) {
+		t.Setenv("GMUX_SOCKET_DIR", "/tmp/custom-sockets")
+		if got := LegacySessionSocketDirs(); len(got) != 0 {
+			t.Errorf("LegacySessionSocketDirs() = %v, want empty", got)
+		}
+	})
+
+	t.Run("includes XDG runtime dir and per-uid temp dir", func(t *testing.T) {
+		t.Setenv("GMUX_SOCKET_DIR", "")
+		t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+		got := LegacySessionSocketDirs()
+		want := []string{
+			"/run/user/1000/gmux/sessions",
+			filepath.Join(os.TempDir(), fmt.Sprintf("gmux-sessions-%d", os.Getuid())),
+		}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("LegacySessionSocketDirs() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("per-uid temp dir only when no XDG_RUNTIME_DIR", func(t *testing.T) {
+		t.Setenv("GMUX_SOCKET_DIR", "")
+		t.Setenv("XDG_RUNTIME_DIR", "")
+		got := LegacySessionSocketDirs()
+		if len(got) != 1 {
+			t.Fatalf("LegacySessionSocketDirs() = %v, want 1 entry", got)
+		}
+	})
+}
+
+func TestDataAndWorktreesDir(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", "/tmp/xdg-data")
+	if got := DataDir(); got != filepath.Join("/tmp/xdg-data", "gmux") {
+		t.Fatalf("DataDir() = %q", got)
+	}
+	if got := WorktreesDir(); got != filepath.Join("/tmp/xdg-data", "gmux", "worktrees") {
+		t.Fatalf("WorktreesDir() = %q", got)
+	}
+}
+
 func TestIsValidSessionID(t *testing.T) {
 	valid := []string{
-		"sess-abcd1234",
-		"sess-0",
-		"sess-claude",
-		"sess-resume_1",
-		"sess-codex-2",
+		"1va8lvdv",
+		"17ikrf3o",
+		"1uml07gq",
+		"19af1jz5",
+		"1spbhw3s",
+		"sess-0e456a30", // imported gmux 1.x identity
 	}
 	for _, id := range valid {
 		if !IsValidSessionID(id) {
@@ -108,16 +143,19 @@ func TestIsValidSessionID(t *testing.T) {
 
 	invalid := []string{
 		"",
-		"abcd1234",          // missing prefix
-		"sess-",             // empty suffix
-		"sess-../escape",    // path traversal
-		"sess-..",           // parent dir
-		"../sess-abcd",      // leading traversal
-		"sess-a/b",          // separator
-		`sess-a\b`,          // backslash separator
-		"sess-a::b",         // folder-key separator
-		"sess-a b",          // space
-		"sess-a\n",          // newline
+		"abcdefg",        // too short
+		"abcdefghi",      // too long
+		"ABC12345",       // uppercase
+		"abcd-123",       // punctuation
+		"../abcd1efg",    // leading traversal
+		"abcd1efg/b",     // separator
+		`abcd1efg\b`,     // backslash separator
+		"abcd1efg::b",    // folder-key separator
+		"abcd1efg b",     // space
+		"abcd1efg\n",     // newline
+		"sess-0e456a3",   // short legacy id
+		"sess-0e456a3z",  // non-hex legacy id
+		"sess-../456a30", // traversal-shaped legacy id
 	}
 	for _, id := range invalid {
 		if IsValidSessionID(id) {

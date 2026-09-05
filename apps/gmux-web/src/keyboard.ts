@@ -12,19 +12,31 @@
  */
 import type { Terminal } from '@xterm/xterm'
 import {
+  firstBinaryType,
+  type UploadResult,
+  uploadClipboardBlob,
+} from './clipboard-upload'
+import {
   eventMatchesKeybind,
   IS_MAC,
   keyComboToSequence,
   type ResolvedKeybind,
 } from './config'
-import {
-  firstBinaryType,
-  uploadClipboardBlob,
-  type UploadResult,
-} from './clipboard-upload'
+import { shouldBlockMobileWebKitImeKey } from './mobile-input'
 import { selectionToText } from './selection'
+import { terminalFindOpen } from './store'
 
 type SendFn = (data: string) => void
+
+/** Immutable terminal connection capability captured at a paste gesture. */
+export interface PasteDestination {
+  readonly sessionId: string
+  readonly bracketedPasteMode: boolean
+  /** Sends only while the exact captured connection is still current and open. */
+  send(text: string): boolean
+}
+
+export type GetPasteDestination = () => PasteDestination | null
 
 /**
  * Detect a touch-primary device (coarse pointer).
@@ -76,19 +88,34 @@ export const defaultPasteFeedback: PasteFeedback = (kind, message) => {
  * input bytes to type into the PTY on success, or null on failure (after
  * surfacing the error via feedback).
  */
-async function uploadAndFormatPath(
+async function uploadAndSendPath(
   blob: Blob,
-  sessionId: string,
-  bracketedPasteMode: boolean,
+  destination: PasteDestination,
   feedback: PasteFeedback,
-): Promise<string | null> {
-  const result: UploadResult = await uploadClipboardBlob(blob, sessionId)
+): Promise<void> {
+  const result: UploadResult = await uploadClipboardBlob(blob, destination.sessionId)
   if (!result.ok) {
     feedback('error', pasteErrorMessage(result.error))
-    return null
+    return
   }
-  feedback('info', `Pasted to ${result.path}`)
-  return formatPasteText(result.path, bracketedPasteMode)
+  if (!destination.send(formatPasteText(result.path, destination.bracketedPasteMode))) {
+    feedback('error', 'Paste cancelled: terminal connection changed')
+  }
+}
+
+/** Upload a file chosen by the user and type its daemon-side path safely. */
+export async function handleBlobPasteAction(
+  blob: Blob,
+  destination: PasteDestination,
+  feedback: PasteFeedback,
+): Promise<void> {
+  await uploadAndSendPath(blob, destination, feedback)
+}
+
+function sendPaste(destination: PasteDestination, text: string, feedback: PasteFeedback): void {
+  if (!destination.send(formatPasteText(text, destination.bracketedPasteMode))) {
+    feedback('error', 'Paste cancelled: terminal connection changed')
+  }
 }
 
 function pasteErrorMessage(code: string): string {
@@ -113,13 +140,18 @@ function pasteErrorMessage(code: string): string {
 export function attachKeyboardHandler(
   term: Terminal,
   send: SendFn,
-  sendRaw: SendFn,
   keybinds: ResolvedKeybind[],
   macCommandIsCtrl = false,
-  sessionId = '',
+  getPasteDestination: GetPasteDestination = () => null,
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): void {
   term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    // iPadOS Korean IME can leak compatibility jamo through xterm's keydown
+    // path. Block xterm processing while leaving the native IME event intact.
+    if (ev.type === 'keydown' && shouldBlockMobileWebKitImeKey(ev)) {
+      return false
+    }
+
     // Mobile Enter → newline (not submit).
     // Bare Enter with no modifiers on a touch device sends \n so the user
     // can compose multi-line messages. The mobile toolbar send button sends
@@ -150,7 +182,7 @@ export function attachKeyboardHandler(
 
       for (const kb of keybinds) {
         if (!eventMatchesKeybind(virtualMods, kb)) continue
-        const handled = executeAction(kb, term, send, sendRaw, sessionId, onPasteFeedback)
+        const handled = executeAction(kb, term, send, getPasteDestination, onPasteFeedback)
         if (handled) { ev.preventDefault(); return false }
       }
 
@@ -168,7 +200,7 @@ export function attachKeyboardHandler(
       // For shift+enter we need to block all event types (keydown, keypress,
       // keyup) to prevent the Kitty keyboard protocol sequence from leaking.
       if (kb.baseKey === 'enter' && kb.shift) {
-        if (ev.type === 'keydown') executeAction(kb, term, send, sendRaw, sessionId, onPasteFeedback)
+        if (ev.type === 'keydown') executeAction(kb, term, send, getPasteDestination, onPasteFeedback)
         ev.preventDefault()
         return false
       }
@@ -176,7 +208,7 @@ export function attachKeyboardHandler(
       // For other bindings, only act on keydown.
       if (ev.type !== 'keydown') return true
 
-      const handled = executeAction(kb, term, send, sendRaw, sessionId, onPasteFeedback)
+      const handled = executeAction(kb, term, send, getPasteDestination, onPasteFeedback)
       if (handled) {
         // Prevent browser default (e.g. Cmd+Left navigating back on Mac).
         // xterm.js does not call preventDefault when the custom handler
@@ -195,15 +227,13 @@ export function attachKeyboardHandler(
  * (not passed to xterm), false if xterm should still process it.
  *
  * `send` is the input channel (may apply mobile ctrl/alt arm modifiers).
- * `sendRaw` bypasses modifier logic, used by paste to avoid corrupting
- * clipboard content.
+ * Paste uses its captured destination capability to bypass modifier logic.
  */
 function executeAction(
   kb: ResolvedKeybind,
   term: Terminal,
   send: SendFn,
-  sendRaw: SendFn,
-  sessionId: string,
+  getPasteDestination: GetPasteDestination,
   onPasteFeedback: PasteFeedback,
 ): boolean {
   switch (kb.action) {
@@ -243,22 +273,30 @@ function executeAction(
       // Inspect the clipboard for binary content first; binary always
       // wins over text (see PRD). Falls back to readText() when only
       // text/* representations are present, preserving prior behavior.
-      // Both branches use sendRaw to bypass mobile ctrl/alt arm logic.
+      // Both branches use the destination capability directly, bypassing
+      // mobile ctrl/alt arm logic.
       //
       // Requires clipboard-read permission in a secure context. The
       // keydown counts as a user gesture. Permission denial is reported
       // via onPasteFeedback so users see why nothing happened.
-      void handlePasteAction({
-        sessionId,
-        bracketedPasteMode: term.modes.bracketedPasteMode,
-        feedback: onPasteFeedback,
-        emit: sendRaw,
-      })
+      const destination = getPasteDestination()
+      if (!destination) {
+        onPasteFeedback('error', 'Paste failed: no active terminal connection')
+        return true
+      }
+      void handlePasteAction(destination, onPasteFeedback)
       return true
     }
 
     case 'selectAll':
       term.selectAll()
+      return true
+
+    case 'find':
+      // Opens the find bar rendered by TerminalView. Via a signal (not a
+      // callback) because this runs deep inside the key handler, far from
+      // the component tree. The bar focuses its own input on mount.
+      terminalFindOpen.value = true
       return true
 
     default:
@@ -269,76 +307,84 @@ function executeAction(
 /**
  * Result of applying armed mobile modifiers to an input payload.
  *
- * `ctrlApplied` / `altApplied` tell the caller which arms were actually
- * encoded into `seq`, so only those get consumed (disarmed). A ctrl arm
- * stays armed when the payload has no ctrl encoding (e.g. a digit),
- * matching the long-standing sendInput behavior.
+ * The `*Applied` flags tell the caller which arms were actually encoded into
+ * `seq`, so only those get consumed (disarmed). An arm stays armed when the
+ * payload has no supported encoding (for example Shift+1); we deliberately do
+ * not guess keyboard-layout-dependent printable mappings.
  */
 export interface ArmedModifierResult {
   seq: string
   ctrlApplied: boolean
   altApplied: boolean
+  shiftApplied: boolean
 }
 
 /**
- * Apply armed ctrl/alt modifiers to an outgoing input payload.
+ * Apply armed mobile modifiers to one outgoing xterm input payload.
+ * Shift uppercases ASCII letters, turns Tab into canonical BackTab, and joins
+ * the existing xterm modifier parameter for supported CSI/CSI-u keys. It does
+ * not remap punctuation because that is keyboard-layout dependent. Already
+ * uppercase keyboard input stays uppercase (rather than being shifted twice).
  *
- * This is the single source of truth for the mobile "arm a modifier, then
- * press a key" feature. It understands more than bare characters:
- *
- *  - Single characters: ctrl via ctrlSequenceFor (legacy control codes,
- *    CSI-u for uppercase), alt via ESC prefix, both combined when armed
- *    together (legacy ESC + control code; CSI-u modifier bits for
- *    uppercase).
- *  - CSI cursor keys (arrows, Home, End): modifier parameter injection,
- *    e.g. \x1b[D + ctrl → \x1b[1;5D (the standard word-left encoding).
- *  - Enter / Tab / Esc: alt uses the universal ESC prefix. Ctrl has no
- *    legacy encoding for these (ctrl+enter is byte-identical to enter),
- *    so CSI-u is emitted — consistent with ctrlSequenceFor's uppercase
- *    handling. Apps without kitty-protocol support won't see it, but
- *    nothing else can represent the combo at all.
- *
- * The CSI-u modifier parameter is 1 + shift(1) + alt(2) + ctrl(4).
+ * The terminal modifier parameter is 1 + shift(1) + alt(2) + ctrl(4).
  */
 export function applyArmedModifiers(
   data: string,
   ctrl: boolean,
   alt: boolean,
+  shift = false,
 ): ArmedModifierResult {
-  const unchanged = { seq: data, ctrlApplied: false, altApplied: false }
-  if (!ctrl && !alt) return unchanged
-  const mod = 1 + (alt ? 2 : 0) + (ctrl ? 4 : 0)
+  const unchanged = { seq: data, ctrlApplied: false, altApplied: false, shiftApplied: false }
+  if (!ctrl && !alt && !shift) return unchanged
+  const mod = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0)
 
-  // CSI cursor-key sequences: inject the modifier parameter.
+  // CSI cursor keys are precisely the set already supported by this encoder.
   // biome-ignore lint/suspicious/noControlCharactersInRegex: matching real ESC (\x1b) in terminal control sequences
-  const csi = /^\x1b\[([A-DHF])$/.exec(data)
-  if (csi) return { seq: `\x1b[1;${mod}${csi[1]}`, ctrlApplied: ctrl, altApplied: alt }
+  const csi = /^\x1b\[([A-DFHZ])$/.exec(data)
+  if (csi) return { seq: `\x1b[1;${mod}${csi[1]}`, ctrlApplied: ctrl, altApplied: alt, shiftApplied: shift }
 
-  // Enter / Tab / Esc with ctrl involved: CSI-u (no legacy encoding exists).
+  // Shift+Tab has a canonical legacy encoding. With additional modifiers,
+  // CSI-u is the existing encoder's lossless representation.
+  if (data === '\t' && shift && !ctrl && !alt) {
+    return { seq: '\x1b[Z', ctrlApplied: false, altApplied: false, shiftApplied: true }
+  }
+
   const csiUCode = data === '\r' ? 13 : data === '\t' ? 9 : data === '\x1b' ? 27 : null
   if (csiUCode !== null && ctrl) {
-    return { seq: `\x1b[${csiUCode};${mod}u`, ctrlApplied: true, altApplied: alt }
+    return { seq: `\x1b[${csiUCode};${mod}u`, ctrlApplied: true, altApplied: alt, shiftApplied: shift }
+  }
+
+  if (data.length === 1 && /[A-Za-z]/.test(data)) {
+    const letter = shift ? data.toUpperCase() : data
+    if (ctrl) {
+      const impliedShift = letter >= 'A' && letter <= 'Z'
+      const ctrlMod = 1 + (impliedShift || shift ? 1 : 0) + (alt ? 2 : 0) + 4
+      return {
+        seq: impliedShift
+          ? `\x1b[${letter.toLowerCase().charCodeAt(0)};${ctrlMod}u`
+          : `${alt ? '\x1b' : ''}${String.fromCharCode(letter.charCodeAt(0) - 96)}`,
+        ctrlApplied: true,
+        altApplied: alt,
+        shiftApplied: shift,
+      }
+    }
+    return { seq: alt ? `\x1b${letter}` : letter, ctrlApplied: false, altApplied: alt, shiftApplied: shift }
   }
 
   if (data.length === 1 && ctrl) {
-    // Uppercase: ctrlSequenceFor would emit CSI-u with mod 6 (shift+ctrl);
-    // fold an armed alt into the modifier bits instead of ESC-prefixing.
-    if (data >= 'A' && data <= 'Z') {
-      return {
-        seq: `\x1b[${data.toLowerCase().charCodeAt(0)};${mod + 1}u`,
-        ctrlApplied: true,
-        altApplied: alt,
-      }
-    }
     const code = ctrlSequenceFor(data)
-    if (code) return { seq: alt ? `\x1b${code}` : code, ctrlApplied: true, altApplied: alt }
+    if (code) return { seq: alt ? `\x1b${code}` : code, ctrlApplied: true, altApplied: alt, shiftApplied: shift }
   }
 
-  // Alt fallback: ESC prefix is the universal legacy alt encoding and is
-  // valid for any remaining payload (chars, \r, \t, even whole sequences).
-  if (alt) return { seq: `\x1b${data}`, ctrlApplied: false, altApplied: true }
+  // Text from an IME, dictation, or a keyboard that already produced its
+  // shifted punctuation passes through verbatim, but still consumes the
+  // one-shot Shift arm so composition cannot leave it stuck.
+  if (shift && data.length > 0 && !data.startsWith('\x1b')) {
+    return { seq: alt ? `\x1b${data}` : data, ctrlApplied: false, altApplied: alt, shiftApplied: true }
+  }
 
-  // Ctrl armed but no encoding for this payload: leave it armed.
+  // Alt's universal legacy encoding remains valid for other payloads.
+  if (alt) return { seq: `\x1b${data}`, ctrlApplied: false, altApplied: true, shiftApplied: false }
   return unchanged
 }
 
@@ -423,18 +469,13 @@ export function formatPasteText(text: string, bracketedPasteMode: boolean): stri
  * - We need to own the bracketed-paste / newline conversion ourselves so it is
  *   always correct regardless of what mobile modifier state is active.
  *
- * The `sendRaw` parameter must be sendRawInput (not sendInput) so that
- * paste is never transformed by the ctrl/alt modifier logic. The name
- * encodes the contract: the keybind paste action takes the same care
- * (see executeAction's `case 'paste'`).
+ * The destination's send capability bypasses ctrl/alt modifier logic.
  *
  * Returns a cleanup function.
  */
 export function attachPasteHandler(
-  term: Terminal,
   container: HTMLElement,
-  sendRaw: SendFn,
-  sessionId = '',
+  getPasteDestination: GetPasteDestination,
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): () => void {
   const handler = (ev: ClipboardEvent) => {
@@ -454,12 +495,12 @@ export function attachPasteHandler(
         onPasteFeedback('error', 'Paste failed: could not read clipboard item')
         return
       }
-      if (!sessionId) {
-        onPasteFeedback('error', 'Paste failed: no session bound')
+      const destination = getPasteDestination()
+      if (!destination) {
+        onPasteFeedback('error', 'Paste failed: no active terminal connection')
         return
       }
-      void uploadAndFormatPath(blob, sessionId, term.modes.bracketedPasteMode, onPasteFeedback)
-        .then(out => { if (out !== null) sendRaw(out) })
+      void uploadAndSendPath(blob, destination, onPasteFeedback)
       return
     }
 
@@ -470,7 +511,12 @@ export function attachPasteHandler(
     ev.stopPropagation()
     ev.preventDefault()
 
-    sendRaw(formatPasteText(text, term.modes.bracketedPasteMode))
+    const destination = getPasteDestination()
+    if (!destination) {
+      onPasteFeedback('error', 'Paste failed: no active terminal connection')
+      return
+    }
+    sendPaste(destination, text, onPasteFeedback)
   }
 
   container.addEventListener('paste', handler, { capture: true })
@@ -515,13 +561,10 @@ export function pickBinaryDataTransferItem(items: DataTransferItemList): DataTra
  * inspect-and-route logic as the keybind path. Without this, the mobile
  * button would be text-only.
  */
-export async function handlePasteAction(args: {
-  sessionId: string
-  bracketedPasteMode: boolean
-  feedback: PasteFeedback
-  emit: SendFn
-}): Promise<void> {
-  const { sessionId, bracketedPasteMode, feedback, emit } = args
+export async function handlePasteAction(
+  destination: PasteDestination,
+  feedback: PasteFeedback = defaultPasteFeedback,
+): Promise<void> {
   const reader = navigator.clipboard
 
   if (typeof reader?.read === 'function') {
@@ -536,22 +579,29 @@ export async function handlePasteAction(args: {
       for (const item of items) {
         const binMime = firstBinaryType(item.types)
         if (!binMime) continue
-        const blob = await item.getType(binMime)
-        if (!sessionId) {
-          feedback('error', 'Paste failed: no session bound')
+        let blob: Blob
+        try {
+          blob = await item.getType(binMime)
+        } catch (err) {
+          feedback('error', 'Paste failed: could not read clipboard item')
+          console.warn('Paste failed: could not read clipboard item.', err)
           return
         }
-        const out = await uploadAndFormatPath(blob, sessionId, bracketedPasteMode, feedback)
-        if (out !== null) emit(out)
+        await uploadAndSendPath(blob, destination, feedback)
         return
       }
       // No binary; extract text from the items we already have so we
       // don't trigger a second clipboard permission prompt.
       for (const item of items) {
         if (!item.types.includes('text/plain')) continue
-        const blob = await item.getType('text/plain')
-        const text = await blob.text()
-        if (text) emit(formatPasteText(text, bracketedPasteMode))
+        try {
+          const blob = await item.getType('text/plain')
+          const text = await blob.text()
+          if (text) sendPaste(destination, text, feedback)
+        } catch (err) {
+          feedback('error', 'Paste failed: could not read clipboard item')
+          console.warn('Paste failed: could not read clipboard item.', err)
+        }
         return
       }
       return // clipboard had only types we don't handle
@@ -560,7 +610,7 @@ export async function handlePasteAction(args: {
 
   try {
     const text = await reader.readText()
-    if (text) emit(formatPasteText(text, bracketedPasteMode))
+    if (text) sendPaste(destination, text, feedback)
   } catch (err) {
     feedback('error', 'Paste failed: clipboard access denied')
     console.warn('Paste failed: clipboard access denied.', err)

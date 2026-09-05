@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, pickBinaryDataTransferItem } from './keyboard'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, handleBlobPasteAction, handlePasteAction, type PasteDestination, pickBinaryDataTransferItem } from './keyboard'
 
 // Build an array-like stand-in for DataTransferItemList. Vitest runs in
 // node by default, where the real DOM type isn't available; a plain
@@ -13,6 +13,106 @@ function makeItems(
   })
   return list as unknown as DataTransferItemList
 }
+
+afterEach(() => vi.unstubAllGlobals())
+
+function destination(sessionId: string, send: (text: string) => boolean): PasteDestination {
+  return { sessionId, bracketedPasteMode: false, send }
+}
+
+function binaryClipboard(getType: () => Promise<Blob>): Clipboard {
+  return {
+    read: async () => [{ types: ['image/png'], getType }],
+  } as unknown as Clipboard
+}
+
+describe('paste destination binding', () => {
+  it('uploads a file chosen from the mobile toolbar and types its path', async () => {
+    const sent: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ ok: true, data: { path: '/tmp/report.pdf' } }))))
+
+    await handleBlobPasteAction(
+      new File(['pdf'], 'report.pdf', { type: 'application/pdf' }),
+      destination('mobile-session', text => { sent.push(text); return true }),
+      vi.fn(),
+    )
+
+    expect(fetch).toHaveBeenCalledWith('/v1/sessions/mobile-session/clipboard', expect.objectContaining({ method: 'POST' }))
+    expect(sent).toEqual(['/tmp/report.pdf'])
+  })
+
+  it('uses one namespaced destination for both upload and delivery', async () => {
+    const sent: string[] = []
+    let requestURL = ''
+    vi.stubGlobal('navigator', { clipboard: binaryClipboard(async () => new Blob(['png'], { type: 'image/png' })) })
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      requestURL = url
+      return new Response(JSON.stringify({ ok: true, data: { path: '/tmp/b.png' } }))
+    }))
+
+    await handlePasteAction(destination('abc@paste-container', text => { sent.push(text); return true }), vi.fn())
+
+    expect(requestURL).toBe('/v1/sessions/abc%40paste-container/clipboard')
+    expect(sent).toEqual(['/tmp/b.png'])
+  })
+
+  it('does not inject a delayed A upload after its connection is replaced', async () => {
+    let finish!: (response: Response) => void
+    vi.stubGlobal('navigator', { clipboard: binaryClipboard(async () => new Blob(['png'])) })
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { finish = resolve })))
+    let currentConnection = 'A'
+    const sent: string[] = []
+    const feedback = vi.fn()
+    const action = handlePasteAction(destination('A', text => {
+      if (currentConnection !== 'A') return false
+      sent.push(text)
+      return true
+    }), feedback)
+
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    currentConnection = 'B'
+    finish(new Response(JSON.stringify({ ok: true, data: { path: '/tmp/a.png' } })))
+    await action
+
+    expect(sent).toEqual([])
+    expect(feedback).toHaveBeenCalledWith('error', 'Paste cancelled: terminal connection changed')
+  })
+
+  it('does not use a replacement socket for stale completion', async () => {
+    let connection = {}
+    const captured = connection
+    const sent: string[] = []
+    vi.stubGlobal('navigator', { clipboard: binaryClipboard(async () => new Blob(['png'])) })
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      connection = {}
+      return new Response(JSON.stringify({ ok: true, data: { path: '/tmp/stale.png' } }))
+    }))
+    const feedback = vi.fn()
+
+    await handlePasteAction(destination('A', text => {
+      if (connection !== captured) return false
+      sent.push(text)
+      return true
+    }), feedback)
+
+    expect(sent).toEqual([])
+    expect(feedback).toHaveBeenCalledWith('error', expect.stringContaining('connection changed'))
+  })
+
+  it('surfaces ClipboardItem.getType failure without uploading or sending', async () => {
+    const fetch = vi.fn()
+    const send = vi.fn(() => true)
+    const feedback = vi.fn()
+    vi.stubGlobal('navigator', { clipboard: binaryClipboard(async () => { throw new Error('gone') }) })
+    vi.stubGlobal('fetch', fetch)
+
+    await handlePasteAction(destination('A', send), feedback)
+
+    expect(fetch).not.toHaveBeenCalled()
+    expect(send).not.toHaveBeenCalled()
+    expect(feedback).toHaveBeenCalledWith('error', 'Paste failed: could not read clipboard item')
+  })
+})
 
 describe('pickBinaryDataTransferItem', () => {
   it('returns the first file with a non-text MIME', () => {
@@ -133,24 +233,24 @@ describe('ctrlSequenceFor', () => {
 describe('applyArmedModifiers', () => {
   it('passes data through unchanged when nothing is armed', () => {
     expect(applyArmedModifiers('a', false, false))
-      .toEqual({ seq: 'a', ctrlApplied: false, altApplied: false })
+      .toEqual({ seq: 'a', ctrlApplied: false, altApplied: false, shiftApplied: false })
     expect(applyArmedModifiers('\r', false, false))
-      .toEqual({ seq: '\r', ctrlApplied: false, altApplied: false })
+      .toEqual({ seq: '\r', ctrlApplied: false, altApplied: false, shiftApplied: false })
   })
 
   it('applies ctrl to single characters via control codes', () => {
     expect(applyArmedModifiers('c', true, false))
-      .toEqual({ seq: '\x03', ctrlApplied: true, altApplied: false })
+      .toEqual({ seq: '\x03', ctrlApplied: true, altApplied: false, shiftApplied: false })
   })
 
   it('applies alt to single characters via ESC prefix', () => {
     expect(applyArmedModifiers('b', false, true))
-      .toEqual({ seq: '\x1bb', ctrlApplied: false, altApplied: true })
+      .toEqual({ seq: '\x1bb', ctrlApplied: false, altApplied: true, shiftApplied: false })
   })
 
   it('combines ctrl+alt on lowercase characters (ESC + control code)', () => {
     expect(applyArmedModifiers('c', true, true))
-      .toEqual({ seq: '\x1b\x03', ctrlApplied: true, altApplied: true })
+      .toEqual({ seq: '\x1b\x03', ctrlApplied: true, altApplied: true, shiftApplied: false })
   })
 
   it('folds alt into the CSI-u modifier for uppercase ctrl combos', () => {
@@ -162,7 +262,7 @@ describe('applyArmedModifiers', () => {
 
   it('leaves ctrl armed when the payload has no ctrl encoding', () => {
     expect(applyArmedModifiers('1', true, false))
-      .toEqual({ seq: '1', ctrlApplied: false, altApplied: false })
+      .toEqual({ seq: '1', ctrlApplied: false, altApplied: false, shiftApplied: false })
   })
 
   it('injects modifier params into CSI cursor-key sequences', () => {
@@ -171,9 +271,15 @@ describe('applyArmedModifiers', () => {
     expect(applyArmedModifiers('\x1b[A', true, true).seq).toBe('\x1b[1;7A')   // ctrl+alt+up
   })
 
+  it('encodes armed modifiers on BackTab without splitting the key', () => {
+    expect(applyArmedModifiers('\x1b[Z', false, false).seq).toBe('\x1b[Z')
+    expect(applyArmedModifiers('\x1b[Z', true, false).seq).toBe('\x1b[1;5Z')
+    expect(applyArmedModifiers('\x1b[Z', false, true).seq).toBe('\x1b[1;3Z')
+  })
+
   it('encodes alt+enter as ESC CR', () => {
     expect(applyArmedModifiers('\r', false, true))
-      .toEqual({ seq: '\x1b\r', ctrlApplied: false, altApplied: true })
+      .toEqual({ seq: '\x1b\r', ctrlApplied: false, altApplied: true, shiftApplied: false })
   })
 
   it('encodes ctrl+enter / ctrl+tab / ctrl+esc as CSI-u (no legacy encoding exists)', () => {
@@ -186,5 +292,33 @@ describe('applyArmedModifiers', () => {
   it('ESC-prefixes alt for keys without special handling', () => {
     expect(applyArmedModifiers('\t', false, true).seq).toBe('\x1b\t')
     expect(applyArmedModifiers('\n', false, true).seq).toBe('\x1b\n')
+  })
+
+  it('composes armed shift with Tab and printable letters', () => {
+    expect(applyArmedModifiers('\t', false, false, true))
+      .toEqual({ seq: '\x1b[Z', ctrlApplied: false, altApplied: false, shiftApplied: true })
+    expect(applyArmedModifiers('a', false, false, true).seq).toBe('A')
+    expect(applyArmedModifiers('A', false, false, true).seq).toBe('A')
+  })
+
+  it('composes shift with supported terminal modifier encodings', () => {
+    expect(applyArmedModifiers('\x1b[A', false, false, true).seq).toBe('\x1b[1;2A')
+    expect(applyArmedModifiers('\x1b[D', true, true, true).seq).toBe('\x1b[1;8D')
+    expect(applyArmedModifiers('c', true, false, true).seq).toBe('\x1b[99;6u')
+    expect(applyArmedModifiers('c', true, true, true).seq).toBe('\x1b[99;8u')
+  })
+
+  it('consumes shift when ctrl fallback emits a non-letter control code', () => {
+    for (const [input, output] of [['@', '\x00'], ['[', '\x1b'], ['\x7f', '\x08']] as const) {
+      expect(applyArmedModifiers(input, true, false, true))
+        .toEqual({ seq: output, ctrlApplied: true, altApplied: false, shiftApplied: true })
+    }
+  })
+
+  it('does not guess layout-dependent shift mappings and consumes on composed text', () => {
+    expect(applyArmedModifiers('1', false, false, true))
+      .toEqual({ seq: '1', ctrlApplied: false, altApplied: false, shiftApplied: true })
+    expect(applyArmedModifiers('dictated text', false, false, true))
+      .toEqual({ seq: 'dictated text', ctrlApplied: false, altApplied: false, shiftApplied: true })
   })
 })

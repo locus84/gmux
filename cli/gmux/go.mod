@@ -2,6 +2,8 @@ module github.com/gmuxapp/gmux/cli/gmux
 
 go 1.26
 
+toolchain go1.26.1
+
 require (
 	github.com/creack/pty v1.1.24
 	golang.org/x/term v0.41.0
@@ -32,3 +34,5 @@ require (
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/sys v0.42.0 // indirect
 )
+
+replace github.com/charmbracelet/x/vt => ../../third_party/vt

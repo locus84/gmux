@@ -1,28 +1,49 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
-import { Terminal } from '@xterm/xterm'
+import { ScrollAnchorAddon } from '@gmux/scroll-anchor'
 import { FitAddon } from '@xterm/addon-fit'
 import { ImageAddon } from '@xterm/addon-image'
+import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
-import type { ResolvedTerminalOptions } from './settings-schema'
-import { loadWebglRenderer } from './webgl-renderer'
-import { refreshAtlasWhenIconFontLoads } from './nerd-font'
-import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, defaultPasteFeedback, handlePasteAction } from './keyboard'
+import { Terminal } from '@xterm/xterm'
+import { effect } from '@preact/signals'
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { DEFAULT_THEME_COLORS, type ResolvedKeybind } from './config'
-import { attachMobileInputHandler } from './mobile-input'
-import { isTouchDevice } from './touch'
-import { createReplayBuffer } from './replay'
-import { createTerminalIO, type TerminalSize } from './terminal-io'
-import { linkAtPoint, type LinkInfo, openLinkAtPoint } from './terminal-link'
-import { createLongPressRecognizer } from './long-press'
+import { fileBrowserPath, pasteFileBrowserPath } from './file-browser'
+import { applyArmedModifiers, attachKeyboardHandler, attachPasteHandler, handleBlobPasteAction, handlePasteAction, type PasteDestination } from './keyboard'
 import { LinkActionSheet } from './link-action-sheet'
-import { TerminalTextSheet } from './terminal-text-sheet'
-import { pressedBufferRow, readTerminalText } from './terminal-text'
-import { decideViewportResize, sameSize } from './terminal-resize'
-import { terminalScrolledUp, terminalScrollToBottom } from './store'
+import { createLongPressRecognizer } from './long-press'
+import {
+  attachMobileInputHandler,
+  flushMobileWebKitImePending,
+  shouldSkipMobileWebKitImeData,
+} from './mobile-input'
 import { MOCK_BY_ID } from './mock-data/index'
+import { refreshAtlasWhenIconFontLoads } from './nerd-font'
+import { createReplayBuffer } from './replay'
+import type { ResolvedTerminalOptions } from './settings-schema'
+import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, urlSearch, vsCodeServerUrl } from './store'
+import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
+import { fetchAuthoritativeReconnectSize, shouldReassertReconnectSize } from './terminal-connection'
+import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
+import { TerminalFindBar } from './terminal-find'
+import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext } from './terminal-file-link'
+import { canSendTerminalInput } from './terminal-input'
+import { createTerminalIO, type TerminalSize } from './terminal-io'
+import { type LinkInfo, linkAtPoint, openLinkAtPoint } from './terminal-link'
+import { decideViewportResize, sameSize, shouldQueueResizeEcho } from './terminal-resize'
+import { pressedBufferRow, readTerminalText } from './terminal-text'
+import { TerminalTextSheet } from './terminal-text-sheet'
+import { pushError } from './toasts'
+import { isTouchDevice } from './touch'
+import { acceleratedScrollRows, decayScrollVelocity, shouldBlurTerminalAfterKeyboardClose, shouldFocusTerminalFromTouch, terminalTouchMoved, type TerminalTouchSnapshot } from './terminal-touch'
 import type { Session } from './types'
+import { resolveTerminalWebUrl } from './vscode-server'
+import { loadWebglRenderer } from './webgl-renderer'
+import { type WsState, wsStateOnClose, wsStateOnOutput } from './ws-state'
+import { attachImeResidueGuard, sendAfterFlushingComposition } from './xterm-composition'
 
 // ── Config ──
+
+type SessionConnection = { readonly sessionId: string, readonly ws: WebSocket }
 
 const USE_MOCK = import.meta.env.VITE_MOCK === '1' || location.search.includes('mock')
 
@@ -33,6 +54,68 @@ const USE_MOCK = import.meta.env.VITE_MOCK === '1' || location.search.includes('
 export const TERM_THEME = DEFAULT_THEME_COLORS
 
 // ── Utilities ──
+
+/** Frames of immediate re-measurement after a null first-claim measurement. */
+const CLAIM_RETRY_FRAME_BUDGET = 20
+/** Hard deadline after which a stuck claim falls back to checkpoint geometry. */
+const CLAIM_RETRY_FALLBACK_MS = 4000
+
+/**
+ * Waits for a viewport-claim measurement to become available after the first
+ * attempt returned null (e.g. xterm's renderer dimensions transiently
+ * undefined). Bounded, no busy loop: a short requestAnimationFrame chain
+ * covers transient renderer states, each ResizeObserver notification on the
+ * shell earns one more attempt, and a hard deadline fires onGiveUp so the
+ * attach can never remain in 'claiming' forever. The returned cancel function
+ * must be called on socket replacement, session switch, or unmount.
+ */
+function watchForClaimMeasurement(opts: {
+  shell: HTMLElement | null
+  measure: () => TerminalSize | null
+  onMeasured: (size: TerminalSize) => void
+  onGiveUp: () => void
+}): () => void {
+  let done = false
+  let raf: number | null = null
+  let framesLeft = CLAIM_RETRY_FRAME_BUDGET
+  let observer: ResizeObserver | null = null
+  const cleanup = () => {
+    done = true
+    observer?.disconnect()
+    observer = null
+    clearTimeout(deadline)
+    if (raf !== null) cancelAnimationFrame(raf)
+    raf = null
+  }
+  const deadline = setTimeout(() => {
+    if (done) return
+    cleanup()
+    opts.onGiveUp()
+  }, CLAIM_RETRY_FALLBACK_MS)
+  const attempt = () => {
+    raf = null
+    if (done) return
+    const size = opts.measure()
+    if (size) {
+      cleanup()
+      opts.onMeasured(size)
+      return
+    }
+    if (framesLeft > 0) {
+      framesLeft--
+      raf = requestAnimationFrame(attempt)
+    }
+  }
+  if (typeof ResizeObserver !== 'undefined' && opts.shell) {
+    observer = new ResizeObserver(() => {
+      // A real layout change earns one fresh measurement attempt.
+      if (!done && raf === null) raf = requestAnimationFrame(attempt)
+    })
+    observer.observe(opts.shell)
+  }
+  raf = requestAnimationFrame(attempt)
+  return cleanup
+}
 
 /**
  * Calculate terminal cols/rows that fit within a given element.
@@ -73,11 +156,9 @@ function measureTerminalFit(
   // forever. offset* is the border-box and ignores scrollbars, so the
   // measurement is a fixed point regardless of transient overflow.
   // (.terminal-shell has no border/padding, so offset* == the viewport.)
-  // On mobile the control bar floats over the terminal's bottom (out of
-  // flow, translucent — see styles.css), so the shell fills the full height
-  // behind it. Reserve the bar's height, but round the row count UP: the
-  // terminal then claims one extra row whose bottom sliver tucks behind the
-  // translucent keys, instead of leaving a sub-cell gap above an opaque bar.
+  // On mobile the two-row control bar floats over the terminal's bottom.
+  // Reserve its full height and floor the row count so terminal content stays
+  // slightly above the keys rather than underlapping their top edge.
   // Detected here — not at the call sites — so every resize path (initial
   // fit, keyboard transitions, manual refit) computes identically. The bar's
   // offsetParent is null when it's display:none (desktop) ⇒ plain floor fit.
@@ -88,7 +169,7 @@ function measureTerminalFit(
   const availH = shellEl.offsetHeight - padY - overlayBar
 
   let cols = Math.max(2, Math.floor(availW / dims.css.cell.width))
-  let rows = Math.max(1, (overlayBar > 0 ? Math.ceil : Math.floor)(availH / dims.css.cell.height))
+  let rows = Math.max(1, Math.floor(availH / dims.css.cell.height))
 
   // Guard against 1px overflow: xterm computes screen width as
   // Math.round(device.cell.width * cols / dpr). Because css.cell.width is
@@ -104,9 +185,7 @@ function measureTerminalFit(
   // Same guard vertically: row height rounding across device/css pixels can
   // overflow by 1px at fractional DPRs (the monitor-move case), which is
   // exactly what seeds the scrollbar flicker described above.
-  // (Skipped in overlay-bar mode: the gained row intentionally exceeds
-  // availH, spilling its bottom sliver behind the translucent bar.)
-  if (overlayBar === 0 && dims.device.cell.height > 0) {
+  if (dims.device.cell.height > 0) {
     const predictedHeight = Math.round(dims.device.cell.height * rows / dpr)
     if (predictedHeight > availH && rows > 1) rows--
   }
@@ -219,7 +298,12 @@ export function TerminalView({
   onCtrlConsumed,
   altArmed,
   onAltConsumed,
+  shiftArmed,
+  onShiftConsumed,
+  onModifiersCancelled,
   onInputReady,
+  onAttachFileReady,
+  onPasteReady,
   onFocusReady,
 }: {
   session: Session
@@ -230,28 +314,46 @@ export function TerminalView({
   onCtrlConsumed: () => void
   altArmed: boolean
   onAltConsumed: () => void
+  shiftArmed: boolean
+  onShiftConsumed: () => void
+  onModifiersCancelled: () => void
   onInputReady?: (send: ((data: string) => void) | null) => void
+  onAttachFileReady?: (attach: ((file: File) => void) | null) => void
+  onPasteReady?: (paste: (() => void) | null) => void
   onFocusReady?: (focus: (() => void) | null) => void
 }) {
   const shellRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
+  // Session ID and socket form one atomic connection identity.
+  const connectionRef = useRef<SessionConnection | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const disposed = useRef(false)
   const currentSessionId = useRef(session.id)
+  // The WebSocket effect can be re-run by unrelated dependency changes. Keep
+  // the reset tied to an observed session-ID transition, not to effect
+  // lifetime or to a reconnect attempt.
+  const terminalSessionId = useRef<string | null>(null)
   const sessionRef = useRef(session)
   const ctrlArmedRef = useRef(ctrlArmed)
   const altArmedRef = useRef(altArmed)
+  const shiftArmedRef = useRef(shiftArmed)
   const termIoRef = useRef<ReturnType<typeof createTerminalIO> | null>(null)
+  const scrollAnchorRef = useRef<ScrollAnchorAddon | null>(null)
+  const searchAddonRef = useRef<SearchAddon | null>(null)
   const termEpochRef = useRef(0)
+  // Drop initial-attach input until replay and viewport claim commit.
+  const inputClaimedRef = useRef(false)
+  const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const fileOverlayOpenRef = useRef(false)
 
   // True once the terminal's font is downloaded; gates xterm mount.
   // See the preload effect below for why this matters.
   const [fontReady, setFontReady] = useState(false)
 
   const [termLoading, setTermLoading] = useState(true)
-  const [wsState, setWsState] = useState<'connecting' | 'open' | 'lost'>('connecting')
+  const [wsState, setWsState] = useState<WsState>('connecting')
   const [viewportSize, setViewportSize] = useState<TerminalSize | null>(null)
   const [linkSheet, setLinkSheet] = useState<LinkInfo | null>(null)
   const [textSheet, setTextSheet] = useState<{ lines: string[]; anchorRow: number } | null>(null)
@@ -267,6 +369,9 @@ export function TerminalView({
   // must not trigger effect re-runs but need current values.
   const viewportSizeRef = useRef<TerminalSize | null>(null)
   const ptySizeRef = useRef<TerminalSize | null>(null)
+  // A claim resize is a FIFO barrier rather than a pending resize. Its echo
+  // releases ownership gating but must not resize xterm a second time.
+  const barrierClaimResizeRef = useRef<TerminalSize | null>(null)
   const resizeEchoGateRef = useRef<{
     awaitingEcho: TerminalSize | null
     dirty: boolean
@@ -282,6 +387,16 @@ export function TerminalView({
   sessionRef.current = session
   ctrlArmedRef.current = ctrlArmed
   altArmedRef.current = altArmed
+  shiftArmedRef.current = shiftArmed
+  const fileParams = new URLSearchParams(urlSearch.value)
+  fileOverlayOpenRef.current = !!(fileParams.get('files') || fileParams.get('projectFiles') || fileParams.get('pasteFile'))
+  fileHrefRef.current = (sessionId, path, pasteImage) => pasteImage
+    ? pasteFileBrowserPath(sessionId, path)
+    : fileBrowserPath(sessionId, path)
+  openFileRef.current = (sessionId, path, pasteImage) => {
+    termRef.current?.textarea?.blur()
+    navigate(fileHrefRef.current(sessionId, path, pasteImage))
+  }
 
   const queueResize = useCallback((size: TerminalSize) => {
     termIoRef.current?.requestResize(size, termEpochRef.current)
@@ -299,6 +414,7 @@ export function TerminalView({
     const gate = resizeEchoGateRef.current
     if (gate.timer !== null) clearTimeout(gate.timer)
     gate.awaitingEcho = null
+    barrierClaimResizeRef.current = null
     gate.dirty = false
     gate.timer = null
   }, [])
@@ -309,6 +425,7 @@ export function TerminalView({
 
     if (gate.timer !== null) clearTimeout(gate.timer)
     gate.awaitingEcho = null
+    if (sameSize(barrierClaimResizeRef.current, applied)) barrierClaimResizeRef.current = null
     gate.timer = null
 
     if (!gate.dirty) return
@@ -316,22 +433,22 @@ export function TerminalView({
     processViewportResizeRef.current?.(true)
   }, [])
 
-  const applyOwnedResize = useCallback((size: TerminalSize) => {
+  const applyOwnedResize = useCallback((size: TerminalSize, queueTerminalResize = true, announceAlways = false) => {
     const prevPty = ptySizeRef.current
 
     // Optimistically sync ptySize so the pill hides immediately, before the
     // server echoes the resize back. Without this, ptySize would lag behind
     // viewportSize for one round-trip, causing a spurious pill flash.
     setPtySize(size); ptySizeRef.current = size
-    queueResize(size)
+    if (queueTerminalResize) queueResize(size)
 
-    if (sameSize(prevPty, size)) return
+    if (!announceAlways && sameSize(prevPty, size)) return
 
     // A new outbound resize supersedes any older echo wait or pending dirty
     // viewport event. The server echo for this exact size re-opens the gate.
     resetResizeEchoGate()
 
-    const ws = wsRef.current
+    const ws = connectionRef.current?.ws
     if (!ws || ws.readyState !== WebSocket.OPEN) return
 
     announceResize(ws, size)
@@ -396,6 +513,21 @@ export function TerminalView({
     applyOwnedResize(dims)
   }, [applyOwnedResize])
 
+  // Announce ownership without occupying TerminalIO's coalescible resize
+  // slot. Initial attach queues this size as a FIFO barrier before held output.
+  const announceViewportClaim = useCallback((): TerminalSize | null => {
+    const term = termRef.current
+    const shell = shellRef.current
+    if (!term || !shell) return null
+    const dims = measureTerminalFit(term, shell)
+    setViewportSize(dims); viewportSizeRef.current = dims
+    if (!dims) return null
+    // A claim is also the ownership assertion and reconnect-redraw trigger,
+    // so it must reach the runner even when checkpoint and viewport match.
+    applyOwnedResize(dims, false, true)
+    return dims
+  }, [applyOwnedResize])
+
   const focusTerminal = useCallback(() => {
     focusTerminalInput(termRef.current)
   }, [])
@@ -410,7 +542,9 @@ export function TerminalView({
   // only suppress focus/selection on shell controls for no benefit.
   const holdShellFocus = useCallback((ev: MouseEvent) => {
     if (!isTouchDevice()) return
-    if (!(ev.target instanceof Element) || !ev.target.closest('.xterm')) ev.preventDefault()
+    // The find bar's input/buttons need default mousedown behavior to
+    // gain focus, so exempt it alongside the grid.
+    if (!(ev.target instanceof Element) || !ev.target.closest('.xterm, .terminal-find-bar')) ev.preventDefault()
   }, [])
 
   const handleShellClick = useCallback((ev: MouseEvent) => {
@@ -457,9 +591,12 @@ export function TerminalView({
   useEffect(() => {
     let cancelled = false
     const spec = `${terminalOptions.fontSize}px ${terminalOptions.fontFamily}`
-    document.fonts.load(spec).finally(() => {
-      if (!cancelled) setFontReady(true)
-    })
+    const finish = () => { if (!cancelled) setFontReady(true) }
+    try {
+      document.fonts.load(spec).then(finish, finish)
+    } catch {
+      finish()
+    }
     return () => { cancelled = true }
   }, [terminalOptions.fontFamily, terminalOptions.fontSize])
 
@@ -473,7 +610,8 @@ export function TerminalView({
       ...terminalOptions,
       linkHandler: {
         activate(_event, text) {
-          window.open(text, '_blank', 'noopener')
+          const current = sessionRef.current
+          window.open(resolveTerminalWebUrl(text, vsCodeServerUrl.value, current.peer), '_blank', 'noopener')
         },
       },
     })
@@ -482,7 +620,31 @@ export function TerminalView({
     term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
     term.loadAddon(new WebLinksAddon())
+    // Find-in-terminal (the find bar drives it; see terminal-find.tsx).
+    const searchAddon = new SearchAddon()
+    term.loadAddon(searchAddon)
+    searchAddonRef.current = searchAddon
     term.open(containerRef.current)
+    const disposeImeResidueGuard = attachImeResidueGuard(term)
+    const getFileLinkContext = (): TerminalFileLinkContext => {
+      const current = sessionRef.current
+      return {
+        sessionId: current.id,
+        root: current.workspace_root?.trim() || current.cwd.trim(),
+        cwd: current.cwd.trim(),
+      }
+    }
+    const fileLinkDisposable = term.registerLinkProvider(createTerminalFileLinkProvider(
+      term,
+      getFileLinkContext,
+      (sessionId, path, pasteImage) => fileHrefRef.current(sessionId, path, pasteImage),
+      (sessionId, path, pasteImage) => openFileRef.current(sessionId, path, pasteImage),
+    ))
+    // Load after open so the addon can observe wheel/touch intent on
+    // terminal.element as well as parser-level output sequences.
+    const scrollAnchor = new ScrollAnchorAddon()
+    term.loadAddon(scrollAnchor)
+    scrollAnchorRef.current = scrollAnchor
     loadWebglRenderer(term)
     // The Nerd Font icon fallback loads lazily; refresh the glyph atlas once
     // it arrives so icons rasterized as tofu beforehand get redrawn.
@@ -494,25 +656,13 @@ export function TerminalView({
     setViewportSize(initialVp); viewportSizeRef.current = initialVp
     termRef.current = term
     termIoRef.current = createTerminalIO(term, {
-      getState() {
-        const buf = term.buffer.active
-        return { viewportY: buf.viewportY, baseY: buf.baseY, rows: term.rows }
-      },
-      scrollToLine(line: number) { term.scrollToLine(line) },
-      scrollToBottom() { term.scrollToBottom() },
-      getLine(y: number): string | null {
-        const line = term.buffer.active.getLine(y)
-        if (!line) return null
-        const text = line.translateToString(true)
-        // Filter trivial anchors so a wipe-and-redraw doesn't snap the
-        // user to the first stretch of separators or whitespace it
-        // finds. Four visible chars is enough to be distinctive without
-        // excluding short but meaningful lines ("DONE", "PASS", etc.).
-        if (text.trim().length < 4) return null
-        return text
-      },
+      isBusy: () => scrollAnchor.busy,
+    })
+    const busyDisposable = scrollAnchor.onBusyChange((busy) => {
+      if (!busy) termIoRef.current?.busyStateChanged()
     })
     ;(window as any).__gmuxTerm = term
+    ;(window as any).__gmuxScrollAnchor = scrollAnchor
     // Test-only inject hook: pumps bytes through the same path as ws.onmessage
     // (createTerminalIO.enqueue) bypassing the WebSocket and replay buffer.
     // Used by e2e/tests/terminal-scroll.spec.ts to exercise scroll preservation
@@ -521,49 +671,116 @@ export function TerminalView({
       const bin = atob(b64)
       const bytes = new Uint8Array(bin.length)
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-      termIoRef.current?.enqueue(bytes, termEpochRef.current)
+      termIoRef.current?.enqueue(bytes, termEpochRef.current, () => setTermLoading(false))
     }
 
     const sendRawInput = (data: string) => {
-      const ws = wsRef.current
-      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      const connection = connectionRef.current
+      if (!canSendTerminalInput(inputClaimedRef.current, connectionRef.current, connection, currentSessionId.current)) return
       // Only re-assert focus if the terminal already had it (keyboard
       // open). Grabbing focus unconditionally would pop the on-screen
       // keyboard on every toolbar key, even when it was closed — the
       // whole point of the toolbar is to work with the keyboard down.
       const hadFocus = document.activeElement === term.textarea
-      ws.send(new TextEncoder().encode(data))
+      connection.ws.send(new TextEncoder().encode(data))
       if (hadFocus) term.focus()
     }
 
     const sendInput = (data: string) => {
-      const r = applyArmedModifiers(data, ctrlArmedRef.current, altArmedRef.current)
+      const r = applyArmedModifiers(data, ctrlArmedRef.current, altArmedRef.current, shiftArmedRef.current)
       if (r.ctrlApplied) { ctrlArmedRef.current = false; onCtrlConsumed() }
       if (r.altApplied) { altArmedRef.current = false; onAltConsumed() }
+      if (r.shiftApplied) { shiftArmedRef.current = false; onShiftConsumed() }
       sendRawInput(r.seq)
     }
 
-    onInputReady?.(sendRawInput)
-    terminalScrollToBottom.value = () => term.scrollToBottom()
+    const sendToolbarInput = (data: string) => sendAfterFlushingComposition(term, sendRawInput, data)
+    onInputReady?.(sendToolbarInput)
+    // follow() already scrolls to the bottom, so a second term.scrollToBottom()
+    // here would compute a zero delta and only add a scroll event for the addon
+    // to classify.
+    terminalScrollToBottom.value = () => scrollAnchor.follow()
+    const pasteFeedback = (kind: 'info' | 'error', message: string) => {
+      if (kind === 'error') {
+        console.warn('[paste]', message)
+        pushError(message)
+      }
+    }
+    const getPasteDestination = (): PasteDestination | null => {
+      const connection = connectionRef.current
+      if (!canSendTerminalInput(inputClaimedRef.current, connectionRef.current, connection, currentSessionId.current)) return null
+      return {
+        sessionId: connection.sessionId,
+        bracketedPasteMode: term.modes.bracketedPasteMode,
+        send(text) {
+          if (!canSendTerminalInput(inputClaimedRef.current, connectionRef.current, connection, currentSessionId.current)) return false
+          connection.ws.send(new TextEncoder().encode(text))
+          return true
+        },
+      }
+    }
+    // Every gesture acquires one immutable session/socket capability. The
+    // keybind, DOM paste, and mobile sheet paths therefore share routing.
     // The paste trigger reads bracketedPasteMode and the clipboard fresh
     // on every invocation: bracketed mode flips at runtime as TUIs come
     // and go, and the clipboard contents are obviously volatile. Sharing
     // handlePasteAction with the keybind path means long-press paste gets
     // binary-paste support without divergent code.
     pasteActionRef.current = () => {
-      void handlePasteAction({
-        sessionId: session.id,
-        bracketedPasteMode: term.modes.bracketedPasteMode,
-        feedback: defaultPasteFeedback,
-        emit: sendRawInput,
-      })
+      const destination = getPasteDestination()
+      if (!destination) {
+        pasteFeedback('error', 'Paste failed: no active terminal connection')
+        return
+      }
+      void handlePasteAction(destination, pasteFeedback)
     }
+    onPasteReady?.(pasteActionRef.current)
+    onAttachFileReady?.((file: File) => {
+      const destination = getPasteDestination()
+      if (!destination) {
+        pasteFeedback('error', 'Upload failed: no active terminal connection')
+        return
+      }
+      void handleBlobPasteAction(file, destination, pasteFeedback)
+    })
     onFocusReady?.(() => focusTerminalInput(term))
 
-    const dataDisposable = term.onData((data) => sendInput(data))
-    attachKeyboardHandler(term, sendInput, sendRawInput, keybinds, macCommandIsCtrl, session.id)
-    const disposePasteHandler = attachPasteHandler(term, containerRef.current!, sendRawInput, session.id)
-    const disposeMobileHandler = attachMobileInputHandler(term, containerRef.current!, sendRawInput)
+    const dataDisposable = term.onData((data) => {
+      if (shouldSkipMobileWebKitImeData(data)) return
+      flushMobileWebKitImePending()
+      sendInput(data)
+    })
+    attachKeyboardHandler(term, sendInput, keybinds, macCommandIsCtrl, getPasteDestination, pasteFeedback)
+    const disposePasteHandler = attachPasteHandler(containerRef.current!, getPasteDestination, pasteFeedback)
+    const sendMobileReplacement = (data: string) => {
+      // Replacement backspaces and text stay byte-for-byte raw so Ctrl/Alt or
+      // Shift cannot corrupt autocorrect/dictation. The replacement is still
+      // the next logical input, so cancel one-shot Shift unconditionally;
+      // this also closes the narrow arm/render race before the ref updates.
+      shiftArmedRef.current = false
+      onShiftConsumed()
+      sendRawInput(data)
+    }
+    const disposeMobileHandler = attachMobileInputHandler(
+      term, containerRef.current!, sendRawInput, sendMobileReplacement,
+    )
+    let keyboardWasOpen = keyboardOpen.value
+    const disposeKeyboardCloseBlur = effect(() => {
+      const open = keyboardOpen.value
+      if (shouldBlurTerminalAfterKeyboardClose(
+        keyboardWasOpen,
+        open,
+        isTouchDevice(),
+        document.activeElement === term.textarea,
+      )) {
+        // Mobile browsers can dismiss the soft keyboard while leaving
+        // xterm's hidden textarea focused. Blur that half-focused textarea so
+        // the next drag cannot reopen the keyboard; a deliberate tap focuses
+        // it again through the touchend path.
+        term.textarea?.blur()
+      }
+      keyboardWasOpen = open
+    })
 
     // OSC 52 clipboard: applications (e.g. pi /copy) write
     //   ESC ] 52 ; <selection> ; <base64-payload> BEL
@@ -595,6 +812,7 @@ export function TerminalView({
       const tag = (ev.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (containerRef.current?.contains(ev.target as Node)) return
+      if (fileOverlayOpenRef.current) return
       term.focus()
     }
     window.addEventListener('keydown', handleGlobalKeydown, true)
@@ -610,7 +828,15 @@ export function TerminalView({
     // intent from a tap: even when nothing is under the finger, the
     // release must not open a link or toggle the keyboard.
     const longPress = createLongPressRecognizer((x, y) => {
-      const link = linkAtPoint(term, x, y)
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), x, y)
+      const fileLink = fileTarget
+        ? { uri: fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage), label: fileTarget.text }
+        : null
+      const nativeLink = linkAtPoint(term, x, y)
+      // Explicit OSC 8 / web links win when their URI differs from the file
+      // path painted under the pointer. A matching provider link is equivalent
+      // to the direct buffer hit and keeps the fresh direct target.
+      const link = nativeLink && nativeLink.uri !== fileLink?.uri ? nativeLink : fileLink || nativeLink
       try { navigator.vibrate?.(10) } catch { /* unsupported */ }
       // On a link: offer open/copy. On empty space: open the text sheet —
       // the buffer as natively-selectable text, scrolled to the pressed
@@ -620,115 +846,208 @@ export function TerminalView({
       const anchorRow = Math.max(0, Math.min(pressedBufferRow(term, y), lines.length - 1))
       setTextSheet({ lines, anchorRow })
     })
-    const touchPanState = {
+    const touchPanState: {
+      active: boolean
+      moved: boolean
+      lastY: number
+      lastMoveAt: number
+      rowRemainder: number
+      velocityRowsPerMs: number
+      momentumFrame: number | null
+      dragScrollFrame: number | null
+      pendingDragRows: number
+      start: TerminalTouchSnapshot
+    } = {
       active: false,
       moved: false,
-      startX: 0,
-      startY: 0,
-      startScrollLeft: 0,
-      startScrollTop: 0,
+      lastY: 0,
+      lastMoveAt: 0,
+      rowRemainder: 0,
+      velocityRowsPerMs: 0,
+      momentumFrame: null,
+      dragScrollFrame: null,
+      pendingDragRows: 0,
+      start: { x: 0, y: 0, scrollLeft: 0, scrollTop: 0 },
+    }
+
+    const flushDragScroll = () => {
+      touchPanState.dragScrollFrame = null
+      const rows = touchPanState.pendingDragRows
+      touchPanState.pendingDragRows = 0
+      if (rows !== 0) scrollAnchor.scrollLinesFromUser(rows)
+    }
+    const queueDragScroll = (rows: number) => {
+      if (!rows) return
+      touchPanState.pendingDragRows += rows
+      if (touchPanState.dragScrollFrame === null) touchPanState.dragScrollFrame = requestAnimationFrame(flushDragScroll)
+    }
+    const cancelDragScroll = (flush = false) => {
+      if (touchPanState.dragScrollFrame !== null) cancelAnimationFrame(touchPanState.dragScrollFrame)
+      touchPanState.dragScrollFrame = null
+      if (flush && touchPanState.pendingDragRows) scrollAnchor.scrollLinesFromUser(touchPanState.pendingDragRows)
+      touchPanState.pendingDragRows = 0
+    }
+    const cancelScrollMomentum = () => {
+      if (touchPanState.momentumFrame !== null) cancelAnimationFrame(touchPanState.momentumFrame)
+      touchPanState.momentumFrame = null
+    }
+    const resetTouchPan = () => {
+      touchPanState.active = false
+      touchPanState.moved = false
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+    }
+    const startScrollMomentum = () => {
+      let velocity = touchPanState.velocityRowsPerMs * 0.5
+      if (Math.abs(velocity) < 0.01) return
+      let last = performance.now()
+      let remainder = 0
+      const tick = (now: number) => {
+        const elapsed = Math.min(32, now - last)
+        last = now
+        const rawRows = remainder + velocity * elapsed
+        const rows = rawRows > 0 ? Math.floor(rawRows) : Math.ceil(rawRows)
+        remainder = rawRows - rows
+        if (rows) scrollAnchor.scrollLinesFromUser(rows)
+        velocity = decayScrollVelocity(velocity, elapsed)
+        if (Math.abs(velocity) >= 0.006) touchPanState.momentumFrame = requestAnimationFrame(tick)
+        else touchPanState.momentumFrame = null
+      }
+      touchPanState.momentumFrame = requestAnimationFrame(tick)
     }
 
     const handleTouchStartCapture = (ev: TouchEvent) => {
       if (ev.touches.length !== 1 || isInteractiveTarget(ev.target)) {
-        longPress.cancel()
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
+        longPress.cancel(); cancelDragScroll(); cancelScrollMomentum(); resetTouchPan(); return
       }
-
       const host = shellRef.current
-      if (!host) {
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
-      }
-
-      // Track touch start for both modes — focus happens on touchend
-      // only if the user didn't drag (tap vs scroll distinction).
+      if (!host) { cancelDragScroll(); cancelScrollMomentum(); resetTouchPan(); return }
+      cancelDragScroll()
+      cancelScrollMomentum()
+      const touch = ev.touches[0]
       touchPanState.active = true
       touchPanState.moved = false
-      touchPanState.startX = ev.touches[0].clientX
-      touchPanState.startY = ev.touches[0].clientY
-      touchPanState.startScrollLeft = host.scrollLeft
-      touchPanState.startScrollTop = host.scrollTop
-      longPress.start(touchPanState.startX, touchPanState.startY)
+      touchPanState.lastY = touch.clientY
+      touchPanState.lastMoveAt = performance.now()
+      touchPanState.rowRemainder = 0
+      touchPanState.velocityRowsPerMs = 0
+      touchPanState.start = {
+        x: touch.clientX, y: touch.clientY,
+        scrollLeft: host.scrollLeft, scrollTop: host.scrollTop,
+      }
+      longPress.start(touch.clientX, touch.clientY)
     }
 
     const handleTouchMoveCapture = (ev: TouchEvent) => {
       if (!touchPanState.active || ev.touches.length !== 1) return
-
       const host = shellRef.current
       if (!host) return
-
       const touch = ev.touches[0]
-      const deltaX = touch.clientX - touchPanState.startX
-      const deltaY = touch.clientY - touchPanState.startY
-      if (Math.abs(deltaX) > 6 || Math.abs(deltaY) > 6) {
+      const current = {
+        x: touch.clientX, y: touch.clientY,
+        scrollLeft: host.scrollLeft, scrollTop: host.scrollTop,
+      }
+      const deltaX = current.x - touchPanState.start.x
+      const deltaY = current.y - touchPanState.start.y
+      if (terminalTouchMoved(touchPanState.start, current)) {
         touchPanState.moved = true
         longPress.cancel()
       }
+      if (!touchPanState.moved) return
 
-      // If viewport matches PTY (in sync), no overflow to pan — let xterm
-      // handle the gesture for selection/scrollback.
       const vp = viewportSizeRef.current
       const pty = ptySizeRef.current
-      if (vp && pty && vp.cols === pty.cols && vp.rows === pty.rows) return
-
+      const viewportMatchesPty = !!vp && !!pty && vp.cols === pty.cols && vp.rows === pty.rows
       const canScrollX = host.scrollWidth > host.clientWidth
       const canScrollY = host.scrollHeight > host.clientHeight
-      if (!canScrollX && !canScrollY) return
+      if (!viewportMatchesPty && (canScrollX || canScrollY)) {
+        if (canScrollX) host.scrollLeft = touchPanState.start.scrollLeft - deltaX
+        if (canScrollY) host.scrollTop = touchPanState.start.scrollTop - deltaY
+        ev.preventDefault(); ev.stopPropagation(); return
+      }
 
-      if (canScrollX) host.scrollLeft = touchPanState.startScrollLeft - deltaX
-      if (canScrollY) host.scrollTop = touchPanState.startScrollTop - deltaY
+      const now = performance.now()
+      const deltaTime = Math.max(1, now - touchPanState.lastMoveAt)
+      const result = acceleratedScrollRows({
+        deltaY: current.y - touchPanState.lastY,
+        totalDeltaY: current.y - touchPanState.start.y,
+        cellHeight: term.dimensions?.css.cell.height || 16,
+        remainder: touchPanState.rowRemainder,
+      })
+      touchPanState.lastY = current.y
+      touchPanState.lastMoveAt = now
+      touchPanState.rowRemainder = result.remainder
+      touchPanState.velocityRowsPerMs = touchPanState.velocityRowsPerMs * 0.45 + (result.exactRows / deltaTime) * 0.55
+      queueDragScroll(result.rows)
       ev.preventDefault()
       ev.stopPropagation()
     }
 
     const handleTouchEndCapture = (ev: TouchEvent) => {
-      // A fired long-press owns this touch: suppress tap behavior and
-      // the browser's synthesized cascade.
       if (longPress.end()) {
-        ev.preventDefault()
-        touchPanState.active = false
-        touchPanState.moved = false
-        return
+        ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
       }
-
-      if (touchPanState.active && !touchPanState.moved) {
-        // Tap on a link opens it by driving xterm's Linkifier with a
-        // synthetic mousemove/mousedown/mouseup handshake (see
-        // terminal-link.ts for why the browser's own synthesized cascade
-        // is unreliable here, especially on iOS). preventDefault stops
-        // the browser from synthesizing its own cascade for this touch,
-        // so the link can't be activated twice. When a link opens, skip
-        // the keyboard focus/scroll — the tap was navigation, not input
-        // intent.
-        if (openLinkAtPoint(term, touchPanState.startX, touchPanState.startY)) {
+      const touch = ev.changedTouches[0]
+      const host = shellRef.current
+      const shouldFocus = !!touch && !!host && shouldFocusTerminalFromTouch(
+        touchPanState.active, touchPanState.moved, touchPanState.start,
+        { x: touch.clientX, y: touch.clientY, scrollLeft: host.scrollLeft, scrollTop: host.scrollTop },
+      )
+      if (touchPanState.active && !shouldFocus) {
+        ev.preventDefault()
+        ev.stopPropagation()
+        if (touchPanState.moved) { cancelDragScroll(true); startScrollMomentum() }
+      }
+      if (shouldFocus) {
+        const fileTarget = terminalFileTargetAtPoint(
+          term, getFileLinkContext(), touchPanState.start.x, touchPanState.start.y,
+        )
+        const nativeLink = linkAtPoint(term, touchPanState.start.x, touchPanState.start.y)
+        const fileHref = fileTarget
+          ? fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          : ''
+        if (nativeLink && nativeLink.uri !== fileHref && openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+          ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
+        }
+        if (fileTarget) {
           ev.preventDefault()
-          touchPanState.active = false
-          touchPanState.moved = false
+          cancelDragScroll(true)
+          cancelScrollMomentum()
+          openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+          resetTouchPan()
           return
         }
-
+        if (openLinkAtPoint(term, touchPanState.start.x, touchPanState.start.y)) {
+          ev.preventDefault(); cancelDragScroll(true); cancelScrollMomentum(); resetTouchPan(); return
+        }
+        ev.preventDefault()
         focusTerminalInput(term)
-        // No eager scroll-to-bottom here: the keyboard-open viewport
-        // shrink triggers one PTY reflow that already lands at the
-        // bottom. A scrollToBottom here would fire mid-slide (its
-        // setTimeout is deferred by the focus/layout work to ~30% of
-        // the keyboard animation), producing a redundant scroll jump
-        // before the reflow does the same thing again.
       }
-      touchPanState.active = false
-      touchPanState.moved = false
+      resetTouchPan()
     }
 
     const clearTouchPan = () => {
-      longPress.end() // full reset: discard pending and fired state
-      touchPanState.active = false
-      touchPanState.moved = false
+      longPress.end()
+      cancelDragScroll()
+      cancelScrollMomentum()
+      resetTouchPan()
     }
 
+    // Resolve file links from the painted buffer at click time. xterm may
+    // retain a stale provider result for a redrawn TUI row until hover moves.
+    const handleMouseClickCapture = (ev: MouseEvent) => {
+      if (ev.button !== 0 || ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey || term.hasSelection() || isInteractiveTarget(ev.target)) return
+      const fileTarget = terminalFileTargetAtPoint(term, getFileLinkContext(), ev.clientX, ev.clientY)
+      if (!fileTarget) return
+      const nativeLink = linkAtPoint(term, ev.clientX, ev.clientY)
+      const fileHref = fileHrefRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+      if (nativeLink && nativeLink.uri !== fileHref) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      openFileRef.current(fileTarget.sessionId, fileTarget.path, fileTarget.pasteImage)
+    }
+
+    shell?.addEventListener('click', handleMouseClickCapture, true)
     shell?.addEventListener('touchstart', handleTouchStartCapture, { capture: true, passive: false })
     shell?.addEventListener('touchmove', handleTouchMoveCapture, { capture: true, passive: false })
     shell?.addEventListener('touchend', handleTouchEndCapture, { capture: true, passive: false })
@@ -751,15 +1070,30 @@ export function TerminalView({
 
     let resizeFrame: number | null = null
     let lastViewportPixels = getResizeSignalPixels(shell, vv)
+    let keyboardSettleTimers: number[] = []
 
     const flushViewportResize = () => {
       resizeFrame = null
+      lastViewportPixels = getResizeSignalPixels(shell, vv)
       processViewportResize()
     }
 
     const scheduleViewportResize = () => {
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
       resizeFrame = requestAnimationFrame(flushViewportResize)
+    }
+
+    const clearKeyboardSettleTimers = () => {
+      for (const timer of keyboardSettleTimers) clearTimeout(timer)
+      keyboardSettleTimers = []
+    }
+
+    const scheduleKeyboardSettleResize = () => {
+      clearKeyboardSettleTimers()
+      // visualViewport can resize before mobile keyboard CSS/layout has
+      // finished animating. Re-measure after the usual animation stages so
+      // xterm and the PTY settle on the actual terminal height.
+      keyboardSettleTimers = [120, 280, 500].map(delay => window.setTimeout(scheduleViewportResize, delay))
     }
 
     const onViewportResize = () => {
@@ -782,43 +1116,117 @@ export function TerminalView({
     const shellObserver = new ResizeObserver(() => onViewportResize())
     if (shell) shellObserver.observe(shell)
 
+    const onVisualViewportResize = () => {
+      onViewportResize()
+      scheduleKeyboardSettleResize()
+    }
+
+    const onVisualViewportResizeEnd = () => {
+      clearKeyboardSettleTimers()
+      scheduleViewportResize()
+    }
+
     // Also listen on window/visualViewport for zoom and soft keyboard.
     window.addEventListener('resize', onViewportResize)
-    if (vv) vv.addEventListener('resize', onViewportResize)
+    if (vv) {
+      vv.addEventListener('resize', onVisualViewportResize)
+      vv.addEventListener('resizeend', onVisualViewportResizeEnd)
+    }
 
     return () => {
       shellObserver.disconnect()
+      clearKeyboardSettleTimers()
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame)
       longPress.cancel()
       disposed.current = true
       window.removeEventListener('keydown', handleGlobalKeydown, true)
       window.removeEventListener('resize', onViewportResize)
-      if (vv) vv.removeEventListener('resize', onViewportResize)
+      if (vv) {
+        vv.removeEventListener('resize', onVisualViewportResize)
+        vv.removeEventListener('resizeend', onVisualViewportResizeEnd)
+      }
+      shell?.removeEventListener('click', handleMouseClickCapture, true)
       shell?.removeEventListener('touchstart', handleTouchStartCapture, true)
       shell?.removeEventListener('touchmove', handleTouchMoveCapture, true)
       shell?.removeEventListener('touchend', handleTouchEndCapture, true)
       shell?.removeEventListener('touchcancel', clearTouchPan, true)
+      clearTouchPan()
       disposePasteHandler()
       disposeMobileHandler()
+      disposeKeyboardCloseBlur()
+      disposeImeResidueGuard()
+      fileLinkDisposable.dispose()
       osc52Disposable.dispose()
       dataDisposable.dispose()
       scrollDisposable.dispose()
+      busyDisposable.dispose()
       terminalScrolledUp.value = false
       terminalScrollToBottom.value = null
+      terminalFindOpen.value = false
+      searchAddonRef.current = null
+      scrollAnchorRef.current = null
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
-      wsRef.current?.close()
-      wsRef.current = null
+      connectionRef.current?.ws.close()
+      connectionRef.current = null
       onInputReady?.(null)
       pasteActionRef.current = null
+      onPasteReady?.(null)
+      onAttachFileReady?.(null)
       onFocusReady?.(null)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null
+      ;(window as any).__gmuxScrollAnchor = null
       ;(window as any).__gmuxInject = null
       disposeIconFontWatch()
       term.dispose()
       termRef.current = null
       termIoRef.current = null
     }
-  }, [onCtrlConsumed, onInputReady, fontReady])
+  }, [onCtrlConsumed, onAltConsumed, onShiftConsumed, onModifiersCancelled, onInputReady, onAttachFileReady, fontReady])
+
+  // Apply appearance changes without remounting xterm and losing its parser,
+  // selection, or scrollback state. This also makes browser-local UI scaling
+  // take effect while the current terminal remains mounted. terminalOptions
+  // is a memoized computed value; keeping that identity stable avoids effect
+  // churn and redundant viewport measurements.
+  useEffect(() => {
+    const term = termRef.current
+    if (!term || !fontReady) return
+
+    let cancelled = false
+    const spec = `${terminalOptions.fontSize}px ${terminalOptions.fontFamily}`
+    const applyOptions = () => {
+      if (cancelled || termRef.current !== term) return
+
+      term.options.fontFamily = terminalOptions.fontFamily
+      term.options.fontSize = terminalOptions.fontSize
+      term.options.fontWeight = terminalOptions.fontWeight
+      term.options.fontWeightBold = terminalOptions.fontWeightBold
+      term.options.lineHeight = terminalOptions.lineHeight
+      term.options.letterSpacing = terminalOptions.letterSpacing
+      term.options.theme = terminalOptions.theme
+      term.options.cursorStyle = terminalOptions.cursorStyle
+      term.options.cursorBlink = terminalOptions.cursorBlink
+      term.options.cursorInactiveStyle = terminalOptions.cursorInactiveStyle
+      term.options.cursorWidth = terminalOptions.cursorWidth
+      term.options.drawBoldTextInBrightColors = terminalOptions.drawBoldTextInBrightColors
+      term.options.minimumContrastRatio = terminalOptions.minimumContrastRatio
+      term.options.scrollSensitivity = terminalOptions.scrollSensitivity
+      term.options.fastScrollSensitivity = terminalOptions.fastScrollSensitivity
+      term.options.smoothScrollDuration = terminalOptions.smoothScrollDuration
+      term.options.wordSeparator = terminalOptions.wordSeparator
+
+      requestAnimationFrame(() => {
+        if (!cancelled && termRef.current === term) processViewportResize()
+      })
+    }
+    try {
+      document.fonts.load(spec).then(applyOptions, applyOptions)
+    } catch {
+      applyOptions()
+    }
+
+    return () => { cancelled = true }
+  }, [fontReady, processViewportResize, terminalOptions])
 
   // WebSocket connection (reconnects when session.id changes).
   useEffect(() => {
@@ -831,16 +1239,23 @@ export function TerminalView({
     let isFirstConnect = true
     let attempt = 0
     let intentionalClose = false
+    // Pending retry for a first claim whose measurement returned null.
+    // Cancelled on socket replacement, reconnect, session switch, unmount.
+    let cancelClaimRetry: (() => void) | null = null
     const epoch = termEpochRef.current + 1
     termEpochRef.current = epoch
     termIoRef.current.reset(epoch)
+    scrollAnchorRef.current?.reset()
+    inputClaimedRef.current = false
 
-    // Full RIS on the xterm instance so SGR colors, modes, cursor state, and
-    // scroll regions from the previous session don't bleed into the next one.
-    // Without this, switching away from a colorful TUI (btop, htop) leaves
-    // its trailing bg/fg attributes active until the new session emits an SGR
-    // of its own, painting plain-text output in btop's last color.
-    termRef.current.reset()
+    const sessionChanged = terminalSessionId.current !== null
+      && terminalSessionId.current !== session.id
+    terminalSessionId.current = session.id
+    // A session change is the one boundary where the existing xterm state is
+    // not authoritative. Reset only on that actual ID transition:
+    // same-session reconnect attempts retain the last committed screen and
+    // parser state during the outage.
+    if (sessionChanged) termRef.current.reset()
 
     // Reset sizes so stale values from a previous session can't trigger a
     // spurious pill while the loading overlay is visible (before ws.onopen).
@@ -853,68 +1268,207 @@ export function TerminalView({
 
     function connect() {
       if (disposed.current) return
+      // A dropped socket can strand an unmatched BSU. Preserve the user's
+      // mode, but clear parser/transient fences before each replay attempt.
+      scrollAnchorRef.current?.reset()
 
-      if (wsRef.current) {
-        wsRef.current.close()
-        wsRef.current = null
+      cancelClaimRetry?.()
+      cancelClaimRetry = null
+
+      if (connectionRef.current) {
+        connectionRef.current.ws.close()
+        connectionRef.current = null
       }
 
-      // Tell the scroll preservation layer to force-scroll-to-bottom for
-      // the replay frame. This avoids the "jump to top" bug: xterm's
-      // isUserScrolling flag can persist from the previous session, and
-      // \x1b[3J resets ybase/ydisp to 0 without clearing that flag. The
-      // force flag makes the BSU/ESU handler treat it as wasAtBottom=true
-      // regardless of the stale scroll state.
-      termIoRef.current?.forceNextScrollToBottom()
-
+      // The runner's binary frame is shared with `gmux attach`, so browser
+      // buffer selection is delivered as metadata rather than ANSI bytes in
+      // that stream. Apply it only once the complete BSU/ESU checkpoint is
+      // staged; the existing screen remains visible during failed attempts.
+      let checkpointAlt: boolean | null = null
+      let checkpointMargins: CheckpointMargins | null = null
+      let checkpointCols: number | undefined
+      let checkpointRawReplay = false
+      // Keep post-checkpoint bytes out of TerminalIO until the initial replay
+      // has committed and xterm has claimed the browser geometry.
+      let attachPhase: 'replay' | 'claiming' | 'claimed' = isFirstConnect ? 'replay' : 'claimed'
+      const postClaimWrites: Uint8Array[] = []
+      let claimFallbackTimer: ReturnType<typeof setTimeout> | null = null
+      let reconnectSizePromise: Promise<TerminalSize | null> | null = null
+      const finishPostClaimWrite = () => {
+        if (claimFallbackTimer !== null) clearTimeout(claimFallbackTimer)
+        claimFallbackTimer = null
+        setTermLoading(false)
+      }
       const replay = createReplayBuffer((chunks) => {
-        queueMany(chunks, () => {
-          termRef.current?.scrollToBottom()
-          setTermLoading(false)
-        })
+        const prepared = prepareBrowserCheckpoint(chunks, checkpointAlt, checkpointMargins)
+        const claiming = attachPhase === 'replay'
+        if (claiming) attachPhase = 'claiming'
+        // New runners declare the exact geometry used to render this frame.
+        // Fall back to the old metadata chain for rolling upgrades.
+        const checkpointSize = resolveCheckpointGeometry(
+          checkpointMargins ? { cols: checkpointCols, rows: checkpointMargins.rows } : null,
+          sessionRef.current.terminal_cols,
+          ptySizeRef.current?.cols,
+        )
+        const declaredCheckpointSize = checkpointCols && checkpointMargins
+          ? { cols: checkpointCols, rows: checkpointMargins.rows }
+          : null
+        if (checkpointSize) {
+          setPtySize(checkpointSize); ptySizeRef.current = checkpointSize
+        }
+        const onReplayed = () => {
+          if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
+          scrollAnchorRef.current?.follow()
+          if (!claiming) {
+            const logicalSize = reconnectSizePromise
+            const localSession = !sessionRef.current.peer
+            if (!logicalSize || !localSession) {
+              setTermLoading(false)
+              return
+            }
+            // The checkpoint is the runner's current physical geometry. Only
+            // write to the shared PTY when it proves the hidden reconnect
+            // shrink (logical cols - 1 at the same row count). This avoids
+            // stealing ownership from another viewer on ordinary reconnects.
+            // Do not hold the replay overlay on an independent HTTP read.
+            setTermLoading(false)
+            void logicalSize.then((size) => {
+              if (connectionRef.current !== connection
+                || connection.ws.readyState !== WebSocket.OPEN
+                || termEpochRef.current !== epoch) return
+              if (!checkpointRawReplay && size && shouldReassertReconnectSize(
+                declaredCheckpointSize,
+                size,
+                ptySizeRef.current,
+                localSession,
+                resizeEchoGateRef.current.awaitingEcho != null,
+              )) {
+                applyOwnedResize(size, true, true)
+              }
+            })
+            return
+          }
+
+          isFirstConnect = false
+          const proceedWithClaim = (claimSize: TerminalSize) => {
+            barrierClaimResizeRef.current = claimSize
+            const onClaimResized = () => {
+              if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
+              attachPhase = 'claimed'
+              inputClaimedRef.current = true
+              claimFallbackTimer = setTimeout(() => {
+                if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
+                claimFallbackTimer = null
+                setTermLoading(false)
+              }, 500)
+              // Include bytes that arrived while the resize barrier was waiting
+              // on the addon's busy fence.
+              const heldWrites = postClaimWrites.splice(0)
+              for (let i = 0; i < heldWrites.length; i++) {
+                queueData(heldWrites[i], i === heldWrites.length - 1 ? finishPostClaimWrite : undefined)
+              }
+            }
+            // Claim geometry is a second FIFO barrier. Held live bytes cannot
+            // parse at checkpoint geometry, and input opens only when it applies.
+            termIoRef.current?.enqueueResizeThenMany(claimSize, [], epoch, undefined, onClaimResized)
+          }
+          const claimSize = announceViewportClaim()
+          if (claimSize) {
+            proceedWithClaim(claimSize)
+            return
+          }
+          // Measurement unavailable (renderer dimensions transiently
+          // undefined). Never park the attach in 'claiming' forever: retry on
+          // real layout/renderer lifecycle, and after a hard deadline fall
+          // back to flowing at checkpoint geometry — the reconnect path
+          // already proves that is safe — without ever sending a made-up
+          // size to the runner.
+          cancelClaimRetry?.()
+          cancelClaimRetry = watchForClaimMeasurement({
+            shell: shellRef.current,
+            measure: announceViewportClaim,
+            onMeasured: (size) => {
+              cancelClaimRetry = null
+              if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
+              proceedWithClaim(size)
+            },
+            onGiveUp: () => {
+              cancelClaimRetry = null
+              if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
+              // Deterministic fallback: enter 'claimed' at the checkpoint
+              // geometry already applied by the replay barrier and release
+              // held output and input. No resize is sent: the runner keeps
+              // its size until a real measurement exists (the pill lets the
+              // user reclaim, and any later resize path re-measures).
+              attachPhase = 'claimed'
+              inputClaimedRef.current = true
+              const heldWrites = postClaimWrites.splice(0)
+              if (heldWrites.length === 0) {
+                setTermLoading(false)
+                return
+              }
+              for (let i = 0; i < heldWrites.length; i++) {
+                queueData(heldWrites[i], i === heldWrites.length - 1 ? finishPostClaimWrite : undefined)
+              }
+            },
+          })
+        }
+        if (checkpointSize) {
+          // Every replay gets an ordered local geometry barrier. Reconnects
+          // do not reclaim or send this checkpoint size back to the runner.
+          termIoRef.current?.enqueueResizeThenMany(checkpointSize, prepared, epoch, onReplayed)
+        } else {
+          queueMany(prepared, onReplayed)
+        }
       })
 
       const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${session.id}`)
+      const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${session.id}?client=browser`)
       ws.binaryType = 'arraybuffer'
-      wsRef.current = ws
+      const connection: SessionConnection = { sessionId: session.id, ws }
+      connectionRef.current = connection
 
       ws.onopen = () => {
+        if (connectionRef.current !== connection) return
         attempt = 0
         setWsState('open')
 
-        if (!isFirstConnect) {
-          // Reconnect: re-sync ptySize from session metadata in case a
-          // terminal_resize WS event was missed during the drop. Session
-          // metadata is updated via SSE independently, so it may be
-          // fresher than our cached ptySize after a network blip.
-          resetResizeEchoGate()
-          const sess = sessionRef.current
-          if (sess.terminal_cols && sess.terminal_rows) {
-            const cached = ptySizeRef.current
-            if (!cached || cached.cols !== sess.terminal_cols || cached.rows !== sess.terminal_rows) {
-              const size = { cols: sess.terminal_cols, rows: sess.terminal_rows }
-              setPtySize(size); ptySizeRef.current = size
-              queueResize(size)
-            }
-          }
-          return
-        }
-        isFirstConnect = false
+        if (isFirstConnect) return
+        inputClaimedRef.current = true
 
-        // First connect for this session: claim ownership by fitting the PTY
-        // to our viewport. fitAndResize measures, sets viewport+pty
-        // optimistically, and sends the resize over this ws (wsRef was set
-        // above).
-        fitAndResize()
+        // Start a fresh logical-size read, but apply it only after the
+        // checkpoint replay commits. The checkpoint then provides positive
+        // evidence of the runner's hidden one-column reconnect shrink.
+        resetResizeEchoGate()
+        const sess = sessionRef.current
+        const fallbackSize = sess.terminal_cols && sess.terminal_rows
+          ? { cols: sess.terminal_cols, rows: sess.terminal_rows }
+          : null
+        reconnectSizePromise = sess.peer
+          ? Promise.resolve(null)
+          : fetchAuthoritativeReconnectSize(session.id).then(size => size ?? fallbackSize)
       }
 
       ws.onmessage = (ev) => {
+        if (connectionRef.current !== connection) return
+        // Safety net: live output proves the connection works. Never show the
+        // disconnected pill while data is flowing on the current socket.
+        setWsState(wsStateOnOutput)
         if (typeof ev.data === 'string') {
           try {
             const msg = JSON.parse(ev.data)
             // Legacy: old proxy sends resize_state on connect with cols/rows.
             // Use it to initialize ptySize if we don't have one yet.
+            if (msg.type === 'terminal_checkpoint') {
+              checkpointAlt = msg.active_buffer === 'alternate'
+              checkpointRawReplay = msg.raw_replay === true
+              checkpointCols = Number.isInteger(msg.cols) && msg.cols > 0 ? msg.cols : undefined
+              if (Number.isInteger(msg.scroll_top) && Number.isInteger(msg.scroll_bottom) && Number.isInteger(msg.rows)) {
+                checkpointMargins = { top: msg.scroll_top, bottom: msg.scroll_bottom, rows: msg.rows }
+              }
+              return
+            }
+
             if (msg.type === 'resize_state') {
               const cols = msg.cols as number | undefined
               const rows = msg.rows as number | undefined
@@ -932,7 +1486,7 @@ export function TerminalView({
               if (cols && rows) {
                 const size = { cols, rows }
                 setPtySize(size); ptySizeRef.current = size
-                queueResize(size)
+                if (shouldQueueResizeEcho(size, barrierClaimResizeRef.current)) queueResize(size)
                 releaseResizeEchoGate(size)
               }
               return
@@ -946,7 +1500,8 @@ export function TerminalView({
             replay.push(data)
             return
           }
-          queueData(data, () => setTermLoading(false))
+          if (attachPhase === 'claiming') postClaimWrites.push(data)
+          else queueData(data, attachPhase === 'claimed' ? finishPostClaimWrite : () => setTermLoading(false))
           return
         }
 
@@ -959,12 +1514,25 @@ export function TerminalView({
           return
         }
 
-        queueData(data, () => setTermLoading(false))
+        if (attachPhase === 'claiming') postClaimWrites.push(data)
+        else queueData(data, attachPhase === 'claimed' ? finishPostClaimWrite : () => setTermLoading(false))
       }
 
       ws.onclose = () => {
+        // A stale socket (superseded by a newer connect() or by the effect
+        // re-running) must not touch shared state: its close event often
+        // fires *after* the replacement socket opened, and marking the
+        // connection 'lost' then would leave the pill stuck on screen
+        // forever while the live socket streams output behind it.
+        const isCurrent = connectionRef.current === connection
+        setWsState(prev => wsStateOnClose(prev, isCurrent))
+        if (isCurrent) onModifiersCancelled()
+        if (!isCurrent) return
+        if (claimFallbackTimer !== null) clearTimeout(claimFallbackTimer)
+        claimFallbackTimer = null
+        cancelClaimRetry?.()
+        cancelClaimRetry = null
         resetResizeEchoGate()
-        setWsState(prev => prev === 'open' ? 'lost' : prev)
         if (disposed.current || intentionalClose) return
         if (currentSessionId.current !== session.id) return
 
@@ -982,15 +1550,19 @@ export function TerminalView({
 
     return () => {
       intentionalClose = true
+      cancelClaimRetry?.()
+      cancelClaimRetry = null
+      inputClaimedRef.current = false
       termEpochRef.current = epoch + 1
       termIoRef.current?.reset(termEpochRef.current)
+      scrollAnchorRef.current?.reset()
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       reconnectTimer.current = null
       resetResizeEchoGate()
-      wsRef.current?.close()
-      wsRef.current = null
+      connectionRef.current?.ws.close()
+      connectionRef.current = null
     }
-  }, [fitAndResize, queueData, queueMany, queueResize, releaseResizeEchoGate, resetResizeEchoGate, session.id, fontReady])
+  }, [announceViewportClaim, queueData, queueMany, queueResize, releaseResizeEchoGate, resetResizeEchoGate, session.id, fontReady])
 
   // Pill is purely derived from size mismatch. No "driving" flag: we claim
   // on every fresh session select (first ws.onopen), and fitAndResize sets
@@ -1000,6 +1572,7 @@ export function TerminalView({
   // terminal) changes ptySize away from our viewport.
   const showDisconnectedPill = wsState === 'lost'
   const showResizePill = !showDisconnectedPill
+    && !termLoading
     && session.alive
     && ptySize != null && viewportSize != null
     && (viewportSize.cols !== ptySize.cols || viewportSize.rows !== ptySize.rows)
@@ -1017,7 +1590,7 @@ export function TerminalView({
     >
       {showDisconnectedPill && (
         <div class="terminal-resize-anchor">
-          <div class="terminal-disconnected-pill">
+          <div class="reconnecting-pill terminal-disconnected-pill">
             Connection lost, reconnecting…
           </div>
         </div>
@@ -1033,6 +1606,19 @@ export function TerminalView({
           </button>
         </div>
       )}
+      {terminalFindOpen.value && searchAddonRef.current && (
+        <div class="terminal-find-anchor">
+          <TerminalFindBar
+            addon={searchAddonRef.current}
+            onClose={() => {
+              terminalFindOpen.value = false
+              // Hand focus back to the terminal — but not on touch, where
+              // that would immediately re-pop the on-screen keyboard.
+              if (!isTouchDevice()) focusTerminal()
+            }}
+          />
+        </div>
+      )}
       <div ref={containerRef} class="terminal-container" />
       {termLoading && (
         <div class="terminal-loading">
@@ -1043,7 +1629,7 @@ export function TerminalView({
         <button
           type="button"
           class="terminal-scroll-end"
-          onClick={() => termRef.current?.scrollToBottom()}
+          onClick={() => scrollAnchorRef.current?.follow()}
           title="Scroll to bottom"
         >
           End ↓
@@ -1085,7 +1671,17 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     term.loadAddon(fit)
     term.open(containerRef.current)
     loadWebglRenderer(term)
-    fit.fit()
+    // Fit like the real terminal: measureTerminalFit reserves the mobile
+    // control bar's height (rounding rows up so one row tucks behind the
+    // translucent keys) instead of FitAddon's naive full-shell fit, which
+    // would paint the terminal background underneath the whole key grid.
+    const refit = () => {
+      const shell = containerRef.current?.closest<HTMLElement>('.terminal-shell')
+      const dims = shell ? measureTerminalFit(term, shell) : null
+      if (dims) term.resize(dims.cols, dims.rows)
+      else fit.fit()
+    }
+    refit()
 
     const mock = MOCK_BY_ID[sessionId]
     if (mock?.terminal) {
@@ -1100,7 +1696,7 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     // Expose for debug: window.__gmuxTerm
     ;(window as any).__gmuxTerm = term
 
-    const onResize = () => fit.fit()
+    const onResize = () => refit()
     window.addEventListener('resize', onResize)
 
     return () => {

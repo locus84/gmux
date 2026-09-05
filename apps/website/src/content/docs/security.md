@@ -21,9 +21,11 @@ This is equivalent to SSH access. The server must not be reachable by anyone who
 
 gmuxd uses two listeners:
 
-1. **Unix socket** (`~/.local/state/gmux/gmuxd.sock`) for local CLI-to-daemon IPC. No authentication needed; access is enforced by filesystem permissions (0600 socket, 0700 directory). This socket cannot be forwarded by VS Code, Docker, or SSH.
+1. **Unix socket** (`~/.local/state/gmux/gmuxd.sock`) for local CLI-to-daemon IPC. No authentication needed; access is enforced by filesystem permissions (0600 socket, 0700 directory). Unlike a TCP port, it is never auto-forwarded by VS Code, Docker Desktop, or SSH port forwarding.
 
-2. **TCP listener** (`127.0.0.1:8790` by default) for browser access. Every request must present a bearer token or session cookie. There is no unauthenticated TCP access, and no option to disable auth.
+2. **TCP listener** (`127.0.0.1:8790` by default) for browser access. Every request must present a bearer token or session cookie — the only unauthenticated paths are the login page itself and the web-app manifest. There is no option to disable auth on this listener, and daemon shutdown is refused on it entirely (it is a Unix-socket-only operation), even with valid credentials.
+
+The separate Tailscale HTTPS listener may be configured with `tailscale.require_token = false`. In that mode Tailscale WhoIs plus the node-owner/`allow` identity list remains the authorization boundary, but gmux does not require a second token login. This is convenient for installed mobile web apps, at the cost of trusting every permitted Tailscale identity with terminal access.
 
 By default, the TCP listener binds to `127.0.0.1`:
 
@@ -32,7 +34,7 @@ By default, the TCP listener binds to `127.0.0.1`:
 - ❌ Not reachable from Tailscale or other VPNs
 - ❌ Not reachable from the internet
 
-The bind address can be changed via `GMUXD_LISTEN` for container and VPN deployments (see [Running in Docker](/running-in-docker/)). The port can be changed in the [config file](/reference/host-toml/).
+The bind address can be changed via `GMUXD_LISTEN` for container and VPN deployments (see [Running in Docker](/running-in-docker/)) — it is validated at startup and only accepts loopback, private (RFC 1918), link-local, CGNAT, ULA, or all-interfaces addresses; binding directly to a public IP is refused (use Tailscale instead). The port can be changed in the [config file](/reference/host-toml/).
 
 ### Bearer token
 
@@ -48,6 +50,37 @@ This is acceptable when:
 
 For remote access without managing certificates yourself, use [Tailscale](/remote-access/). For container deployments, see [Running in Docker](/running-in-docker/) for examples with WireGuard and Traefik.
 :::
+
+### Browser sessions: same-origin enforcement
+
+The two credentials behave very differently in a browser, so they are constrained differently:
+
+- **Bearer header** — attached explicitly by the client. A web page on another origin cannot forge it, so bearer-authenticated requests carry **no origin constraint**. CLI, API, and hub↔spoke peering traffic all use bearer auth and are unaffected by everything below.
+- **Session cookie** — attached *ambiently* by the browser, regardless of which page initiated the request. Cookie-authenticated requests must therefore prove they came from the gmux UI itself.
+
+The cookie is `HttpOnly` and `SameSite=Strict` (and `Secure` when served over HTTPS), which blocks classic cross-**site** attacks like DNS rebinding: a malicious page on `evil.com` that resolves to your loopback address gets neither the token nor the cookie. But `SameSite` reasons about *sites*, not *origins* — and `ts.net` is on the [Public Suffix List](https://publicsuffix.org/), which makes `<tailnet>.ts.net` the registrable domain. Every other web service on your own tailnet is **same-site** with gmux, so `SameSite=Strict` does nothing between them. A compromised or XSS'd co-tenant tailnet service could otherwise ride the cookie into gmux's control plane — which, via a WebSocket to a terminal, is code execution.
+
+So for cookie-authenticated requests, gmuxd enforces **same-origin**:
+
+- **WebSocket upgrades** must originate from the gmux origin itself. This closes cross-origin WebSocket hijacking of terminal I/O, the highest-value path.
+- **State-changing requests** — any `POST`/`PUT`/`PATCH`/`DELETE`, on any path — must carry `Sec-Fetch-Site: same-origin`; browsers that don't send fetch metadata fall back to an `Origin` header matching the request's own host. Anything else gets `403`.
+- **Reads over `GET`** are exempt: gmuxd never emits CORS headers, so a foreign page cannot read the response anyway.
+
+The check is a single dynamic comparison against the request's **own** Host (honoring `X-Forwarded-Host` behind proxies that rewrite it) — whatever hostname the browser used to load the UI is, by definition, the hostname it sends in both `Origin` and `Host`. Localhost, LAN IPs, tailnet FQDNs, and reverse-proxy vhosts (e.g. Traefik routing `gmux.example.com`) all work without configuration.
+
+**Why not a hostname allowlist?** An earlier design validated the `Host` header against a configured list of trusted names (`GMUXD_TRUSTED_HOSTS`). It was rejected: an allowlist must enumerate every name the daemon can legitimately be reached by — localhost, the bind host, every tailnet FQDN, every reverse-proxy hostname — which is brittle and easy to misconfigure into a lockout, while adding nothing the token, the cookie attributes, and the same-origin check don't already provide.
+
+The UI also sends `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY` on every response, so gmux can never be embedded in another page's frame.
+
+The full decision record is [ADR 0020](https://github.com/gmuxapp/gmux/blob/main/docs/adr/0020-same-origin-enforcement-for-cookie-auth.md).
+
+The login page itself is self-contained: no external resources are loaded before authentication (the brand font is embedded), so nothing leaks pre-auth and it works air-gapped.
+
+### Local filesystem safeguards
+
+- Per-session runner sockets live in a per-user directory under the state dir (`~/.local/state/gmux/run/sessions`, mode 0700) — never in world-shared `/tmp`, where another local user could squat the directory.
+- Clipboard paste files are created with `0600` permissions so pasted secrets aren't readable by other local users.
+- Session IDs and slugs are validated against a strict allowlist before any filesystem or URL use, so an attacker-influenced ID can't carry `..` or path separators into the state directory.
 
 ## Remote access: Tailscale
 
@@ -66,7 +99,9 @@ The Tailscale account that owns the node is automatically added to the allow lis
 
 ### Allow list design
 
-The allow list matches **login names**, not device names. Tailscale device names are unique within a tailnet, but they can be renamed by the user. A renamed device would silently fall off the allow list. Login names are stable identities tied to the authentication provider (GitHub, Google, etc.). For per-device access control, use [Tailscale ACLs](https://tailscale.com/kb/1018/acls).
+The allow list matches **login names** and **device tags**, not device names. Tailscale device names are unique within a tailnet, but they can be renamed by the user. A renamed device would silently fall off the allow list. Login names are stable identities tied to the authentication provider (GitHub, Google, etc.). For per-device access control, use [Tailscale ACLs](https://tailscale.com/kb/1018/acls).
+
+[Tagged devices](https://tailscale.com/kb/1068/tags) carry no user identity — `WhoIs` reports the pseudo-login `tagged-devices` — so they cannot be allowed by login name. Instead, add the device's ACL tag (e.g. `tag:gmux`) to the allow list. Tags are assigned via your tailnet's ACL policy and can only be changed by tailnet admins, making them a stable, admin-controlled identity.
 
 The allow list is for when you have multiple accounts on the same tailnet (e.g. a personal and a work account) or when you've shared the gmux device to another tailnet you own. It is not designed for giving other people access. See the [not a collaboration tool](/remote-access) caveat.
 
@@ -78,17 +113,17 @@ gmux faces the same security problem as [Jupyter](https://jupyter-server.readthe
 
 **You don't lose anything.** The token is a plain file on disk at `~/.local/state/gmux/auth-token`. Any integration that needs programmatic access can read it and set the `Authorization: Bearer <token>` header. A reverse proxy like Traefik can inject the token into forwarded requests via a headers middleware, so you never interact with it directly.
 
-For container deployments, the `GMUXD_TOKEN` environment variable can seed the token file on first start. If a token file already exists, the env var must match or gmuxd refuses to start. The variable is unset from the process after consumption so child shells don't inherit it. See [Environment variables](/reference/environment/#auth-token) for details.
+For container deployments, the `GMUXD_TOKEN` environment variable can seed the token file on first start. User-provided tokens must be at least 64 hex characters (256 bits) — the same strength as auto-generated ones. If a token file already exists, the env var must match or gmuxd refuses to start. The variable is unset from the process after consumption so child shells don't inherit it. See [Environment variables](/reference/environment/#auth-token) for details.
 
 The file remains the primary storage. Environment variables are inherited by child processes, visible in `/proc/*/environ`, and tend to appear in CI logs and Docker inspect output. CLI flags show up in `ps` and shell history. A file with `0600` permissions is the smallest attack surface for a long-lived secret. The env var is a provisioning convenience for containers, not a replacement for the file.
 
 The [`examples/`](https://github.com/gmuxapp/gmux/tree/main/examples) directory has ready-to-run Docker Compose setups showing how to handle auth in common deployment scenarios: [Tailscale](/running-in-docker/#tailscale-recommended), [WireGuard](/running-in-docker/#wireguard), and [Traefik with OIDC](/running-in-docker/#reverse-proxy-with-oidc-traefik--pocketid).
 
-**For easy access from other devices**, use [Tailscale remote access](/remote-access). It gives you HTTPS with automatic certificates and cryptographic identity verification; access still requires the host's token (run `gmux auth` to get its connect URL).
+**For easy access from other devices**, use [Tailscale remote access](/remote-access). It gives you HTTPS with automatic certificates and cryptographic identity verification. By default access also requires the host's token (`gmux auth`); trusted-tailnet installations can opt out of that second gate with `tailscale.require_token = false`.
 
 ## Config validation
 
-The config file is strictly validated at startup. Silent fallback to defaults is dangerous for security settings: a typo like `alow` instead of `allow` would silently result in an empty allow list. See [host.toml reference](/reference/host-toml/#strict-validation) for the full list of rules.
+The config file is strictly validated at startup. Silent fallback to defaults is dangerous for security settings: a typo like `alow` instead of `allow` would silently result in an empty allow list. Keys removed in 2.0 (`tailscale.hostname`, `[[peers]]`, `discovery.tailscale`) produce a warning instead of an error, so an old config won't brick the daemon. See [host.toml reference](/reference/host-toml/#strict-validation) for the full list of rules.
 
 ## Recommendations
 

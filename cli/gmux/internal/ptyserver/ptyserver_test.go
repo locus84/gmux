@@ -6,16 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/gmuxapp/gmux/cli/gmux/internal/session"
+	"github.com/gmuxapp/gmux/packages/adapter"
 	"github.com/gmuxapp/gmux/packages/scrollback"
 	"nhooyr.io/websocket"
 )
@@ -30,6 +35,10 @@ func mustBindSocket(t *testing.T, sockPath string) net.Listener {
 	if err != nil {
 		t.Fatalf("BindSocket %s: %v", sockPath, err)
 	}
+	// Release the lease at the end of the test even when the test never
+	// shuts the server down, so a leaked lease cannot make an unrelated
+	// later test see ErrSocketInUse.
+	t.Cleanup(func() { _ = ln.ReleaseOwnership() })
 	return ln
 }
 
@@ -555,7 +564,9 @@ func TestPTYServerSnapshotBeforeLiveData(t *testing.T) {
 
 	for i := 0; i < numClients; i++ {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Generous timeout: 20 concurrent clients over the race detector
+			// take several seconds; a tighter budget flakes under -race.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
@@ -874,8 +885,8 @@ func stringContains(s, sub string) bool {
 // response-drain goroutine, Write blocks forever because the emulator
 // writes the response to an internal pipe that nobody reads.
 func TestNewScreenDSRNonBlocking(t *testing.T) {
-	screen := newScreen(80, 24, func(bool) {})
-	defer screen.Close()
+	screen, screenDrain := newScreen(80, 24, func(bool) {})
+	defer stopScreenDrain(screen, screenDrain)
 
 	done := make(chan struct{})
 	go func() {
@@ -892,11 +903,96 @@ func TestNewScreenDSRNonBlocking(t *testing.T) {
 	}
 }
 
+// TestShutdownDrainNoRace guards against the data race between the DSR drain
+// goroutine's e.Read (via io.Copy) and shutting the emulator down. It writes
+// DSR-generating input continuously (forcing the drain goroutine to keep
+// Reading) and then tears the screen down via stopScreenDrain. Under -race
+// this fails if the drain goroutine's Read runs concurrently with Close
+// touching the emulator's unsynchronized `closed` flag.
+func TestShutdownDrainNoRace(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		screen, screenDrain := newScreen(80, 24, func(bool) {})
+
+		// Writes are serialized w.r.t. shutdown in the real Server (both run
+		// under s.mu), so we finish writing before tearing down. Each DSR
+		// (ESC[6n) makes the emulator queue a response the drain goroutine
+		// must Read, keeping the drain busy right up to teardown.
+		for j := 0; j < 100; j++ {
+			screen.Write([]byte("x\x1b[6n"))
+		}
+
+		// Tears down while the drain goroutine is still Reading queued
+		// responses: its e.Read must not race the emulator Close.
+		stopScreenDrain(screen, screenDrain)
+	}
+}
+
+func TestTerminalCheckpointMetadataCarriesGeometryAndMargins(t *testing.T) {
+	data, err := json.Marshal(terminalCheckpointMetadata{
+		Type: "terminal_checkpoint", ActiveBuffer: "alternate", ScrollTop: 2, ScrollBottom: 4, Cols: 91, Rows: 44,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":"terminal_checkpoint","active_buffer":"alternate","scroll_top":2,"scroll_bottom":4,"cols":91,"rows":44}`
+	if string(data) != want {
+		t.Fatalf("metadata = %s, want %s", data, want)
+	}
+}
+
+func TestMarginsFollowVTPerBufferAndResetSemantics(t *testing.T) {
+	margins := newMarginTracker(6)
+	screen, screenDrain := newScreenWithMargins(20, 6, func(bool) {}, margins)
+	defer stopScreenDrain(screen, screenDrain)
+
+	screen.Write([]byte("\x1b[2;5r"))
+	if got := margins.active(false); got != (verticalMargins{top: 2, bottom: 5}) {
+		t.Fatalf("normal margins = %+v, want 2..5", got)
+	}
+	screen.Write([]byte("\x1b[?1049h\x1b[3;6r"))
+	if got := margins.active(true); got != (verticalMargins{top: 3, bottom: 6}) {
+		t.Fatalf("alternate margins = %+v, want 3..6", got)
+	}
+	if got := margins.active(false); got != (verticalMargins{top: 2, bottom: 5}) {
+		t.Fatalf("normal margins changed across 1049 = %+v", got)
+	}
+	screen.Write([]byte("\x1bc"))
+	if got := margins.active(false); got != (verticalMargins{top: 1, bottom: 6}) {
+		t.Fatalf("normal margins after RIS = %+v, want full screen", got)
+	}
+	if got := margins.active(true); got != (verticalMargins{top: 1, bottom: 6}) {
+		t.Fatalf("alternate margins after RIS = %+v, want full screen", got)
+	}
+}
+
+func TestSnapshotFrameIsSharedAttachStream(t *testing.T) {
+	screen, screenDrain := newScreen(20, 4, func(bool) {})
+	defer stopScreenDrain(screen, screenDrain)
+
+	// This is the raw frame consumed by `gmux attach`. Even when the PTY is
+	// currently in an alternate screen, it must not change the caller's own
+	// terminal buffer; only the PTY's bytes are forwarded.
+	screen.Write([]byte("\x1b[?1049h\x1b[2J\x1b[H\x1b[44mALT\x1b[0m"))
+	frame := string(snapshotFrame(screen, false))
+	for _, want := range []string{"\x1b[?2026h", "\x1b[r\x1b[H\x1b[2J\x1b[3J", "ALT", "\x1b[?25h", "\x1b[?2026l"} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("snapshot missing %q in %q", want, frame)
+		}
+	}
+	if strings.Contains(frame, "\x1b[?1049") {
+		t.Fatalf("raw attach frame changes caller buffer: %q", frame)
+	}
+	if strings.Index(frame, "\x1b[?2026h") > strings.Index(frame, "ALT") ||
+		strings.Index(frame, "\x1b[?2026l") < strings.Index(frame, "ALT") {
+		t.Fatalf("snapshot is not atomically framed: %q", frame)
+	}
+}
+
 // TestRenderScreenIncludesScrollback verifies that renderScreen includes
 // lines that scrolled off the top of the screen, not just the visible rows.
 func TestRenderScreenIncludesScrollback(t *testing.T) {
-	screen := newScreen(80, 5, func(bool) {})
-	defer screen.Close()
+	screen, screenDrain := newScreen(80, 5, func(bool) {})
+	defer stopScreenDrain(screen, screenDrain)
 
 	// Write 10 lines through a 5-row terminal: lines 1-5 scroll off,
 	// lines 6-10 remain visible.
@@ -918,8 +1014,8 @@ func TestRenderScreenIncludesScrollback(t *testing.T) {
 // filled screen has exactly Height-1 CRLF separators (no extra blank rows
 // from buffer growth) and that adding scrollback increases the total.
 func TestRenderScreenLineCount(t *testing.T) {
-	screen := newScreen(40, 5, func(bool) {})
-	defer screen.Close()
+	screen, screenDrain := newScreen(40, 5, func(bool) {})
+	defer stopScreenDrain(screen, screenDrain)
 
 	// Write 3 short lines, staying within the 5-row screen.
 	for i := 1; i <= 3; i++ {
@@ -934,8 +1030,8 @@ func TestRenderScreenLineCount(t *testing.T) {
 	}
 
 	// Now push content into scrollback: write 10 lines through a 5-row terminal.
-	screen2 := newScreen(40, 5, func(bool) {})
-	defer screen2.Close()
+	screen2, screen2Drain := newScreen(40, 5, func(bool) {})
+	defer stopScreenDrain(screen2, screen2Drain)
 	for i := 1; i <= 10; i++ {
 		fmt.Fprintf(screen2, "Line-%02d\r\n", i)
 	}
@@ -1104,9 +1200,9 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Helper to connect a WS client.
+	// Helper to connect a browser WS client.
 	dial := func() *websocket.Conn {
-		conn, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
+		conn, _, err := websocket.Dial(ctx, "ws://localhost/?client=browser", &websocket.DialOptions{
 			HTTPClient: &http.Client{
 				Transport: &http.Transport{
 					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -1169,6 +1265,27 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	// This should trigger a genuine SIGWINCH because the PTY is at 79 cols.
 	conn2 := dial()
 	defer conn2.Close(websocket.StatusNormalClosure, "")
+
+	// Browser checkpoint geometry must expose exactly the runner's hidden
+	// one-column shrink. The web reconnect guard deliberately relies on this
+	// contract before reasserting the logical 80x25 size.
+	typ, data, err := conn2.Read(ctx)
+	if err != nil {
+		t.Fatalf("read checkpoint metadata: %v", err)
+	}
+	if typ != websocket.MessageText {
+		t.Fatalf("checkpoint metadata type = %v, want text", typ)
+	}
+	var checkpoint terminalCheckpointMetadata
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		t.Fatalf("decode checkpoint metadata: %v", err)
+	}
+	if checkpoint.Cols != 79 || checkpoint.Rows != 25 {
+		t.Fatalf("checkpoint size = %dx%d, want hidden shrink 79x25", checkpoint.Cols, checkpoint.Rows)
+	}
+	if typ, _, err = conn2.Read(ctx); err != nil || typ != websocket.MessageBinary {
+		t.Fatalf("read checkpoint frame: type=%v err=%v", typ, err)
+	}
 
 	go func() {
 		for {
@@ -1336,7 +1453,7 @@ func envValue(env []string, name string) string {
 // terminfo entry.
 func TestBuildChildEnv_DefaultsTermWhenAbsent(t *testing.T) {
 	parent := []string{"PATH=/usr/bin", "HOME=/home/test"}
-	env := buildChildEnv(parent, nil, "1.2.3")
+	env := buildChildEnv(parent, []string{"_GMXINTERNAL_TARGET_GATE_FD=4"}, "1.2.3")
 
 	if got := envValue(env, "TERM"); got != "xterm-256color" {
 		t.Errorf("TERM = %q, want xterm-256color", got)
@@ -1347,7 +1464,7 @@ func TestBuildChildEnv_DefaultsTermWhenAbsent(t *testing.T) {
 // terminal's terminfo entry.
 func TestBuildChildEnv_PreservesParentTerm(t *testing.T) {
 	parent := []string{"TERM=screen-256color"}
-	env := buildChildEnv(parent, nil, "1.2.3")
+	env := buildChildEnv(parent, []string{"_GMXINTERNAL_TARGET_GATE_FD=4"}, "1.2.3")
 
 	if got := envValue(env, "TERM"); got != "screen-256color" {
 		t.Errorf("TERM = %q, want parent value screen-256color", got)
@@ -1376,7 +1493,7 @@ func TestBuildChildEnv_AdvertisesTerminalCapabilities(t *testing.T) {
 		"TERM_PROGRAM_VERSION=3.4.0",
 		"COLORTERM=",
 	}
-	env := buildChildEnv(parent, nil, "1.2.3")
+	env := buildChildEnv(parent, []string{"_GMXINTERNAL_TARGET_GATE_FD=4"}, "1.2.3")
 
 	if got := envValue(env, "TERM_PROGRAM"); got != "gmux" {
 		t.Errorf("TERM_PROGRAM = %q, want gmux", got)
@@ -1444,20 +1561,77 @@ func TestNewSpawnsChildWithComposedEnv(t *testing.T) {
 	}
 }
 
+func TestNewSpawnedChildScrubsInternalEnv(t *testing.T) {
+	for key, value := range map[string]string{
+		"_GMXINTERNAL_RESUME_ID":    "inherited-secret",
+		"_GMXINTERNAL_HANDSHAKE_FD": "3",
+		"GMUX":                      "1",
+		"GMUX_SESSION_ID":           "sess-public",
+		"GMUX_ADAPTER":              "shell",
+		"GMUX_SOCKET":               "/tmp/gmux-public.sock",
+	} {
+		t.Setenv(key, value)
+	}
+
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+	var out syncBuffer
+	srv, err := New(Config{
+		Command:    []string{"sh", "-c", "env"},
+		Cwd:        "/tmp",
+		Env:        []string{"_GMXINTERNAL_TARGET_GATE_FD=4", "_GMXINTERNAL_EXTRA=secret"},
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+		LocalOut:   &out,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	select {
+	case <-srv.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("child did not exit")
+	}
+	<-srv.PTYDone()
+
+	childEnv := strings.ReplaceAll(out.String(), "\r", "")
+	if strings.Contains(childEnv, "_GMXINTERNAL_") {
+		t.Errorf("spawned child leaked internal environment: %q", childEnv)
+	}
+	for _, want := range []string{
+		"GMUX=1\n",
+		"GMUX_SESSION_ID=sess-public\n",
+		"GMUX_ADAPTER=shell\n",
+		"GMUX_SOCKET=/tmp/gmux-public.sock\n",
+	} {
+		if !strings.Contains(childEnv, want) {
+			t.Errorf("spawned child env missing %q: %q", want, childEnv)
+		}
+	}
+}
+
 func TestBindSocketStaleFile(t *testing.T) {
-	// A leftover socket file with no listener is not a real owner;
-	// BindSocket should remove it and listen successfully.
+	// A leftover pathname whose lease-aware owner is gone (socket file plus
+	// its lock file, the state a SIGKILLed runner leaves) is reclaimable:
+	// holding the lease proves that owner is not running.
+	//
+	// Note the change of premise from the pre-lease version of this test,
+	// which cleared *any* occupant. An occupant with no lock file is no
+	// longer removed at all, because nothing proves it is not a live runner
+	// from before this protocol -- see TestBindSocketRefusesUnleasedOccupant.
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "stale.sock")
-	if err := os.WriteFile(sockPath, []byte("not a socket"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	stale := crashedLeaseAwareSocket(t, sockPath)
 
 	ln, err := BindSocket(sockPath)
 	if err != nil {
-		t.Fatalf("BindSocket on stale file: %v", err)
+		t.Fatalf("BindSocket on a lease-aware stale socket: %v", err)
 	}
 	defer ln.Close()
+	if fresh := mustIdent(t, sockPath); fresh.Same(stale) {
+		t.Fatal("BindSocket reused the stale socket instead of rebinding")
+	}
 
 	// A second bind on the same path should now see a live owner
 	// (the first listener) and refuse with ErrSocketInUse.
@@ -1547,38 +1721,47 @@ func TestKillReleasesSocketPathBeforeResponding(t *testing.T) {
 	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
 		t.Errorf("socket path still exists after /kill returned 204: %v", err)
 	}
-
-	// And a fresh BindSocket on the same path must succeed:
-	// path is gone, no live owner.
+	// And a fresh BindSocket on the same path must succeed *without* waiting
+	// for the old runner's Shutdown: the daemon spawns the restart
+	// replacement as soon as it sees the exit event, which the old runner
+	// emits well before it shuts down. /kill therefore has to hand over the
+	// lease, not just unlink the pathname.
 	ln, err := BindSocket(sockPath)
 	if err != nil {
-		t.Fatalf("BindSocket after /kill: %v", err)
+		t.Fatalf("BindSocket after /kill: %v (the dying runner still owns the socket lease)", err)
 	}
-	ln.Close()
+	ln.Listener.Close()
+	_ = ln.ReleaseOwnership()
 }
 
-// TestBuildChildEnv_StripsResumeID guards the runner→child boundary
-// against leaking GMUX_RESUME_ID. The runner inherits this env var
+// TestBuildChildEnv_StripsInternalEnv guards the runner→child boundary
+// against leaking _GMXINTERNAL_RESUME_ID. The runner inherits this env var
 // from gmuxd as a private "use this id when you bind" directive
 // (ADR 0003); leaking it to the PTY child would let a nested
 // `gmux foo` invocation try to re-bind the parent runner's id and
 // rely on the collision fallback as a safety net, which is exactly
 // the scenario the dedicated env var name was meant to eliminate.
-func TestBuildChildEnv_StripsResumeID(t *testing.T) {
+func TestBuildChildEnv_StripsInternalEnv(t *testing.T) {
 	parent := []string{
 		"PATH=/usr/bin",
-		"GMUX_RESUME_ID=sess-parent",
-		"GMUX_SESSION_ID=sess-parent", // intentionally NOT stripped (children consume this)
+		"_GMXINTERNAL_RESUME_ID=1rz9lyqa",
+		"_GMXINTERNAL_HANDSHAKE_FD=3",
+		"GMUX=1",
+		"GMUX_SESSION_ID=1rz9lyqa",
+		"GMUX_ADAPTER=shell",
+		"GMUX_SOCKET=/tmp/session.sock",
 		"HOME=/home/u",
 	}
-	env := buildChildEnv(parent, nil, "1.2.3")
+	env := buildChildEnv(parent, []string{"_GMXINTERNAL_TARGET_GATE_FD=4"}, "1.2.3")
 	for _, e := range env {
-		if strings.HasPrefix(e, "GMUX_RESUME_ID=") {
-			t.Errorf("child env must not contain GMUX_RESUME_ID; got %q", e)
+		if strings.HasPrefix(e, "_GMXINTERNAL_") {
+			t.Errorf("child env must not contain internal variables; got %q", e)
 		}
 	}
-	if !hasEnv(env, "GMUX_SESSION_ID") {
-		t.Errorf("child env must retain GMUX_SESSION_ID for adapter / hook consumption")
+	for _, key := range []string{"GMUX", "GMUX_SESSION_ID", "GMUX_ADAPTER", "GMUX_SOCKET"} {
+		if !hasEnv(env, key) {
+			t.Errorf("child env must retain public variable %s", key)
+		}
 	}
 	if !hasEnv(env, "PATH") || !hasEnv(env, "HOME") {
 		t.Errorf("child env dropped unrelated parent vars")
@@ -1617,7 +1800,7 @@ func TestPutSlugValidation(t *testing.T) {
 		Cwd:        "/tmp",
 		Listener:   mustBindSocket(t, sockPath),
 		SocketPath: sockPath,
-		State:      session.New(session.Config{ID: "sess-abcd1234"}),
+		State:      session.New(session.Config{ID: "1va8lvdv"}),
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -1679,5 +1862,367 @@ func TestPutSlugValidation(t *testing.T) {
 	// Empty after slugify (only separators): rejected.
 	if code := putSlug("///"); code != http.StatusBadRequest {
 		t.Errorf("put unslugifiable = %d, want 400", code)
+	}
+}
+
+// TestShutdownIdempotent guards the sync.Once added to Shutdown: the
+// registration-reap path and a signal handler can now both call
+// Shutdown concurrently, so a second (or concurrent) call must not
+// panic on a double listener/ptmx close or a re-closed screen.
+func TestShutdownIdempotent(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+	// A short-lived child keeps the Done assertion robust: Shutdown
+	// closes the PTY master to SIGHUP the child, but delivery races the
+	// child's controlling-terminal setup — calling Shutdown microseconds
+	// after New (as this test does) can land before that, so the SIGHUP
+	// is missed. A 1s command means the child self-exits well within the
+	// timeout even in that case; we're asserting Shutdown doesn't
+	// deadlock, not that it kills instantly.
+	srv, err := New(Config{
+		Command:    []string{"sleep", "1"},
+		Cwd:        "/tmp",
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	// Concurrent shutdowns — the exact race the sync.Once defends. None
+	// may panic (double listener/ptmx close, re-closed screen, double
+	// drain-join) and all must return (no deadlock in the once'd body).
+	const n = 8
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			srv.Shutdown()
+		}()
+	}
+	wg.Wait()
+
+	// Done must fire: either the SIGHUP took, or the child ran to
+	// completion. Generous timeout so this can't flake under CI load.
+	select {
+	case <-srv.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout: Done not closed after Shutdown")
+	}
+
+	// A further call after the child has exited must also be safe.
+	srv.Shutdown()
+}
+
+// ── CommandWrapper + ExtraFiles + adapter argv extension ──
+
+// hookTestAdapter extends the command argv with a deterministic marker via the
+// SessionHookCommand path. The marker is recognisable in the subprocess output
+// without embedding a path-dependent binary reference.
+type hookTestAdapter struct{}
+
+func (hookTestAdapter) Name() string                    { return "test-hook" }
+func (hookTestAdapter) Discover() bool                  { return false }
+func (hookTestAdapter) Match([]string) bool             { return false }
+func (hookTestAdapter) Env(adapter.EnvContext) []string { return nil }
+func (hookTestAdapter) HookCommand(args []string, _ string) ([]string, bool) {
+	// Append a fixed marker that does NOT start with '-' so Go flag.Parse in
+	// the subprocess helper treats it as a non-flag positional argument.
+	return append(args, "HOOK_MARKER"), true
+}
+
+// TestPTYServerCommandWrapperAndExtraFiles exercises the production wiring of
+// Config.CommandWrapper + Config.ExtraFiles through ptyserver.New, including
+// the adapter argv extension that happens before wrapping. It verifies:
+//
+//  1. The final subprocess argv is [wrapper..., extended-command...] in the
+//     correct order (extension before wrapping, both before exec).
+//  2. ExtraFiles are inherited by the subprocess as open pipe fds at
+//     positions 3 and 4.
+//
+// Mutation resistance:
+//   - Dropping Config.ExtraFiles: the subprocess sees FD3/FD4 as non-pipe,
+//     failing the pipe assertions.
+//   - Removing CommandWrapper: the subprocess binary is not the test binary
+//     and the helper role check never runs, making the result pipe empty.
+//   - Removing adapter extension: HOOK_MARKER is absent from the result,
+//     failing the argv assertion.
+func TestPTYServerCommandWrapperAndExtraFiles(t *testing.T) {
+	const roleEnv = "PTYSERVER_WRAPPER_ROLE"
+	if os.Getenv(roleEnv) == "check" {
+		// Subprocess helper: write check results to fd 3 (the result pipe)
+		// then exit. os.Args[2:] contains the "command" portion passed via
+		// Config.Command plus any adapter-extended args.
+		resultFD := os.NewFile(3, "result")
+		var fd3Pipe, fd4Pipe bool
+		var st syscall.Stat_t
+		if syscall.Fstat(3, &st) == nil && st.Mode&syscall.S_IFMT == syscall.S_IFIFO {
+			fd3Pipe = true
+		}
+		if syscall.Fstat(4, &st) == nil && st.Mode&syscall.S_IFMT == syscall.S_IFIFO {
+			fd4Pipe = true
+		}
+		cmdArgs := os.Args[2:] // wrapper consumed os.Args[0..1]; command starts at [2]
+		fmt.Fprintf(resultFD, "ARGS=%s\nFD3=%v\nFD4=%v\n",
+			strings.Join(cmdArgs, ","), fd3Pipe, fd4Pipe)
+		_ = resultFD.Close()
+		os.Exit(0)
+	}
+
+	// Parent: create result pipe (fd 3 in subprocess) and an extra pipe
+	// for fd 4. Both are passed via Config.ExtraFiles so the subprocess
+	// receives them as open, usable file descriptors.
+	resultR, resultW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resultR.Close()
+	pipe4R, pipe4W, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe4R.Close()
+	defer pipe4W.Close()
+
+	sockPath := filepath.Join(t.TempDir(), "test.sock")
+
+	// Config.CommandWrapper is the argv prefix prepended AFTER adapter
+	// extension. Using the test binary as the wrapper lets the subprocess
+	// role check run inside the helper and write its results.
+	// Config.Command provides the "user command" that appears after the
+	// wrapper prefix in the final argv.
+	// The hookTestAdapter extends Config.Command with HOOK_MARKER before
+	// wrapping, so the expected subprocess os.Args[2:] is:
+	//   [user-cmd, user-arg, HOOK_MARKER]
+	srv, err := New(Config{
+		CommandWrapper: []string{os.Args[0], "-test.run=^TestPTYServerCommandWrapperAndExtraFiles$"},
+		Command:        []string{"user-cmd", "user-arg"},
+		Cwd:            "/tmp",
+		Env:            []string{roleEnv + "=check", "GMUX_NO_AGENT_HOOK=0"},
+		ExtraFiles:     []*os.File{resultW, pipe4R}, // fd 3=resultW, fd 4=pipe4R
+		Listener:       mustBindSocket(t, sockPath),
+		SocketPath:     sockPath,
+		Adapter:        hookTestAdapter{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer srv.Shutdown()
+
+	// Close the parent's copies of the ExtraFiles write-ends so the
+	// subprocess is the sole owner. resultW must be closed so io.ReadAll
+	// returns when the subprocess closes its end.
+	_ = resultW.Close()
+	_ = pipe4R.Close()
+
+	// Read result from the subprocess. Deadline guards against test hangs.
+	_ = resultR.SetReadDeadline(time.Now().Add(10 * time.Second))
+	data, _ := io.ReadAll(resultR)
+	result := string(data)
+
+	// Wait for the subprocess to finish.
+	select {
+	case <-srv.Done():
+	case <-time.After(12 * time.Second):
+		t.Fatal("timeout waiting for subprocess to exit")
+	}
+
+	if result == "" {
+		t.Fatal("subprocess wrote nothing to result pipe (check ExtraFiles or CommandWrapper)")
+	}
+
+	// (1) Argv order: user-cmd comes first, then user-arg, then the
+	//     adapter-extended HOOK_MARKER. This exact string fails if the
+	//     wrapper and command are reversed, or if extension is dropped.
+	wantArgs := "ARGS=user-cmd,user-arg,HOOK_MARKER"
+	if !strings.Contains(result, wantArgs) {
+		t.Errorf("argv order wrong; want %q in %q", wantArgs, result)
+	}
+
+	// (2) ExtraFiles: both fd 3 and fd 4 must be open pipes.
+	if !strings.Contains(result, "FD3=true") {
+		t.Errorf("fd 3 not a pipe in subprocess (ExtraFiles[0] not passed): %q", result)
+	}
+	if !strings.Contains(result, "FD4=true") {
+		t.Errorf("fd 4 not a pipe in subprocess (ExtraFiles[1] not passed): %q", result)
+	}
+}
+
+func TestRenderScreenSoftWrapRoundTripReflows(t *testing.T) {
+	const text = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzAB"
+	if len(text) != 100 {
+		t.Fatalf("test text length = %d", len(text))
+	}
+
+	narrow, narrowDrain := newScreen(40, 5, func(bool) {})
+	defer stopScreenDrain(narrow, narrowDrain)
+	if _, err := narrow.WriteString(text); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := renderScreen(narrow)
+	if strings.Contains(checkpoint[:len(text)], "\r\n") {
+		t.Fatalf("checkpoint injected a visual-row break: %q", checkpoint[:len(text)])
+	}
+
+	wide, wideDrain := newScreen(80, 5, func(bool) {})
+	defer stopScreenDrain(wide, wideDrain)
+	if _, err := wide.WriteString(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	var got strings.Builder
+	occupiedRows := 0
+	for y := 0; y < wide.Height(); y++ {
+		var row strings.Builder
+		for x := 0; x < wide.Width(); x++ {
+			if c := wide.CellAt(x, y); c != nil {
+				row.WriteString(c.Content)
+			}
+		}
+		content := strings.TrimRight(row.String(), " ")
+		if content != "" {
+			occupiedRows++
+			got.WriteString(content)
+		}
+	}
+	if occupiedRows != 2 {
+		t.Fatalf("reflow occupied %d rows, want 2; checkpoint=%q got=%q", occupiedRows, checkpoint, got.String())
+	}
+	if got.String() != text {
+		t.Fatalf("text changed across checkpoint: got %q", got.String())
+	}
+}
+
+func TestSnapshotFrameWrappedRowsRoundTrip(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"boundary spaces", "the quick brown fox jumps"},
+		{"multiple boundaries", "one two three four five six seven eight nine ten eleven twelve"},
+		{"wide forced wrap", "123456789界XY"},
+		{"styled boundary blank", "123456789\x1b[44m \x1b[0mX"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src, srcDrain := newScreen(10, 8, func(bool) {})
+			defer stopScreenDrain(src, srcDrain)
+			if _, err := src.WriteString(tc.input); err != nil {
+				t.Fatal(err)
+			}
+
+			frame := snapshotFrameWithScreen(src, false, true)
+			if tc.name == "wide forced wrap" {
+				if !screenContainsCell(src, "界", 2) {
+					t.Fatal("source emulator dropped forced-wrap wide grapheme")
+				}
+				if !strings.Contains(ansi.Strip(string(frame)), "界") {
+					t.Fatalf("checkpoint dropped forced-wrap wide grapheme: %q", frame)
+				}
+			}
+			if tc.name == "boundary spaces" && strings.Contains(ansi.Strip(string(frame)), "quickbrown") {
+				t.Fatalf("checkpoint concatenated words: %q", frame)
+			}
+			dst, dstDrain := newScreen(10, 8, func(bool) {})
+			defer stopScreenDrain(dst, dstDrain)
+			if _, err := dst.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+			assertScreensEqual(t, src, dst)
+		})
+	}
+}
+
+func screenContainsCell(screen interface {
+	Width() int
+	Height() int
+	CellAt(int, int) *uv.Cell
+}, content string, width int) bool {
+	for y := 0; y < screen.Height(); y++ {
+		for x := 0; x < screen.Width(); x++ {
+			if c := screen.CellAt(x, y); c != nil && c.Content == content && c.Width == width {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestSnapshotFrameAfterWidthChangesReflowsWithoutCorruption(t *testing.T) {
+	words := make([]string, 60)
+	for i := range words {
+		words[i] = fmt.Sprintf("word%02d", i)
+	}
+	sentence := strings.Join(words, " ")
+	for _, tc := range []struct {
+		name           string
+		prefix, suffix string
+	}{
+		{"visible", "", ""},
+		{"scrollback", strings.Repeat("old line\r\n", 5), "\r\n" + strings.Repeat("new line\r\n", 30)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, srcDrain := newScreen(80, 25, func(bool) {})
+			defer stopScreenDrain(src, srcDrain)
+			src.SetScrollbackSize(200)
+			if _, err := src.WriteString(tc.prefix + sentence + tc.suffix); err != nil {
+				t.Fatal(err)
+			}
+
+			// Production sequence: launch width, browser claim, then the
+			// detach shrink. Normal history must reflow at both width changes.
+			src.Resize(114, 44)
+			src.Resize(113, 44)
+			frame := snapshotFrameWithScreen(src, false, true)
+			plain := ansi.Strip(string(frame))
+			if !strings.Contains(plain, sentence) {
+				t.Fatalf("checkpoint lost sentence word fidelity: %q", plain)
+			}
+			if strings.Contains(plain, "  ") {
+				t.Fatalf("checkpoint injected interior padding: %q", plain)
+			}
+
+			dst, dstDrain := newScreen(113, 44, func(bool) {})
+			defer stopScreenDrain(dst, dstDrain)
+			dst.SetScrollbackSize(200)
+			if _, err := dst.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+			assertScreensEqual(t, src, dst)
+			if src.Scrollback().Len() != dst.Scrollback().Len() {
+				t.Fatalf("scrollback lengths differ: %d != %d", src.Scrollback().Len(), dst.Scrollback().Len())
+			}
+			for i, line := range src.Scrollback().Lines() {
+				if line.Render() != dst.Scrollback().Line(i).Render() || src.Scrollback().Wrapped(i) != dst.Scrollback().Wrapped(i) {
+					t.Fatalf("scrollback row %d differs after replay", i)
+				}
+			}
+		})
+	}
+}
+
+func assertScreensEqual(t *testing.T, want, got interface {
+	Width() int
+	Height() int
+	Wrapped(int) bool
+	CellAt(int, int) *uv.Cell
+	CursorPosition() uv.Position
+}) {
+	t.Helper()
+	if want.Width() != got.Width() || want.Height() != got.Height() {
+		t.Fatalf("screen sizes differ: %dx%d != %dx%d", want.Width(), want.Height(), got.Width(), got.Height())
+	}
+	if want.CursorPosition() != got.CursorPosition() {
+		t.Errorf("cursor differs: want %+v, got %+v", want.CursorPosition(), got.CursorPosition())
+	}
+	for y := 0; y < want.Height(); y++ {
+		if want.Wrapped(y) != got.Wrapped(y) {
+			t.Errorf("row %d wrapped: want %v, got %v", y, want.Wrapped(y), got.Wrapped(y))
+		}
+		for x := 0; x < want.Width(); x++ {
+			wc, gc := want.CellAt(x, y), got.CellAt(x, y)
+			if (wc == nil) != (gc == nil) || (wc != nil && !wc.Equal(gc)) {
+				t.Errorf("cell (%d,%d) differs: want %#v, got %#v", x, y, wc, gc)
+			}
+		}
 	}
 }

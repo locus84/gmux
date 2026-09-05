@@ -10,7 +10,24 @@ code {
   border-radius: 4px;
 }
 
+/* Visually hidden, still announced. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 :root {
+  /* Native scrollbars (and form controls) render dark instead of the
+     browser's light default — load-bearing for leaving platform overlay
+     scrollbars alone (see the scrollbar block below). */
+  color-scheme: dark;
   /* Surfaces — widened gaps for clearer distinction */
   --bg: oklch(12% 0.015 250);
   --bg-sidebar: oklch(16.5% 0.015 250);
@@ -24,7 +41,7 @@ code {
   --text-muted: oklch(65% 0.01 250);
 
   /* Borders. Two tiers; the base tier drives dividers, card/button
-   * outlines and scrollbar thumbs, so it needs enough lightness to read
+   * outlines and classic-scrollbar thumbs, so it needs enough lightness to read
    * against the near-black surfaces. --border-strong stays ~6pts above
    * for hover/emphasis separators. */
   --border: oklch(32% 0.015 250);
@@ -51,6 +68,11 @@ code {
   --sidebar-width: 272px;
   --header-height: 44px;
   --radius: 6px;
+  /* Tap target of the inline "+" launch button. It's the tallest thing
+   * in a folder header, so the header's own min-height derives from it
+   * — that keeps headers *without* a "+" (unresolved-host references)
+   * exactly as tall as the rest. */
+  --launch-btn-size: 24px;
 }
 
 * {
@@ -61,36 +83,52 @@ code {
 
 /* ── Scrollbars ──
  *
- * One scrollbar style for the whole app, derived from the sidebar's slim
- * thumb but a touch wider and brighter so it's easier to spot and grab.
+ * Scrollbars: the platform's own overlay scrollbars (macOS, iOS,
+ * Android, most Linux desktops) are exactly what we'd design — floating,
+ * thin, appearing on scroll — and :root's color-scheme keeps them dark,
+ * so by default we don't touch them at all. No CSS can distinguish
+ * overlay from classic scrollbars, so a startup probe (see main.tsx)
+ * measures whether scrollbars consume layout space and tags
+ * <html class="classic-scrollbars"> only when they do. Those hosts —
+ * wide, blocking, arrow-adorned — get this slim custom skin instead.
  *
- * Two mechanisms on purpose: Chromium 121+ and Firefox honor the standard
- * scrollbar-width/scrollbar-color properties (and then ignore the
- * ::-webkit-scrollbar pseudos entirely); Safari only understands the
- * webkit pseudos. Each browser picks the one it supports.
- *
- * Keeping the thumb thin also keeps the layout cost of classic
- * (non-overlay) scrollbars small wherever they take up space. */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+ * Two mechanisms on purpose, but not both at once: a browser that
+ * understands the ::-webkit-scrollbar pseudos (Chromium, Safari) gets
+ * the fully custom scrollbar — thumb only, no stepper arrows — while
+ * Firefox, which doesn't, gets the standard scrollbar-width/color
+ * properties instead (its thin scrollbar has no buttons either). The
+ * split matters because Chromium 121+ honors the standard properties
+ * too, and once they're set it *ignores* the webkit pseudos — drawing
+ * its native thin scrollbar, arrows included on desktop themes. */
+@supports not selector(::-webkit-scrollbar) {
+  .classic-scrollbars * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
 }
-*::-webkit-scrollbar {
+.classic-scrollbars *::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
-*::-webkit-scrollbar-track {
+.classic-scrollbars *::-webkit-scrollbar-track {
   background: transparent;
 }
-*::-webkit-scrollbar-thumb {
+.classic-scrollbars *::-webkit-scrollbar-thumb {
   background: var(--border-strong);
   border-radius: 3px;
 }
-*::-webkit-scrollbar-thumb:hover {
+.classic-scrollbars *::-webkit-scrollbar-thumb:hover {
   background: oklch(46% 0.015 250);
 }
-*::-webkit-scrollbar-corner {
+.classic-scrollbars *::-webkit-scrollbar-corner {
   background: transparent;
+}
+/* No stepper arrows, anywhere. Styled scrollbars don't draw them
+ * unless asked, but saying so keeps every theme honest. */
+.classic-scrollbars *::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 html, body, #app {
@@ -111,7 +149,7 @@ body {
   font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, sans-serif;
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--ui-font-size, 14px);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -139,6 +177,8 @@ body {
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border);
   overflow: hidden;
+  /* Positioning context for the floating scroll-to-top pill. */
+  position: relative;
 }
 
 .sidebar-header {
@@ -149,6 +189,46 @@ body {
   gap: 10px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--border);
+}
+
+/* Projects/Activity switch: the family-tally language (square, quiet,
+ * sidebar fill progression) stretched into an equal-width pair. Thin on
+ * desktop — one text line, like the rows below it. */
+.sidebar-view-toggle {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 4px;
+  flex-shrink: 0;
+}
+.sidebar-view-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 1px 7px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font: 400 12px/1.4 'Source Sans 3', sans-serif;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.sidebar-view-btn:hover { background: var(--bg-hover); }
+.sidebar-view-btn.active {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+.sidebar-view-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Touch: the header row (logo) docks to the bottom for thumb reach
+ * (order 3, further down), so the switch slots in right above it —
+ * both pieces of sidebar navigation stay together, inside the same
+ * reach. Flex order avoids moving the node; the larger targets are
+ * mobile-only. */
+@media (pointer: coarse) {
+  .sidebar-view-toggle { order: 2; }
+  .sidebar-view-btn { min-height: 34px; font-size: 13px; }
 }
 
 .sidebar-logo {
@@ -170,10 +250,11 @@ body {
   text-shadow: 0 0 6px rgba(255, 255, 255, 0.25);
 }
 
-/* Settings gear, pinned opposite the logo in the header. */
+/* Header actions. The view-menu anchor owns the auto spacer; refresh and
+ * settings stay grouped beside it. */
+.sidebar-refresh-btn,
 .sidebar-settings-btn {
   position: relative;
-  margin-left: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -187,7 +268,9 @@ body {
   cursor: pointer;
   transition: color 0.15s, background 0.15s;
 }
-.sidebar-settings-btn:hover {
+.sidebar-refresh-btn:hover,
+.sidebar-settings-btn:hover,
+.sidebar-settings-btn.open {
   color: var(--text);
   background: var(--bg-hover);
 }
@@ -248,9 +331,205 @@ body {
    * the extra whitespace is the visual cue that the user has actually
    * reached the end of the list (rather than wondering whether more
    * content is hidden by the fold). */
-  padding: 6px 0 48px;
+  padding: 0 0 48px;
   display: flex;
   flex-direction: column;
+}
+/* Rows live on their own element so the scrollport's background can sit
+ * behind them (see the touch cavity below). No paint of its own on
+ * desktop; it must not shrink, or a long list would compress instead of
+ * scrolling. */
+.sidebar-list {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+/* Keep the initial breathing room as scrollable content, not scrollport
+ * padding. Top padding remains visible while scrolling, so a sticky header
+ * pinned below it leaves a strip where rows can bleed through. */
+.sidebar-scroll::before {
+  content: '';
+  flex: 0 0 6px;
+}
+/* Touch: the header sits at the bottom (thumb zone), so a top-aligned
+ * list puts its first items where the thumb can't go. One rule fixes
+ * that, expressed by the top spacer: on open, the list occupies
+ * `min(list height, thumb reach)` at the bottom of the drawer.
+ *
+ *   - Shorter than the thumb zone — the spacer grows (flex) and the list
+ *     rests on the header. Nothing scrolls; the drawer can't be scrolled
+ *     past its own content.
+ *   - Taller — the spacer stops at the reserve (min-height), so the first
+ *     item lands exactly at the top of the thumb zone and the remainder
+ *     overflows below the fold, scrolled to as usual.
+ *
+ * The reserve is everything above the thumb zone: the drawer's height
+ * less the chrome below the list (header + home-indicator inset) less
+ * the reach itself. max() floors it so it degrades to a sliver rather
+ * than going negative on very short screens.
+ *
+ * The spacer itself paints nothing — it only reserves the space that the
+ * cavity below shows through. */
+@media (pointer: coarse) {
+  /* Thumb reach: how much list a thumb can cover from the bottom bar.
+   * 350px measured, raised to 40% of the viewport on tall screens so the
+   * zone scales instead of leaving an absurd cavity. px, not vh, so it
+   * stays put across device-pixel-ratio and font scaling; --app-height is
+   * the JS-measured, address-bar-aware viewport the drawer itself uses. */
+  .sidebar {
+    --thumb-reach: max(350px, var(--app-height, 100dvh) * 0.4);
+  }
+
+  .sidebar-scroll::before {
+    flex: 1 1 0;
+    min-height: max(
+      8px,
+      calc(
+        var(--app-height, 100dvh) - var(--header-height)
+        - env(safe-area-inset-bottom) - var(--thumb-reach)
+      )
+    );
+  }
+
+  /* The cavity is the scrollport's own back plane, not a block of
+   * content: painted on the scroll container, it stays put while the
+   * list slides in front of it. That's what makes it read as depth
+   * rather than as a dark first row — and it means the well shows
+   * wherever the slab doesn't reach: above the first row, in the strip
+   * below the last one, and in the momentary gap an overscroll bounce
+   * opens at either end (iOS rubber-banding moves the content, never
+   * the backdrop).
+   *
+   * Only the two horizontal walls are shaded — the side walls would
+   * frame the list itself, and the list is the surface in front, not
+   * something sunk into the well. They're built exactly like the slab's
+   * contact shadows below: stacked layers with decaying opacity and
+   * growing reach (an exponential-ish falloff rather than one linear
+   * ramp), plus small radial pools in the four corners where a second
+   * wall blocks the light. Gradients rather than inset box-shadows,
+   * which blur around a *box* and so thin out at the left and right
+   * ends.
+   *
+   * The gradient runs light-to-dark *downward*: a well lit from above
+   * catches light high on its back wall and pools shadow in the corner
+   * the slab sits in, so the darkest point is the contact line, not the
+   * top edge. The hue stays on the app's 250 — a warmer or cooler well
+   * reads as a different material, not a deeper one. A fine noise tile
+   * over the gradient gives the light something to sit in and keeps a
+   * near-flat 450px from banding on OLED. */
+  .sidebar-scroll {
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.15'/%3E%3C/svg%3E"),
+      radial-gradient(72px 40px at 0% 0%, rgb(0 0 0 / 0.2), rgb(0 0 0 / 0) 72%),
+      radial-gradient(72px 40px at 100% 0%, rgb(0 0 0 / 0.2), rgb(0 0 0 / 0) 72%),
+      radial-gradient(56px 26px at 0% 100%, rgb(0 0 0 / 0.14), rgb(0 0 0 / 0) 72%),
+      radial-gradient(56px 26px at 100% 100%, rgb(0 0 0 / 0.14), rgb(0 0 0 / 0) 72%),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.22), rgb(0 0 0 / 0) 14px),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.14), rgb(0 0 0 / 0) 40px),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.09), rgb(0 0 0 / 0) 96px),
+      linear-gradient(to top, rgb(0 0 0 / 0.14), rgb(0 0 0 / 0) 10px),
+      linear-gradient(to top, rgb(0 0 0 / 0.09), rgb(0 0 0 / 0) 26px),
+      linear-gradient(to top, rgb(0 0 0 / 0.05), rgb(0 0 0 / 0) 56px),
+      linear-gradient(
+        to bottom,
+        oklch(16% 0.015 250),
+        oklch(12.5% 0.015 250)
+      );
+    /* The strip of cavity the list rests above; replaces the desktop
+     * end-of-list padding, which said the same thing with whitespace.
+     * Deep enough for the contact shadow and the bottom wall to resolve
+     * — much shallower and the two overlap into a flat dark bar. */
+    padding-bottom: 32px;
+  }
+
+  /* The raised surface. Opaque so it occludes the cavity as it scrolls
+   * over it. Its top edge is the only place the two planes meet, so it
+   * carries the depth: a hard 1px dark line (the corner itself, which
+   * no soft shadow can render at this scale), a contact shadow spilling
+   * up into the well, and a lit lip on the slab where it catches the
+   * light. Three cues on one edge — and none of them a frame around the
+   * list. */
+  .sidebar-list {
+    background: var(--bg-sidebar);
+    /* A border, not an inset shadow: the first .folder-header is sticky
+     * and opaque, so it paints over anything drawn inside the slab's top
+     * edge. The border box is outside its reach. Same token as the
+     * drawer's own edges — this is the same kind of line, so it should
+     * not be its own colour. */
+    border-top: 1px solid var(--border);
+    /* The bottom edge is the same joint seen from the other side, so the
+     * two tones swap places: the slab's underside faces away from the
+     * light and goes dark, and the lit line lands *below* it, on the
+     * strip of floor the light still grazes. Both are dimmer than the
+     * top edge — that face is in the slab's own shadow. */
+    border-bottom: 1px solid rgb(0 0 0 / 0.55);
+    /* Hard 1px lines only — unblurred, so they stay true corner to
+     * corner. The soft part of each joint is a gradient below. */
+    box-shadow:
+      0 -1px 0 0 rgb(0 0 0 / 0.95),
+      0 1px 0 0 color-mix(in oklch, var(--border) 55%, transparent);
+    position: relative;
+  }
+
+  /* The contact shadows the slab casts into the well, one per edge.
+   * Pseudo-elements sitting just outside the slab, for the same reason
+   * the walls are gradients: uniform full-bleed falloff instead of a
+   * box-shadow's corner rounding. They ride with the slab as it scrolls,
+   * which is what a cast shadow should do.
+   *
+   * The band is built the way a real contact shadow falls off: several
+   * stacked layers, each weaker and reaching further, so the darkness
+   * decays roughly exponentially away from the joint instead of the
+   * linear ramp a single gradient gives. It stays flat and horizontal
+   * across the full width — that's the dominant read.
+   *
+   * The corner occlusion is then two small radial pools anchored in the
+   * bottom corners, where light is blocked by the side wall as well as
+   * by the slab. Radial, because they have to fade out in *every*
+   * direction: the previous full-height linear pools ended abruptly at
+   * the top of the strip and left a visible seam. They only reach ~56px
+   * in, so the band reads as horizontal with darker corners, not as a
+   * curve. */
+  .sidebar-list::before,
+  .sidebar-list::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+  }
+  .sidebar-list::before {
+    bottom: 100%;
+    height: 26px;
+    background:
+      radial-gradient(56px 22px at 0% 100%, rgb(0 0 0 / 0.26), rgb(0 0 0 / 0) 72%),
+      radial-gradient(56px 22px at 100% 100%, rgb(0 0 0 / 0.26), rgb(0 0 0 / 0) 72%),
+      linear-gradient(to top, rgb(0 0 0 / 0.26), rgb(0 0 0 / 0) 5px),
+      linear-gradient(to top, rgb(0 0 0 / 0.16), rgb(0 0 0 / 0) 12px),
+      linear-gradient(to top, rgb(0 0 0 / 0.1), rgb(0 0 0 / 0) 26px);
+  }
+  /* Shallower and weaker: this face is already in the slab's shadow. */
+  .sidebar-list::after {
+    top: 100%;
+    height: 18px;
+    background:
+      radial-gradient(48px 16px at 0% 0%, rgb(0 0 0 / 0.18), rgb(0 0 0 / 0) 72%),
+      radial-gradient(48px 16px at 100% 0%, rgb(0 0 0 / 0.18), rgb(0 0 0 / 0) 72%),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.2), rgb(0 0 0 / 0) 4px),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.12), rgb(0 0 0 / 0) 10px),
+      linear-gradient(to bottom, rgb(0 0 0 / 0.08), rgb(0 0 0 / 0) 18px);
+  }
+}
+
+/* Keep the mobile drawer list top-aligned. The upstream thumb-reach cavity
+ * leaves a large blank area above short lists, which is especially awkward
+ * when the drawer was opened to switch sessions quickly. */
+@media (pointer: coarse) {
+  .sidebar-scroll::before { flex: 0 0 6px; min-height: 0; }
+  .sidebar-scroll { background: none; padding-bottom: 48px; }
+  .sidebar-list { border: 0; box-shadow: none; }
+  .sidebar-list::before,
+  .sidebar-list::after { content: none; }
 }
 
 /* ── Folder ── */
@@ -277,15 +556,29 @@ body {
   display: flex;
   align-items: center;
   padding: 5px 12px 5px 14px;
+  /* Height comes from the "+" button, not from whether it's rendered. */
+  min-height: calc(var(--launch-btn-size) + 10px);
   user-select: none;
   gap: 6px;
   cursor: pointer;
   transition: background 0.1s;
+  /* Pin the project title while its sessions scroll underneath. Opaque
+   * background so rows don't bleed through; z-index sits above the
+   * session rows (which are position:relative). */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-sidebar);
 }
 .folder-header:hover {
   background: var(--bg-hover);
 }
-.folder-header.current {
+.folder-header:has(.folder-name:focus-visible) {
+  background: var(--bg-hover);
+}
+/* Pressed: a touch brighter than hover while the mouse button is held
+ * on the title, so the header reads as actively engaged. */
+.folder-header:has(.folder-name:active) {
   background: var(--bg-selected);
 }
 
@@ -300,14 +593,37 @@ body {
   margin-left: auto;
 }
 
+.folder-file-btn,
+.folder-vscode-btn {
+  width: var(--launch-btn-size);
+  min-width: var(--launch-btn-size);
+  height: var(--launch-btn-size);
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.folder-file-btn:hover,
+.folder-vscode-btn:hover { background: var(--bg-selected); color: var(--text); }
+
 .launch-container.folder-launch-btn {
-  margin-left: auto;
   opacity: 0;
   transition: opacity 0.1s;
 }
 
 .folder-header:hover .launch-container.folder-launch-btn,
-.launch-container.folder-launch-btn:has(.loading) {
+/* Keep the button fully opaque while launching or while the menu is open —
+   otherwise leaving the folder row's hover fades the button out from under
+   the cursor. (The open menu itself is portaled to <body>, so it never
+   inherits this opacity.) */
+.launch-container.folder-launch-btn:has(.loading),
+.launch-container.folder-launch-btn.open {
   opacity: 1;
 }
 
@@ -325,8 +641,8 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 24px;
-  min-height: 24px;
+  min-width: var(--launch-btn-size);
+  min-height: var(--launch-btn-size);
 }
 
 .launch-btn:hover {
@@ -346,17 +662,25 @@ body {
   to { transform: rotate(360deg); }
 }
 
-/* Inline menu — fixed-positioned by JS so it escapes overflow:hidden parents */
+/* Inline menu — portaled to <body> and fixed-positioned by JS so it escapes
+   overflow:hidden parents and transformed ancestors (the mobile sidebar
+   drawer's translateX would otherwise become its containing block). */
 .launch-inline-menu {
   position: fixed;
   background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
+  /* Same anchored-popover skin as the session ⋮ menu, the family panel
+     and the view menu. */
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
   min-width: 180px;
+  /* Backstop for the JS re-clamp: never wider than the viewport. */
+  max-width: calc(100vw - 16px);
   z-index: 1000;
   padding: 4px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .launch-target-line {
@@ -399,26 +723,48 @@ body {
   margin: 4px 0;
 }
 
-/* Non-default items fade in with stagger */
-.launch-inline-item:not(.launch-inline-default) {
-  opacity: 0;
-  animation: launch-item-in 0.12s ease-out forwards;
-}
-
-@keyframes launch-item-in {
-  from { opacity: 0; transform: translateY(-3px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
 .folder-name {
+  display: flex;
+  align-items: center;
+  /* gap between chevron and label; sized so the label lands at the
+   * session-title column (14px header pad + 12px chevron + 3px = 29px,
+   * matching .session-item's 14px pad + 7px dot + 8px gap). The chevron
+   * itself sits in the status-dot column, so headers and rows share one
+   * clean two-column grid. */
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+  /* Reset the <button> we now render as. */
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  flex: 1;
+  outline: none;
+}
+
+.folder-name-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  text-decoration: none;
+}
+
+.folder-chevron {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  color: var(--text-muted);
+}
+/* Expanded state points down (glyph default); collapsed rotates the
+ * same glyph to point right. */
+.folder-chevron.collapsed {
+  transform: rotate(-90deg);
 }
 
 
@@ -427,6 +773,113 @@ body {
   overflow: hidden;
   padding-top: 1px;
 }
+
+.folder-checkouts { overflow: hidden; }
+.checkout-group + .checkout-group { margin-top: 2px; }
+.checkout-header {
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  color: var(--text-muted);
+  font-size: 0.75em;
+  line-height: 1.5;
+  font-family: 'Fira Code', monospace;
+}
+.checkout-fold-btn {
+  min-width: 0;
+  min-height: 32px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.35em 0.15em 1em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.checkout-fold-btn:hover,
+.checkout-fold-btn:focus-visible,
+.checkout-actions button:hover,
+.checkout-actions button:focus-visible { background: var(--bg-hover); }
+.checkout-chevron {
+  flex: none;
+  font-family: sans-serif;
+  font-size: 1.35em;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+.checkout-chevron.expanded { transform: rotate(90deg); }
+.checkout-tree-mark { flex: none; opacity: 0.55; }
+.checkout-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.checkout-primary-label,
+.checkout-state-label,
+.checkout-session-count {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 0.4em;
+  font-family: 'Instrument Sans', sans-serif;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.checkout-state-label { color: var(--status-warning); }
+.checkout-session-count { min-width: 1.5em; text-align: center; }
+.checkout-actions { flex: none; display: flex; align-items: center; padding-right: 0.65em; }
+.checkout-actions .launch-btn,
+.checkout-remove-btn {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.checkout-remove-btn { display: inline-flex; align-items: center; justify-content: center; font-size: 16px; cursor: pointer; }
+.checkout-remove-btn:hover,
+.checkout-remove-btn:focus-visible { color: var(--status-error); }
+.checkout-sessions { overflow: hidden; }
+.checkout-sessions .session-item { padding-left: 1.65em; }
+.checkout-inventory-error {
+  width: calc(100% - 2em);
+  min-height: 44px;
+  margin: 0 1em 0.2em;
+  border: 0;
+  border-radius: 0.35em;
+  background: transparent;
+  color: var(--status-warning);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  font-size: 0.78em;
+}
+.checkout-inventory-error:hover,
+.checkout-inventory-error:focus-visible { background: var(--bg-hover); }
+@media (pointer: coarse) {
+  .checkout-fold-btn { min-height: 44px; }
+  .checkout-actions .launch-btn,
+  .checkout-remove-btn { width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
+}
+
+.worktree-remove-sheet { width: min(380px, calc(100vw - 24px)); padding: 18px; gap: 10px; }
+.worktree-remove-sheet h2,
+.worktree-remove-sheet p { margin: 0; }
+.worktree-remove-sheet code { overflow-wrap: anywhere; color: var(--text-secondary); }
+.worktree-remove-safety { color: var(--text-muted); font-size: 12px; }
+.worktree-remove-error { color: var(--status-error); font-size: 13px; }
+.worktree-remove-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.worktree-remove-confirm { color: var(--status-error); }
 
 /* ── Host suffix (project headers) ── */
 .host-suffix {
@@ -440,6 +893,10 @@ body {
 .host-suffix-sep {
   opacity: 0.6;
   margin: 0 0.1em;
+}
+/* "on" connective before a host name: inherits the host's muted colour. */
+.host-suffix-prep {
+  color: inherit;
 }
 
 /* ── Session Item ── */
@@ -484,21 +941,29 @@ body {
 
 }
 
-.session-dot-indicator.working {
+.session-dot-indicator.working,
+.session-dot-indicator.active-error {
   background: transparent;
-  border: 1.5px solid var(--accent);
+  /* A hair thicker than the 1.5px it grew up with: hollow rings read
+     thinner than the filled dots they sit beside, and at 7px the ring
+     was dropping below legibility on low-DPI screens. */
+  border: 1.75px solid var(--accent);
   animation: subtle-pulse 2.5s ease-in-out infinite;
+}
+
+.session-dot-indicator.active-error {
+  border-color: var(--status-error);
 }
 
 .session-dot-indicator.active {
   background: transparent;
-  border: 1.5px solid var(--active);
+  border: 1.75px solid var(--active);
   animation: subtle-pulse 3s ease-in-out infinite;
 }
 
 .session-dot-indicator.fading {
   background: transparent;
-  border: 1.5px solid var(--active);
+  border: 1.75px solid var(--active);
   animation: dot-fade-out 800ms ease-out forwards;
 }
 
@@ -688,10 +1153,6 @@ body {
   font-weight: 700;
   line-height: 1cap;
 }
-.session-status-label {
-  color: var(--text-secondary);
-}
-
 @keyframes subtle-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -724,8 +1185,13 @@ body {
   transition: background 0.1s, color 0.1s, opacity 0.15s;
   padding: 0;
 }
+/* The group owns hover, so pointing anywhere in a family entry must
+   still reveal the root row's close button. */
+.session-family:hover .session-close-btn,
 .session-item:hover .session-close-btn,
-.session-item.selected .session-close-btn {
+.session-item.selected .session-close-btn,
+.session-row:hover .session-close-btn,
+.session-row.selected .session-close-btn {
   opacity: 1;
   background: oklch(22% 0.01 250 / 0.45);
 }
@@ -738,13 +1204,272 @@ body {
 /* Mock mode (landing page screenshots): hide per-session close
  * buttons. Previously chained to the .session-dragging rule below
  * via a stray comma, so mock mode left them at opacity 0.4 instead
- * of hiding them. Both the compact sidebar item (.session-close-btn)
- * and the wide dashboard row (.session-row-close) need hiding so
- * neither variant leaks into screenshots. */
-.mock-mode .session-close-btn,
-.mock-mode .session-row-close {
+ * of hiding them. Sidebar items and activity-feed rows share the
+ * .session-close-btn class, so one rule hides both in screenshots. */
+.mock-mode .session-close-btn {
   display: none;
 }
+
+/* ── Sidebar family entry ──
+   A family is one sidebar entry: a root row, the member you're viewing
+   (or last viewed), and a line counting everyone else. Hit areas and
+   highlights nest. The group is the root's area — it takes the hover
+   and carries the "you are in this family" background — and the member
+   row is its own area inside it, one tone above. The accent bar is the
+   only thing that marks a single row, so it moves between the root and
+   the member while the group stays lit either way. */
+.session-family {
+  position: relative;
+  border-radius: 3px;
+  /* The whole group selects the root, so all of it reads as clickable —
+     the activity line and the slack included. */
+  cursor: pointer;
+}
+.session-family:hover {
+  background: var(--bg-hover);
+}
+.session-family.selected {
+  background: var(--bg-selected);
+}
+/* The root row doesn't paint itself: hovering or selecting it *is*
+   hovering or selecting the group. */
+.session-family .session-item:hover,
+.session-family .session-item.selected {
+  background: none;
+}
+/* Nor does it draw its own bar. Selecting the root selects the whole
+   family, so the bar spans the group; it narrows to a single row only
+   when a member takes the selection off the root. */
+.session-family .session-item.selected::before {
+  display: none;
+}
+.session-family:has(> .session-item.selected)::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 0 1px 1px 0;
+}
+
+/* The subordinate row's indent puts the family button's glyph on the
+   column under the root title (14px pad + 7px dot + 8px gap). The
+   button's own inner padding is subtracted from the indent so its hit
+   area starts at its visible edge and the glyph still lands on the
+   column — derived, so the two can't drift apart. */
+.session-family {
+  --family-indent: 29px;
+  --family-btn-pad: 8px;
+}
+/* The subordinate row: one per family at most, holding the static
+   family button and, while a descendant owns selection, the member row
+   beside it. The container is not a target — its slack (the gutter and
+   everything right of the content) falls through to the root, like the
+   rest of the entry's slack. The indent stops short of the glyph
+   column by the button's own padding, so the button's hit area starts
+   at its visible edge and the glyph still lands on the column. */
+.family-sub {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  /* Tucked up under the root: without this the row sits as far from
+     its own root as from the next entry below, and the family reads
+     as two unrelated rows. The pull-up eats into the root row's
+     bottom padding (whitespace, not content). */
+  margin-top: -4px;
+  padding: 1px 8px 3px calc(var(--family-indent) - var(--family-btn-pad));
+}
+
+/* Every glyph in that column occupies the same width, whatever it is,
+   so nothing shifts horizontally when a member's state changes. */
+.family-glyph {
+  flex: 0 0 7px;
+  width: 7px;
+  text-align: center;
+}
+/* The activity line's own glyph: the family mark, same as the header's
+   trigger. Slightly larger than the 7px glyph column and centered on
+   it — a 7px tree is a smudge — but the column's own width is what
+   keeps the numbers aligned with member glyphs above. */
+.family-activity-icon {
+  width: 12px;
+  height: 12px;
+  display: block;
+  /* Centered on the 7px glyph column: auto margins can't go negative,
+     so split the 5px overflow explicitly. */
+  margin: 0 -2.5px;
+  color: var(--text-muted);
+}
+
+/* Member row: the family member you're viewing. Title-sized and
+   title-coloured — a peer of the root row you navigate to, so only the
+   background says where you are. Its highlight sits one tone above the
+   group's in both states, so the row under the pointer is unmistakable
+   without breaking the entry apart. --bg-hover/--bg-surface read as a
+   dent inside a selected group, hence the explicit tones. It claims
+   only its content — the slack right of the title stays the root's. */
+.family-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  /* Same height as the family button beside it (see .family-activity),
+     so the row never changes height between its two states. */
+  min-height: 23px;
+  box-sizing: border-box;
+  padding: 1px 8px;
+  text-decoration: none;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.35;
+  border-radius: 3px;
+}
+.family-slot:hover {
+  background: oklch(26% 0.02 250);
+}
+.session-family.selected .family-slot:hover,
+.family-slot.selected {
+  background: oklch(30% 0.02 250);
+}
+/* Same 2px bar as any selected sidebar item, on the row that owns the
+   selection — the group's background can't cover it there. */
+.family-slot.selected::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  background: var(--accent);
+  border-radius: 0 1px 1px 0;
+}
+.family-slot-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* The family button: the row's static head — the family mark and an
+   ellipsis — carrying the activity segments while nothing in the
+   family is selected. Same panel as the header's trigger, but it does
+   not borrow that control's fill: the sidebar's design language is
+   flat rows with background hovers, so it takes the member row's exact
+   treatment — one tone above the group's, in both states. It claims
+   only its content: the hit area stops where the numbers (or the …)
+   do, and the slack to the right stays the root's. */
+.family-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 0;
+  /* Match the member row's height: the two states of the row must not
+     shift the list when selection moves. */
+  min-height: 23px;
+  box-sizing: border-box;
+  /* Clip, not spill, at the sidebar's narrowest. */
+  max-width: 100%;
+  padding: 1px var(--family-btn-pad);
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  cursor: pointer;
+}
+.family-activity:hover {
+  background: oklch(26% 0.02 250);
+}
+.session-family.selected .family-activity:hover {
+  background: oklch(30% 0.02 250);
+}
+.family-activity:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.family-activity-glyphs {
+  display: flex;
+  align-items: center;
+  /* Tight enough that all four segments clear a 150px sidebar, which
+     is the narrowest the pane goes. */
+  gap: 8px;
+  min-width: 0;
+  /* Four segments only overflow on an extremely narrow sidebar; clip
+     rather than spill past the row. Attention states come first, so
+     what survives the clip is what matters. */
+  overflow: hidden;
+}
+.family-activity-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+/* The `$`: process identity. Its one state is lifecycle — a running
+   process is lit cyan and set bold, a finished one dims to muted at
+   regular weight, the same filled-versus-faded language as the status
+   dots but in ink. Agent attention and command exit status never
+   recolor it.
+
+   Vocabulary only: no box. The sidebar pairs it with `.family-glyph`,
+   which owns the fixed column there, and repeating those properties
+   here would silently outrank that class by source order — the exact
+   drift this merge existed to end. */
+.family-proc {
+  font-family: 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 600;
+  color: var(--accent);
+}
+.family-proc.done {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+/* The panel has no glyph-column class of its own, so it gives the `$`
+   the same box its status dots occupy. */
+.family-row .family-proc {
+  flex: 0 0 auto;
+  width: 7px; /* match .session-dot-indicator for title alignment */
+  text-align: center;
+}
+.family-proc-filter.quiet { color: var(--text-muted); }
+
+/* States that belong to the root row are the whole entry's states —
+   it's one entry, so it dims, drags and takes a drop line as a unit. */
+.session-family:has(.session-item.unavailable) .family-sub {
+  opacity: 0.55;
+}
+.session-family:has(.session-item.session-dragging) {
+  opacity: 0.4;
+}
+.session-family:has(.session-item.session-drop-target) {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+.session-family .session-item.session-dragging {
+  opacity: 1;
+}
+.session-family .session-item.session-drop-target {
+  box-shadow: none;
+}
+
+/* Keyboard focus must be visible on the member row even though the
+   group carries the background. */
+.session-family a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: 3px;
+}
+
 
 /* Session drag-to-reorder */
 .session-item.session-dragging {
@@ -754,11 +1479,149 @@ body {
   box-shadow: inset 0 -2px 0 0 var(--accent);
 }
 
+/* ── Sidebar view menu (mode switcher) ── */
+/* One small entry point in the header; a compact popover with two
+   radio groups (View / Show). Selection applies instantly — the list
+   itself is the preview — and persists in localStorage. */
+
+.view-menu-anchor {
+  position: relative;
+  margin-left: auto; /* takes over the gear's auto-margin; gear follows */
+}
+.view-menu-anchor .sidebar-settings-btn,
+.view-menu-anchor + .sidebar-settings-btn { margin-left: 0; }
+
+.view-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 29; /* just under .view-menu */
+}
+
+.view-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: -30px; /* roughly under the gear; keeps the popover on-screen */
+  z-index: 30;
+  min-width: 160px;
+  background: var(--bg-surface);
+  /* One anchored-popover skin, shared with the session ⋮ menu and the
+     family panel: strong border, 6px corners, one shadow. */
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
+  padding: 4px;
+}
+.view-menu-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 6px 10px 2px;
+}
+.view-menu-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 10px 5px 6px;
+  border: none;
+  background: transparent;
+  /* Same resting tone as the session ⋮ menu's actions. */
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.view-menu-option:hover { background: var(--bg-hover); color: var(--text); }
+.view-menu-option.active { color: var(--text); }
+.view-menu-check {
+  width: 14px;
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 11px;
+  text-align: center;
+}
+
+/* Chip row: one removable chip per ?filter= selector. Rendered only
+   when the tab is narrowed — zero pixels otherwise. */
+.sidebar-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 12px 2px 14px;
+  flex-shrink: 0;
+}
+.sidebar-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--bg-selected);
+  border: 1px solid var(--border);
+  /* Square like the app's other small controls; pills are for floating
+     status overlays. */
+  border-radius: 4px;
+  padding: 1px 4px 1px 8px;
+  max-width: 100%;
+}
+.sidebar-chip-x {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 3px;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.sidebar-chip-x:hover { color: var(--text); background: var(--bg-hover); }
+
+/* ── Sidebar activity view ── */
+/* Home's partition at sidebar density: section labels replace folder
+   headers; SessionRow is compacted (no card chrome, tighter padding,
+   single-line meta). */
+
+.sidebar-activity-section + .sidebar-activity-section { margin-top: 10px; }
+
+.sidebar-section-title {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 4px 14px;
+  /* Pin the day label while its rows scroll underneath (mirrors the
+   * Projects view's sticky .folder-header). Opaque bg so rows don't
+   * bleed through; above the rows (position:relative). */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-sidebar);
+}
+
+.sidebar-scroll .session-row {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 5px 12px 5px 14px;
+  gap: 8px;
+}
+.sidebar-scroll .session-row:hover { background: var(--bg-hover); }
+.sidebar-scroll .session-row.selected {
+  background: var(--bg-selected);
+}
+.sidebar-scroll .session-row-compact .session-row-content { font-size: 13px; }
+.sidebar-scroll .session-row-title { font-weight: 400; }
+.sidebar-scroll .session-row-meta { font-size: 11px; margin-top: 1px; }
+
 /* ── Wide session row (dashboard / project page) ────────────────────── */
-/* Two-line variant of the sidebar's SessionItem. Same dot conventions
-   and close-button behavior; line 2 carries optional project / cwd /
-   status / age metadata. The host suffix uses the existing
-   .host-suffix styling. */
+/* Single-line `project · title` row for the activity feed (home +
+   sidebar Activity). Same dot conventions and close-button behavior as
+   the sidebar's Projects-view SessionItem. The host suffix uses the
+   existing .host-suffix styling. */
 
 .session-row {
   display: flex;
@@ -789,7 +1652,30 @@ body {
   min-width: 0;
 }
 
-.session-row-title {
+/* Compact (older buckets): one flex line — project · title · cwd. The
+ * title is the anchor and shrinks/ellipsizes first when tight; project
+ * and badges keep their size, so the row packs left with no variable gap. */
+.session-row-compact .session-row-content {
+  display: flex;
+  align-items: baseline;
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.session-row-compact .session-row-title {
+  font-weight: 500;
+  color: var(--text);
+  flex: 0 1 auto;
+  min-width: 2.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Full (today): two lines — title, then "age · project on host · cwd". */
+.session-row-full .session-row-title {
+  /* block so overflow/text-overflow apply — an inline span won't ellipsize. */
+  display: block;
   font-size: 13px;
   font-weight: 500;
   color: var(--text);
@@ -797,32 +1683,45 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
 .session-row-meta {
   display: flex;
-  flex-wrap: wrap;
   align-items: baseline;
   margin-top: 3px;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-muted);
-  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
 }
+
 .session-row-sep {
   color: var(--text-muted);
-  opacity: 0.6;
+  opacity: 0.5;
+  margin: 0 0.4em;
+  flex: 0 0 auto;
 }
 .session-row-project {
-  color: var(--text);
-  opacity: 0.85;
-}
-.session-row-cwd {
-  font-family: var(--font-mono, monospace);
-}
-.session-row-status {
-  font-style: italic;
+  /* Muted leading context. Middle-truncated in JS, so it never shrinks
+   * via flex: a short name like "gmux" always shows whole, and the width
+   * is stable row-to-row (no variable gap before the separator). */
+  color: var(--text-muted);
+  font-weight: 400;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .session-row-age {
+  color: var(--text-muted);
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
+}
+.session-row-cwd {
+  /* No monospace: the ./ ~/ / prefix already marks it as a folder.
+   * Ellipsizes only when it exceeds the line (full path in the title). */
+  color: var(--text-muted);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .session-row-dup,
 .session-dup-warning {
@@ -830,37 +1729,26 @@ body {
   font-weight: 500;
 }
 
-.session-row-close {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
-  opacity: 0;
-  transition: opacity 0.1s, color 0.1s, background 0.1s;
-}
-.session-row:hover .session-row-close,
-.session-row.selected .session-row-close {
-  opacity: 1;
-}
-.session-row-close:hover {
-  color: var(--text);
-  background: var(--bg-active);
-}
-@media (hover: none) {
-  .session-row-close { opacity: 1; }
-}
-
 /* On touch devices (no hover), show interactive buttons permanently */
 @media (hover: none) {
   .launch-container.folder-launch-btn { opacity: 1; }
+  .folder-file-btn,
+  .folder-vscode-btn { width: 44px; min-width: 44px; height: 44px; }
   .session-close-btn { opacity: 1; }
 }
 
-/* ── Sidebar empty state ── */
+/* ── Sidebar stream warning / empty state ── */
+.sidebar-stream-warning {
+  margin: 8px 10px 4px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning, #d08770) 45%, transparent);
+  border-radius: 6px;
+  color: var(--warning, #d08770);
+  background: color-mix(in srgb, var(--warning, #d08770) 10%, transparent);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .sidebar-hint {
   padding: 12px 16px;
   font-size: 12px;
@@ -897,6 +1785,21 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+.home-activity-header .hub-title { margin-right: auto; }
+.mobile-page-refresh {
+  display: none;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  align-items: center;
+  justify-content: center;
+}
+@media (pointer: coarse) {
+  .mobile-page-refresh { display: inline-flex; }
 }
 
 /* Enable-notifications affordance, right-aligned in the Activity header.
@@ -1565,7 +2468,7 @@ body {
 
 .session-dot.working {
   background: transparent;
-  border: 1.5px solid var(--accent);
+  border: 1.75px solid var(--accent);
 }
 .session-dot.error   { background: var(--status-error); }
 .session-dot.idle    { background: var(--text-muted); }
@@ -1576,8 +2479,12 @@ body {
 .main-panel {
   flex: 1;
   display: flex;
+  position: relative;
   flex-direction: column;
-  min-width: 0;
+  /* Keep a usable terminal beside the fixed desktop sidebar. When the native
+     app window is narrower than both, clip the layout at the viewport instead
+     of collapsing the terminal and propagating a degenerate PTY resize. */
+  min-width: 320px;
   min-height: 0;
   background: var(--bg);
 }
@@ -1599,6 +2506,10 @@ body {
 
 .main-header-left {
   display: flex;
+  /* Center, not baseline: the row mixes text (title, crumbs) with boxes
+   * (the family trigger, status dots). Baseline alignment lets a single
+   * text item define the line box, which floated the title ~3px above
+   * every other control once the crumbs landed. */
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1621,38 +2532,274 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   letter-spacing: -0.01em;
+  /* Block, not flex: text-overflow never applies to a flex container's
+   * anonymous text item, so a flex title hard-clipped mid-glyph instead
+   * of ellipsizing. line-height matches the 26px control row so the
+   * title's box lines up with the trigger and ⋮ button. */
+  display: block;
+  line-height: 26px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+/* One quiet-button language for the family surfaces: a square control
+ * that speaks the sidebar's fill progression — bg-hover to point at it,
+ * bg-selected when it's on — rather than outlines. The trigger, the
+ * panel's tally filters and the bulk action are the same kind of thing,
+ * so they share one rule instead of three near-copies (and none of them
+ * is a pill — that shape belongs to floating status overlays, not
+ * buttons). Only Mark all read keeps a border: a lone text action
+ * beside a sentence needs its shape even at rest. */
+.family-trigger,
+.family-count,
+.family-mark-read {
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+
+/* Family trigger: a soft fill instead of an outline — the header's other
+ * controls are borderless ghosts, so containment does the "one coherent
+ * button" work a border was doing, and hover/open step the fill up the
+ * way the header's other controls do. Never shrinks: it is the densest
+ * thing in the row, and the title yields instead. The corner badge
+ * repeats the family's aggregated dot state so background family
+ * activity is visible without opening the panel. */
+.family-trigger {
+  height: 26px;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 0 8px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font: 500 12px/1 'Source Sans 3', sans-serif;
 }
-
-.main-header-meta {
+.family-trigger:hover,
+.family-trigger[aria-expanded="true"] {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+.family-trigger-seg {
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 12px;
-  color: var(--text-muted);
+}
+/* The sidebar's own glyphs at the sidebar's own size, so the button
+ * reads as the same sentence relocated, not a new dialect. */
+/* The quiet family wears the tree icon: several nodes, one structure. */
+.family-trigger-icon { width: 16px; height: 16px; display: block; }
+
+.family-trigger-proc {
+  font: 600 11px/1 'Source Sans 3', sans-serif;
+  color: var(--accent);
 }
 
-.main-header-cwd {
+/* Ancestor breadcrumbs in the title row: quiet path prefix, each crumb a
+ * ghost link with the ancestor's live status dot. The current session is
+ * the plain bold title that follows. */
+.header-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  /* Explicit `min-content`, not `auto`: with `overflow: hidden` the
+   * flexbox automatic minimum computes to zero, so the strip — 4ch
+   * crumb floors and all — collapsed to nothing under a long title.
+   * min-content is bounded here because the crumbs cap at three (root ›
+   * … › parent), so the strip refuses to shrink past ~120px and the
+   * title, whose min-width is 0, yields instead. */
+  min-width: min-content;
+  /* Shrink no faster than the title: where the selected session is is
+   * at least as important as what it's called, and a shrink factor of 2
+   * here let any long title erase the ancestors entirely. The per-crumb
+   * title floor below is what actually guarantees their survival — flex
+   * weighting alone cannot, because a long title's flex basis dwarfs
+   * the crumbs' and takes nearly everything regardless of factors. When
+   * even the floors overflow, the clip falls on the root end
+   * (justify-content: flex-end) so the immediate parent stays readable
+   * until the mobile layout gives the crumbs their own row. */
+  flex-shrink: 1;
+  justify-content: flex-end;
+  overflow: hidden;
+  /* Match the 26px control row so crumb text shares the title's center. */
+  height: 26px;
+}
+.header-crumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  /* 26px tall like the trigger and ⋮ buttons, so every hover rectangle in
+   * the header row is the same height. */
+  padding: 4px 6px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.header-crumb:hover { background: var(--bg-hover); color: var(--text); }
+.header-crumb-title {
+  max-width: 18ch;
+  /* A small floor, so a crumb degrades to `ter…` and stops, instead of
+   * ellipsizing to nothing and leaving a bare dot — or less. Kept just
+   * big enough to be legible: every ch of floor here widens the band of
+   * medium widths where the strip's min-content exceeds its box and the
+   * root end clips mid-glyph. */
+  min-width: 4ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.header-crumb-sep,
+.header-crumb-gap { color: var(--text-muted); font-size: 12px; flex-shrink: 0; line-height: 26px; }
+/* Same optical breathing room as a crumb's own 6px padding. */
+.header-crumb-gap { padding: 0 4px; }
+
+.family-trigger:focus-visible,
+.header-crumb:focus-visible,
+.family-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* The family panel: a floating popover in the ⋮ dropdown's visual
+ * language, anchored under the trigger at the header's left edge. */
+.family-drawer {
+  position: absolute;
+  top: calc(100% + 4px);
+  /* Flush with the trigger button's left edge (the header's own padding),
+   * not 4px shy of it. */
+  left: 16px;
+  z-index: 100;
+  /* One constrained width: filtering must not shrink the card beneath the
+     control being pressed, and the whole-family tree needs room for depth. */
+  width: min(560px, calc(100vw - 24px));
+  min-width: 0;
+  max-width: none;
+  max-height: min(65vh, 520px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
+}
+/* The counts line stays put; only the tree scrolls. */
+.family-drawer-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-height: 43px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.family-drawer-head .family-counts { flex: 1 1 auto; }
+.family-action-slot {
+  flex: 0 0 96px;
+  display: flex;
+  justify-content: flex-end;
+}
+/* Quiet until wanted: it sits beside a counts line that is itself the
+   reason to press it, so it needs to be findable, not loud. */
+.family-mark-read {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-color: var(--border);
+  color: var(--text-muted);
+  font: 400 11px/1.4 'Source Sans 3', sans-serif;
+  white-space: nowrap;
+}
+.family-mark-read:hover { color: var(--text); border-color: var(--text-muted); }
+.family-drawer-scroll { flex: 1 1 auto; overflow: auto; padding: 6px 8px 8px; }
+/* One segment per state, each carrying the dot the rows use for it, so
+   the header reads as a key to the tree below rather than a separate
+   vocabulary. Spacing does the separating that a `·` used to. */
+.family-counts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  font: 400 12px/1.4 'Source Sans 3', sans-serif;
+  color: var(--text-muted);
+}
+/* Each tally is also the filter for its own state, so it looks like
+   something you can press without shouting: no chrome until you point
+   at it, a filled square button once it's on. */
+.family-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 7px;
+  margin: -2px 0;
+  color: inherit;
+  font: inherit;
+}
+.family-count:hover { background: var(--bg-hover); }
+.family-count.active {
+  background: var(--bg-selected);
+  color: var(--text);
+}
+.family-count:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.family-count-attention { color: var(--unread); font-weight: 600; }
+.family-process-section + .family-process-section { margin-top: 8px; }
+.family-process-section h3 {
+  margin: 0;
+  padding: 6px 10px 3px;
+  color: var(--text-muted);
+  font: 600 11px/1.4 'Source Sans 3', sans-serif;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.family-process-list { list-style: none; margin: 0; padding: 0; }
+.family-process-parent {
+  min-width: 0;
+  max-width: 34%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
 }
-
-.main-header-status {
+.family-process-parent::before { content: 'from '; }
+.family-tree,
+.family-tree ul { list-style: none; margin: 0; padding: 0; }
+.family-row { min-height: 34px; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; color: var(--text-secondary); text-decoration: none; }
+.family-row:hover { background: var(--bg-hover); color: var(--text); }
+.family-row.selected { background: var(--bg-selected); color: var(--text); }
+.family-row.process .family-row-title { color: var(--text-muted); }
+.family-row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Age: the key every level is sorted by, so it stays on screen. Tabular
+   figures keep the column from wobbling as rows tick over. */
+.family-row-age {
+  margin-left: auto;
+  padding-left: 8px;
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+/* Collapsed-group summary row: a ghost row, quieter than real rows. */
+.family-more {
+  min-height: 30px;
+  width: 100%;
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-  flex-shrink: 0;
-  color: var(--text-secondary);
+  gap: 8px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font: 400 12px/1 'Source Sans 3', sans-serif;
+  text-align: left;
+  cursor: pointer;
 }
-
-.main-header-status.working { color: var(--accent); }
-.main-header-status.error   { color: var(--status-error); }
+.family-more:hover { background: var(--bg-hover); color: var(--text-secondary); }
+.family-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.family-more-chevron { flex: 0 0 auto; width: 7px; font-size: 9px; }
 
 /* Session actions menu */
 
@@ -1737,6 +2884,22 @@ body {
   color: var(--text);
 }
 
+/* Resume in flight: keep the busy label visible but inert. */
+.session-menu-action:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+.session-menu-action:disabled:hover,
+.session-menu-action[aria-disabled='true']:hover {
+  background: none;
+  color: var(--text-secondary);
+}
+
+.session-menu-action[aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .session-menu-action.stale {
   color: oklch(80% 0.15 65);
 }
@@ -1744,6 +2907,25 @@ body {
 .session-menu-action.stale:hover {
   background: oklch(80% 0.15 65 / 0.08);
   color: oklch(88% 0.15 65);
+}
+
+/* Promote/demote item: label plus an explanatory note underneath. The
+ * note is part of the button (one accessible name, one hit target) and
+ * says what the flag does NOT do — promotion never severs ownership —
+ * or which family a demote rejoins. */
+.session-menu-action.session-menu-promotion {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.session-menu-action-note {
+  display: block;
+  max-width: 240px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-muted);
+  white-space: normal;
 }
 
 /* Small tag shown next to the action label when runner is stale */
@@ -1791,6 +2973,31 @@ body {
   font-family: 'Fira Code', monospace;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+/* The ID row: monospace value with a minimal inline copy button — icon
+   only, ghost until hovered, sized to disappear into the row. */
+.session-menu-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.session-menu-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.session-menu-copy:hover {
+  background: var(--bg-hover);
+  color: var(--text);
 }
 
 .session-menu-value.stale {
@@ -1871,14 +3078,17 @@ body {
     0 8px 24px oklch(0% 0 0 / 0.28);
 }
 
-.terminal-disconnected-pill {
+/* Shared "reconnecting" pill skin. One visual source of truth for the
+   offline/reconnecting cue across both data planes — the per-terminal
+   PTY WebSocket (`.terminal-disconnected-pill`) and the app-level SSE
+   control plane (`.app-reconnecting-pill`). The two keep separate
+   drivers (they watch independent transports) and separate positioning
+   wrappers; only the look and copy are shared here. */
+.reconnecting-pill {
   pointer-events: none;
-  position: relative;
-  top: 12px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: min(calc(100% - 24px), 460px);
   padding: 10px 16px;
   border: 1px solid oklch(0.45 0.12 20 / 0.5);
   border-radius: 999px;
@@ -1896,6 +3106,127 @@ body {
   white-space: nowrap;
 }
 
+/* Terminal PTY-socket pill: anchored inside the terminal shell so it
+   points at the affected pane. Skin comes from `.reconnecting-pill`. */
+.terminal-disconnected-pill {
+  position: relative;
+  top: 12px;
+  max-width: min(calc(100% - 24px), 460px);
+}
+
+/* App-level SSE pill: fixed top-center overlay for views with no
+   terminal pane to anchor to (sidebar, home, project hub). Skin comes
+   from `.reconnecting-pill`. */
+.app-reconnecting-pill {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  max-width: min(calc(100vw - 24px), 460px);
+}
+
+/* ── Find-in-terminal bar ────────────────────────────────────────────────────────
+   Floats over the top-right of the terminal (sticky, like the resize
+   anchor, so it stays put when the shell scrolls in passive mode). Shares
+   the pill design language: translucent surface, blur, soft border. */
+.terminal-find-anchor {
+  position: sticky;
+  top: 0;
+  height: 0;
+  overflow: visible;
+  display: flex;
+  justify-content: flex-end;
+  /* The anchor is height:0; the default align-items:stretch would crush
+     the bar's content height to zero. */
+  align-items: flex-start;
+  z-index: 14;
+  pointer-events: none;
+}
+
+.terminal-find-bar {
+  pointer-events: auto;
+  position: relative;
+  top: 8px;
+  margin-right: 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 6px;
+  border: 1px solid color-mix(in oklch, var(--accent) 22%, var(--border-strong));
+  border-radius: 10px;
+  background: color-mix(in oklch, var(--bg-sidebar) 82%, #0f141a 18%);
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.28);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.terminal-find-input {
+  appearance: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: 'Source Sans 3', sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 4px 6px;
+  width: 160px;
+}
+
+.terminal-find-input::placeholder {
+  color: var(--text-muted);
+}
+
+.terminal-find-count {
+  min-width: 34px;
+  text-align: right;
+  padding-right: 4px;
+  color: var(--text-muted);
+  font-family: 'Source Sans 3', sans-serif;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.terminal-find-count.no-matches {
+  color: oklch(0.7 0.12 20);
+}
+
+.terminal-find-btn {
+  appearance: none;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.terminal-find-btn:hover:not(:disabled) {
+  background: color-mix(in oklch, var(--bg-sidebar) 40%, var(--accent) 12%);
+  color: var(--text);
+}
+
+.terminal-find-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Touch: bigger tap targets, and a wider input is unnecessary — keep the
+   bar compact so it doesn't cover half the terminal on phones. */
+@media (pointer: coarse) {
+  .terminal-find-bar { gap: 4px; }
+  .terminal-find-input { width: 132px; font-size: 14px; }
+  .terminal-find-btn { width: 38px; height: 38px; font-size: 18px; }
+}
+
 .terminal-loading {
   position: absolute;
   inset: 0;
@@ -1910,10 +3241,14 @@ body {
   z-index: 10;
 }
 
-.terminal-scroll-end {
+/* Shared floating "scroll to edge" button skin: the terminal's scroll-
+ * to-bottom (normal + replay/resume views) and the sidebar Activity
+ * scroll-to-top. One visual source of truth; each sets its own anchor
+ * position (see below). */
+.terminal-scroll-end,
+.jump-to-bottom,
+.scroll-top-btn {
   position: absolute;
-  bottom: 12px;
-  right: 16px;
   padding: 8px 12px;
   border-radius: 8px;
   border: 1px solid oklch(from var(--border-strong) l c h / 0.7);
@@ -1931,10 +3266,14 @@ body {
   pointer-events: auto;
 }
 
-.terminal-scroll-end:hover {
+.terminal-scroll-end:hover,
+.jump-to-bottom:hover,
+.scroll-top-btn:hover {
   background: oklch(from var(--bg-surface) l c h / 0.92);
   color: oklch(76% 0.012 250);
 }
+
+.terminal-scroll-end { bottom: 12px; right: 16px; }
 
 /* Use JetBrains Mono for italic glyphs since Fira Code has no italic variant.
    The bundled JetBrains Mono italic files (from fonts.css) are referenced here
@@ -2045,6 +3384,17 @@ body {
 }
 /* Configured-projects manage-list (Settings → Projects). Management
  * only: drag-to-reorder + remove, no navigation, no launch. */
+.mp-push-error {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 35%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--status-error) 9%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .mp-configured-list {
   display: flex;
   flex-direction: column;
@@ -2111,24 +3461,25 @@ body {
 .mp-configured-rest {
   color: var(--text-muted);
 }
+.mp-configured-notify,
 .mp-configured-remove {
   background: none;
   border: none;
   color: var(--text-muted);
-  font-size: 18px;
   line-height: 1;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 4px;
-  opacity: 0;
   flex-shrink: 0;
   transition: opacity 0.1s, color 0.1s, background 0.1s;
 }
+.mp-configured-notify { min-width: 40px; min-height: 40px; font-size: 16px; opacity: .8; }
+.mp-configured-notify.active { color: var(--accent); opacity: 1; }
+.mp-configured-notify:disabled { opacity: .45; cursor: wait; }
+.mp-configured-remove { min-width: 40px; min-height: 40px; font-size: 18px; opacity: 0; }
 .mp-configured-row:hover .mp-configured-remove { opacity: 1; }
-.mp-configured-remove:hover {
-  color: var(--text);
-  background: var(--bg-active);
-}
+.mp-configured-notify:hover,
+.mp-configured-remove:hover { color: var(--text); background: var(--bg-active); }
 @media (hover: none) {
   .mp-configured-remove { opacity: 1; }
 }
@@ -2195,12 +3546,43 @@ body {
     padding: 0 12px;
   }
 
-  .main-header-meta {
-    display: none;
+  /* Sessions with ancestors get a second, breadcrumb-only row above the
+   * title row; standalone sessions keep the single row. The crumbs
+   * participate in keyboard-collapsed via the header itself. */
+  .main-header:has(.header-crumbs) {
+    height: auto;
+    min-height: var(--header-height);
+    padding-top: 4px;
+    padding-bottom: 4px;
+    /* The ⋮ belongs on the title row, not floating half a row above it. */
+    align-items: flex-end;
   }
+  .main-header:has(.header-crumbs) .main-header-left {
+    flex-wrap: wrap;
+    row-gap: 2px;
+    width: 100%;
+  }
+  .header-crumbs { order: -1; width: 100%; flex: 0 0 100%; justify-content: flex-start; }
+  /* The trailing separator points at the title; on the wrapped layout the
+   * title is on the next row, so it would dangle at the line end. */
+  .header-crumbs .header-crumb-sep:last-child { display: none; }
+  /* flex-basis: 0 so a long title shrinks inside the trigger's row instead
+   * of wrapping onto a third row of its own. */
+  .main-header:has(.header-crumbs) .main-header-title { flex: 1 1 0; }
 
-  .main-header-status {
-    font-size: 11px;
+  /* Full-width sheet instead of a floating card: a 380px popover on a
+   * 390px screen is a sheet with sad margins. */
+  .family-drawer {
+    top: 100%;
+    left: 0;
+    right: 0;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    border-left: 0;
+    border-right: 0;
+    border-top: 0;
+    border-radius: 0;
   }
 
   .terminal-container .xterm {
@@ -2209,6 +3591,16 @@ body {
 
   .session-item {
     padding: 8px 10px 8px 14px;
+  }
+
+  /* The member row is a real tap target on touch. */
+  .family-slot {
+    padding-top: 9px;
+    padding-bottom: 9px;
+  }
+  .family-activity {
+    padding-top: 3px;
+    padding-bottom: 7px;
   }
 }
 
@@ -2239,6 +3631,7 @@ body {
 
   .main-panel {
     width: 100%;
+    min-width: 0;
     /* Stacking-context root for the key layering: key borders (z:1) <
        terminal (z:2) < glyphs + feedback (z:3). Also anchors the overlaid
        control bar. */
@@ -2258,21 +3651,29 @@ body {
     left: 0;
     right: 0;
     bottom: 0;
-    /* Phones: 7-column × 2-row grid. The empty top-left corner and the
-       scroll-end / empty top-right simply fall out of the template (no
-       placeholder elements needed). */
+    /* Typical phones keep the full key set in an 8-column × 2-row grid.
+       Very narrow phones switch to the seven-column layout below so touch
+       targets do not shrink just to retain word-jumps. */
     display: grid;
-    grid-template-columns: repeat(7, 1fr);
+    grid-template-columns: repeat(8, 1fr);
     grid-template-rows: repeat(2, 40px);
     grid-template-areas:
-      '.    esc  tab  wl  au  wr  end'
-      'menu ctrl alt  al  ad  ar  send';
+      'esc  stab tab  wl  au  wr  paste end'
+      'menu ctrl alt  al  ad  ar  send  send';
     /* One knob for spacing: the visual gap between keys. Hitboxes bridge it
        automatically (each .mkey-face extends half of it), so there are no
        dead gaps between buttons no matter what you set this to. */
     --key-gap: 5px;
     gap: var(--key-gap);
-    padding: 0 4px calc(4px + env(safe-area-inset-bottom));
+    /* Keep the first/last controls inside landscape cutouts as well as the
+       bottom home-indicator inset. The custom properties make the mechanism
+       easy to exercise with synthetic side insets in browser tests. */
+    --mobile-safe-area-left: env(safe-area-inset-left, 0px);
+    --mobile-safe-area-right: env(safe-area-inset-right, 0px);
+    padding-top: 0;
+    padding-right: max(4px, var(--mobile-safe-area-right));
+    padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px));
+    padding-left: max(4px, var(--mobile-safe-area-left));
     background: transparent;
     /* No z-index: the bar must NOT form a stacking context, so its keys'
        borders (z:1) and glyphs (z:3) can sit on either side of the
@@ -2283,6 +3684,7 @@ body {
      only the template (above / below) changes between layouts. */
   .mk-menu { grid-area: menu; }
   .mk-esc  { grid-area: esc; }
+  .mk-shift-tab { grid-area: stab; }
   .mk-tab  { grid-area: tab; }
   .mk-ctrl { grid-area: ctrl; }
   .mk-alt  { grid-area: alt; }
@@ -2292,8 +3694,14 @@ body {
   .mk-ad   { grid-area: ad; }
   .mk-au   { grid-area: au; }
   .mk-ar   { grid-area: ar; }
-  .mk-end  { grid-area: end; }
-  .mk-send { grid-area: send; }
+  .mk-end    { grid-area: end; }
+  .mk-paste  { grid-area: paste; }
+  /* Portrait preserves the original top-right swap: attach while at the
+     bottom, replaced by End while scrolled. Double-width Send fills row two. */
+  .mk-attach { grid-area: end; }
+  .mk-attach.scroll-end-visible { display: none; }
+  .mk-send   { grid-area: send; }
+  .mobile-attach-input { display: none; }
 
   /* No bottom padding under the grid: the control bar overlays it, so the
      reclaimed terminal row can run right to the bottom edge. */
@@ -2380,6 +3788,7 @@ body {
   /* Top layer: glyph + press/armed feedback, lifted above the terminal. */
   .mkey-face {
     position: absolute;
+    white-space: nowrap;
     /* Extend the hit area by half the gap on every side so neighbouring
        faces meet edge-to-edge (the CSS equivalent of hitSlop). The glyph
        stays centred and the visual border (::before) keeps the cell's
@@ -2432,6 +3841,15 @@ body {
     background: var(--unread);
     /* Ring in the page background so the dot reads cleanly against the button border */
     box-shadow: 0 0 0 1.5px var(--bg-base);
+  }
+
+  /* In the mobile keyboard, Esc now occupies the cell above the menu. Keep
+     this instance's badge inside the menu face so it does not cross that
+     key's painted hit surface. Other MenuButton placements retain the
+     established overhanging badge position above. */
+  .mobile-bottom-bar .mobile-bottom-action.menu-btn.mk-menu.bg-waiting::after {
+    top: 4px;
+    right: 4px;
   }
 
   /* Re-blink when a new session enters the waiting state */
@@ -2503,6 +3921,13 @@ body {
     border-bottom: none;
   }
   .sidebar-scroll { order: 1; }
+
+  /* The header sits at the bottom of the screen here, so the view menu
+   * opens upward instead of downward — otherwise it drops off-screen. */
+  .view-menu {
+    top: auto;
+    bottom: calc(100% + 4px);
+  }
 }
 
 /* Collapse the session header while the on-screen keyboard is open on
@@ -2562,6 +3987,7 @@ body {
     animation: none;
   }
   .session-dot-indicator.working,
+  .session-dot-indicator.active-error,
   .session-dot-indicator.active,
   .session-dot-indicator.fading,
   .session-dot-indicator.error {
@@ -2838,8 +4264,10 @@ body {
 }
 
 /* Replay (read-only dead session) layout: terminal area fills remaining
-   vertical space, action bar pinned beneath. The action bar carries the
-   resume/dismiss buttons that the sidebar used to auto-trigger on click. */
+   vertical space, action bar pinned beneath. The bar carries the primary
+   Resume/Rerun action (also mirrored in the header menu, where Restart
+   lives for alive sessions); exit status is header chrome, and
+   non-resumable sessions render no bar. */
 .replay-root {
   flex: 1;
   display: flex;
@@ -2855,49 +4283,78 @@ body {
 .replay-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 8px 16px;
   background: var(--bg-surface);
   border-top: 1px solid var(--border);
 }
 
-.replay-status {
-  color: var(--text-muted);
-  font-size: 13px;
+/* Resume stays on the right whether or not the (touch-only) ☰ occupies
+   the left slot. */
+.replay-actions .btn {
+  margin-left: auto;
 }
 
-.replay-buttons {
-  display: flex;
-  gap: 8px;
+/* Notched devices: the replay action bar is the bottom-most chrome on
+   dead sessions (no key bar there), so it absorbs the safe-area inset. */
+@media (pointer: coarse) {
+  .replay-actions {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+}
+
+/* Standalone ☰ (replay footer / floating home + project variant): only
+   meaningful on touch, where the sidebar is an off-canvas overlay. On fine
+   pointers the sidebar is always visible, so hide it (this also skips the
+   key-visual styles, which live inside the coarse block). */
+.menu-btn-standalone {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  /* Same two-layer key visuals as the bar cells, with a local --key-gap
+     (the bar defines it on the grid) and an explicit size since there's
+     no grid track to size against. */
+  .menu-btn-standalone {
+    --key-gap: 0px;
+    display: inline-flex;
+    width: 48px;
+    min-height: 38px;
+  }
+
+  /* Floating over screens without any bottom bar (home / project hub /
+     transient states). Bottom-left — the same corner the key bar's ☰
+     occupies on session screens — with an opaque fill since it overlays
+     scrollable content. */
+  .menu-btn-floating {
+    position: absolute;
+    left: 10px;
+    bottom: calc(10px + env(safe-area-inset-bottom));
+    z-index: 50;
+    background: var(--bg-surface);
+    box-shadow: 0 2px 8px oklch(0% 0 0 / 0.35);
+  }
 }
 
 
 /* Floating "jump to bottom" overlay for any xterm-hosting view (replay,
    live terminal). Anchors to the nearest positioned ancestor, which
-   .terminal-shell already establishes (position: relative). */
-.jump-to-bottom {
-  position: absolute;
-  right: 16px;
-  bottom: 16px;
-  z-index: 5;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--bg-surface);
-  color: var(--text);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 18px;
-  line-height: 1;
-  box-shadow: 0 2px 8px oklch(0% 0 0 / 0.35);
-  transition: background 0.1s, transform 0.1s;
+   .terminal-shell already establishes (position: relative). Skin shared
+   with .terminal-scroll-end (see above). */
+.jump-to-bottom { right: 16px; bottom: 16px; }
+
+/* Sidebar scroll-to-top: top-right on desktop, bottom-right (thumb
+ * reach) on touch. */
+.scroll-top-btn {
+  right: 12px;
+  top: calc(var(--header-height) + 10px);
 }
-.jump-to-bottom:hover { background: oklch(28% 0.015 250); }
-.jump-to-bottom:active { transform: translateY(1px); }
+@media (pointer: coarse) {
+  .scroll-top-btn {
+    top: auto;
+    bottom: calc(var(--header-height) + env(safe-area-inset-bottom) + 12px);
+  }
+}
 
 /* ── Link action sheet (long-press a link on touch devices) ────────
    Reuses the modal backdrop/panel conventions; the panel is a narrow
@@ -3046,17 +4503,35 @@ body {
    these win; both thresholds are placeholders to fine-tune. Keys are moved
    purely by re-stating grid-template-areas (see .mk-* map). */
 
-/* Single row, word-jumps dropped. */
-@media (pointer: coarse) and (min-width: 600px) {
+/* Preserve seven-column hit targets on the narrowest supported phones. */
+@media (pointer: coarse) and (max-width: 340px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(10, 1fr);
+    grid-template-columns: repeat(7, 1fr);
+    grid-template-areas:
+      'esc  stab tab  au  paste paste end'
+      'menu ctrl alt  al  ad    ar    send';
+  }
+  .mk-wl,
+  .mk-wr { display: none; }
+}
+
+/* Single row, word-jumps dropped. */
+@media (pointer: coarse) and (min-width: 680px) {
+  .mobile-bottom-bar {
+    grid-template-columns: repeat(13, 1fr);
     grid-template-rows: 40px;
-    grid-template-areas: 'menu esc tab ctrl alt al ad au ar send';
+    grid-template-areas: 'menu esc stab tab ctrl alt paste attach al au ad ar send';
   }
   /* Word-jumps aren't part of the single-row layout. */
   .mk-wl,
   .mk-wr {
     display: none;
+  }
+  /* Wide bars keep attach independent while End floats above the row. */
+  .mk-attach,
+  .mk-attach.scroll-end-visible {
+    display: flex;
+    grid-area: attach;
   }
   /* Scroll-end floats above the top-right of the row instead of taking a
      column. Unlike the in-row keys (which the terminal slides under), it
@@ -3078,11 +4553,292 @@ body {
 /* Wider still: fold the word-jumps back in, flanking the arrow cluster. */
 @media (pointer: coarse) and (min-width: 820px) {
   .mobile-bottom-bar {
-    grid-template-columns: repeat(12, 1fr);
-    grid-template-areas: 'menu esc tab ctrl alt wl al ad au ar wr send';
+    grid-template-columns: repeat(15, 1fr);
+    grid-template-areas: 'menu esc stab tab ctrl alt paste attach wl al au ad ar wr send';
   }
   .mk-wl,
   .mk-wr {
     display: inline-flex;
   }
 }
+
+/* ── Toasts ───────────────────────────────────────────────────────────────
+ * Transient notifications for backend/action failures. Fixed overlay,
+ * bottom-right on desktop; above modals (settings is z 1000). Never traps
+ * focus — purely informational, dismissible. */
+.toast-host {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 4px 16px oklch(0% 0 0 / 0.4);
+  animation: toast-in 140ms ease-out;
+}
+
+.toast-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.toast-error {
+  border-left-color: var(--status-error);
+}
+
+.toast-info {
+  border-left-color: var(--accent);
+}
+
+.toast-message {
+  flex: 1;
+  word-break: break-word;
+}
+
+.toast-count {
+  flex: none;
+  align-self: center;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+.toast-dismiss {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+.toast-dismiss:hover {
+  color: var(--text);
+}
+
+/* Countdown bar: shrinks across the toast's TTL (duration set inline).
+ * Its animationend drives dismissal, so this bar and the actual removal
+ * are one clock. Pausing on hover freezes both. */
+.toast-countdown {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  transform-origin: left center;
+  background: var(--border-strong);
+  animation-name: toast-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+.toast-error .toast-countdown { background: var(--status-error); }
+.toast-info .toast-countdown { background: var(--accent); }
+
+.toast:hover .toast-countdown,
+.toast:focus-within .toast-countdown {
+  animation-play-state: paused;
+}
+
+@keyframes toast-countdown {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Honor reduced-motion: no shrink animation means no animationend to
+ * dismiss on, so fall back to opacity and let the toast persist until
+ * manually dismissed. */
+@media (prefers-reduced-motion: reduce) {
+  .toast-countdown { animation: none; opacity: 0.4; }
+}
+
+/* On phones, span the bottom edge above the mobile bar. */
+@media (max-width: 640px) {
+  .toast-host {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+}
+
+/* ── Crash fallback (error boundary) ──────────────────────────────────────── */
+.crash-fallback {
+  max-width: 560px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.crash-report-links {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.crash-report-links a {
+  color: var(--accent);
+}
+
+.crash-report {
+  margin-top: 14px;
+  text-align: left;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.crash-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* ── Session file viewer overlay ─────────────────────────────────────────── */
+.file-view {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  height: var(--app-height, 100dvh);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.file-view-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.file-back-btn,
+.file-close-btn,
+.file-copy-btn,
+.file-code-btn {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-secondary);
+  border-radius: 9px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 10px;
+  font: inherit;
+}
+.file-copy-btn { min-width: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.file-code-btn { color: var(--accent); padding: 0; }
+.file-close-btn { font-size: 22px; line-height: 1; }
+.file-view-title-block { min-width: 0; flex: 1; }
+.file-view-title { font-size: 15px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-view-subtitle { margin-top: 2px; font-family: "JetBrains Mono", "SF Mono", monospace; font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-breadcrumbs { display: flex; gap: 6px; overflow-x: auto; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.file-breadcrumbs button { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-surface); color: var(--text-secondary); min-height: 36px; padding: 0 10px; font-size: 12px; }
+.file-list { flex: 1; min-height: 0; overflow: auto; padding: 8px; }
+.file-entry { display: flex; width: 100%; align-items: center; gap: 12px; min-height: 52px; padding: 8px 10px; border: 0; border-bottom: 1px solid var(--border-subtle, var(--border)); background: transparent; color: inherit; text-align: left; }
+.file-entry-icon { width: 24px; text-align: center; flex-shrink: 0; }
+.file-entry-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.file-entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.file-entry-meta,
+.file-empty { color: var(--text-muted); font-size: 12px; }
+.file-empty { padding: 18px 12px; }
+.file-content-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.file-content-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; color: var(--text-muted); font-size: 12px; border-bottom: 1px solid var(--border); }
+.file-content-actions > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-image-zoom-level { flex-shrink: 0; min-width: 36px; text-align: right; font-variant-numeric: tabular-nums; }
+.file-image-mode { display: inline-flex; flex-shrink: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+.file-image-mode button { border: 0; border-left: 1px solid var(--border); background: transparent; color: var(--text-secondary); min-height: 44px; min-width: 44px; padding: 0 10px; font: inherit; font-size: 12px; font-weight: 650; }
+.file-image-mode button:first-child { border-left: 0; }
+.file-image-mode button.active { background: var(--accent); color: var(--bg); }
+.file-content { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 12px; font-family: "JetBrains Mono", "SF Mono", monospace; font-size: 12px; line-height: 1.55; white-space: pre; }
+.file-image-preview-wrap { position: relative; flex: 1; min-height: 0; overflow: auto; background: color-mix(in srgb, var(--bg) 92%, var(--text) 8%); overscroll-behavior: none; touch-action: pan-x pan-y; -webkit-overflow-scrolling: touch; }
+.file-image-preview-wrap > .state-subtitle,
+.file-image-preview-wrap > .file-error { position: absolute; z-index: 1; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+.file-image-stage { box-sizing: border-box; display: grid; place-items: center; min-width: 100%; min-height: 100%; padding: 12px; }
+.file-image-preview { display: block; max-width: none; max-height: none; border-radius: 10px; user-select: none; -webkit-user-select: none; }
+.file-error { margin: 24px 16px; padding: 18px; border: 1px solid var(--border); border-radius: 12px; text-align: center; }
+.file-toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 18px); transform: translateX(-50%); z-index: 1110; padding: 8px 12px; border-radius: 999px; background: var(--accent); color: var(--bg); font-size: 12px; font-weight: 700; }
+
+/* Project worktree manager — a touch-first bottom sheet that leaves xterm mounted. */
+.launch-inline-footer { color: var(--accent); }
+.worktree-sheet { box-sizing: border-box; width: min(560px, calc(100vw - 24px)); max-height: min(720px, calc(var(--app-height, 100vh) - 24px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 16px; background: var(--bg-surface); color: var(--text); box-shadow: 0 18px 60px rgb(0 0 0 / .35); }
+.worktree-sheet-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border); }
+.worktree-sheet h2, .worktree-sheet h3, .worktree-sheet p { margin: 0; }
+.worktree-sheet h2 { font-size: 17px; }
+.worktree-sheet-header p { margin-top: 3px; color: var(--text-muted); font-size: 12px; }
+.worktree-close, .worktree-remove { min-width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--text-secondary); }
+.worktree-close { font-size: 24px; }
+.worktree-list { min-height: 80px; overflow: auto; padding: 8px; }
+.worktree-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
+.worktree-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.worktree-row-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.worktree-row-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: "JetBrains Mono", monospace; font-size: 10px; }
+.worktree-row-main small { color: var(--accent); }
+.worktree-launch .launch-btn { min-width: 44px; min-height: 44px; }
+.worktree-remove { padding: 0 8px; font-size: 12px; }
+.worktree-remove.confirm { background: var(--danger, #b54141); color: white; }
+.worktree-create { display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 10px; padding: 14px 16px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
+.worktree-create h3, .worktree-create .worktree-error { grid-column: 1 / -1; }
+.worktree-create h3 { font-size: 13px; }
+.worktree-create label { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 11px; }
+.worktree-create input { box-sizing: border-box; min-width: 0; width: 100%; min-height: 44px; padding: 0 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); color: var(--text); font: inherit; }
+.worktree-create button[type="submit"] { min-height: 44px; padding: 0 14px; border: 0; border-radius: 9px; background: var(--accent); color: var(--bg); font-weight: 700; }
+.worktree-create button:disabled { opacity: .5; }
+.worktree-state, .worktree-error { padding: 12px; color: var(--text-muted); font-size: 12px; }
+.worktree-error { color: var(--danger, #d66767); }
+@media (max-width: 520px) {
+  .worktree-sheet { width: 100vw; max-height: calc(var(--app-height, 100vh) - 8px); border-radius: 16px 16px 0 0; }
+  .action-sheet-backdrop:has(.worktree-sheet) { align-items: flex-end; }
+  .worktree-create { grid-template-columns: 1fr; }
+  .worktree-create h3, .worktree-create .worktree-error { grid-column: auto; }
+}
+
+
+/* Browser-local appearance preferences. */
+.ui-scale-help { margin-bottom: 18px; }
+.ui-scale-control { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 10px 14px; }
+.ui-scale-label { font-weight: 650; }
+.ui-scale-value { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 700; }
+.ui-scale-range { grid-column: 1 / -1; width: 100%; min-height: 44px; accent-color: var(--accent); }
+.ui-scale-number { width: 110px; min-height: 44px; }
+.ui-scale-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.ui-scale-actions button { min-height: 44px; }

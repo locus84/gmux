@@ -87,24 +87,6 @@ export default async function globalSetup(_config: FullConfig) {
   fs.mkdirSync(stateDir)
   fs.mkdirSync(workspaceDir)
 
-  // Seed projects.json with a single project rule matching workspaceDir.
-  // The test session is spawned with cwd=workspaceDir below, so it'll
-  // be matched into this project and reachable at /test-project/shell/...
-  // navigateToSession (called from the test helper) needs the session
-  // to belong to *some* project to compute a URL.
-  //
-  // Path layout matches paths.StateDir(): $XDG_STATE_HOME/gmux/.
-  const gmuxStateDir = path.join(stateDir, 'gmux')
-  fs.mkdirSync(gmuxStateDir, { recursive: true })
-  fs.writeFileSync(
-    path.join(gmuxStateDir, 'projects.json'),
-    JSON.stringify({
-      version: 2,
-      items: [
-        { slug: 'test-project', match: [{ path: workspaceDir }] },
-      ],
-    }),
-  )
 
   // Write host.toml with:
   //  - the allocated port (so gmuxd doesn't fight a dev instance on 8790)
@@ -144,7 +126,7 @@ export default async function globalSetup(_config: FullConfig) {
 
   // Pre-seed smoke fixtures (one valid JSONL per adapter) before
   // gmuxd starts. The bootstrap scan picks them up and the smoke spec
-  // asserts they're reachable at /v1/conversations/{kind}/{slug}. If a
+  // asserts they're reachable at /v1/conversations/{adapter}/{slug}. If a
   // fixture is invalid for its parser, the smoke spec fails first with
   // a clear "fixture didn't reach the index" signal, before the
   // discovery spec's tests run.
@@ -192,6 +174,29 @@ export default async function globalSetup(_config: FullConfig) {
 
   await waitForHealth(port, testToken)
 
+  // Seed a single project rule matching workspaceDir. The test session is
+  // spawned with cwd=workspaceDir below, so it'll be matched into this
+  // project and reachable at /test-project/shell/... navigateToSession
+  // (called from the test helper) needs the session to belong to *some*
+  // project to compute a URL.
+  //
+  // Seeded via the API: the SQLite central store is the only project
+  // authority — gmuxd never reads projects.json (fresh-state release,
+  // no legacy migration ships in the product).
+  const seedResp = await fetch(`http://127.0.0.1:${port}/v1/projects`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${testToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      items: [{ slug: 'test-project', match: [{ path: workspaceDir }] }],
+    }),
+  })
+  if (!seedResp.ok) {
+    throw new Error(`failed to seed test project: ${seedResp.status} ${await seedResp.text()}`)
+  }
+
   // Start a test shell session (non-interactive — no local terminal attach).
   // cwd=workspaceDir so the session is matched into the seeded project.
   const gmux = spawn(GMUX, ['--', 'bash', '-c', 'echo READY; while true; do sleep 60; done'], {
@@ -225,6 +230,7 @@ export default async function globalSetup(_config: FullConfig) {
   // runs the tests.
   process.env.GMUXD_TEST_PORT = String(port)
   process.env.GMUX_TEST_SESSION_ID = sessionId
+  process.env.GMUX_TEST_WORKSPACE = workspaceDir
   process.env.GMUX_TEST_TOKEN = testToken
   // Tests that write into adapter session roots (conversation
   // discovery, etc.) need to know where the daemon is looking for

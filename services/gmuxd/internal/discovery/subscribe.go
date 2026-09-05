@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -31,16 +30,12 @@ type Subscriptions struct {
 	mu     sync.Mutex
 	active map[string]*subEntry // sessionID → entry
 	store  *store.Store
-	// OnExit is called after a session exit event is processed.
-	// Returns true if the session was transitioned to resumable
-	// (caller should not set exit status).
-	OnExit func(sess *store.Session) bool
-	// OnSessionFile fires when a runner reports (via the agent extension)
-	// the JSONL session file its agent holds. This is the authoritative
-	// attribution signal (ADR 0011); gmuxd wires it to
-	// FileMonitor.AttributeFromHook, which also suppresses daemon-side
-	// parsing for the session (its runner owns derived state).
-	OnSessionFile func(sessionID, filePath string)
+	// OnExit is called while a session exit event is being processed,
+	// before the dead session is written back to the store. The hook may
+	// mutate the session (gmuxd derives the resume command here) but must
+	// leave Status alone: the last Status is the session's turn state at
+	// death, which post-mortem waits resolve by (ADR 0023).
+	OnExit func(sess *store.Session)
 	// OnDead fires after the store Upsert that records an exit
 	// event. The session passed is the post-Upsert snapshot,
 	// including any Title / Resumable derivation the store applied
@@ -256,17 +251,30 @@ func (sub *Subscriptions) handleEvent(sessionID, socketPath, eventType string, d
 			if meta.Unread != nil {
 				sess.Unread = *meta.Unread
 				if !*meta.Unread && sess.Status != nil && sess.Status.Error {
-					sess.Status.Error = false
+					// Replace, don't mutate: store.Update's copy is shallow,
+					// so writing through the shared *Status would also
+					// rewrite the store's previous snapshot and defeat its
+					// no-op change detection.
+					sess.Status = &store.Status{Active: sess.Status.Active, Interrupted: sess.Status.Interrupted}
 				}
 			}
-			if meta.Slug != nil && *meta.Slug != "" {
+			// A slug key is only ever present on a deliberate SetSlug (the
+			// general meta emission omits it), so honor it verbatim — including
+			// an explicit empty, which clears a stale slug when a session
+			// re-binds to an untitled conversation (web then falls back to the
+			// gmux session id). A title-only meta update has meta.Slug == nil and
+			// leaves the recorded slug untouched.
+			if meta.Slug != nil {
 				sess.Slug = *meta.Slug
 			}
 		})
 
 	case "exit":
 		var exit struct {
-			ExitCode int `json:"exit_code"`
+			ExitCode    int   `json:"exit_code"`
+			Active      *bool `json:"active"`
+			Error       *bool `json:"error"`
+			Interrupted *bool `json:"interrupted"`
 		}
 		if err := json.Unmarshal(data, &exit); err != nil {
 			log.Printf("subscribe: %s: bad exit event: %v", sessionID, err)
@@ -282,20 +290,37 @@ func (sub *Subscriptions) handleEvent(sessionID, socketPath, eventType string, d
 		sess.Alive = false
 		sess.ExitCode = &exit.ExitCode
 		sess.ExitedAt = time.Now().UTC().Format(time.RFC3339)
-		// Let the OnExit hook set the resume command before upsert.
-		// If it returns true, the session transitioned to resumable,
-		// so don't overwrite with exit status.
-		resumed := false
-		if sub.OnExit != nil {
-			resumed = sub.OnExit(&sess)
-		}
-		if !resumed {
-			if exit.ExitCode == 0 {
-				sess.Status = nil // clean exit, no label needed
-			} else {
-				sess.Status = &store.Status{Label: fmt.Sprintf("exited (%d)", exit.ExitCode)}
+		// New runners may fuse a synthetic lifetime-turn close into exit. Pointer
+		// fields preserve backward compatibility with old plain exit events.
+		if exit.Active != nil || exit.Error != nil || exit.Interrupted != nil {
+			status := store.Status{}
+			if sess.Status != nil {
+				status = *sess.Status
 			}
+			if exit.Active != nil {
+				status.Active = *exit.Active
+			}
+			if exit.Error != nil {
+				status.Error = *exit.Error
+			}
+			if exit.Interrupted != nil {
+				status.Interrupted = *exit.Interrupted
+			}
+			sess.Status = &status
 		}
+		// Let the OnExit hook set the resume command before upsert.
+		if sub.OnExit != nil {
+			sub.OnExit(&sess)
+		}
+		// The last Status is deliberately kept across death: it records
+		// whether the session's turn was closed when the process exited,
+		// which is what lets a wait issued after the exit resolve the
+		// same way as one that watched it live — "idle" for a closed
+		// turn (one-shot completed, shell exited at its prompt, agent
+		// exited after its turn), "died" for an open one (mid-command /
+		// mid-turn crash). See terminalReason. The frontend keys its
+		// active/error dots on Alive and derives "exited (N)" from
+		// exit_code, so a persisted Status doesn't disturb it.
 		if !sub.store.Update(sessionID, func(current *store.Session) {
 			*current = sess
 		}) {
@@ -305,34 +330,37 @@ func (sub *Subscriptions) handleEvent(sessionID, socketPath, eventType string, d
 			sub.OnDead(sess)
 		}
 
-	case "session_file":
+	// "session_file" is the pre-v2 name for the same event: long-lived
+	// runners survive daemon upgrades, so the daemon accepts both for one
+	// release. New runners emit only "conversation_file" — itself a legacy
+	// wire name whose "path" payload carries the adapter-opaque
+	// conversation ref (ADR 0022).
+	// TODO(v2.1): drop the "session_file" case.
+	case "conversation_file", "session_file":
 		var sf struct {
 			Path string `json:"path"`
 		}
 		if err := json.Unmarshal(data, &sf); err != nil {
-			log.Printf("subscribe: %s: bad session_file event: %v", sessionID, err)
+			log.Printf("subscribe: %s: bad conversation_file event: %v", sessionID, err)
 			return
 		}
 		if sf.Path == "" {
 			return
 		}
-		// session → file is authoritative and per-session (ADR 0011): record it
-		// on the session itself so the frontend can derive file → {sessions}
-		// and warn when a conversation is open in more than one runner. A
-		// rebind (/resume) just overwrites this session's own file; it never
-		// clobbers another session's.
+		// session → conversation is authoritative and per-session (ADR 0011):
+		// record the ref on the session itself so the frontend can derive
+		// ref → {sessions} and warn when a conversation is open in more than
+		// one runner. A rebind (/resume) just overwrites this session's own
+		// ref; it never clobbers another session's.
 		sub.store.Update(sessionID, func(sess *store.Session) {
-			sess.SessionFile = sf.Path
+			sess.ConversationRef = sf.Path
 		})
-		if sub.OnSessionFile != nil {
-			sub.OnSessionFile(sessionID, sf.Path)
-		}
 
 	case "activity":
 		// Transient signal: terminal produced output with no attached clients.
 		// Forward to the store's subscribers without mutating state.
 		sub.store.Broadcast(store.Event{
-			Type: "session-activity",
+			Type: store.EventSessionActivity,
 			ID:   sessionID,
 		})
 

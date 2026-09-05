@@ -5,13 +5,13 @@ const DIM = '\x1b[2m'
 const GRAY = '\x1b[90m'
 
 export default {
-  id: 'sess-openclaw-logs',
+  id: '176jgh4z',
   created_at: ago(20),
   command: ['openclaw', 'logs', '-f'],
   cwd: '/home/user/dev/openclaw',
   workspace_root: '/home/user/dev/openclaw',
   remotes: { origin: 'github.com/acme/openclaw' },
-  kind: 'shell',
+  adapter: 'shell',
   alive: true,
   pid: 9200,
   exit_code: null,
@@ -19,10 +19,11 @@ export default {
   exited_at: null,
   title: 'logs',
   subtitle: '',
-  status: { label: '', working: false },
+  status: { active: false },
   unread: false,
+  project_slug: 'openclaw',
+  last_output_at: ago(15),
   socket_path: '/tmp/gmux-sessions/mock.sock',
-  peer: 'server/container',
   mockActive: true,
   terminal: [
     `${GRAY}[09:14:22]${RST} ${DIM}info${RST}  worker started pid=4821`,

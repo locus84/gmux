@@ -5,20 +5,43 @@
  * callbacks and the mobile open/close toggle are passed as props.
  */
 
-import { useState, useCallback } from 'preact/hooks'
-import { sessionPath } from './routing'
-import { reorderKeysForFolder } from './projects'
+import type { ComponentChildren } from 'preact'
+import { useState, useCallback, useRef, useEffect } from 'preact/hooks'
+import { needsReveal } from './sidebar-reveal'
+import { hasSessionSlugCollision, sessionPath, viewToPath } from './routing'
+import { FamilyIcon } from './family-icon'
+import { familyDrawerRoot } from './family-drawer-state'
+import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
+import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
+import { projectFileBrowserPath } from './file-browser'
+import { buildVSCodeServerUrl } from './vscode-server'
 import { LaunchButton } from './launcher'
+import { WorktreeSheet } from './worktree-sheet'
+import { SheetBackdrop } from './sheet'
+import { readCheckoutExpanded, writeCheckoutExpanded } from './checkout-fold'
 import { useArrivalPulse } from './use-arrival-pulse'
 import {
-  folders, selectedId, currentProjectKey,
-  activityMap, projects, connState,
+  folders, familySelectedId, sessions,
+  activityMap, projects, connState, health, peers,
+  collapsedFolders, toggleFolderCollapsed,
   updateProjects, reorderSessions,
-  peerStatusByName, isSessionUnavailable, localPeerNames, sessionDotState,
-  unreadCount, localHostLabel, unresolvedHosts, duplicateSessionFiles,
+  peerStatusByName, isSessionUnavailable, localPeerNames, ownDotState, selectedId,
+  familyActivityById, familySlotById, type FamilySlot,
+  unreadCount, localHostLabel, unresolvedHosts, duplicateConversationFiles,
+  vsCodeServerUrl, vsCodeServerHomeDir,
+  sidebarActivity, sidebarMode, setSidebarMode,
+  activeSelectors, removeSelector, setHostFilter,
+  aliveOnly, setAliveOnly, tabHref, navigate, sessionStreamWarnings, sessionStreamOmittedTotal, peerStreamOmissions, peerOmittedTotal,
+  projectWorktreeInventories, projectWorktreeInventoryKey, ensureProjectWorktrees, removeProjectWorktree,
+  aggregateSessionDotState,
   type DotState,
 } from './store'
 import { HostSuffix } from './host-suffix'
+import { SessionRow } from './session-row'
+import {
+  childTrailTitle, familyActivityLabel, familyMemberGlyph, familySegments,
+  type FamilyActivity,
+} from './family'
 import type { Session, Folder } from './types'
 
 // ── Types ──
@@ -46,6 +69,73 @@ export const IconSettings = () => (
     <path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/>
     <circle cx="10.5" cy="4.5" r="1.7"/>
     <circle cx="5.5" cy="11.5" r="1.7"/>
+  </svg>
+)
+
+export const IconVSCode = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.5 2.5 5 7.8l6.5 5.7 2-1V3.5l-2-1Z" />
+    <path d="M5 7.8 2.8 5.7 2 6.3v3l.8.6L5 7.8Z" />
+  </svg>
+)
+
+export const IconFiles = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z" />
+    <path d="M2.5 4.5V3.8a1 1 0 0 1 1-1h2.7l1.1 1.2" />
+  </svg>
+)
+
+export const IconRefresh = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
+    <path d="M13 5.2A5.2 5.2 0 0 0 3.4 4" />
+    <path d="M13 2.5v2.7h-2.7" />
+    <path d="M3 10.8A5.2 5.2 0 0 0 12.6 12" />
+    <path d="M3 13.5v-2.7h2.7" />
+  </svg>
+)
+
+function ProjectFilesButton({ folder, onClick }: { folder: Folder; onClick?: () => void }) {
+  return (
+    <a
+      class="folder-file-btn"
+      href={projectFileBrowserPath(folder.slug, folder.peer)}
+      title={`Browse ${folder.launchCwd || folder.name}`}
+      aria-label={`Browse ${folder.name} files`}
+      onClick={() => onClick?.()}
+    >
+      <IconFiles />
+    </a>
+  )
+}
+
+function VSCodeServerButton({ href, workspacePath }: { href: string; workspacePath: string }) {
+  return (
+    <button
+      class="folder-vscode-btn"
+      type="button"
+      title={`Open ${workspacePath} in VS Code Server`}
+      aria-label={`Open ${workspacePath} in VS Code Server`}
+      onClick={event => { event.preventDefault(); event.stopPropagation(); window.open(href, '_blank', 'noopener,noreferrer') }}
+    >
+      <IconVSCode />
+    </button>
+  )
+}
+
+const IconArrange = () => (
+  <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
+    <path d="M2.5 4h8M2.5 8h6M2.5 12h4"/>
+    <path d="M13 6.5v6M13 12.5l-2-2M13 12.5l2-2"/>
+  </svg>
+)
+
+/** Disclosure chevron for folder headers. Points down when expanded;
+ *  CSS rotates it to point right when collapsed, so the same glyph
+ *  animates between states. */
+const IconChevron = ({ className }: { className?: string }) => (
+  <svg class={className} viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M2.5 4.5 L6 8 L9.5 4.5" />
   </svg>
 )
 
@@ -85,6 +175,13 @@ function DevcontainerMarker({ peer }: { peer: string }) {
       <path d="M4 3.5v6 M6 3.5v6 M8 3.5v6" />
     </svg>
   )
+}
+
+/** Deep link to any session by id (the child rows can't reuse the
+ *  folder's slug: a descendant may live in another project). */
+function sessionHref(session: Session): string | undefined {
+  const path = viewToPath({ kind: 'session', sessionId: session.id }, projects.value, sessions.value)
+  return path ? tabHref(path) : undefined
 }
 
 function reorder<T>(arr: T[], from: number, to: number): T[] {
@@ -128,13 +225,15 @@ function SessionItem({
   onDragOver?: () => void
   onDragEnd?: () => void
 }) {
-  const effectiveDotState = resuming ? 'working' : rawDotState
-  // Nothing is "unread" if you're already looking at it.
-  const dotState = (selected && (effectiveDotState === 'error' || effectiveDotState === 'unread')) ? 'none' : effectiveDotState
+  // The row's own status, muted for selection ("nothing is unread if
+  // you're already looking at it") by `ownDotState` — a root row shows
+  // the root's state, never a roll-up of its children's, so a working
+  // child cannot masquerade as a working root.
+  const dotState = resuming ? 'working' : rawDotState
   const arrival = useArrivalPulse(dotState)
   const sleeping = !session.alive && session.resumable
   // Same conversation file live in another runner (ADR 0011 N:1).
-  const duplicateOpen = !!session.session_file && duplicateSessionFiles.value.has(session.session_file)
+  const duplicateOpen = !!session.conversation_file && duplicateConversationFiles.value.has(session.conversation_file)
 
   const cls = [
     'session-item',
@@ -149,9 +248,7 @@ function SessionItem({
       class={cls}
       href={href}
       draggable={canDrag && !!onDragStart}
-      onClick={() => {
-        onClick?.()
-      }}
+      onClick={() => { onClick?.() }}
       onAuxClick={(e) => { if (e.button === 1 && onClose) { e.preventDefault(); onClose() } }}
       onDragStart={(e) => {
         e.dataTransfer!.effectAllowed = 'move'
@@ -159,26 +256,26 @@ function SessionItem({
         onDragStart?.()
       }}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer!.dropEffect = 'move'; onDragOver?.() }}
-      onDrop={(e) => { e.preventDefault(); onDragEnd?.() }}
+      // Family entries wrap this row in a group that is itself a drop
+      // target; without this the drop runs both handlers in one dispatch,
+      // before a re-render can clear `drag`, and the reorder is sent twice.
+      onDrop={(e) => { e.preventDefault(); e.stopPropagation(); onDragEnd?.() }}
       onDragEnd={onDragEnd}
     >
       {unavailable
         ? <svg class="session-unavailable-icon" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><title>Peer unavailable</title><path d="M2 2 L10 10 M10 2 L2 10" /></svg>
-        : sleeping
+        : sleeping && dotState === 'none'
         ? <svg class="session-sleep-icon" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><title>Resumable</title><path d="M7 1h4l-4 4h4" /><path d="M1 5h5l-5 6h5" /></svg>
-        : <span class={`session-dot-indicator ${dotState}${arrival ? ` ${arrival}` : ''}`} />
+        : <span class={`session-dot-indicator ${dotState}${arrival ? ` ${arrival}` : ''}`} title={sleeping ? 'Unread · resumable' : undefined} />
       }
       {showHostMarker && session.peer && <DevcontainerMarker peer={session.peer} />}
       <div class="session-content">
         <div class="session-title-row">
           <span class="session-title">{session.title}</span>
         </div>
-        {(session.status?.label || duplicateOpen) && (
+        {duplicateOpen && (
           <div class="session-meta">
-            {session.status?.label && <span class="session-status-label">{session.status.label}</span>}
-            {duplicateOpen && (
-              <span class="session-dup-warning" title="This conversation is open in more than one tab">⚠ open elsewhere</span>
-            )}
+            <span class="session-dup-warning" title="This conversation is open in more than one tab">⚠ open elsewhere</span>
           </div>
         )}
       </div>
@@ -195,26 +292,349 @@ function SessionItem({
   )
 }
 
+/** The family button: the static opener at the head of the subordinate
+ *  row, carrying the activity segments while nothing in the family is
+ *  selected. The icon never moves — it is the row's fixed identity —
+ *  only what follows it changes: counts inside the button, or the
+ *  member row beside it. */
+function FamilyOpenButton({
+  activity,
+  rootId,
+  rootHref,
+  onClick,
+}: {
+  activity: FamilyActivity | undefined
+  rootId: string
+  rootHref: string
+  onClick?: () => void
+}) {
+  const segments = activity ? familySegments(activity) : []
+  const label = activity ? familyActivityLabel(activity) : 'Session family'
+  return (
+    <button
+      type="button"
+      class="family-activity"
+      title={label}
+      aria-label={`${label}. Open family panel`}
+      aria-controls="agent-family-drawer"
+      onClick={() => {
+        // A second press dismisses: if the panel is already open and
+        // there is nowhere left to navigate, the press can only mean
+        // "put it away". While elsewhere in the family it navigates to
+        // the root instead, and the open drawer simply follows.
+        if (familyDrawerRoot.value === rootId && selectedId.value === rootId) {
+          familyDrawerRoot.value = null
+          return
+        }
+        // Name the family first, then go: the header opens the drawer
+        // when it arrives somewhere that family owns. Stating the want
+        // before the trip also keeps it true if navigation ever became
+        // synchronous — the arrival would already agree with it.
+        familyDrawerRoot.value = rootId
+        navigate(rootHref)
+        onClick?.()
+      }}
+    >
+      {/* The family mark, same as the header's trigger: this line is
+        * the standard family numbers — everyone beneath the root — not
+        * "the others", so it anchors to the root's glyph column rather
+        * than indenting under whichever member row happens to be shown. */}
+      {/* The mark is the whole visible button when a member row sits
+        * beside it — it's the same icon as the header's trigger, so it
+        * already means "family panel" without a suffix. */}
+      <span class="family-glyph" aria-hidden="true"><FamilyIcon class="family-activity-icon" /></span>
+      {/* Glyphs are decoration; the sentence carries the meaning. */}
+      {segments.length > 0 && (
+        <span class="family-activity-glyphs" aria-hidden="true">
+          {segments.map(segment => (
+            <span key={segment.state} class="family-activity-seg">
+              {segment.dot
+                ? <span class={`family-glyph session-dot-indicator ${segment.dot}`} />
+                : <span class="family-glyph family-proc">$</span>}
+              {segment.count}
+            </span>
+          ))}
+        </span>
+      )}
+      <span class="sr-only">{label}</span>
+    </button>
+  )
+}
+
+/** The sidebar's family entry: a root row and at most one subordinate
+ *  row, led by the static family button. The button carries the family
+ *  counts until a descendant takes selection; then the counts yield to
+ *  the member's own row beside it, and return the moment selection
+ *  leaves the family. No history: the member row *is* the selection.
+ *
+ *  Selection and hit areas nest, the way the sessions do:
+ *   - the group is the root's area. Hovering anywhere in it highlights
+ *     the whole group, and any click that doesn't land on the member
+ *     row selects the root — including the slack around its nested
+ *     targets, which has nothing better to do;
+ *   - the member row and family button are their own areas inside that
+ *     one, each with its own hover treatment;
+ *   - the background says *which family* you're in, the accent bar says
+ *     *which row*, so selecting a member keeps the group lit and moves
+ *     the bar down to it.
+ *
+ *  One more rule holds the content together: the root row's dot is the
+ *  root session's own status, so a working child never masquerades as
+ *  a working root. The counts, by contrast, are a summary and may well
+ *  include the member selected within — the standard family numbers are
+ *  a fact about the family, the same on every surface, and subtracting
+ *  whatever a surface happens to name made them wobble with unrelated
+ *  state (see `familyActivityById`).
+ */
+function FamilyEntry({
+  selected,
+  rootId,
+  rootHref,
+  slot,
+  slotHref,
+  slotTrail,
+  activity,
+  onClick,
+  onDragOver,
+  onDragEnd,
+  children,
+}: {
+  /** Something in this family is selected — root or member. */
+  selected: boolean
+  rootId: string
+  rootHref: string
+  slot?: FamilySlot
+  slotHref?: string
+  /** Root › … › member trail, for the member row's hover title. */
+  slotTrail?: string
+  activity: FamilyActivity | undefined
+  onClick?: () => void
+  /** Reorder drop target for the whole group, not just the root row. */
+  onDragOver?: () => void
+  onDragEnd?: () => void
+  /** The root's own `SessionItem`. */
+  children: preact.ComponentChildren
+}) {
+  const member = slot?.session
+  // One decision, made in `family.ts` so it can be tested: which glyph
+  // this member gets, and what state it carries. This row is the only
+  // place this member is named, so its glyph has to be able to say
+  // `unread` — the line below counts it among many, but a count is not
+  // a way to see which member needs you.
+  const glyph = member
+    ? familyMemberGlyph(member, ownDotState(member, activityMap.value, selectedId.value))
+    : null
+  return (
+    // Not focusable on purpose: the group's own rows are the keyboard
+    // targets, and this only hands the pointer the slack between them,
+    // which leads somewhere those rows already go.
+    <div
+      class={`session-family${selected ? ' selected' : ''}`}
+      onClick={(e) => {
+        // Anything with its own target keeps it (root row, member row,
+        // close button); the leftovers fall through to the root.
+        if ((e.target as HTMLElement | null)?.closest('a, button')) return
+        // The slack is a convenience, not a link, so it declines every
+        // gesture a link would answer differently: a modified click
+        // wants a new tab or a download, and a click that ends a text
+        // selection wants the text, not a navigation. Doing otherwise
+        // makes the entry feel like it grabs at the pointer.
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return
+        if (!(getSelection()?.isCollapsed ?? true)) return
+        e.preventDefault()
+        navigate(rootHref)
+        onClick?.()
+      }}
+      // A family entry is one reorder target. Without this the drop is
+      // only accepted over the root row, so the taller the entry grows
+      // the more of it silently refuses the drag.
+      onDragOver={onDragOver && ((e) => { e.preventDefault(); e.dataTransfer!.dropEffect = 'move'; onDragOver() })}
+      onDrop={onDragEnd && ((e) => { e.preventDefault(); onDragEnd() })}
+    >
+      {children}
+      {(member || activity) && (
+        <div class="family-sub">
+          {/* The static head of the row: same button in both states, so
+            * the panel's entry point never teleports. Only the content
+            * after it changes — counts inside the button, or the member
+            * row beside it. */}
+          <FamilyOpenButton
+            activity={member ? undefined : activity}
+            rootId={rootId}
+            rootHref={rootHref}
+            onClick={onClick}
+          />
+          {member && (
+            <a
+              class="family-slot selected"
+              href={slotHref}
+              aria-current="page"
+              title={slotTrail}
+              onClick={() => onClick?.()}
+            >
+              {/* One fixed-width glyph column: the member's status, or
+                * its `$` if it's a process. A quiet member shows nothing —
+                * the family button beside the row already says it hangs
+                * off the root, and a filler arrow next to that icon read
+                * as a second, mysterious control. */}
+              {glyph?.kind === 'process'
+                ? <span class={`family-glyph family-proc${glyph.running ? '' : ' done'}`} aria-hidden="true">$</span>
+                : glyph?.kind === 'dot'
+                ? <span class={`family-glyph session-dot-indicator ${glyph.state}`} aria-hidden="true" />
+                : null}
+              <span class="family-slot-title">{member.title}</span>
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CheckoutSection({ group, folder, selectedId, resumingId, am, peerStatus, children }: {
+  group: CheckoutGroup
+  folder: Folder
+  selectedId: string | null
+  resumingId: string | null
+  am: ReadonlyMap<string, 'active' | 'fading'>
+  peerStatus: ReadonlyMap<string, string>
+  children: ComponentChildren
+}) {
+  const foldIdentity = group.path || group.key
+  const [expanded, setExpanded] = useState(() => readCheckoutExpanded(folder.key, foldIdentity))
+  const [removeOpen, setRemoveOpen] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState('')
+  const removeCancelRef = useRef<HTMLButtonElement>(null)
+  const collapsedDot = aggregateSessionDotState(group.sessions, am, { selectedId, resumingId, peerStatus })
+  const collapsedArrival = useArrivalPulse(expanded ? 'none' : collapsedDot)
+  const canRemove = !!group.worktree && !group.primary && !group.fallback
+
+  useEffect(() => {
+    if (selectedId && group.sessions.some(session => session.id === selectedId)) setExpanded(true)
+  }, [selectedId, group.key])
+
+  const closeRemove = () => {
+    if (removing) return
+    setRemoveOpen(false)
+    setRemoveError('')
+  }
+  useEffect(() => {
+    if (!removeOpen) return
+    const focusFrame = requestAnimationFrame(() => removeCancelRef.current?.focus())
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || removing) return
+      event.preventDefault()
+      closeRemove()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      cancelAnimationFrame(focusFrame)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [removeOpen, removing])
+  const confirmRemove = async () => {
+    setRemoving(true)
+    setRemoveError('')
+    try {
+      await removeProjectWorktree(folder.slug, group.path, folder.peer)
+      setRemoveOpen(false)
+    } catch (error) {
+      setRemoveError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setRemoving(false)
+    }
+  }
+
+  return (
+    <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
+      <div class="checkout-header" title={group.path || group.label}>
+        <button
+          type="button"
+          class="checkout-fold-btn"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.label}${!expanded && collapsedDot !== 'none' ? ', session needs attention' : ''}`}
+          onClick={() => setExpanded(value => {
+            const next = !value
+            writeCheckoutExpanded(folder.key, foldIdentity, next)
+            return next
+          })}
+        >
+          <span class={`checkout-chevron${expanded ? ' expanded' : ''}`} aria-hidden="true">›</span>
+          <span class="checkout-tree-mark" aria-hidden="true">↳</span>
+          <span class="checkout-name">{group.label}</span>
+          {group.primary && <span class="checkout-primary-label">default</span>}
+          {group.worktree?.locked && <span class="checkout-state-label">locked</span>}
+          {!expanded && group.sessions.length > 0 && <span class="checkout-session-count">{group.sessions.length}</span>}
+          {!expanded && collapsedDot !== 'none' && (
+            <span class={`session-dot-indicator ${collapsedDot}${collapsedArrival ? ` ${collapsedArrival}` : ''}`} aria-hidden="true" />
+          )}
+        </button>
+        {!group.fallback && group.path && (
+          <div class="checkout-actions">
+            <LaunchButton cwd={group.path} peer={folder.peer} className="checkout-launch-btn" />
+            {canRemove && (
+              <button type="button" class="checkout-remove-btn" aria-label={`Remove worktree ${group.label}`} title="Remove worktree" onClick={() => setRemoveOpen(true)}>×</button>
+            )}
+          </div>
+        )}
+      </div>
+      {expanded && <div class="checkout-sessions">{children}</div>}
+      {removeOpen && (
+        <SheetBackdrop onClose={closeRemove} blurActiveElement={false}>
+          <div class="modal-panel worktree-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="worktree-remove-title">
+            <h2 id="worktree-remove-title">Remove worktree?</h2>
+            <p><strong>{group.label}</strong></p>
+            <code>{group.path}</code>
+            <p>The checkout directory will be removed. Its Git branch will remain.</p>
+            <p class="worktree-remove-safety">Removal is blocked if it has changes or ignored files, is locked, or has a live or resumable session.</p>
+            {removeError && <div class="worktree-remove-error" role="alert">{removeError}</div>}
+            <div class="worktree-remove-buttons">
+              <button ref={removeCancelRef} type="button" class="sheet-btn sheet-btn-quiet" aria-disabled={removing} onClick={closeRemove}>Cancel</button>
+              <button type="button" class="sheet-btn worktree-remove-confirm" disabled={removing} onClick={() => void confirmRemove()}>{removing ? 'Removing…' : 'Remove worktree'}</button>
+            </div>
+          </div>
+        </SheetBackdrop>
+      )}
+    </div>
+  )
+}
+
 function FolderGroup({
   folder,
   selId,
-  currentKey,
   resumingId,
   am,
   peerStatus,
+  aliveOnly,
   onCloseSession,
   onClick,
 }: {
   folder: Folder
   selId: string | null
-  currentKey: string | null
   resumingId: string | null
   am: ReadonlyMap<string, 'active' | 'fading'>
   peerStatus: ReadonlyMap<string, string>
+  /** Hide dead-but-resumable sessions (tab-scoped toggle). */
+  aliveOnly?: boolean
   onCloseSession: (session: Session) => void
   onClick?: () => void
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
+  const [worktreesOpen, setWorktreesOpen] = useState(false)
+  const ownerStatus = folder.peer ? peerStatus.get(folder.peer) : 'local'
+  useEffect(() => {
+    if (!location.search.includes('mock') && !folder.unresolved && !folder.missing && (ownerStatus === 'local' || ownerStatus === 'connected')) {
+      void ensureProjectWorktrees(folder.slug, folder.peer)
+    }
+  }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
+  const inventory = projectWorktreeInventories.value[projectWorktreeInventoryKey(folder.slug, folder.peer)]
+  // Snapshot-wide family derivations, read once per folder render. All
+  // three are O(n) maps built once per session-list identity in the
+  // store, so a folder's rows stay O(rows) lookups.
+  const activityById = familyActivityById.value
+  const slots = familySlotById.value
+  const rawSelId = selectedId.value
 
   const handleDragStart = useCallback((idx: number) => {
     setDrag({ from: idx, over: idx })
@@ -246,10 +666,25 @@ function FolderGroup({
     setDrag(null)
   }, [drag, folder.slug, folder.peer])
 
-  const visible = folder.sessions.filter(s => s.alive || s.resumable)
+  // folder.sessions is already the filtered set (see store.ts
+  // sidebarSessions) — alive-only, ?filter=, and the resumable baseline
+  // are all applied upstream. Render it as-is.
+  const visible = folder.sessions
   const displayItems = drag ? reorder(visible, drag.from, drag.over) : visible
-  const isCurrent = currentKey === folder.key
-  const href = folder.peer ? `/@${folder.peer}/${folder.slug}` : `/${folder.slug}`
+  const collapsed = collapsedFolders.value.has(folder.key)
+  // A collapsed folder still shows the selected session: you can't hide
+  // the thing you're looking at (it also keeps the row in the DOM for
+  // mobile scroll-into-view). The header reads as collapsed; the one
+  // row just sits beneath it.
+  const shown = collapsed ? displayItems.filter(s => s.id === selId) : displayItems
+  const checkoutGroups = groupSessionsByCheckout(
+    { ...folder, sessions: shown },
+    inventory?.data?.worktrees,
+    inventory?.data?.primary_path,
+  )
+  // Drag-reorder is disabled while collapsed (the visible subset no
+  // longer maps onto the stored order) or under the alive-only toggle.
+  const dragDisabled = collapsed || !!aliveOnly
   // Folder spans multiple hosts iff its sessions don't all share the
   // same .peer value. In practice this is the devcontainer case: a
   // local project's folder containing both parent-local sessions
@@ -257,58 +692,332 @@ function FolderGroup({
   // sessions agree, per-row markers are noise.
   const folderPeers = new Set(visible.map(s => s.peer ?? ''))
   const mixedHosts = folderPeers.size > 1
+  // A local project folder can contain Local-peer (devcontainer) sessions.
+  // Their paths belong to the container and must not be opened by the
+  // parent's VS Code Server; use only parent-local sessions as fallback.
+  const workspaceSession = visible.find(session => !session.peer && session.alive && (session.workspace_root?.trim() || session.cwd?.trim()))
+    ?? visible.find(session => !session.peer && (session.workspace_root?.trim() || session.cwd?.trim()))
+  const workspacePath = folder.launchCwd?.trim()
+    || workspaceSession?.workspace_root?.trim()
+    || workspaceSession?.cwd?.trim()
+    || ''
+  const codeHref = folder.peer
+    ? null
+    : buildVSCodeServerUrl(vsCodeServerUrl.value, workspacePath, vsCodeServerHomeDir.value)
+
+  const headerRef = useRef<HTMLDivElement>(null)
+  // Collapsing removes the rows below the header. Because headers are
+  // sticky, if you're scrolled down inside this folder its box can end
+  // up entirely above the viewport once its rows vanish — the header you
+  // just clicked disappears upward, which is disorienting. So when (and
+  // only when) collapsing would push the clicked header off the top,
+  // pull the scroll position back so it stays where it was.
+  const handleToggleCollapse = () => {
+    const el = headerRef.current
+    const scroll = el?.closest('.sidebar-scroll') as HTMLElement | null
+    const wasCollapsed = collapsed
+    const beforeTop = el && scroll
+      ? el.getBoundingClientRect().top - scroll.getBoundingClientRect().top
+      : 0
+    toggleFolderCollapsed(folder.key)
+    if (wasCollapsed || !el || !scroll) return // only correct when collapsing
+    requestAnimationFrame(() => {
+      const afterTop = el.getBoundingClientRect().top - scroll.getBoundingClientRect().top
+      if (afterTop < 0) scroll.scrollTop += afterTop - beforeTop
+    })
+  }
   return (
     <div class="folder">
-      <div class="folder-header">
-        <a
-          class={`folder-name${isCurrent ? ' current' : ''}${folder.missing ? ' missing' : ''}${folder.unresolved ? ' unresolved' : ''}`}
-          href={href}
+      <div class="folder-header" ref={headerRef}>
+        <button
+          type="button"
+          class={`folder-name${folder.missing ? ' missing' : ''}${folder.unresolved ? ' unresolved' : ''}`}
+          aria-expanded={!collapsed}
           title={folder.unresolved
             ? `Host “${folder.peer}” isn't a connected or manually-added host — it may have been renamed or removed. Open Settings → Hosts to remap or remove it.`
             : folder.missing
-            ? `${folder.name} no longer exists on ${folder.peer}; remove via the home page`
-            : `Open ${folder.name} hub`}
-          onClick={onClick}
+            ? `${folder.name} no longer exists on ${folder.peer} — remove this reference in Settings → Projects.`
+            : collapsed ? `Expand ${folder.name}` : `Collapse ${folder.name}`}
+          onClick={handleToggleCollapse}
         >
-          {folder.name}
+          <IconChevron className={`folder-chevron${collapsed ? ' collapsed' : ''}`} />
+          <span class="folder-name-label">{folder.name}</span>
           <HostSuffix peer={folder.peer ?? localHostLabel.value} local={!folder.peer} />
-          {folder.missing && <span class="folder-missing-icon" title="Project missing on peer">?</span>}
+          {folder.missing && <span class="folder-missing-icon" title="Project missing on host — remove in Settings → Projects">?</span>}
           {folder.unresolved && (
             <span class="folder-unresolved-icon" title="Host not found — fix in Settings → Hosts">!</span>
           )}
-        </a>
+        </button>
+        {!folder.unresolved && !folder.missing && (
+          <>
+            {folder.launchCwd && <ProjectFilesButton folder={folder} onClick={onClick} />}
+            {codeHref && <VSCodeServerButton href={codeHref} workspacePath={workspacePath} />}
+          </>
+        )}
         {!folder.unresolved && (
           <LaunchButton
-            sessions={folder.sessions}
-            selectedId={selId}
-            fallbackCwd={folder.launchCwd ?? ''}
+            // Project-row "+" always launches in the project's canonical
+            // dir (the first match-rule path, carried by launchCwd), never
+            // a recently-used session's cwd. peer stays authoritative for
+            // references.
+            cwd={folder.launchCwd ?? ''}
             peer={folder.peer}
             className="folder-launch-btn"
+            footerAction={{ label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }}
           />
         )}
       </div>
-      <div class="folder-sessions">
-        {displayItems.map((s, i) => (
-          <SessionItem
-            key={s.id}
-            session={s}
-            href={sessionPath(folder.slug, s, folder.peer)}
-            selected={selId === s.id}
-            resuming={resumingId === s.id}
-            dotState={sessionDotState(s, am)}
-            unavailable={isSessionUnavailable(s, peerStatus)}
-            showHostMarker={mixedHosts}
-            dragging={drag !== null && s.id === visible[drag.from]?.id}
-            dropTarget={drag !== null && drag.over === i && drag.from !== i}
-            onClose={() => onCloseSession(s)}
-            onClick={onClick}
-            onDragStart={() => handleDragStart(i)}
-            onDragOver={() => handleDragOver(i)}
-            onDragEnd={() => handleDragEnd(visible)}
-          />
-        ))}
-      </div>
+      {(!collapsed || shown.length > 0) && (
+        <div class="folder-checkouts" aria-busy={inventory?.loading || undefined}>
+          {inventory?.error && (
+            <button
+              type="button"
+              class="checkout-inventory-error"
+              title={inventory.error}
+              onClick={() => void ensureProjectWorktrees(folder.slug, folder.peer, true)}
+            >Worktrees unavailable · Retry</button>
+          )}
+          {checkoutGroups.map(group => (
+            <CheckoutSection
+              key={group.key}
+              group={group}
+              folder={folder}
+              selectedId={selId}
+              resumingId={resumingId}
+              am={am}
+              peerStatus={peerStatus}
+            >
+              {group.sessions.map(s => {
+                const i = displayItems.indexOf(s)
+                const href = tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))
+                const activity = activityById.get(s.id)
+                const slot = slots.get(s.id)
+                const item = (
+                  <SessionItem
+                    key={s.id}
+                    session={s}
+                    href={href}
+                    selected={selId === s.id && !slot}
+                    resuming={resumingId === s.id}
+                    dotState={ownDotState(s, am, rawSelId)}
+                    unavailable={isSessionUnavailable(s, peerStatus)}
+                    showHostMarker={mixedHosts}
+                    dragging={drag !== null && s.id === visible[drag.from]?.id}
+                    dropTarget={drag !== null && drag.over === i && drag.from !== i}
+                    onClose={() => onCloseSession(s)}
+                    onClick={onClick}
+                    onDragStart={dragDisabled ? undefined : () => handleDragStart(i)}
+                    onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
+                    onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
+                  />
+                )
+                if (!slot && !activity) return item
+                return (
+                  <FamilyEntry
+                    key={s.id}
+                    selected={selId === s.id}
+                    rootId={s.id}
+                    rootHref={href}
+                    onDragOver={dragDisabled ? undefined : () => handleDragOver(i)}
+                    onDragEnd={dragDisabled ? undefined : () => handleDragEnd(visible)}
+                    slot={slot}
+                    slotHref={slot && sessionHref(slot.session)}
+                    slotTrail={slot && childTrailTitle(s, slot.ancestors, slot.session)}
+                    activity={activity}
+                    onClick={onClick}
+                  >{item}</FamilyEntry>
+                )
+              })}
+            </CheckoutSection>
+          ))}
+        </div>
+      )}
+      {worktreesOpen && <WorktreeSheet slug={folder.slug} peer={folder.peer} onClose={() => setWorktreesOpen(false)} />}
     </div>
+  )
+}
+
+/** Always-visible Projects/Activity switch: under the header on desktop,
+ *  above the logo/header row on touch layouts (see the coarse-pointer
+ *  rules on .sidebar-view-toggle). Two equal buttons rather than one
+ *  cycling control — a glance answers both where you are and what the
+ *  alternative is. The active fill is the sidebar's selected-row fill:
+ *  "you are here" in the language the rows below already speak. */
+function ViewToggle({ mode }: { mode: 'projects' | 'activity' }) {
+  return (
+    <div class="sidebar-view-toggle" role="group" aria-label="Sidebar view">
+      <button
+        class={`sidebar-view-btn${mode === 'projects' ? ' active' : ''}`}
+        aria-pressed={mode === 'projects'}
+        onClick={() => setSidebarMode('projects')}
+      >Projects</button>
+      <button
+        class={`sidebar-view-btn${mode === 'activity' ? ' active' : ''}`}
+        aria-pressed={mode === 'activity'}
+        onClick={() => setSidebarMode('activity')}
+      >Activity</button>
+    </div>
+  )
+}
+
+/** Compact popover behind the header's arrange icon. Two concerns,
+ *  two lifetimes:
+ *    Host  — narrows the tab to one host (`*@host` in ?filter=).
+ *    Alive only — hides resumable corpses; sessionStorage (per tab).
+ *  The Projects/Activity switch moved out to the always-visible
+ *  ViewToggle above. One entry point, instant switching — the list is
+ *  the preview. */
+function ViewMenu({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const selectors = activeSelectors.value
+  // The Host radio reflects a sole `*@host` selector; anything more
+  // exotic (project selectors, several hosts) lives in the chip row.
+  const hostSelectors = selectors.filter(s => s.project === '*')
+  const currentHost = hostSelectors.length === 1 ? hostSelectors[0].host : null
+  const alive = aliveOnly.value
+
+  const Option = ({ checked, label, onSelect }: {
+    checked: boolean; label: string; onSelect: () => void
+  }) => (
+    <button
+      class={`view-menu-option${checked ? ' active' : ''}`}
+      onClick={() => { onSelect(); onToggle() }}
+    >
+      <span class="view-menu-check">{checked ? '✓' : ''}</span>
+      {label}
+    </button>
+  )
+
+  // Host list: the viewer's own host first, then connected/known peers.
+  const localName = health.value?.hostname
+  const peerNames = peers.value.map(p => p.name)
+
+  return (
+    <div class="view-menu-anchor">
+      <button
+        class={`sidebar-settings-btn${open ? ' open' : ''}`}
+        onClick={onToggle}
+        aria-label="List options"
+        title="List options"
+        aria-expanded={open}
+      >
+        <IconArrange />
+      </button>
+      {open && (
+        // Transparent backdrop: a click anywhere outside the popover
+        // closes it (the sidebar-scroll onClick only covers the list).
+        <div class="view-menu-backdrop" onClick={onToggle} />
+      )}
+      {open && (
+        <div class="view-menu" role="menu">
+          <div class="view-menu-label">Host</div>
+          <Option checked={currentHost === null && hostSelectors.length === 0} label="All hosts" onSelect={() => setHostFilter(null)} />
+          {localName && (
+            <Option checked={currentHost === localName || currentHost === 'local'} label={localName} onSelect={() => setHostFilter(localName)} />
+          )}
+          {peerNames.map(name => (
+            <Option key={name} checked={currentHost === name} label={name} onSelect={() => setHostFilter(name)} />
+          ))}
+          <div class="view-menu-label">Show</div>
+          <Option checked={alive} label="Alive only" onSelect={() => setAliveOnly(!alive)} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Chip row: renders one removable chip per `?filter=` selector.
+ *  Occupies zero pixels when the tab isn't narrowed; when it is, the
+ *  narrowing is loud enough that nobody wonders where their sessions
+ *  went. */
+function FilterChips({ selectors }: { selectors: readonly Selector[] }) {
+  if (selectors.length === 0) return null
+  return (
+    <div class="sidebar-chips">
+      {selectors.map(sel => (
+        <span class="sidebar-chip" key={`${sel.project}@${sel.host}`}>
+          {selectorLabel(sel)}
+          <button
+            class="sidebar-chip-x"
+            onClick={() => removeSelector(sel)}
+            aria-label={`Remove filter ${selectorLabel(sel)}`}
+            title="Remove filter"
+          >×</button>
+        </span>
+      ))}
+    </div>
+  )
+}
+
+/** Activity view: the same sessions as the Projects view (folders),
+ *  grouped by activity instead of by project. Flat list — no folder
+ *  headers — with section labels (Waiting / Active / recency buckets /
+ *  Older) and per-row project context. */
+function ActivityList({
+  selId,
+  resumingId,
+  onCloseSession,
+  onClick,
+}: {
+  selId: string | null
+  resumingId: string | null
+  onCloseSession: (session: Session) => void
+  onClick?: () => void
+}) {
+  const buckets = sidebarActivity.value
+  const foldersVal = folders.value
+
+  const folderBySessionId = new Map<string, Folder>()
+  for (const f of foldersVal) {
+    for (const s of f.sessions) folderBySessionId.set(s.id, f)
+  }
+
+  // compact=false for today (two-line with age), true for older buckets
+  // (single-line project · title — the day heading carries the time).
+  const renderRow = (s: Session, compact: boolean) => {
+    const folder = folderBySessionId.get(s.id)
+    if (!folder) return null
+    return (
+      <SessionRow
+        key={s.id}
+        session={s}
+        href={tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))}
+        selected={selId === s.id}
+        resuming={resumingId === s.id}
+        compact={compact}
+        showProject
+        projectName={folder.name}
+        onClick={onClick}
+        onClose={() => onCloseSession(s)}
+      />
+    )
+  }
+
+  // Drop folderless sessions per bucket (the brief post-restart window
+  // where recovered sessions arrive unstamped) so a day heading never
+  // renders with no rows. partitionByDay never emits empty buckets.
+  const sections = buckets
+    .map(b => ({ label: b.label, sessions: b.sessions.filter(s => folderBySessionId.has(s.id)) }))
+    .filter(sec => sec.sessions.length > 0)
+
+  if (sections.length === 0) {
+    return (
+      <div class="sidebar-hint">
+        {activeSelectors.value.length > 0
+          ? 'No sessions match this filter.'
+          : 'No sessions yet.'}
+      </div>
+    )
+  }
+
+  return (
+    <>
+      {sections.map(sec => (
+        <div class="sidebar-activity-section" key={sec.label ?? 'today'}>
+          {sec.label !== null && <div class="sidebar-section-title">{sec.label}</div>}
+          {sec.sessions.map(s => renderRow(s, sec.label !== null))}
+        </div>
+      ))}
+    </>
   )
 }
 
@@ -328,10 +1037,14 @@ export function Sidebar({
   // Read signals; component re-renders only when these values change.
   const foldersVal = folders.value
   const projectsVal = projects.value
-  const selId = selectedId.value
-  const curKey = currentProjectKey.value
+  const selId = familySelectedId.value
   const am = activityMap.value
   const peerStatus = peerStatusByName.value
+  const mode = sidebarMode.value
+  const selectors = activeSelectors.value
+  const aliveOnlyVal = aliveOnly.value
+  const collapsedVal = collapsedFolders.value
+  const [menuOpen, setMenuOpen] = useState(false)
 
   // Waiting indicator on the logo: mirrors the mobile hamburger badge so
   // the always-visible brand mark doubles as a "a session elsewhere is
@@ -346,10 +1059,80 @@ export function Sidebar({
   const hasUnresolved = unresolvedHosts.value.length > 0
   const bgArrival = useArrivalPulse(waiting ? 'unread' : 'none', waitingCount)
 
-  const totalVisible = foldersVal.reduce(
-    (n, f) => n + f.sessions.filter(s => s.alive || s.resumable).length, 0,
-  )
+  // Mobile: when the off-canvas sidebar opens (or the selection changes
+  // while it's open), reveal the selected session instead of leaving the
+  // user at the top of the list. Scrolls only when the row is actually
+  // outside the viewport, and centers it so neighbors give context.
+  // Desktop is unaffected: there `open` never transitions to true.
+  //
+  // No retry/polling: the effect runs after commit, and the selected row
+  // is guaranteed present whenever this runs. `open` can only become true
+  // once data has loaded (the mobile open-trigger lives in surfaces that
+  // don't render until then); the selected session is pinned into the
+  // list past any `?filter=` (see store.ts sidebarSessions); and a
+  // collapsed folder still renders its selected row (see FolderGroup). So
+  // the row is in the DOM by the time this reads it.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const container = scrollRef.current
+    // Both row flavors: .session-item (projects view) and .session-row
+    // (activity view).
+    const el = container?.querySelector<HTMLElement>('.session-item.selected, .session-row.selected')
+    if (!container || !el) return
+    if (needsReveal(container.getBoundingClientRect(), el.getBoundingClientRect()))
+      el.scrollIntoView({ block: 'center' })
+    // Re-reveal when the selected row's placement can shift while the
+    // drawer stays open: selection change, Projects<->Activity switch,
+    // alive-only toggle, a filter edit, or a folder collapse/expand.
+  }, [open, selId, mode, aliveOnlyVal, selectors, collapsedVal])
+
+  // The view menu shouldn't outlive the sidebar on mobile.
+  useEffect(() => { if (!open) setMenuOpen(false) }, [open])
+
+  // Scroll-to-top pill (Activity view only): show once you're a decent
+  // way into the *content*, so the top items are one tap away without a
+  // long scroll back. Measured relative to the first section rather than
+  // a fixed scrollTop, because the top thumb gap is itself hundreds of px
+  // on tall phones — a fixed threshold would fire while still scrolling
+  // through the blank gap.
+  const [scrolledDown, setScrolledDown] = useState(false)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    // Projects view has no scroll-to-top button, so don't track scroll
+    // there (avoids a querySelector-miss on every wheel tick and stale
+    // state nothing renders).
+    if (mode !== 'activity') { setScrolledDown(false); return }
+    // Selecting Activity jumps back to the top (the most-recent items).
+    // This deliberately runs after the reveal effect above (declared
+    // first, so it fires first on a mode change), overriding its
+    // scroll-selected-into-view for the view switch — within Activity a
+    // later selId change still reveals normally.
+    el.scrollTop = 0
+    const onScroll = () => {
+      const first = el.querySelector('.sidebar-activity-section')
+      setScrolledDown(
+        first
+          ? first.getBoundingClientRect().top < el.getBoundingClientRect().top - 240
+          : el.scrollTop > 240,
+      )
+    }
+    onScroll()
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [mode])
+
+  // folder.sessions is already the shown set (see store.ts
+  // sidebarSessions), so this is just the visible session count.
+  const totalVisible = foldersVal.reduce((n, f) => n + f.sessions.length, 0)
   const connected = connState.value === 'connected'
+  const streamWarnings = sessionStreamWarnings.value
+  const localOmittedCount = sessionStreamOmittedTotal.value
+  const peerOmissions = peerStreamOmissions.value
+  const omittedSessionCount = localOmittedCount + peerOmittedTotal.value
+  const detailedOmittedCount = streamWarnings.reduce((sum, warning) => sum + warning.count, 0)
+  const suppressedOmittedCount = Math.max(0, localOmittedCount - detailedOmittedCount)
   const hasProjects = projectsVal.length > 0
   const isOnlyHomeProject = projectsVal.length === 1
     && projectsVal[0].slug === 'home'
@@ -368,9 +1151,18 @@ export function Sidebar({
         <div class="sidebar-header">
           <a
             class={`sidebar-logo${waiting ? ' bg-waiting' : ''}${bgArrival ? ` bg-${bgArrival}` : ''}`}
-            href="/"
+            href={tabHref('/')}
             onClick={onClose}
           >gmux</a>
+          <ViewMenu open={menuOpen} onToggle={() => setMenuOpen(v => !v)} />
+          <button
+            class="sidebar-refresh-btn"
+            onClick={() => location.reload()}
+            aria-label="Refresh app"
+            title="Refresh app"
+          >
+            <IconRefresh />
+          </button>
           <button
             class="sidebar-settings-btn"
             onClick={onOpenSettings}
@@ -381,16 +1173,58 @@ export function Sidebar({
             {hasUnresolved && <span class="settings-attention-pip" aria-hidden="true" />}
           </button>
         </div>
-        <div class="sidebar-scroll">
-          {foldersVal.map(f => (
+        <ViewToggle mode={mode} />
+        <FilterChips selectors={selectors} />
+        <div class="sidebar-scroll" ref={scrollRef} onClick={() => menuOpen && setMenuOpen(false)}>
+          {/* Every row lives on one opaque slab so the scrollport's own
+            * background can act as a fixed backdrop behind it (see the
+            * cavity in styles.css). Purely presentational. */}
+          <div class="sidebar-list">
+          {omittedSessionCount > 0 && (
+            <div
+              class="sidebar-stream-warning"
+              role="status"
+              title={[
+                ...streamWarnings.map(w => `${w.id}: ${w.message || w.code}`),
+                ...(suppressedOmittedCount > 0 ? [`${suppressedOmittedCount} additional omitted sessions`] : []),
+                ...peerOmissions.map(o => `${o.peer}: ${o.count} ${o.count === 1 ? 'session' : 'sessions'} omitted upstream`),
+              ].join('\n')}
+            >
+              ⚠ {omittedSessionCount} {omittedSessionCount === 1 ? 'session is' : 'sessions are'} omitted from the live list
+            </div>
+          )}
+          {mode === 'projects' && selectors.length > 0
+            && foldersVal.every(f => f.sessions.length === 0
+              && !folderMatchesFilter(f, selectors, health.value?.hostname)) && (
+            // A bookmarked filter that matches nothing must say so —
+            // silently falling back to everything would make the URL lie.
+            <div class="sidebar-hint">No sessions match this filter.</div>
+          )}
+          {mode === 'activity' ? (
+
+            <ActivityList
+              selId={selId}
+              resumingId={resumingId}
+              onCloseSession={onCloseSession}
+              onClick={onClose}
+            />
+          ) : foldersVal
+            // A narrowed tab hides folders outside its scope entirely
+            // (an empty header would be noise, not context) — but keeps
+            // in-scope folders even when empty, so a pinned project tab
+            // retains its launch target. Without a filter, all folders
+            // render as before.
+            .filter(f => f.sessions.length > 0
+              || folderMatchesFilter(f, selectors, health.value?.hostname))
+            .map(f => (
             <FolderGroup
               key={f.key}
               folder={f}
               selId={selId}
-              currentKey={curKey}
               resumingId={resumingId}
               am={am}
               peerStatus={peerStatus}
+              aliveOnly={aliveOnlyVal}
               onCloseSession={onCloseSession}
               onClick={onClose}
             />
@@ -416,7 +1250,19 @@ export function Sidebar({
               </button> to organize sessions by repo.
             </div>
           )}
+          </div>
         </div>
+        {mode === 'activity' && scrolledDown && (
+          <button
+            type="button"
+            class="scroll-top-btn"
+            aria-label="Scroll to top"
+            title="Scroll to top"
+            onClick={() => { if (scrollRef.current) scrollRef.current.scrollTop = 0 }}
+          >
+            Top ↑
+          </button>
+        )}
       </aside>
     </>
   )

@@ -32,7 +32,16 @@ cli/gmux/gmux
 *.local.*
 test-results/
 tests/pi-adapter/pi-adapter
-gmux gmuxd
+/gmux
+/gmuxd
 
 # Agent handoff/scratch docs
 .memory/
+
+# Pi local/runtime state
+.pi/settings.json
+.pi/subagent-runs/
+.pi/subagent-results/
+.pi/tmp/
+.pi/worktrees/
+.pi/worktree-runs/

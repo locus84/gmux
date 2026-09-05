@@ -15,7 +15,15 @@ Variables that affect the daemon.
 | `GMUXD_TOKEN` | Seed the auth token file on first start. | *(none)* |
 | `XDG_CONFIG_HOME` | Base directory for config files. | `~/.config` |
 | `XDG_STATE_HOME` | Base directory for runtime state (socket, auth token). | `~/.local/state` |
+| `GMUXD_TS_HOSTNAME` | Seed the requested Tailscale node name at *first* registration (advanced/multi-instance setups); ignored once registered. | `gmux-<hostname>` |
 | `GMUXD_DEV_PROXY` | Proxy frontend requests to a Vite dev server (development only). | *(none)* |
+| `GMUXD_WEB_DIR` | Serve built frontend assets from a directory instead of the embedded build. Overrides `web_dir`. | *(embedded)* |
+
+### External frontend assets
+
+Set `GMUXD_WEB_DIR` to test or deploy a web build without replacing the daemon binary. The directory must contain `index.html`. `GMUXD_DEV_PROXY` takes precedence when both are set.
+
+For a persistent local install, prefer the `web_dir` field in [`host.toml`](/reference/host-toml/) and update it with `./scripts/install-web.sh`.
 
 ### Bind address
 
@@ -69,8 +77,9 @@ Variables that affect the session runner.
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `GMUX_ADAPTER` | Force a specific adapter instead of auto-detection. | *(auto)* |
-| `GMUX_SOCKET_DIR` | Directory for per-session Unix sockets. | `/tmp/gmux-sessions` |
-| `GMUX_NO_AGENT_HOOK` | Disable injecting the gmux agent extension/hook (e.g. the pi extension). An escape hatch if an agent release breaks the extension: the agent runs unmodified, and gmux loses hook-driven title/status/attribution for it. Any value other than `0`/empty disables. Read by the runner, so it covers foreground and `-d` launches; for daemon-initiated launches set it in the daemon's environment. | *(unset)* |
+| `GMUX_SOCKET_DIR` | Directory for per-session Unix sockets. | `~/.local/state/gmux/run/sessions` |
+| `GMUX_EDIT_FALLBACK` | Editor command for `gmux edit` (may include flags, e.g. `vim -u NONE`). Without it, the first of `nano`, `vim`, `vi` on PATH is used. | *(unset)* |
+| `GMUX_NO_AGENT_HOOK` | Disable injecting the gmux agent extension/hook (the pi extension, or the claude/codex command hooks). An escape hatch if an agent release breaks the extension: the agent runs unmodified, and gmux loses hook-driven title/status/attribution for it. Any value other than `0`/empty disables. Read by the runner, so it covers foreground and `-d` launches; for daemon-initiated launches set it in the daemon's environment. | *(unset)* |
 
 ## Set by gmux in child processes
 
@@ -79,17 +88,17 @@ These are available inside every session launched by `gmux`. Use them to detect 
 | Variable | Purpose | Example |
 |----------|---------|---------|
 | `GMUX` | Always `1` inside a gmux session. Used for nested-session detection. | `1` |
-| `GMUX_SOCKET` | Unix socket path for callbacks to the session runner. | `/tmp/gmux-sessions/sess-abc123.sock` |
-| `GMUX_SESSION_ID` | Unique session identifier. | `sess-abc123` |
+| `GMUX_SOCKET` | Unix socket path for callbacks to the session runner. | `~/.local/state/gmux/run/sessions/16y0lfv7.sock` |
+| `GMUX_SESSION_ID` | Unique session identifier. | `16y0lfv7` |
 | `GMUX_ADAPTER` | Name of the matched adapter. | `pi`, `shell` |
-| `GMUX_RUNNER_VERSION` | Version of the gmux runner hosting the session. | `0.4.0` |
-| `GMUX_SESSION_SOCK` | Socket the agent extension/hook posts session + turn events to. Set only for adapters that ship a hook (pi); absent if `GMUX_NO_AGENT_HOOK` is set. | `/tmp/gmux-sessions/sess-abc123.sock` |
+| `GMUX_SESSION_SOCK` | Socket the agent extension/hook posts session + turn events to (same socket as `GMUX_SOCKET`; a separate variable so hooks stay decoupled from the general child API). Set only for adapters that ship a hook (pi, claude, codex); absent if `GMUX_NO_AGENT_HOOK` is set. | `~/.local/state/gmux/run/sessions/16y0lfv7.sock` |
+| `EDITOR`, `VISUAL` | Defaulted to `<gmux> edit` so agents/git open files as managed editor tabs. Only set when your dotfiles don't set them. | `/usr/local/bin/gmux edit` |
 
 See [Adapter Architecture](/develop/adapter-architecture) for how to use the child-to-runner API.
 
 ## How a session's environment is sourced
 
-When the daemon starts, resumes, or **restarts** a session (the launch buttons in the UI), it sources a fresh environment from an interactive login shell — roughly `$SHELL -l -i` run in the session's working directory — and hands that to the session. This means edits to your `~/.zshrc` / `~/.bashrc` / `~/.profile` (and per-directory hooks like `direnv`) take effect on the next launch or restart, **without** needing a `gmux daemon restart`. Clicking **Restart session** behaves like opening a fresh terminal.
+When the daemon starts, resumes, or **restarts** a session (the launch buttons in the UI), it sources a fresh environment from an interactive login shell — the probe is `$SHELL -l -i -c 'gmux __dump-env'` run in the session's working directory — and hands that to the session. This means edits to your `~/.zshrc` / `~/.bashrc` / `~/.profile` (and per-directory hooks like `direnv`) take effect on the next launch or restart, **without** needing a `gmux daemon restart`. Clicking **Restart session** behaves like opening a fresh terminal.
 
 The captured environment is merged onto the daemon's own environment, so session/desktop variables that your dotfiles never set — `DISPLAY`, `SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, and similar — are preserved. (One consequence of the merge: a variable you *remove* from your dotfiles may linger until the daemon itself is restarted.)
 

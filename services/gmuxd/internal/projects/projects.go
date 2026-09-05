@@ -18,14 +18,14 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/gmuxapp/gmux/packages/paths"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/projectmatch"
 )
 
 const fileName = "projects.json"
 
 // currentVersion is the latest projects.json schema version.
 // See migrateState for the evolution history.
-const currentVersion = 3
+const currentVersion = 4
 
 // MatchRule is a single criterion for matching sessions to a project.
 // Exactly one of Path or Remote should be set.
@@ -47,7 +47,7 @@ type MatchRule struct {
 //
 //   - Owned: Slug + Match[] + Sessions[]. This is a project owned by
 //     this host. Match drives session attribution; Sessions[] holds
-//     the ordered list of session keys for sidebar order.
+//     the ordered list of session IDs for sidebar order.
 //   - Reference: Slug + Peer. This is a viewer-side reference to a
 //     project owned by a peer. Match and Sessions are unused: the
 //     peer's projects.json is the source of truth for both. The viewer
@@ -56,15 +56,17 @@ type MatchRule struct {
 //
 // Validate enforces exactly one of {Match present, Peer present}.
 type Item struct {
-	Slug     string      `json:"slug"`
-	Peer     string      `json:"peer,omitempty"`
-	Match    []MatchRule `json:"match,omitempty"`
-	Sessions []string    `json:"sessions,omitempty"`
-	// NodeID anchors a reference on the peer's stable opaque identity
-	// (ADR 0007) so it survives the peer being renamed: the viewer
-	// resolves the reference by NodeID first, falling back to Peer
-	// (the display name). Set only on references; opportunistically
-	// backfilled once the referenced peer is reachable (refs #270).
+	Slug  string      `json:"slug"`
+	Peer  string      `json:"peer,omitempty"`
+	Match []MatchRule `json:"match,omitempty"`
+	// Sessions holds ordered session IDs only (v4). Hand-edited slug keys are
+	// unsupported; legacy slug keys are converted once during v3 → v4 Load.
+	Sessions []string `json:"sessions,omitempty"`
+	// NodeID is the referenced peer's stable opaque identity (ADR 0007).
+	// Peer (the display name) is the runtime key; NodeID is only the
+	// viewer's liveness anchor (ADR 0017): it keeps a reference matching
+	// the right host across re-adds and stops a reused name from matching
+	// the wrong one. Set only on references; stamped at creation.
 	NodeID string `json:"node_id,omitempty"`
 }
 
@@ -83,8 +85,6 @@ type State struct {
 
 // Load reads the project state from stateDir/projects.json.
 // Returns an empty state if the file doesn't exist.
-// Older schema versions are migrated in memory; the migrated form is
-// written back on the next Save.
 func Load(stateDir string) (*State, error) {
 	path := filepath.Join(stateDir, fileName)
 	data, err := os.ReadFile(path)
@@ -95,37 +95,41 @@ func Load(stateDir string) (*State, error) {
 		return nil, fmt.Errorf("projects: reading %s: %w", path, err)
 	}
 
-	// Before a real schema upgrade rewrites the file, snapshot the
-	// pre-migration bytes to projects.json.bak so the change is
-	// recoverable (notably across the 2.0 upgrade). Best-effort.
-	if onDiskVersion(data) < currentVersion {
-		backupFile(path, data)
-	}
-
-	// Run migrations on the raw JSON before unmarshaling into the
-	// current struct layout. This keeps each migration self-contained
-	// and independent of the Go types.
-	data, err = migrateState(data)
-	if err != nil {
-		return nil, fmt.Errorf("projects: migrating %s: %w", path, err)
-	}
-
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("projects: parsing %s: %w", path, err)
 	}
+
+	// Drop invalid items (e.g. a hand-edited "match": null) instead of
+	// letting them poison the whole state: Manager.Update validates the
+	// full state before every save, so one bad on-disk entry would make
+	// every future mutation fail.
+	if dropped := s.sanitize(); len(dropped) > 0 {
+		backupFile(path, data)
+		for _, err := range dropped {
+			log.Printf("projects: dropping invalid item in %s: %v", path, err)
+		}
+	}
 	return &s, nil
 }
 
-// onDiskVersion peeks at the schema version of a raw projects.json
-// document. A missing or invalid version field is the original
-// pre-version format (0).
-func onDiskVersion(data []byte) int {
-	var doc struct {
-		Version int `json:"version"`
+// sanitize removes items that fail validation, keeping the rest in
+// order. Each item is checked against the already-accepted prefix, so
+// cross-item rules (duplicate slugs, duplicate paths) resolve
+// first-wins. Returns one error per dropped item.
+func (s *State) sanitize() []error {
+	valid := State{Version: s.Version}
+	var dropped []error
+	for _, item := range s.Items {
+		candidate := State{Version: s.Version, Items: append(append([]Item{}, valid.Items...), item)}
+		if err := candidate.Validate(); err != nil {
+			dropped = append(dropped, fmt.Errorf("item %q: %w", item.Slug, err))
+			continue
+		}
+		valid.Items = candidate.Items
 	}
-	_ = json.Unmarshal(data, &doc)
-	return doc.Version
+	s.Items = valid.Items
+	return dropped
 }
 
 // backupFile writes the pre-migration bytes to path+".bak" (0600),
@@ -268,70 +272,23 @@ type MatchParams struct {
 // Among all matching projects, the one with the longest matching path
 // wins. If no path rule matches, the first remote-matched project wins.
 func (s *State) Match(p MatchParams) *Item {
-	normCwd := NormalizePath(p.Cwd)
-	normWS := NormalizePath(p.WorkspaceRoot)
-
-	var bestPath *Item
-	bestPathLen := 0
-	var firstRemote *Item
-
-	for i := range s.Items {
-		item := &s.Items[i]
-		// Skip reference items: their content is driven by peer
-		// stamps, not local rules. Match() returns owned projects
-		// only.
-		if item.IsReference() {
-			continue
-		}
-		for _, rule := range item.Match {
-			if rule.Remote != "" {
-				normRemote := NormalizeRemote(rule.Remote)
-				for _, url := range p.Remotes {
-					if NormalizeRemote(url) == normRemote {
-						if firstRemote == nil {
-							firstRemote = item
-						}
-						break
-					}
-				}
-			}
-
-			if rule.Path != "" {
-				norm := NormalizePath(rule.Path)
-				if norm == "" {
-					continue
-				}
-				var matched bool
-				if rule.Exact {
-					matched = normCwd == norm || normWS == norm
-				} else {
-					matched = pathUnder(normCwd, norm) || pathUnder(normWS, norm)
-				}
-				if matched && len(norm) > bestPathLen {
-					bestPathLen = len(norm)
-					bestPath = item
-				}
+	entries := make([]projectmatch.Entry, len(s.Items))
+	for i, item := range s.Items {
+		entries[i].Reference = item.IsReference()
+		entries[i].Rules = make([]projectmatch.Rule, len(item.Match))
+		for j, rule := range item.Match {
+			entries[i].Rules[j] = projectmatch.Rule{
+				Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact,
 			}
 		}
 	}
-
-	// Path match is more specific; prefer it when available.
-	if bestPath != nil {
-		return bestPath
+	index, ok := projectmatch.Match(entries, projectmatch.Inputs{
+		CWD: p.Cwd, WorkspaceRoot: p.WorkspaceRoot, Remotes: p.Remotes,
+	})
+	if !ok {
+		return nil
 	}
-	return firstRemote
-}
-
-// pathUnder returns true if candidate is equal to or a subdirectory of base.
-// Both must be cleaned paths (no trailing slashes except root).
-func pathUnder(candidate, base string) bool {
-	if candidate == "" || base == "" {
-		return false
-	}
-	if candidate == base {
-		return true
-	}
-	return strings.HasPrefix(candidate, base+"/")
+	return &s.Items[index]
 }
 
 // --- Path normalization ---
@@ -339,9 +296,8 @@ func pathUnder(candidate, base string) bool {
 // NormalizePath expands a stored path to an absolute form for comparison.
 // Expands ~ prefix to $HOME and calls filepath.Clean.
 func NormalizePath(p string) string {
-	return paths.NormalizePath(p)
+	return projectmatch.NormalizePath(p)
 }
-
 
 // --- Remote normalization ---
 
@@ -355,23 +311,7 @@ func NormalizePath(p string) string {
 //	git@github.com:org/repo.git      -> github.com/org/repo
 //	ssh://git@github.com/org/repo    -> github.com/org/repo
 func NormalizeRemote(url string) string {
-	// Strip protocol prefix.
-	for _, prefix := range []string{"https://", "http://", "ssh://", "git://"} {
-		url = strings.TrimPrefix(url, prefix)
-	}
-	// Strip user@ prefix (e.g. "git@github.com:..." -> "github.com:...").
-	if at := strings.Index(url, "@"); at >= 0 {
-		url = url[at+1:]
-	}
-	// Convert SCP-style colon to slash (github.com:org/repo -> github.com/org/repo).
-	// Only if there's no slash before the colon (avoids mangling port numbers in URLs
-	// that already had their protocol stripped, like "host:8080/repo").
-	if colon := strings.Index(url, ":"); colon > 0 && !strings.Contains(url[:colon], "/") {
-		url = url[:colon] + "/" + url[colon+1:]
-	}
-	url = strings.TrimSuffix(url, ".git")
-	url = strings.TrimRight(url, "/")
-	return url
+	return projectmatch.NormalizeRemote(url)
 }
 
 // --- Slug helpers ---
@@ -538,15 +478,11 @@ type Assignment struct {
 	Index int
 }
 
-// AssignmentsByKey returns a flat map from session key to the
-// project Assignment claiming it. Pure derivation from State; the
-// caller is expected to use the result to stamp sessions (see
-// store.Store.Reconcile).
-//
-// First occurrence wins on duplicate keys: a key appearing in two
-// items would point at the first item's Assignment. This shouldn't
-// happen because dismiss/auto-assign keep entries unique, but the
-// behaviour is at least defined.
+// AssignmentsByKey returns a flat map from session ID to the project
+// Assignment claiming it. Pure derivation from State; the caller is expected
+// to use the result to stamp sessions (see store.Store.Reconcile). IDs are
+// unique by construction because auto-assignment never adds an ID already
+// present in a project.
 func (s *State) AssignmentsByKey() map[string]Assignment {
 	out := make(map[string]Assignment)
 	for _, item := range s.Items {
@@ -573,16 +509,6 @@ func (s *State) FindSessionProject(key string) string {
 	return ""
 }
 
-// SessionKey returns the key used to identify a session in project arrays.
-// Uses Slug if available (stable across restarts), falls back to
-// session ID (ephemeral, for sessions without attribution).
-func SessionKey(id, slug string) string {
-	if slug != "" {
-		return slug
-	}
-	return id
-}
-
 // --- Discovery (offered projects) ---
 
 // SessionInfo contains the session fields needed for matching and discovery.
@@ -599,9 +525,8 @@ type SessionInfo struct {
 	LocalHost bool
 	Alive     bool
 	Resumable bool // dead but has a resume command persisted
-	Slug      string
 	// LastActive is an RFC3339 timestamp of the session's most recent
-	// noteworthy activity (last_activity_at, falling back to
+	// noteworthy activity (last_output_at, falling back to
 	// created_at). Used to sort discovered suggestions by recency so a
 	// peer-advertised discovered row sorts consistently against the
 	// viewer's own local discovery.
@@ -640,7 +565,7 @@ func (s *State) UnmatchedActiveCount(sessions []SessionInfo) int {
 		if !sess.Alive {
 			continue
 		}
-		key := SessionKey(sess.ID, sess.Slug)
+		key := sess.ID
 		if s.FindSessionProject(key) != "" {
 			continue
 		}

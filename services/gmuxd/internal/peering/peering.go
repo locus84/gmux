@@ -30,8 +30,9 @@ import (
 type PeerOption func(*Peer)
 
 // WithTransport sets a custom HTTP transport for all peer connections.
-// Used for tailscale-discovered peers that route through tsnet. The
-// transport is stored and applied when newPeer constructs the
+// The hub passes a shared tsauth.RoutedTransport so same-tailnet
+// MagicDNS peers route through the embedded tsnet once it is ready.
+// The transport is stored and applied when newPeer constructs the
 // underlying apiclient.Client.
 func WithTransport(rt http.RoundTripper) PeerOption {
 	return func(p *Peer) {
@@ -103,7 +104,7 @@ type SpokeProject struct {
 
 // SpokeDiscovered is the hub's verbatim copy of a single entry from a
 // spoke's authoritative `discovered` list (GET /v1/projects). Discovery
-// is host-authoritative (ADR 0002/0005): only the owning host runs its
+// is host-authoritative (ADR 0002/0025): only the owning host runs its
 // own match rules over its own sessions, so the hub re-broadcasts the
 // spoke's self-advertised discovered rows under
 // peer_discovered[<peerName>][] rather than recomputing them blind.
@@ -125,6 +126,15 @@ type PeerInfo struct {
 	Status          string        `json:"status"`
 	SessionCount    int           `json:"session_count"`
 	LastError       string        `json:"last_error,omitempty"`
+	// SessionsOmitted is the number of session rows the peer's last committed
+	// protocol-3 transaction quarantined at the sender (e.g. row_too_large,
+	// transaction_limit). Non-zero means this peer's sessions in the merged
+	// projection are knowingly incomplete. SessionsOmittedCodes is a bounded
+	// per-code breakdown; counts are exact even past the per-row diagnostic
+	// detail cap. Older daemons never set these fields; older browsers ignore
+	// them.
+	SessionsOmitted      int            `json:"sessions_omitted,omitempty"`
+	SessionsOmittedCodes map[string]int `json:"sessions_omitted_codes,omitempty"`
 	Version         string        `json:"version,omitempty"`
 	DefaultLauncher string        `json:"default_launcher,omitempty"`
 	Launchers       []LauncherDef `json:"launchers,omitempty"`
@@ -137,7 +147,7 @@ type PeerInfo struct {
 	Local bool `json:"local,omitempty"`
 	// Source records how the peer was added: "tailscale" (auto-discovered
 	// on the tailnet), "devcontainer" (auto-discovered Docker container),
-	// or "manual" (peers.json / POST /v1/peers). Used by the UI to group
+	// or "manual" (state.db / POST /v1/peers). Used by the UI to group
 	// hosts; empty for the synthesized self row.
 	Source string `json:"source,omitempty"`
 	// NodeID is the peer's stable opaque identity (ADR 0007), reported

@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -58,9 +59,9 @@ const httpActionTimeout = 10 * time.Second
 // Client is an authenticated HTTP + WebSocket client pointed at one
 // gmuxd instance (the "spoke" from the hub's perspective).
 type Client struct {
-	baseURL          string
-	token            string
-	transport        http.RoundTripper
+	baseURL           string
+	token             string
+	transport         http.RoundTripper
 	streamIdleTimeout time.Duration
 
 	// httpClient is a long-lived client with no Timeout so SSE
@@ -108,6 +109,26 @@ func New(baseURL string, opts ...Option) *Client {
 // BaseURL returns the base URL this client was constructed with.
 func (c *Client) BaseURL() string { return c.baseURL }
 
+// Get issues an authenticated GET against a relative API path. The caller
+// owns and must close the returned response body. It is used by peer-aware
+// read-only endpoints whose response should stream through the hub unchanged.
+func (c *Client) Get(ctx context.Context, path, rawQuery string) (*http.Response, error) {
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("apiclient Get: path must be absolute")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("apiclient Get: %w", err)
+	}
+	req.URL.RawQuery = rawQuery
+	c.setAuth(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("apiclient Get: %w", err)
+	}
+	return resp, nil
+}
+
 // setAuth adds the bearer token to a request if one is configured.
 func (c *Client) setAuth(req *http.Request) {
 	if c.token != "" {
@@ -127,9 +148,12 @@ func (c *Client) Events() *sseclient.Client {
 		opts = append(opts, sseclient.WithIdleTimeout(c.streamIdleTimeout))
 	}
 	// `?as=peer` instructs the spoke to filter to owned sessions and
-	// suppress snapshot.world (ADR 0001). The hub composes its own
-	// world view from local state and union of peer feeds.
-	return sseclient.New(c.baseURL+"/v1/events?as=peer", opts...)
+	// suppress snapshot.world (ADR 0001). session_stream=3 explicitly opts
+	// into bounded begin/batch/ready framing. Old daemons ignore the unknown
+	// parameter and continue sending snapshot.sessions, which this client
+	// still accepts; new daemons use the absence of the marker to serve old
+	// peers their legacy fallback.
+	return sseclient.New(c.baseURL+"/v1/events?as=peer&session_stream=3", opts...)
 }
 
 // GetHealth fetches GET /v1/health and returns the Data field of the
@@ -238,6 +262,9 @@ func (c *Client) ForwardAction(w http.ResponseWriter, r *http.Request, sessionID
 // project-management writes (and other host-scoped state) to the
 // session's owning host (ADR 0002).
 func (c *Client) ForwardPath(w http.ResponseWriter, r *http.Request, path string) {
+	if raw := r.URL.RawQuery; raw != "" {
+		path += "?" + raw
+	}
 	c.proxyHTTP(w, r, path)
 }
 
@@ -314,7 +341,7 @@ func (c *Client) proxyHTTP(w http.ResponseWriter, r *http.Request, path string) 
 // DialWS opens a WebSocket connection to the spoke's /ws/{sessionID}
 // endpoint, injecting bearer auth and honoring the client's transport.
 // The caller owns the returned connection and must close it.
-func (c *Client) DialWS(ctx context.Context, sessionID string) (*websocket.Conn, error) {
+func (c *Client) DialWS(ctx context.Context, sessionID string, browser ...bool) (*websocket.Conn, error) {
 	base := strings.TrimRight(c.baseURL, "/")
 	switch {
 	case strings.HasPrefix(base, "https://"):
@@ -323,6 +350,9 @@ func (c *Client) DialWS(ctx context.Context, sessionID string) (*websocket.Conn,
 		base = "ws://" + base[len("http://"):]
 	}
 	spokeURL := fmt.Sprintf("%s/ws/%s", base, sessionID)
+	if len(browser) > 0 && browser[0] {
+		spokeURL += "?client=browser"
+	}
 
 	dialOpts := &websocket.DialOptions{}
 	if c.token != "" {
@@ -364,6 +394,9 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 	// the storm returns the moment you view a peer's session on mobile.
 	// The hub->spoke hop (DialWS) is uncompressed too. Revisit #242's
 	// bandwidth goal another way (e.g. bounding replay size) if needed.
+	//
+	// InsecureSkipVerify: Origin enforcement for cookie-authed upgrades
+	// happens upstream in netauth.Middleware on the hub.
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
 	})
@@ -372,7 +405,11 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 		return
 	}
 
-	spokeConn, err := c.DialWS(r.Context(), sessionID)
+	// Only propagate the one browser capability understood by the spoke.
+	// Never forward arbitrary hub query parameters across the authenticated
+	// peer boundary.
+	browserAttach := browserAttachQuery(r.URL.Query())
+	spokeConn, err := c.DialWS(r.Context(), sessionID, browserAttach)
 	if err != nil {
 		log.Printf("apiclient ProxyWS: dial %s: %v", sessionID, err)
 		clientConn.Close(websocket.StatusInternalError, "peer unavailable")
@@ -385,6 +422,14 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 	spokeConn.SetReadLimit(wsSpokeReadLimit)
 
 	c.pipeWS(r.Context(), clientConn, spokeConn, sessionID)
+}
+
+// browserAttachQuery is deliberately strict: client=browser is a capability
+// marker, not a general query proxy. Reject duplicate values and every other
+// key so routing/auth parameters cannot cross the authenticated peer hop.
+func browserAttachQuery(q url.Values) bool {
+	values, ok := q["client"]
+	return ok && len(q) == 1 && len(values) == 1 && values[0] == "browser"
 }
 
 // pipeWS runs the bidirectional copy loop between an already-accepted

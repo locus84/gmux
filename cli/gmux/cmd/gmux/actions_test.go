@@ -1,22 +1,72 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
+	"net/http"
+	"sort"
 	"strings"
 	"testing"
 )
 
-// TestMatchSession covers the reference-resolution rules the CLI
-// documents: short form (as shown by --list), full ID, slug, and
-// unique prefixes of any of those. These cases double as the
-// compatibility contract between --list's output and the other
-// management flags — if --list prints "abcd1234", `--kill abcd1234`
-// must resolve it.
+func TestCmdDismissUsesLeafScopeUnlessTreeConfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantQuery string
+		tree            bool
+	}{
+		{name: "leaf", wantQuery: "leaf=1"},
+		{name: "tree", tree: true, wantQuery: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Alive: false}})
+			d.on(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+			})
+			if code := cmdDismiss("1va8lvdv", tc.tree); code != 0 {
+				t.Fatalf("cmdDismiss exit=%d", code)
+			}
+			request := d.lastRequest(t)
+			if request.path != "/v1/sessions/1va8lvdv/dismiss" || request.query != tc.wantQuery {
+				t.Fatalf("request=%+v", request)
+			}
+		})
+	}
+}
+
+func TestCmdDismissRefusesUnverifiableRemoteLeafScope(t *testing.T) {
+	d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Peer: "laptop", Alive: false}})
+	code := 0
+	stderr := captureStderr(t, func() { code = cmdDismiss("1va8lvdv@laptop", false) })
+	if code == 0 || !strings.Contains(stderr, "--tree") {
+		t.Fatalf("cmdDismiss: exit=%d stderr=%q", code, stderr)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.requests) != 0 {
+		t.Fatalf("remote leaf refusal sent requests: %+v", d.requests)
+	}
+}
+
+func TestCmdDismissExplainsDescendantOptIn(t *testing.T) {
+	d := startStubDaemon(t, []cliSession{{ID: "1va8lvdv", Alive: false}})
+	d.on(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"has_children","message":"session has 2 descendants"}}`))
+	})
+	code := 0
+	stderr := captureStderr(t, func() { code = cmdDismiss("1va8lvdv", false) })
+	if code == 0 || !strings.Contains(stderr, "--tree") {
+		t.Fatalf("cmdDismiss: exit=%d stderr=%q", code, stderr)
+	}
+}
+
+// TestMatchSession covers the liberal reference grammar: full ID, slug, and
+// unique prefixes of either. The full ID printed by `gmux ls` must resolve.
 func TestMatchSession(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234", Slug: "fix-auth"},
-		{ID: "sess-abcd5678", Slug: "fix-bug"},
-		{ID: "sess-ef019283", Slug: "build-docs"},
+		{ID: "1va8lvdv", Slug: "fix-auth"},
+		{ID: "14zknoqk", Slug: "fix-bug"},
+		{ID: "1lp4cge2", Slug: "build-docs"},
 	}
 
 	cases := []struct {
@@ -24,12 +74,10 @@ func TestMatchSession(t *testing.T) {
 		ref    string
 		wantID string
 	}{
-		{"full id", "sess-abcd1234", "sess-abcd1234"},
-		{"short form as shown by --list", "abcd1234", "sess-abcd1234"},
-		{"exact slug", "fix-auth", "sess-abcd1234"},
-		{"unique short-form prefix", "ef01", "sess-ef019283"},
-		{"unique slug prefix", "build", "sess-ef019283"},
-		{"unique full-id prefix", "sess-ef", "sess-ef019283"},
+		{"full id", "1va8lvdv", "1va8lvdv"},
+		{"exact slug", "fix-auth", "1va8lvdv"},
+		{"unique id prefix", "1lp4", "1lp4cge2"},
+		{"unique slug prefix", "build", "1lp4cge2"},
 	}
 
 	for _, tc := range cases {
@@ -51,35 +99,33 @@ func TestMatchSession(t *testing.T) {
 // message.
 func TestMatchSessionAmbiguous(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234", Slug: "fix-auth"},
-		{ID: "sess-abcd5678", Slug: "fix-bug"},
+		{ID: "1va8lvdv", Slug: "fix-auth"},
+		{ID: "14zknoqk", Slug: "fix-bug"},
 	}
-	_, err := matchSession(sessions, "abcd")
+	_, err := matchSession(sessions, "1")
 	if err == nil {
 		t.Fatal("expected ambiguous error")
 	}
 	// Both candidates must appear in the error so the user can
 	// disambiguate by typing more characters.
 	msg := err.Error()
-	if !strings.Contains(msg, "abcd1234") || !strings.Contains(msg, "abcd5678") {
+	if !strings.Contains(msg, "1va8lvdv") || !strings.Contains(msg, "14zknoqk") {
 		t.Errorf("error should list both candidates, got: %s", msg)
 	}
 }
 
-// TestMatchSessionExactBeatsPrefix covers the corner case where the
-// user's ref is itself a valid session short id AND a prefix of
-// another: the exact match must win, otherwise the unambiguous case
-// would report ambiguity.
-func TestMatchSessionExactBeatsPrefix(t *testing.T) {
+// TestMatchSessionExactIDBeatsSlug pins the deterministic exact-match tie:
+// an immutable ID wins over another session's exact slug.
+func TestMatchSessionExactIDBeatsSlug(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd"},     // exact match for short form "abcd"
-		{ID: "sess-abcdef01"}, // also starts with "abcd"
+		{ID: "1va8lvdv"},
+		{ID: "wxyz5678", Slug: "1va8lvdv"},
 	}
-	got, err := matchSession(sessions, "abcd")
+	got, err := matchSession(sessions, "1va8lvdv")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got.ID != "sess-abcd" {
+	if got.ID != "1va8lvdv" {
 		t.Errorf("expected exact match to win, got %q", got.ID)
 	}
 }
@@ -88,7 +134,7 @@ func TestMatchSessionExactBeatsPrefix(t *testing.T) {
 // pointed at a session from another machine. Error, don't pick a
 // random one.
 func TestMatchSessionNoMatch(t *testing.T) {
-	sessions := []cliSession{{ID: "sess-abcd1234"}}
+	sessions := []cliSession{{ID: "1va8lvdv"}}
 	if _, err := matchSession(sessions, "zzzz"); err == nil {
 		t.Error("expected error for non-matching ref")
 	}
@@ -100,29 +146,11 @@ func TestMatchSessionNoMatch(t *testing.T) {
 	}
 }
 
-// TestShortID covers the conversion between gmuxd's full session IDs
-// and the display form shown by --list, which is what users type back
-// into --attach / --kill / --tail.
-func TestShortID(t *testing.T) {
-	cases := map[string]string{
-		"sess-abcd1234": "abcd1234", // normal case
-		"sess-ab":       "ab",       // unusually short (shouldn't happen, but don't crash)
-		"abcd1234":      "abcd1234", // already short — idempotent
-		"":              "",         // defensive
-	}
-	for in, want := range cases {
-		if got := shortID(in); got != want {
-			t.Errorf("shortID(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-// TestBuildSendBody pins the wire-level contract of --send: by default
-// the bytes written to the PTY end with the carriage return that
-// submits the input, and --no-submit suppresses exactly that byte and
-// nothing else. Both inline-text and stdin paths are covered because
-// they construct the body differently and the carriage-return logic
-// has to wrap both.
+// TestBuildSendBody pins the wire-level contract of `gmux send`: the
+// bytes written to the PTY are exactly text/stdin then rendered keys —
+// nothing implicit, and nothing derived from the session's adapter.
+// Inline-text and stdin paths are both covered because they construct
+// the body differently.
 func TestBuildSendBody(t *testing.T) {
 	noStdin := "\x00NIL" // sentinel: this case passes a nil stdin reader
 	tests := []struct {
@@ -169,6 +197,16 @@ func TestBuildSendBody(t *testing.T) {
 			stdin: "hi",
 			want:  "hi\r",
 		},
+		{
+			// Regression guard for the removed --steering/--follow-up
+			// flags: a prompt with no key tokens is NOT submitted, for
+			// any adapter. send is raw; semantic submission is the
+			// agent layer's job (ADR 0027).
+			name:  "prompt-shaped text is never auto-submitted",
+			text:  stringPtr("also do X"),
+			stdin: noStdin,
+			want:  "also do X",
+		},
 	}
 
 	for _, tc := range tests {
@@ -194,13 +232,13 @@ func stringPtr(s string) *string { return &s }
 // TestMatchSessionStrictLocalDefault locks in the rule that drove
 // the new addressing design: with no --host and no @suffix, peer
 // sessions are invisible to the lookup. A user who has only a peer
-// session with id "abcd1234" must not have `gmux --kill abcd1234`
+// session with id "1va8lvdv" must not have `gmux --kill 1va8lvdv`
 // silently kill it; they have to opt in via @peer or --host.
 func TestMatchSessionStrictLocalDefault(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234", Peer: "konyvtar"},
+		{ID: "1va8lvdv", Peer: "konyvtar"},
 	}
-	_, err := matchSession(sessions, "abcd1234")
+	_, err := matchSession(sessions, "1va8lvdv")
 	if err == nil {
 		t.Fatal("strict-local lookup should not see a peer-only session")
 	}
@@ -213,14 +251,14 @@ func TestMatchSessionStrictLocalDefault(t *testing.T) {
 // the strict default feels like a regression.
 func TestMatchSessionFriendlyHintForPeerOnlyMatch(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234", Peer: "konyvtar"},
+		{ID: "1va8lvdv", Peer: "konyvtar"},
 	}
-	_, err := matchSession(sessions, "abcd1234")
+	_, err := matchSession(sessions, "1va8lvdv")
 	if err == nil {
-		t.Fatal("expected error for peer-only short id without --host")
+		t.Fatal("expected error for peer-only ID without --host")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "abcd1234@konyvtar") {
+	if !strings.Contains(msg, "1va8lvdv@konyvtar") {
 		t.Errorf("error should suggest qualified form, got: %s", msg)
 	}
 }
@@ -232,11 +270,11 @@ func TestMatchSessionFriendlyHintForPeerOnlyMatch(t *testing.T) {
 // action subcommands.
 func TestMatchSessionAtSuffixRoutes(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234"},                   // local
-		{ID: "sess-abcd1234", Peer: "konyvtar"}, // namespaced collision
-		{ID: "sess-ef019283", Peer: "bespin"},
+		{ID: "1va8lvdv"},                   // local
+		{ID: "1va8lvdv", Peer: "konyvtar"}, // namespaced collision
+		{ID: "1lp4cge2", Peer: "bespin"},
 	}
-	got, err := matchSession(sessions, "abcd1234@konyvtar")
+	got, err := matchSession(sessions, "1va8lvdv@konyvtar")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,10 +290,10 @@ func TestMatchSessionAtSuffixRoutes(t *testing.T) {
 // session if a local one happened to match.
 func TestMatchSessionEmptyHostSuffixRejected(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234"},                   // local
-		{ID: "sess-abcd1234", Peer: "konyvtar"}, // peer
+		{ID: "1va8lvdv"},                   // local
+		{ID: "1va8lvdv", Peer: "konyvtar"}, // peer
 	}
-	_, err := matchSession(sessions, "abcd1234@")
+	_, err := matchSession(sessions, "1va8lvdv@")
 	if err == nil {
 		t.Fatal("expected error for trailing @ with empty host suffix")
 	}
@@ -277,17 +315,17 @@ func TestMatchSessionEmptyHostSuffixRejected(t *testing.T) {
 // id) can match multiple sessions across peers.
 func TestMatchSessionMultiplePeerMatchesGetCandidateList(t *testing.T) {
 	sessions := []cliSession{
-		{ID: "sess-abcd1234", Peer: "konyvtar"},
-		{ID: "sess-ab98ef76", Peer: "bespin"},
+		{ID: "1va8lvdv", Peer: "konyvtar"},
+		{ID: "15g979sl", Peer: "bespin"},
 	}
-	_, err := matchSession(sessions, "ab")
+	_, err := matchSession(sessions, "1")
 	if err == nil {
 		t.Fatal("expected error for prefix matching multiple peer sessions")
 	}
 	msg := err.Error()
 	// Both qualified forms must appear; the user uses the message to
 	// pick the right one and retypes.
-	if !strings.Contains(msg, "abcd1234@konyvtar") || !strings.Contains(msg, "ab98ef76@bespin") {
+	if !strings.Contains(msg, "1va8lvdv@konyvtar") || !strings.Contains(msg, "15g979sl@bespin") {
 		t.Errorf("error should list both qualified candidates, got: %s", msg)
 	}
 }
@@ -303,6 +341,7 @@ func TestStripANSI(t *testing.T) {
 		{"cursor-move CSI removed", "a\x1b[2Kb\x1b[1;5Hc", "abc"},
 		{"OSC title (BEL-terminated) removed", "\x1b]0;my title\x07done", "done"},
 		{"OSC (ST-terminated) removed", "\x1b]8;;http://x\x1b\\link", "link"},
+		{"DCS payload removed", "before\x1bPq?sixel-data\x1b\\after", "beforeafter"},
 		{"CRLF normalized to LF", "line1\r\nline2\r\n", "line1\nline2\n"},
 		{"UTF-8 multibyte preserved", "café — π ✓", "café — π ✓"},
 		{"lone ESC at end does not panic", "trailing\x1b", "trailing"},
@@ -314,4 +353,252 @@ func TestStripANSI(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsNoMatchError(t *testing.T) {
+	// The specific "no session matches" error from matchSession is retryable.
+	sessions := []cliSession{{ID: "1va8lvdv"}}
+	_, err := matchSession(sessions, "zzzz")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !isNoMatchError(err) {
+		t.Errorf("expected isNoMatchError=true for %q", err)
+	}
+
+	// Ambiguous errors are NOT retryable.
+	sessions = []cliSession{
+		{ID: "1va8lvdv"},
+		{ID: "14zknoqk"},
+	}
+	_, err = matchSession(sessions, "1")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if isNoMatchError(err) {
+		t.Errorf("ambiguous error should not be retryable: %q", err)
+	}
+
+	// Empty ref errors are NOT retryable.
+	_, err = matchSession(nil, "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if isNoMatchError(err) {
+		t.Errorf("empty ref error should not be retryable: %q", err)
+	}
+}
+
+func TestListJSONCommandGolden(t *testing.T) {
+	exit := 0
+	tests := []struct {
+		name     string
+		sessions []cliSession
+		all      bool
+		want     string
+	}{
+		{
+			name: "empty is an array",
+			want: "[]\n",
+		},
+		{
+			name:     "minimal local",
+			sessions: []cliSession{{ID: "1va8lvdv", Adapter: "shell", Alive: true}},
+			want:     "[\n  {\n    \"ref\": \"1va8lvdv\",\n    \"id\": \"1va8lvdv\",\n    \"adapter\": \"shell\",\n    \"alive\": true\n  }\n]\n",
+		},
+		{
+			name: "full peer",
+			all:  true,
+			sessions: []cliSession{{
+				ID: "1va8lvdv", Peer: "work-laptop", Cwd: "/home/mg/dev/gmux",
+				Adapter: "pi", Alive: false, Pid: 4242, Title: "fix auth bug",
+				Slug: "fix-auth-bug", RunnerVersion: "2.0.0", ParentSessionID: "1u0xpj5g",
+				SocketPath: "/run/gmux/1va8lvdv.sock", Command: []string{"pi", "--model", "sonnet"},
+				StartedAt: "2026-07-27T10:00:00.123Z", ExitedAt: "2026-07-27T10:05:00Z", ExitCode: &exit,
+			}},
+			want: "[\n  {\n    \"ref\": \"1va8lvdv@work-laptop\",\n    \"id\": \"1va8lvdv\",\n    \"peer\": \"work-laptop\",\n    \"cwd\": \"/home/mg/dev/gmux\",\n    \"adapter\": \"pi\",\n    \"alive\": false,\n    \"pid\": 4242,\n    \"title\": \"fix auth bug\",\n    \"slug\": \"fix-auth-bug\",\n    \"runner_version\": \"2.0.0\",\n    \"parent_session_id\": \"1u0xpj5g\",\n    \"socket_path\": \"/run/gmux/1va8lvdv.sock\",\n    \"command\": [\n      \"pi\",\n      \"--model\",\n      \"sonnet\"\n    ],\n    \"started_at\": \"2026-07-27T10:00:00.123Z\",\n    \"exited_at\": \"2026-07-27T10:05:00Z\",\n    \"exit_code\": 0\n  }\n]\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			startStubDaemon(t, tc.sessions)
+			var stdout string
+			stderr := captureStderr(t, func() {
+				stdout = captureStdout(t, func() {
+					if code := cmdList(tc.all, true); code != 0 {
+						t.Errorf("cmdList exit = %d, want 0", code)
+					}
+				})
+			})
+			if stdout != tc.want {
+				t.Errorf("stdout mismatch\ngot:\n%s\nwant:\n%s", stdout, tc.want)
+			}
+			if stderr != "" {
+				t.Errorf("stderr = %q, want empty", stderr)
+			}
+		})
+	}
+}
+
+func TestListTableUsesContractOrdering(t *testing.T) {
+	startStubDaemon(t, []cliSession{
+		{ID: "dead-new", Adapter: "shell", StartedAt: "2026-07-31T12:00:00Z"},
+		{ID: "live-old", Adapter: "pi", Alive: true, StartedAt: "2026-07-30T12:00:00Z"},
+		{ID: "live-new", Adapter: "pi", Alive: true, StartedAt: "2026-07-31T12:00:00Z"},
+	})
+	var stdout string
+	stderr := captureStderr(t, func() {
+		stdout = captureStdout(t, func() {
+			if code := cmdList(false, false); code != 0 {
+				t.Errorf("cmdList exit = %d, want 0", code)
+			}
+		})
+	})
+	want := "ID        STATUS  ADAPTER  TITLE\n" +
+		"live-new  alive   pi       \n" +
+		"live-old  alive   pi       \n" +
+		"dead-new  dead    shell    \n"
+	if stdout != want {
+		t.Errorf("stdout mismatch\ngot:\n%q\nwant:\n%q", stdout, want)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+}
+
+func TestListJSONOrderingResultsNullNormalizationAndRefs(t *testing.T) {
+	startStubDaemon(t, nil).onSessions(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true,"data":[
+			{"id":"dead-zero","adapter":"shell","alive":false,"started_at":"2026-07-30T10:00:00Z","exited_at":"2026-07-30T10:01:00Z","exit_code":0},
+			{"id":"live-b","peer":"tower","adapter":"pi","alive":true,"started_at":"2026-07-31T10:00:00Z","pid":null,"exited_at":null,"exit_code":null,"binary_hash":"private"},
+			{"id":"dead-unknown","adapter":"shell","alive":false,"started_at":"2026-07-31T11:00:00Z"},
+			{"id":"live-a","adapter":"pi","alive":true,"started_at":"2026-07-31T12:00:00+02:00"}
+		]}`)
+	})
+	var stdout string
+	stderr := captureStderr(t, func() {
+		stdout = captureStdout(t, func() {
+			if code := cmdList(true, true); code != 0 {
+				t.Fatalf("cmdList exit = %d", code)
+			}
+		})
+	})
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(stdout), &rows); err != nil {
+		t.Fatalf("stdout is not one JSON array: %v\n%s", err, stdout)
+	}
+	wantRefs := []string{"live-a", "live-b@tower", "dead-unknown", "dead-zero"}
+	if len(rows) != len(wantRefs) {
+		t.Fatalf("rows = %d, want %d", len(rows), len(wantRefs))
+	}
+	for i, wantRef := range wantRefs {
+		var ref string
+		if err := json.Unmarshal(rows[i]["ref"], &ref); err != nil || ref != wantRef {
+			t.Errorf("row %d ref = %q (%v), want %q", i, ref, err, wantRef)
+		}
+		for _, key := range []string{"pid", "exited_at", "exit_code"} {
+			if string(rows[i][key]) == "null" {
+				t.Errorf("row %d emits %s:null; optional fields must be omitted", i, key)
+			}
+		}
+		if _, ok := rows[i]["binary_hash"]; ok {
+			t.Errorf("row %d exposes binary_hash", i)
+		}
+	}
+	if _, ok := rows[3]["exit_code"]; !ok {
+		t.Error("known zero exit_code was omitted")
+	}
+	if _, ok := rows[2]["exit_code"]; ok {
+		t.Error("unknown exit_code was emitted")
+	}
+
+	// Every emitted ref must round-trip through the same resolver used by
+	// tail/send/wait/kill/agent verbs.
+	sessions, err := fetchSessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range wantRefs {
+		if _, err := matchSession(sessions, ref); err != nil {
+			t.Errorf("emitted ref %q is not reusable: %v", ref, err)
+		}
+	}
+}
+
+func TestFetchSessionsRejectsAmbiguousPeerName(t *testing.T) {
+	startStubDaemon(t, nil).onSessions(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true,"data":[{"id":"abc12345","peer":"bad@peer","adapter":"pi","alive":true}]}`)
+	})
+	if _, err := fetchSessions(); err == nil || !strings.Contains(err.Error(), "invalid peer name") {
+		t.Fatalf("fetchSessions error = %v, want invalid peer name", err)
+	}
+}
+
+// This test pins existing fields and their types while deliberately allowing
+// additive keys in future 2.x releases.
+func TestListJSONSchemaIsStable(t *testing.T) {
+	exit := 0
+	full := cliSession{
+		ID: "1va8lvdv", Peer: "laptop", Cwd: "/work", Adapter: "pi", Alive: true,
+		Pid: 42, Title: "title", Slug: "slug", RunnerVersion: "2.0.0",
+		ParentSessionID: "parent", SocketPath: "/run/socket", Command: []string{"pi"},
+		StartedAt: "2026-07-27T10:00:00Z", ExitedAt: "2026-07-27T10:05:00Z", ExitCode: &exit,
+		UnreadToken: "internal-token",
+	}
+	got := jsonKeys(t, full)
+	wantTypes := map[string]byte{
+		"ref": '"', "id": '"', "peer": '"', "cwd": '"', "adapter": '"', "alive": 't',
+		"pid": '4', "title": '"', "slug": '"', "runner_version": '"', "parent_session_id": '"',
+		"socket_path": '"', "command": '[', "started_at": '"', "exited_at": '"', "exit_code": '0',
+	}
+	for key, firstByte := range wantTypes {
+		value, ok := got[key]
+		if !ok {
+			t.Errorf("populated session omits documented key %q; keys: %v", key, sortedKeys(got))
+		} else if len(value) == 0 || value[0] != firstByte {
+			t.Errorf("key %q has value %s, want JSON type beginning %q", key, value, firstByte)
+		}
+	}
+
+	if _, ok := got["unread_token"]; ok {
+		t.Error("ls --json exposes internal unread_token")
+	}
+
+	bare := jsonKeys(t, cliSession{ID: "1va8lvdv"})
+	for _, key := range []string{"ref", "id", "adapter", "alive"} {
+		if _, ok := bare[key]; !ok {
+			t.Errorf("minimal session omits required key %q", key)
+		}
+	}
+	for _, key := range []string{"peer", "cwd", "pid", "title", "slug", "runner_version", "parent_session_id", "socket_path", "command", "started_at", "exited_at", "exit_code"} {
+		if _, ok := bare[key]; ok {
+			t.Errorf("optional key %q appears on a minimal session", key)
+		}
+	}
+}
+
+func jsonKeys(t *testing.T, s cliSession) map[string]json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal cliSession: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal cliSession: %v", err)
+	}
+	return m
+}
+
+func sortedKeys(m map[string]json.RawMessage) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }

@@ -53,9 +53,35 @@ const runnerRequestTimeout = 3 * time.Second
 // (earlier deadline wins) and cancels its internal timer when the
 // body is closed. body may be nil for parameterless GET / POST.
 func runnerRequest(ctx context.Context, socketPath, method, urlPath string, body io.Reader) (*http.Response, error) {
+	return runnerRequestHeaders(ctx, socketPath, method, urlPath, body, nil)
+}
+
+func runnerRequestHeaders(ctx context.Context, socketPath, method, urlPath string, body io.Reader, header http.Header) (*http.Response, error) {
+	return runnerRequestTimed(ctx, socketPath, method, urlPath, body, header, runnerRequestTimeout)
+}
+
+// runnerRequestUnbounded issues a request bounded only by ctx.
+//
+// The 3 s client timeout is right for the short control calls (/meta, /kill,
+// /input) and wrong for the semantic action routes: the runner legitimately
+// blocks there for the adapter's readiness timeout (10 s for pi) and, on a
+// PTY the agent is not reading, for longer still. Cutting such a call off at
+// 3 s would convert a legitimate slow admission into a transport error whose
+// delivery is indeterminate — the worst possible answer, since it forbids a
+// safe retry. Callers of this helper must impose their own deadline via ctx.
+func runnerRequestUnbounded(ctx context.Context, socketPath, method, urlPath string, body io.Reader, header http.Header) (*http.Response, error) {
+	return runnerRequestTimed(ctx, socketPath, method, urlPath, body, header, 0)
+}
+
+func runnerRequestTimed(ctx context.Context, socketPath, method, urlPath string, body io.Reader, header http.Header, timeout time.Duration) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+urlPath, body)
 	if err != nil {
 		return nil, err
+	}
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
 	// Mark the connection for closure after the response. With
 	// this set, the transport closes the underlying FD when the
@@ -69,7 +95,7 @@ func runnerRequest(ctx context.Context, socketPath, method, urlPath string, body
 				return d.DialContext(ctx, "unix", socketPath)
 			},
 		},
-		Timeout: runnerRequestTimeout,
+		Timeout: timeout,
 	}
 	return client.Do(req)
 }

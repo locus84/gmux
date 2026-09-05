@@ -25,6 +25,36 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestGetForwardsAuthPathAndQuery(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/sessions/local/files" || r.URL.RawQuery != "path=src" {
+			t.Fatalf("request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer ts.Close()
+
+	resp, err := New(ts.URL, WithBearerToken("secret")).Get(context.Background(), "/v1/sessions/local/files", "path=src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q, err = %v", body, err)
+	}
+}
+
+func TestGetRejectsRelativePath(t *testing.T) {
+	if _, err := New("http://example.invalid").Get(context.Background(), "v1/files", ""); err == nil {
+		t.Fatal("expected relative path rejection")
+	}
+}
+
 func TestNew_WithBearerToken(t *testing.T) {
 	c := New("http://host", WithBearerToken("abc"))
 	if c.token != "abc" {
@@ -161,12 +191,12 @@ func TestForwardAction_PathConstruction(t *testing.T) {
 	defer ts.Close()
 
 	c := New(ts.URL, WithBearerToken("tok"))
-	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/sess-123/kill", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/13hlltir/kill", nil)
 	w := httptest.NewRecorder()
-	c.ForwardAction(w, req, "sess-123", "kill")
+	c.ForwardAction(w, req, "13hlltir", "kill")
 
-	if gotPath != "/v1/sessions/sess-123/kill" {
-		t.Errorf("path = %q, want /v1/sessions/sess-123/kill", gotPath)
+	if gotPath != "/v1/sessions/13hlltir/kill" {
+		t.Errorf("path = %q, want /v1/sessions/13hlltir/kill", gotPath)
 	}
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %q, want POST", gotMethod)
@@ -187,7 +217,7 @@ func TestForwardAction_BearerInjected(t *testing.T) {
 	c := New(ts.URL, WithBearerToken("my-token"))
 	req := httptest.NewRequest(http.MethodPost, "/anything", nil)
 	w := httptest.NewRecorder()
-	c.ForwardAction(w, req, "sess-x", "resume")
+	c.ForwardAction(w, req, "1108gm0e", "resume")
 
 	if gotAuth != "Bearer my-token" {
 		t.Errorf("Authorization = %q, want Bearer my-token", gotAuth)
@@ -207,7 +237,7 @@ func TestForwardAction_PreservesBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"payload":"hello"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	c.ForwardAction(w, req, "sess-y", "read")
+	c.ForwardAction(w, req, "1jjd02g1", "read")
 
 	if gotBody != `{"payload":"hello"}` {
 		t.Errorf("body = %q, want %q", gotBody, `{"payload":"hello"}`)
@@ -235,7 +265,7 @@ func TestForwardAction_PropagatesStatusCode(t *testing.T) {
 	c := New(ts.URL)
 	req := httptest.NewRequest(http.MethodPost, "/anything", nil)
 	w := httptest.NewRecorder()
-	c.ForwardAction(w, req, "sess-missing", "kill")
+	c.ForwardAction(w, req, "13stq9rd", "kill")
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
@@ -252,7 +282,7 @@ func TestForwardLaunch_StripsPeerField(t *testing.T) {
 			return
 		}
 		received, _ = io.ReadAll(r.Body)
-		_, _ = w.Write([]byte(`{"ok":true,"data":{"id":"sess-1"}}`))
+		_, _ = w.Write([]byte(`{"ok":true,"data":{"id":"1vshk4fu"}}`))
 	}))
 	defer ts.Close()
 
@@ -297,11 +327,12 @@ func TestForwardLaunch_InvalidJSON(t *testing.T) {
 
 // ── ForwardPath ───────────────────────────────────────────────────
 
-func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
-	var gotPath, gotMethod string
+func TestForwardPath_PreservesMethodPathQueryAndBody(t *testing.T) {
+	var gotPath, gotQuery, gotMethod string
 	var gotBody []byte
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
 		gotMethod = r.Method
 		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
@@ -311,7 +342,7 @@ func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
 
 	c := New(ts.URL, WithBearerToken("tok"))
 	req := httptest.NewRequest(http.MethodPatch,
-		"/v1/peers/tower/v1/projects/gmux/sessions",
+		"/v1/peers/tower/v1/projects/gmux/sessions?path=src%2Fapi&raw=1",
 		strings.NewReader(`{"sessions":["a","b"]}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -320,6 +351,9 @@ func TestForwardPath_PreservesMethodPathAndBody(t *testing.T) {
 
 	if gotPath != "/v1/projects/gmux/sessions" {
 		t.Errorf("path = %q, want /v1/projects/gmux/sessions", gotPath)
+	}
+	if gotQuery != "path=src%2Fapi&raw=1" {
+		t.Errorf("query = %q, want path and raw", gotQuery)
 	}
 	if gotMethod != http.MethodPatch {
 		t.Errorf("method = %q, want PATCH", gotMethod)
@@ -376,7 +410,7 @@ func TestEvents_CallsAuthorizedSubscribe(t *testing.T) {
 func TestEvents_DeliversEvent(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: session-upsert\ndata: {\"id\":\"sess-1\"}\n\n"))
+		_, _ = w.Write([]byte("event: session-upsert\ndata: {\"id\":\"1vshk4fu\"}\n\n"))
 	}))
 	defer ts.Close()
 
@@ -397,8 +431,8 @@ func TestEvents_DeliversEvent(t *testing.T) {
 		if ev.Type != "session-upsert" {
 			t.Errorf("type = %q, want session-upsert", ev.Type)
 		}
-		if !strings.Contains(string(ev.Data), `"sess-1"`) {
-			t.Errorf("data = %s, want to contain sess-1", ev.Data)
+		if !strings.Contains(string(ev.Data), `"1vshk4fu"`) {
+			t.Errorf("data = %s, want to contain 1vshk4fu", ev.Data)
 		}
 	default:
 		t.Fatal("no event received")
@@ -451,11 +485,105 @@ func TestDialWS_Success(t *testing.T) {
 	c := New(ts.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	conn, err := c.DialWS(ctx, "sess-xyz")
+	conn, err := c.DialWS(ctx, "10nu1y5n")
 	if err != nil {
 		t.Fatalf("DialWS: %v", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
+}
+
+func TestDialWS_BrowserCapabilityIsAllowlisted(t *testing.T) {
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	conn, err := c.DialWS(ctx, "sess", true)
+	if err != nil {
+		t.Fatalf("DialWS: %v", err)
+	}
+	conn.Close(websocket.StatusNormalClosure, "")
+	if gotQuery != "client=browser" {
+		t.Fatalf("query = %q, want client=browser", gotQuery)
+	}
+}
+
+func TestProxyWS_ForwardsBrowserCapability(t *testing.T) {
+	gotQuery := make(chan string, 1)
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery <- r.URL.RawQuery
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		<-r.Context().Done()
+	}))
+	defer spoke.Close()
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		New(spoke.URL).ProxyWS(w, r, "sess")
+	}))
+	defer hub.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	wsURL := "ws" + strings.TrimPrefix(hub.URL, "http") + "/?client=browser"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("browser dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	select {
+	case query := <-gotQuery:
+		if query != "client=browser" {
+			t.Fatalf("query = %q, want client=browser", query)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestProxyWS_DoesNotForwardArbitraryQuery(t *testing.T) {
+	gotQuery := make(chan string, 1)
+	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery <- r.URL.RawQuery
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		<-r.Context().Done()
+	}))
+	defer spoke.Close()
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		New(spoke.URL).ProxyWS(w, r, "sess")
+	}))
+	defer hub.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	wsURL := "ws" + strings.TrimPrefix(hub.URL, "http") + "/?client=browser&evil=1"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("browser dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	select {
+	case query := <-gotQuery:
+		if query != "" {
+			t.Fatalf("query = %q, want empty", query)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 }
 
 func TestDialWS_BearerInjected(t *testing.T) {
@@ -528,7 +656,7 @@ func TestProxyWS_LargeSnapshot(t *testing.T) {
 	// WS and calls apiclient.ProxyWS to bridge to spokeServer.
 	c := New(spokeServer.URL)
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.ProxyWS(w, r, "sess-large")
+		c.ProxyWS(w, r, "1bs60d8p")
 	}))
 	defer hub.Close()
 
@@ -674,7 +802,6 @@ func TestProxyWS_NoCompressionToBrowser(t *testing.T) {
 	}
 }
 
-
 // TestForwardAction_PreservesQueryString locks in the contract that
 // action endpoints with query parameters (e.g. /scrollback?tail=N)
 // work the same against peer sessions as against local ones.
@@ -692,12 +819,12 @@ func TestForwardAction_PreservesQueryString(t *testing.T) {
 	defer ts.Close()
 
 	c := New(ts.URL)
-	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-1@peer/scrollback?tail=5", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/1vshk4fu@peer/scrollback?tail=5", nil)
 	w := httptest.NewRecorder()
-	c.ForwardAction(w, req, "sess-1", "scrollback")
+	c.ForwardAction(w, req, "1vshk4fu", "scrollback")
 
-	if gotPath != "/v1/sessions/sess-1/scrollback" {
-		t.Errorf("path = %q, want /v1/sessions/sess-1/scrollback (peer suffix must be stripped)", gotPath)
+	if gotPath != "/v1/sessions/1vshk4fu/scrollback" {
+		t.Errorf("path = %q, want /v1/sessions/1vshk4fu/scrollback (peer suffix must be stripped)", gotPath)
 	}
 	if gotRawQuery != "tail=5" {
 		t.Errorf("raw query = %q, want tail=5", gotRawQuery)

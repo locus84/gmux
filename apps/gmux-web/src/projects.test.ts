@@ -1,12 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import type { ProjectItem, PeerInfo } from './types'
+import type { ProjectItem } from './types'
 import {
   normalizeRemote,
   matchSession,
   buildProjectFolders,
   parseSessionHostPath,
   reorderKeysForFolder,
-  buildProjectTopology,
   isSessionVisibleInProject,
   slugify,
   slugFromRemote,
@@ -15,8 +14,85 @@ import {
   discoverProjects,
   countUnmatchedActive,
   projectAvailability,
+  placeChildSessions,
+  groupSessionsByCheckout,
+  checkoutPathContains,
 } from './projects'
 import { makeSession } from './test-helpers'
+
+describe('worktree checkout grouping', () => {
+  const folder = (sessions: ReturnType<typeof makeSession>[]) => ({ key: '::backend', slug: 'backend', name: 'backend', launchCwd: '~/WorkSpace/backend', sessions })
+
+  it('places the primary checkout session under Main', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'main-session', cwd: '~/WorkSpace/backend' }),
+      makeSession({ id: 'linked-session', cwd: '~/.local/share/gmux/worktrees/backend/fix-auth' }),
+    ]), [
+      { path: '~/WorkSpace/backend', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false },
+      { path: '~/.local/share/gmux/worktrees/backend/fix-auth', branch: 'fix/auth', primary: false, detached: false, bare: false, locked: false, prunable: false },
+    ])
+    expect(groups.map(group => [group.label, group.sessions.map(session => session.id)])).toEqual([
+      ['Main', ['main-session']],
+      ['fix/auth', ['linked-session']],
+    ])
+  })
+
+  it('matches portable worktree paths against absolute v2 session cwd values', () => {
+    const groups = groupSessionsByCheckout(folder([
+      makeSession({ id: 'absolute-main', cwd: '/Users/rhee/WorkSpace/backend' }),
+      makeSession({ id: 'absolute-linked', cwd: '/Users/rhee/.local/share/gmux/worktrees/Users/rhee/WorkSpace/backend/fix-auth/src' }),
+    ]), [
+      { path: '~/WorkSpace/backend', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false },
+      { path: '~/.local/share/gmux/worktrees/Users/rhee/WorkSpace/backend/fix-auth', branch: 'fix/auth', primary: false, detached: false, bare: false, locked: false, prunable: false },
+    ])
+    expect(groups.map(group => [group.label, group.sessions.map(session => session.id)])).toEqual([
+      ['Main', ['absolute-main']],
+      ['fix/auth', ['absolute-linked']],
+    ])
+  })
+
+  it('uses the deepest containing checkout', () => {
+    expect(checkoutPathContains('/repo', '/repo/packages/api')).toBe(true)
+    expect(checkoutPathContains('/repo', '/repo-other')).toBe(false)
+    expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend/src')).toBe(true)
+    expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend-other')).toBe(false)
+  })
+})
+
+describe('placeChildSessions', () => {
+  const s = (id: string, parent?: string) =>
+    makeSession({ id, cwd: '/p', parent_session_id: parent })
+
+  it('moves a child directly after its parent', () => {
+    const list = [s('child', 'parent'), s('a'), s('parent'), s('b')]
+    placeChildSessions(list)
+    expect(list.map(x => x.id)).toEqual(['a', 'parent', 'child', 'b'])
+  })
+
+  it('keeps multiple children in relative order after the parent', () => {
+    const list = [s('c1', 'p'), s('p'), s('c2', 'p'), s('x')]
+    placeChildSessions(list)
+    expect(list.map(x => x.id)).toEqual(['p', 'c1', 'c2', 'x'])
+  })
+
+  it('leaves orphans (parent not in folder) in place', () => {
+    const list = [s('a'), s('orphan', 'elsewhere'), s('b')]
+    placeChildSessions(list)
+    expect(list.map(x => x.id)).toEqual(['a', 'orphan', 'b'])
+  })
+
+  it('ignores self-referential parents', () => {
+    const list = [s('a'), s('weird', 'weird')]
+    placeChildSessions(list)
+    expect(list.map(x => x.id)).toEqual(['a', 'weird'])
+  })
+
+  it('no-ops without parent stamps', () => {
+    const list = [s('a'), s('b')]
+    placeChildSessions(list)
+    expect(list.map(x => x.id)).toEqual(['a', 'b'])
+  })
+})
 
 describe('normalizeRemote', () => {
   it('strips protocol and .git suffix', () => {
@@ -180,6 +256,20 @@ describe('buildProjectFolders', () => {
     expect(folders[0].launchCwd).toBe('/dev/proj')
   })
 
+  it('launchCwd is the canonical first path, not the MRU session cwd', () => {
+    // The project-row "+" launches in launchCwd, so it must stay the
+    // project's canonical dir regardless of where recent sessions ran.
+    const projects: ProjectItem[] = [
+      { slug: 'proj', match: [{ path: '/dev/proj' }] },
+    ]
+    const sessions = [
+      makeSession({ id: 'a', project_slug: 'proj', cwd: '/dev/proj/subdir', created_at: '2026-01-01T00:00:00Z' }),
+      makeSession({ id: 'b', project_slug: 'proj', cwd: '/dev/elsewhere', created_at: '2026-04-01T00:00:00Z' }),
+    ]
+    const folders = buildProjectFolders(projects, sessions)
+    expect(folders[0].launchCwd).toBe('/dev/proj')
+  })
+
   it('drops disclaimed sessions even when their cwd matches a local rule', () => {
     // Under the references model, viewer match rules don't adopt
     // sessions client-side. Only stamps put a session in a folder.
@@ -302,18 +392,16 @@ describe('buildProjectFolders', () => {
     expect(folders[0].missing).toBeUndefined()
   })
 
-  it('buckets a renamed host\'s sessions under a reference resolved by node_id', () => {
-    // The seam with resolveReferences: the reference is stored under the
-    // old name "unraid" but resolveRef maps it to the host's current
-    // name "gmux-hs". The session (stamped with the live name) must land
-    // in the folder, and the folder must carry the live name.
-    const projects: ProjectItem[] = [{ slug: 'apps', peer: 'unraid', node_id: 'node_hs' }]
+  it('buckets a reference\'s sessions by its stored name and stays resolved when present', () => {
+    // `peer` is the runtime key (ADR 0017): sessions stamped with the
+    // same name land in the folder, and the liveness predicate (node_id
+    // present) keeps it resolved.
+    const projects: ProjectItem[] = [{ slug: 'apps', peer: 'gmux-hs', node_id: 'node_hs' }]
     const sessions = [
       makeSession({ id: 's1', cwd: '/mnt/apps', peer: 'gmux-hs', project_slug: 'apps', alive: true }),
     ]
-    const resolveRef = (peer: string, slug: string) =>
-      peer === 'unraid' && slug === 'apps' ? { effectivePeer: 'gmux-hs', resolved: true } : undefined
-    const folders = buildProjectFolders(projects, sessions, undefined, {}, resolveRef)
+    const isPresent = (_peer: string, nodeId?: string) => nodeId === 'node_hs'
+    const folders = buildProjectFolders(projects, sessions, undefined, {}, isPresent)
     expect(folders).toHaveLength(1)
     expect(folders[0].peer).toBe('gmux-hs')
     expect(folders[0].unresolved).toBeUndefined()
@@ -321,13 +409,13 @@ describe('buildProjectFolders', () => {
   })
 
   it('flags an unresolved reference and takes precedence over missing', () => {
-    // resolveRef reports the host is in no roster bucket. Even though we
-    // have no peer_projects entry for it, the folder is flagged
-    // unresolved (host renamed/removed) rather than left as a plain
-    // empty reference — and unresolved is never conflated with missing.
-    const projects: ProjectItem[] = [{ slug: 'apps', peer: 'hs' }]
-    const resolveRef = () => ({ effectivePeer: 'hs', resolved: false })
-    const folders = buildProjectFolders(projects, [], undefined, {}, resolveRef)
+    // The reference's anchor (node_id) is in no roster bucket — host
+    // renamed-away-and-gone or removed. Even with no peer_projects entry,
+    // the folder is flagged unresolved rather than left a plain empty
+    // reference — and unresolved is never conflated with missing.
+    const projects: ProjectItem[] = [{ slug: 'apps', peer: 'hs', node_id: 'node_gone' }]
+    const isPresent = () => false
+    const folders = buildProjectFolders(projects, [], undefined, {}, isPresent)
     expect(folders[0].unresolved).toBe(true)
     expect(folders[0].missing).toBeUndefined()
     expect(folders[0].peer).toBe('hs')
@@ -443,15 +531,15 @@ describe('buildProjectFolders', () => {
 })
 
 describe('isSessionVisibleInProject', () => {
-  const project: ProjectItem = { slug: 'test', match: [{ path: '/dev/test' }], sessions: ['my-session', 'sess-tracked'] }
+  const project: ProjectItem = { slug: 'test', match: [{ path: '/dev/test' }], sessions: ['my-session', '15ik4p59'] }
 
   it('alive sessions are always visible', () => {
-    const s = makeSession({ id: 'sess-new', cwd: '/dev/test', alive: true })
+    const s = makeSession({ id: '1vx41244', cwd: '/dev/test', alive: true })
     expect(isSessionVisibleInProject(s, project)).toBe(true)
   })
 
   it('dead non-resumable sessions are hidden', () => {
-    const s = makeSession({ id: 'sess-gone', cwd: '/dev/test', alive: false, resumable: false })
+    const s = makeSession({ id: '1ve25bnc', cwd: '/dev/test', alive: false, resumable: false })
     expect(isSessionVisibleInProject(s, project)).toBe(false)
   })
 
@@ -460,7 +548,7 @@ describe('isSessionVisibleInProject', () => {
     // stamped sessions, so by the time isSessionVisibleInProject
     // runs, the session already belongs in this folder. The check
     // collapses to alive-or-resumable.
-    const s = makeSession({ id: 'sess-x', cwd: '/dev/test', alive: false, resumable: true, slug: 'my-session' })
+    const s = makeSession({ id: '1108gm0e', cwd: '/dev/test', alive: false, resumable: true, slug: 'my-session' })
     expect(isSessionVisibleInProject(s, project)).toBe(true)
   })
 
@@ -468,7 +556,7 @@ describe('isSessionVisibleInProject', () => {
     // The tracked-set check was a holdover from cross-host adoption,
     // where some sessions arrived in a folder without a stamp. With
     // stamps as the sole authority, the helper no longer reads it.
-    const s = makeSession({ id: 'sess-orphan', cwd: '/dev/test', alive: false, resumable: true, slug: 'orphan' })
+    const s = makeSession({ id: '1c80rqj5', cwd: '/dev/test', alive: false, resumable: true, slug: 'orphan' })
     expect(isSessionVisibleInProject(s, project)).toBe(true)
   })
 
@@ -485,21 +573,21 @@ describe('isSessionVisibleInProject', () => {
 
 describe('parseSessionHostPath', () => {
   it('treats bare ids as local', () => {
-    expect(parseSessionHostPath('sess-abc')).toEqual({ originalId: 'sess-abc', path: [] })
+    expect(parseSessionHostPath('1j6y9mx6')).toEqual({ originalId: '1j6y9mx6', path: [] })
   })
 
   it('extracts a single peer hop', () => {
-    expect(parseSessionHostPath('sess-abc@workstation')).toEqual({
-      originalId: 'sess-abc', path: ['workstation'],
+    expect(parseSessionHostPath('1j6y9mx6@workstation')).toEqual({
+      originalId: '1j6y9mx6', path: ['workstation'],
     })
   })
 
   it('reverses nested chains to outermost-first', () => {
-    // On-the-wire (innermost-first): sess-abc@dev@workstation
-    // Means: session sess-abc lives on dev, which is workstation's peer.
+    // On-the-wire (innermost-first): 1j6y9mx6@dev@workstation
+    // Means: session 1j6y9mx6 lives on dev, which is workstation's peer.
     // UI path (root -> leaf): ['workstation', 'dev']
-    expect(parseSessionHostPath('sess-abc@dev@workstation')).toEqual({
-      originalId: 'sess-abc', path: ['workstation', 'dev'],
+    expect(parseSessionHostPath('1j6y9mx6@dev@workstation')).toEqual({
+      originalId: '1j6y9mx6', path: ['workstation', 'dev'],
     })
   })
 
@@ -530,12 +618,12 @@ describe('reorderKeysForFolder', () => {
     expect(reorderKeysForFolder(sessions, 'tower')).toEqual(['a', 'b'])
   })
 
-  it('peer folder: keeps slug as-is for slugged sessions', () => {
+  it('peer folder: strips @<peer> namespace from titled session ids', () => {
     const sessions = [
       makeSession({ id: 'a@tower', cwd: '/x', slug: 'fix-auth', peer: 'tower' }),
       makeSession({ id: 'b@tower', cwd: '/x', slug: 'login-page', peer: 'tower' }),
     ]
-    expect(reorderKeysForFolder(sessions, 'tower')).toEqual(['fix-auth', 'login-page'])
+    expect(reorderKeysForFolder(sessions, 'tower')).toEqual(['a', 'b'])
   })
 
   it('local folder: drops adopted peer-owned sessions', () => {
@@ -549,7 +637,7 @@ describe('reorderKeysForFolder', () => {
       makeSession({ id: 'local-2', cwd: '/x', slug: '' }),
     ]
     expect(reorderKeysForFolder(sessions, undefined))
-      .toEqual(['fix-auth', 'local-2'])
+      .toEqual(['local-1', 'local-2'])
   })
 
   it('returns empty when no session matches the folder owner', () => {
@@ -568,194 +656,21 @@ describe('reorderKeysForFolder', () => {
     // shape, not strip @<peer>, or the merge logic will treat the
     // session as new and prepend it.
     const sessions = [
-      makeSession({ id: 'sess-1', cwd: '/x', slug: '' }),
-      makeSession({ id: 'sess-2@container', cwd: '/x', slug: '', peer: 'container' }),
+      makeSession({ id: '1vshk4fu', cwd: '/x', slug: '' }),
+      makeSession({ id: '155mk8b7@container', cwd: '/x', slug: '', peer: 'container' }),
     ]
     const isLocal = (n: string) => n === 'container'
     expect(reorderKeysForFolder(sessions, undefined, isLocal))
-      .toEqual(['sess-1', 'sess-2@container'])
+      .toEqual(['1vshk4fu', '155mk8b7@container'])
   })
 
-  it('local folder + Local peer: slug takes precedence over namespaced id', () => {
-    // A container session that's been attribution-resolved (e.g.
-    // claude/codex) keys by slug, not id, in projects.json.
+  it('local folder + Local peer: keeps namespaced id for titled sessions', () => {
     const sessions = [
-      makeSession({ id: 'sess-1@container', cwd: '/x', slug: 'claude-fix', peer: 'container' }),
+      makeSession({ id: '1vshk4fu@container', cwd: '/x', slug: 'claude-fix', peer: 'container' }),
     ]
     const isLocal = (n: string) => n === 'container'
     expect(reorderKeysForFolder(sessions, undefined, isLocal))
-      .toEqual(['claude-fix'])
-  })
-})
-
-describe('buildProjectTopology', () => {
-  const projects: ProjectItem[] = [
-    { slug: 'fluxer', match: [{ path: '/home/mg/dev/fluxer' }], sessions: [] },
-  ]
-
-  const peers: PeerInfo[] = [
-    { name: 'workstation', url: 'http://100.64.0.2:8790', status: 'connected', session_count: 2 },
-    { name: 'offline-box', url: 'http://10.0.0.9:8790', status: 'disconnected', session_count: 0 },
-  ]
-
-  it('returns empty array for unknown project', () => {
-    expect(buildProjectTopology('ghost', [], projects, peers)).toEqual([])
-  })
-
-  it('returns empty array when project has no sessions', () => {
-    expect(buildProjectTopology('fluxer', [], projects, peers)).toEqual([])
-  })
-
-  it('groups local sessions by cwd', () => {
-    const sessions = [
-      makeSession({ id: 'sess-1', cwd: '/home/mg/dev/fluxer', created_at: '2026-01-01T00:00:02Z',
-                    project_slug: 'fluxer', project_index: 0 }),
-      makeSession({ id: 'sess-2', cwd: '/home/mg/dev/fluxer', created_at: '2026-01-01T00:00:01Z',
-                    project_slug: 'fluxer', project_index: 1 }),
-      makeSession({ id: 'sess-3', cwd: '/home/mg/dev/fluxer/api',
-                    project_slug: 'fluxer', project_index: 2 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, projects, peers)
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].path).toEqual([])
-    expect(hosts[0].status).toBe('local')
-    expect(hosts[0].folders).toHaveLength(2)
-    expect(hosts[0].folders[0].cwd).toBe('/home/mg/dev/fluxer')
-    expect(hosts[0].folders[1].cwd).toBe('/home/mg/dev/fluxer/api')
-  })
-
-  it('collapses Local-peer (devcontainer) sessions into the local host node', () => {
-    // Under the references model, Local-peer sessions are owned by
-    // the parent: their stamps come from the parent's match rules
-    // and they live in the parent's local folder. The hub shows
-    // them under the local host node, with their session id chain
-    // still indicating the container hop in the folder grouping.
-    const sessions = [
-      makeSession({ id: 's-local', cwd: '/home/mg/dev/fluxer',
-                    project_slug: 'fluxer', project_index: 0 }),
-      makeSession({ id: 's-container@dev', cwd: '/workspaces/fluxer', peer: 'dev',
-                    project_slug: 'fluxer', project_index: 1 }),
-    ]
-    const isLocal = (name: string) => name === 'dev'
-    const hosts = buildProjectTopology('fluxer', sessions, projects, peers, undefined, isLocal)
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].path).toEqual([])
-    // Both sessions land under local; their cwds differ so they
-    // become separate folder groups.
-    const allIds = hosts[0].folders.flatMap(f => f.sessions.map(s => s.id))
-    expect(allIds.sort()).toEqual(['s-container@dev', 's-local'].sort())
-  })
-
-  it('reference hub: shows only the peer\'s stamped sessions', () => {
-    const refProjects: ProjectItem[] = [
-      { slug: 'fluxer', peer: 'workstation' },
-    ]
-    const sessions = [
-      makeSession({ id: 'sess-local', cwd: '/home/mg/dev/fluxer',
-                    project_slug: 'fluxer', project_index: 0 }),
-      makeSession({ id: 'sess-remote@workstation', cwd: '/home/mg/dev/fluxer',
-                    peer: 'workstation',
-                    project_slug: 'fluxer', project_index: 0 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, refProjects, peers, 'workstation')
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].path).toEqual(['workstation'])
-    expect(hosts[0].status).toBe('connected')
-    expect(hosts[0].meta).toBe('http://100.64.0.2:8790')
-    expect(hosts[0].folders[0].sessions.map(s => s.id)).toEqual(['sess-remote@workstation'])
-  })
-
-  it('nested peers form multi-segment paths', () => {
-    const refProjects: ProjectItem[] = [
-      { slug: 'fluxer', peer: 'workstation' },
-    ]
-    const sessions = [
-      makeSession({ id: 'sess-nested@dev@workstation', cwd: '/workspace/fluxer',
-                    peer: 'workstation',
-                    project_slug: 'fluxer', project_index: 0 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, refProjects, peers, 'workstation')
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].path).toEqual(['workstation', 'dev'])
-    // Nested inherits root peer status.
-    expect(hosts[0].status).toBe('connected')
-  })
-
-  it('marks unknown peers as disconnected', () => {
-    const refProjects: ProjectItem[] = [
-      { slug: 'fluxer', peer: 'ghost' },
-    ]
-    const sessions = [
-      makeSession({ id: 'sess-a@ghost', cwd: '/home/mg/dev/fluxer', peer: 'ghost',
-                    project_slug: 'fluxer', project_index: 0 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, refProjects, peers, 'ghost')
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].status).toBe('disconnected')
-    expect(hosts[0].meta).toBe('')
-  })
-
-  it('reflects peer status from the peers list', () => {
-    const refProjects: ProjectItem[] = [
-      { slug: 'fluxer', peer: 'offline-box' },
-    ]
-    const sessions = [
-      makeSession({ id: 'sess-o@offline-box', cwd: '/home/mg/dev/fluxer', peer: 'offline-box',
-                    project_slug: 'fluxer', project_index: 0 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, refProjects, peers, 'offline-box')
-    expect(hosts[0].status).toBe('disconnected')
-  })
-
-  it('sorts sessions within a folder: alive first, then newest-first', () => {
-    const sessions = [
-      makeSession({
-        id: 'dead-old', cwd: '/home/mg/dev/fluxer',
-        alive: false, resumable: true, created_at: '2026-01-01T00:00:00Z',
-        project_slug: 'fluxer', project_index: 0,
-      }),
-      makeSession({
-        id: 'alive-old', cwd: '/home/mg/dev/fluxer',
-        alive: true, created_at: '2026-01-02T00:00:00Z',
-        project_slug: 'fluxer', project_index: 1,
-      }),
-      makeSession({
-        id: 'alive-new', cwd: '/home/mg/dev/fluxer',
-        alive: true, created_at: '2026-01-03T00:00:00Z',
-        project_slug: 'fluxer', project_index: 2,
-      }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, projects, peers)
-    expect(hosts[0].folders[0].sessions.map(s => s.id)).toEqual([
-      'alive-new', 'alive-old', 'dead-old',
-    ])
-  })
-
-  it('hides dead non-resumable sessions', () => {
-    const sessions = [
-      makeSession({ id: 'alive-1', cwd: '/home/mg/dev/fluxer', alive: true,
-                    project_slug: 'fluxer', project_index: 0 }),
-      makeSession({ id: 'dead-1', cwd: '/home/mg/dev/fluxer', alive: false, resumable: false,
-                    project_slug: 'fluxer', project_index: 1 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, projects, peers)
-    expect(hosts[0].folders[0].sessions.map(s => s.id)).toEqual(['alive-1'])
-  })
-
-  it('filters sessions by stamp (ignores unrelated stamps)', () => {
-    const projects2: ProjectItem[] = [
-      { slug: 'fluxer', match: [{ path: '/home/mg/dev/fluxer' }] },
-      { slug: 'other', match: [{ path: '/home/mg/dev/other' }] },
-    ]
-    const sessions = [
-      makeSession({ id: 'f1', cwd: '/home/mg/dev/fluxer',
-                    project_slug: 'fluxer', project_index: 0 }),
-      makeSession({ id: 'o1', cwd: '/home/mg/dev/other',
-                    project_slug: 'other', project_index: 0 }),
-    ]
-    const hosts = buildProjectTopology('fluxer', sessions, projects2, peers)
-    expect(hosts).toHaveLength(1)
-    expect(hosts[0].folders[0].sessions.map(s => s.id)).toEqual(['f1'])
+      .toEqual(['1vshk4fu@container'])
   })
 })
 
@@ -923,7 +838,7 @@ describe('discoverProjects', () => {
   })
 
   it('excludes ALL peer sessions (discovery is host-authoritative)', () => {
-    // Discovery is owned by the originating host (ADR 0002/0005): the
+    // Discovery is owned by the originating host (ADR 0002/0025): the
     // viewer computes discovery only for its own local sessions. Peer
     // sessions — connected or not — are discovered by their owning
     // host and relayed verbatim (merged in store.discovered), never
@@ -939,7 +854,7 @@ describe('discoverProjects', () => {
   })
 
   it('treats local-peer (devcontainer) sessions as local', () => {
-    // Per ADR 0005 a Local peer's project assignment is owned by the
+    // Per ADR 0025 a Local peer's project assignment is owned by the
     // parent, so its disclaimed sessions flow through the parent's
     // local discovery rather than the container's own.
     const sessions = [

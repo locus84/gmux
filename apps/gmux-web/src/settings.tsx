@@ -21,14 +21,20 @@ import {
   removeProject, removePeerReference, localHostLabel,
   health, peers, sessions, connectHost, removeHost, parseConnectURL,
   unresolvedHosts, removeReferences,
+  UI_SCALE_MIN, UI_SCALE_MAX, uiScaleDefault, uiScaleOverride, uiScaleEffective,
+  setBrowserUiScale, resetBrowserUiScale,
 } from './store'
 import { HostSuffix } from './host-suffix'
 import { hostStatus } from './host-status'
 import { projectAvailability } from './projects'
+import {
+  refreshWebPushState, setWebPushProject, webPushBusy, webPushEnabled,
+  webPushError, webPushPendingProjectSlug, webPushProjectSlugs, webPushSupported,
+} from './push-subscriptions'
 import type { ProjectItem, DiscoveredProject, Folder, PeerInfo } from './types'
 import type { UnresolvedHost } from './references'
 
-type SettingsTab = 'projects' | 'hosts'
+type SettingsTab = 'projects' | 'hosts' | 'appearance'
 
 // ── SettingsModal ──
 
@@ -43,9 +49,7 @@ export function SettingsModal({
   onClose: () => void
   onSelectTab: (tab: SettingsTab) => void
 }) {
-  // Normalize the raw `?settings` value: anything that isn't 'hosts'
-  // falls back to the projects tab (covers bare `?settings`).
-  const activeTab: SettingsTab = tab === 'hosts' ? 'hosts' : 'projects'
+  const activeTab: SettingsTab = tab === 'hosts' || tab === 'appearance' ? tab : 'projects'
   const [discoveredQuery, setDiscoveredQuery] = useState('')
   const [pathDraft, setPathDraft] = useState('')
   const [pathError, setPathError] = useState('')
@@ -65,6 +69,7 @@ export function SettingsModal({
       setDiscoveredQuery('')
       setPathDraft('')
       setPathError('')
+      void refreshWebPushState()
     }
   }, [open])
 
@@ -164,11 +169,17 @@ export function SettingsModal({
             aria-selected={activeTab === 'hosts'}
             onClick={() => onSelectTab('hosts')}
           >Hosts</button>
+          <button
+            class={`settings-tab${activeTab === 'appearance' ? ' active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'appearance'}
+            onClick={() => onSelectTab('appearance')}
+          >Appearance</button>
         </nav>
 
         <div class="settings-main">
           <div class="settings-main-header">
-            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : 'Projects'}</span>
+            <span class="settings-main-title">{activeTab === 'hosts' ? 'Hosts' : activeTab === 'appearance' ? 'Appearance' : 'Projects'}</span>
             {activeTab === 'projects' && (
               <a
                 class="mp-docs-link"
@@ -184,8 +195,16 @@ export function SettingsModal({
           <div class="modal-body">
             <HostsTab />
           </div>
+        ) : activeTab === 'appearance' ? (
+          <div class="modal-body">
+            <AppearanceTab />
+          </div>
         ) : (
         <div class="modal-body">
+          {webPushError.value && (
+            <div class="mp-push-error" role="status">{webPushError.value}</div>
+          )}
+
           {/* ── Configured projects (manage: reorder + remove) ── */}
           <ConfiguredProjectsSection configured={configured} />
 
@@ -261,6 +280,36 @@ export function SettingsModal({
         </div>
       </div>
     </div>
+  )
+}
+
+function AppearanceTab() {
+  const effective = uiScaleEffective.value
+  const override = uiScaleOverride.value
+  const format = (scale: number) => `${Math.round(scale * 100)}%`
+  const update = (value: string) => {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) setBrowserUiScale(parsed)
+  }
+  return (
+    <section class="mp-section">
+      <div class="mp-section-label">This browser</div>
+      <div class="mp-path-hint ui-scale-help">
+        Stored only on this device. Scales gmux controls and terminal text. The shared default is {format(uiScaleDefault.value)}.
+      </div>
+      <label class="ui-scale-control">
+        <span class="ui-scale-label">UI scale</span>
+        <span class="ui-scale-value">{format(effective)}</span>
+        <input class="ui-scale-range" type="range" min={UI_SCALE_MIN} max={UI_SCALE_MAX} step="0.05" value={effective}
+          onInput={event => update(event.currentTarget.value)} />
+        <input class="mp-filter-input ui-scale-number" type="number" min={UI_SCALE_MIN} max={UI_SCALE_MAX} step="0.05" value={effective}
+          onInput={event => update(event.currentTarget.value)} />
+      </label>
+      <div class="ui-scale-actions">
+        <button class="mp-manual-btn" onClick={() => setBrowserUiScale(1)}>Use 100%</button>
+        <button class="mp-manual-btn" onClick={resetBrowserUiScale} disabled={override == null}>Reset to shared default</button>
+      </div>
+    </section>
   )
 }
 
@@ -629,6 +678,9 @@ function ConfiguredProjectRow({
   const alive = f.sessions.filter(s => s.alive).length
   const resumable = f.sessions.filter(s => !s.alive && s.resumable).length
   const isReference = !!project.peer
+  const pushOn = webPushEnabled.value && webPushProjectSlugs.value.has(project.slug)
+  const canTogglePush = !isReference && webPushSupported.value
+  const pushPending = webPushPendingProjectSlug.value === project.slug
   // Mirror the sidebar: a reference whose host is unresolved, dangling,
   // or offline reads as unavailable here too — muted row + a marker
   // sharing the sidebar's pip vocabulary.
@@ -672,6 +724,21 @@ function ConfiguredProjectRow({
           {alive === 0 && resumable === 0 && <span class="mp-configured-rest">no sessions</span>}
         </span>
       </div>
+      {canTogglePush && (
+        <button
+          class={`mp-configured-notify${pushOn ? ' active' : ''}`}
+          disabled={webPushBusy.value}
+          onClick={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            void setWebPushProject(project.slug, !pushOn)
+          }}
+          title={webPushError.value || (pushOn ? 'Disable push notifications' : 'Enable push notifications')}
+          aria-label={`${pushOn ? 'Disable' : 'Enable'} push notifications for ${project.slug}`}
+        >
+          {pushPending ? '…' : pushOn ? '🔔' : '🔕'}
+        </button>
+      )}
       <button
         class="mp-configured-remove"
         onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(project) }}

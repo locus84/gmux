@@ -225,7 +225,7 @@ function generateFile(session: Session, terminal: string, cursorX: number, curso
   if (session.workspace_root) {
     lines.push(`  workspace_root: '${session.workspace_root}',`)
   }
-  lines.push(`  kind: '${session.kind}',`)
+  lines.push(`  adapter: '${session.adapter}',`)
   lines.push(`  alive: ${session.alive},`)
   lines.push(`  pid: ${session.pid},`)
   lines.push(`  exit_code: ${session.exit_code},`)
@@ -234,7 +234,9 @@ function generateFile(session: Session, terminal: string, cursorX: number, curso
   lines.push(`  title: ${JSON.stringify(session.title)},`)
   lines.push(`  subtitle: ${JSON.stringify(session.subtitle)},`)
   if (session.status) {
-    lines.push(`  status: { label: ${JSON.stringify(session.status.label)}, working: ${session.status.working} },`)
+    const errorPart = session.status.error ? ', error: true' : ''
+    const interruptedPart = session.status.interrupted ? ', interrupted: true' : ''
+    lines.push(`  status: { active: ${session.status.active}${errorPart}${interruptedPart} },`)
   } else {
     lines.push(`  status: null,`)
   }

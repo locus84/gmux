@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -51,6 +52,26 @@ func TestParseCLI(t *testing.T) {
 				}
 			}},
 
+		{name: "edit", args: []string{"edit", "notes.txt"}, wantMode: modeEdit,
+			check: func(t *testing.T, c *command) {
+				if c.editFile != "notes.txt" {
+					t.Errorf("editFile = %q", c.editFile)
+				}
+			}},
+		{name: "edit without path prompts later", args: []string{"edit"}, wantMode: modeEdit,
+			check: func(t *testing.T, c *command) {
+				if c.editFile != "" {
+					t.Errorf("editFile = %q, want empty", c.editFile)
+				}
+			}},
+		{name: "edit child internal", args: []string{"__edit-child", "/tmp/x"}, wantMode: modeEditChild,
+			check: func(t *testing.T, c *command) {
+				if c.editFile != "/tmp/x" {
+					t.Errorf("editFile = %q", c.editFile)
+				}
+			}},
+		{name: "edit child without path", args: []string{"__edit-child"}, wantMode: modeEditChild},
+
 		{name: "ls", args: []string{"ls"}, wantMode: modeList},
 		{name: "ls --all --json", args: []string{"ls", "--all", "--json"}, wantMode: modeList,
 			check: func(t *testing.T, c *command) {
@@ -71,17 +92,47 @@ func TestParseCLI(t *testing.T) {
 					t.Errorf("ref = %q", c.ref)
 				}
 			}},
+		{name: "dismiss leaf", args: []string{"dismiss", "abc"}, wantMode: modeDismiss,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || c.dismissTree {
+					t.Errorf("dismiss command=%#v", c)
+				}
+			}},
+		{name: "dismiss tree", args: []string{"dismiss", "abc", "--tree"}, wantMode: modeDismiss,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || !c.dismissTree {
+					t.Errorf("dismiss command=%#v", c)
+				}
+			}},
+		{name: "project add", args: []string{"project", "add", "."}, wantMode: modeProject,
+			check: func(t *testing.T, c *command) {
+				if c.projectSub != "add" || c.projectPath != "." {
+					t.Errorf("project command=%#v", c)
+				}
+			}},
+		{name: "promote", args: []string{"promote", "abc"}, wantMode: modePromote,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" {
+					t.Errorf("promote command=%#v", c)
+				}
+			}},
+		{name: "reparent", args: []string{"reparent", "abc", "root"}, wantMode: modeReparent,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || c.parentRef != "root" {
+					t.Errorf("reparent command=%#v", c)
+				}
+			}},
 
 		{name: "tail defaults to 100 lines", args: []string{"tail", "abc"}, wantMode: modeTail,
 			check: func(t *testing.T, c *command) {
-				if c.tailLines != 100 || c.raw {
-					t.Errorf("tailLines=%d raw=%v", c.tailLines, c.raw)
+				if c.tailLines != 100 {
+					t.Errorf("tailLines=%d", c.tailLines)
 				}
 			}},
-		{name: "tail -n and --raw", args: []string{"tail", "-n", "500", "--raw", "abc"}, wantMode: modeTail,
+		{name: "tail -n", args: []string{"tail", "-n", "500", "abc"}, wantMode: modeTail,
 			check: func(t *testing.T, c *command) {
-				if c.tailLines != 500 || !c.raw {
-					t.Errorf("tailLines=%d raw=%v", c.tailLines, c.raw)
+				if c.tailLines != 500 || c.ref != "abc" {
+					t.Errorf("tailLines=%d ref=%q", c.tailLines, c.ref)
 				}
 			}},
 
@@ -108,6 +159,58 @@ func TestParseCLI(t *testing.T) {
 				if c.sendText != nil || len(c.sendKeys) != 0 {
 					t.Errorf("expected stdin form: text=%v keys=%v", c.sendText, c.sendKeys)
 				}
+				if c.sendWait {
+					t.Error("sendWait should default to false")
+				}
+			}},
+		{name: "send --wait with timeout", args: []string{"send", "--wait", "--timeout", "60", "abc", "do it", "Enter"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if !c.sendWait || c.timeout != 60 {
+					t.Errorf("sendWait=%v timeout=%d", c.sendWait, c.timeout)
+				}
+				if c.ref != "abc" || c.sendText == nil || *c.sendText != "do it" ||
+					len(c.sendKeys) != 1 || c.sendKeys[0] != "Enter" {
+					t.Errorf("ref=%q text=%v keys=%v", c.ref, c.sendText, c.sendKeys)
+				}
+			}},
+		{name: "send --timeout=N form before ref", args: []string{"send", "--wait", "--timeout=30", "abc", "go", "Enter"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if !c.sendWait || c.timeout != 30 {
+					t.Errorf("sendWait=%v timeout=%d", c.sendWait, c.timeout)
+				}
+			}},
+		{name: "send --follow-up is no longer a flag: literal text after ref", args: []string{"send", "abc", "--follow-up"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if c.sendText == nil || *c.sendText != "--follow-up" {
+					t.Errorf("text = %v, want literal --follow-up", c.sendText)
+				}
+			}},
+		{name: "send prompt with no keys stays unsubmitted", args: []string{"send", "abc", "also do X"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || c.sendText == nil || *c.sendText != "also do X" || len(c.sendKeys) != 0 {
+					t.Errorf("ref=%q text=%v keys=%v", c.ref, c.sendText, c.sendKeys)
+				}
+			}},
+		{name: "send dash-leading text after ref is literal (no guard)", args: []string{"send", "abc", "-v"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if c.sendText == nil || *c.sendText != "-v" {
+					t.Errorf("text = %v, want literal -v", c.sendText)
+				}
+			}},
+		{name: "send flag-looking text after ref is literal", args: []string{"send", "abc", "--wait"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if c.sendWait {
+					t.Error("--wait after the ref must be literal text, not a flag")
+				}
+				if c.sendText == nil || *c.sendText != "--wait" {
+					t.Errorf("text = %v, want literal --wait", c.sendText)
+				}
+			}},
+		{name: "send -- guard before ref still works", args: []string{"send", "--", "abc", "hi"}, wantMode: modeSend,
+			check: func(t *testing.T, c *command) {
+				if c.ref != "abc" || c.sendText == nil || *c.sendText != "hi" {
+					t.Errorf("ref=%q text=%v", c.ref, c.sendText)
+				}
 			}},
 
 		{name: "send-keys tmux compat", args: []string{"send-keys", "-t", "abc", "C-c"}, wantMode: modeSendKeys,
@@ -124,6 +227,12 @@ func TestParseCLI(t *testing.T) {
 			}},
 
 		{name: "wait idle default", args: []string{"wait", "abc"}, wantMode: modeWait},
+		{name: "wait multiple interspersed", args: []string{"wait", "abc", "--quiet", "def", "--timeout", "8", "ghi"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if strings.Join(c.waitRefs, ",") != "abc,def,ghi" || !c.quiet || c.timeout != 8 {
+					t.Errorf("refs=%v quiet=%v timeout=%d", c.waitRefs, c.quiet, c.timeout)
+				}
+			}},
 		{name: "wait --timeout", args: []string{"wait", "--timeout", "30", "abc"}, wantMode: modeWait,
 			check: func(t *testing.T, c *command) {
 				if c.timeout != 30 || c.ref != "abc" {
@@ -136,19 +245,55 @@ func TestParseCLI(t *testing.T) {
 					t.Errorf("timeout=%d ref=%q", c.timeout, c.ref)
 				}
 			}},
+		{name: "wait --for-text", args: []string{"wait", "abc", "--for-text", "BUILD OK"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if c.forText != "BUILD OK" || c.ref != "abc" {
+					t.Errorf("forText=%q ref=%q", c.forText, c.ref)
+				}
+			}},
+		{name: "wait --for-regex with timeout", args: []string{"wait", "--for-regex", `error: \d+`, "--timeout", "30", "abc"}, wantMode: modeWait,
+			check: func(t *testing.T, c *command) {
+				if c.forRegex != `error: \d+` || c.timeout != 30 || c.ref != "abc" {
+					t.Errorf("forRegex=%q timeout=%d ref=%q", c.forRegex, c.timeout, c.ref)
+				}
+			}},
 
 		{name: "daemon status", args: []string{"daemon", "status"}, wantMode: modeDaemon,
 			check: func(t *testing.T, c *command) {
-				if c.daemonSub != "status" {
-					t.Errorf("daemonSub = %q", c.daemonSub)
+				if c.daemonSub != "status" || len(c.daemonArgs) != 1 || c.daemonArgs[0] != "status" {
+					t.Errorf("daemonSub = %q daemonArgs = %v", c.daemonSub, c.daemonArgs)
+				}
+			}},
+		{name: "daemon state check", args: []string{"daemon", "state", "check"}, wantMode: modeDaemon,
+			check: func(t *testing.T, c *command) {
+				if c.daemonSub != "state" || strings.Join(c.daemonArgs, " ") != "state check" {
+					t.Errorf("daemonArgs = %v", c.daemonArgs)
+				}
+			}},
+		{name: "daemon state backup with path", args: []string{"daemon", "state", "backup", "/tmp/b.db"}, wantMode: modeDaemon,
+			check: func(t *testing.T, c *command) {
+				if strings.Join(c.daemonArgs, " ") != "state backup /tmp/b.db" {
+					t.Errorf("daemonArgs = %v", c.daemonArgs)
+				}
+			}},
+		{name: "daemon state reset", args: []string{"daemon", "state", "reset", "--yes"}, wantMode: modeDaemon,
+			check: func(t *testing.T, c *command) {
+				if strings.Join(c.daemonArgs, " ") != "state reset --yes" {
+					t.Errorf("daemonArgs = %v", c.daemonArgs)
+				}
+			}},
+		{name: "daemon state help", args: []string{"daemon", "state", "--help"}, wantMode: modeDaemon,
+			check: func(t *testing.T, c *command) {
+				if strings.Join(c.daemonArgs, " ") != "state --help" {
+					t.Errorf("daemonArgs = %v", c.daemonArgs)
 				}
 			}},
 		{name: "auth", args: []string{"auth"}, wantMode: modeAuth},
 		{name: "remote", args: []string{"remote"}, wantMode: modeRemote},
 
-		{name: "internal __run with directives", args: []string{"__run", "--resume-id=sess-1", "--initial-cols=80", "--", "pi"}, wantMode: modeRun,
+		{name: "internal __run with directives", args: []string{"__run", "--resume-id=1vshk4fu", "--initial-cols=80", "--", "pi"}, wantMode: modeRun,
 			check: func(t *testing.T, c *command) {
-				if c.resumeID != "sess-1" || c.initialCols != 80 {
+				if c.resumeID != "1vshk4fu" || c.initialCols != 80 {
 					t.Errorf("resumeID=%q cols=%d", c.resumeID, c.initialCols)
 				}
 				if strings.Join(c.runArgs, " ") != "pi" {
@@ -174,21 +319,178 @@ func TestParseCLI(t *testing.T) {
 	}
 }
 
+// TestHelpAliases pins the interchangeable help spellings: help, --help,
+// -h and ? all work at the top level, per verb, and inside the agent
+// namespace, and `gmux help <verb>` routes to the verb's page. Nothing
+// here may error — a help request is a question, not a mistake.
+func TestHelpAliases(t *testing.T) {
+	tests := []struct {
+		args  []string
+		topic string
+	}{
+		{[]string{"help"}, ""},
+		{[]string{"--help"}, ""},
+		{[]string{"-h"}, ""},
+		{[]string{"?"}, ""},
+		{[]string{"help", "send"}, "send"},
+		{[]string{"help", "wait"}, "wait"},
+		{[]string{"help", "nonsense"}, ""}, // lenient: unknown topic prints the synopsis
+		{[]string{"send", "--help"}, "send"},
+		{[]string{"send", "-h"}, "send"},
+		{[]string{"send", "?"}, "send"},
+		{[]string{"send", "help"}, "send"},
+		{[]string{"wait", "--help"}, "wait"},
+		{[]string{"wait", "abc", "--help"}, "wait"}, // flag position also answers
+		{[]string{"tail", "?"}, "tail"},
+		{[]string{"ls", "-h"}, "ls"},
+		{[]string{"attach", "--help"}, "attach"},
+		{[]string{"kill", "?"}, "kill"},
+		{[]string{"promote", "--help"}, "promote"},
+		{[]string{"promote", "abc", "--help"}, "promote"}, // flagless verbs answer here too
+		{[]string{"reparent", "abc", "def", "--help"}, "reparent"},
+		{[]string{"help", "reparent"}, "reparent"},
+		{[]string{"edit", "--help"}, "edit"},
+		{[]string{"send-keys", "--help"}, "send-keys"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, "_"), func(t *testing.T) {
+			c, err := parseCLI(tt.args)
+			if err != nil {
+				t.Fatalf("parseCLI(%v): %v", tt.args, err)
+			}
+			if c.mode != modeHelp || c.helpTopic != tt.topic {
+				t.Fatalf("parseCLI(%v) = mode %v topic %q, want modeHelp/%q", tt.args, c.mode, c.helpTopic, tt.topic)
+			}
+		})
+	}
+
+	// Every topic those aliases can reach must have a page, and every page
+	// must present its verb's canonical form.
+	for topic, page := range verbHelpPages {
+		if !strings.Contains(page, "gmux "+topic) {
+			t.Errorf("help page %q does not show its own canonical form", topic)
+		}
+	}
+
+	// -v joins version/--version.
+	for _, args := range [][]string{{"version"}, {"--version"}, {"-v"}} {
+		c, err := parseCLI(args)
+		if err != nil || c.mode != modeVersion {
+			t.Errorf("parseCLI(%v) = (%v, %v), want modeVersion", args, c, err)
+		}
+	}
+
+	// Daemon help is forwarded to gmuxd (one help text, two front doors):
+	// bare, help-token and `gmux help daemon` spellings all exec `gmuxd help`.
+	for _, args := range [][]string{{"daemon"}, {"daemon", "--help"}, {"daemon", "?"}, {"help", "daemon"}} {
+		c, err := parseCLI(args)
+		if err != nil || c.mode != modeDaemon || len(c.daemonArgs) != 1 || c.daemonArgs[0] != "help" {
+			t.Errorf("parseCLI(%v) = (%+v, %v), want daemon forward of [help]", args, c, err)
+		}
+	}
+}
+
+// TestUsageErrorsCarryTheirTopic pins the error-help pairing: a mistake
+// inside a verb names that verb's help page, so main prints the page that
+// explains the mistake instead of the top-level synopsis. Agent verbs
+// typed without their namespace route to the agent guide.
+func TestUsageErrorsCarryTheirTopic(t *testing.T) {
+	tests := []struct {
+		args  []string
+		topic string
+	}{
+		{[]string{"wait"}, "wait"},
+		{[]string{"send", "--frob", "abc"}, "send"},
+		{[]string{"tail"}, "tail"},
+		{[]string{"agent", "frobnicate"}, "agent"},
+		{[]string{"agent", "prompt"}, "agent"},
+		{[]string{"reparent", "abc"}, "reparent"},
+		{[]string{"promote"}, "promote"},
+		{[]string{"prompt", "hi"}, "agent"},
+		{[]string{"cancel", "abc"}, "agent"},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(tt.args, "_"), func(t *testing.T) {
+			_, err := parseCLI(tt.args)
+			if err == nil {
+				t.Fatalf("parseCLI(%v) = nil error", tt.args)
+			}
+			var ue *usageError
+			if !errors.As(err, &ue) {
+				t.Fatalf("parseCLI(%v) error %q is not a usageError", tt.args, err)
+			}
+			if ue.topic != tt.topic {
+				t.Errorf("parseCLI(%v) topic = %q, want %q", tt.args, ue.topic, tt.topic)
+			}
+		})
+	}
+
+	// Errors with no verb home (unknown command, removed flag) stay plain
+	// so main points at the top-level synopsis.
+	for _, args := range [][]string{{"waitt", "abc"}, {"--list"}} {
+		_, err := parseCLI(args)
+		var ue *usageError
+		if err == nil || errors.As(err, &ue) {
+			t.Errorf("parseCLI(%v) = %v, want a plain (untagged) error", args, err)
+		}
+	}
+
+	// Errors are followed by a one-line pointer at the owning help page,
+	// never the page itself (repeated mistakes must not flood the output).
+	for topic, want := range map[string]string{
+		"":             "run 'gmux --help' for usage",
+		"wait":         "run 'gmux wait --help' for usage",
+		"promote":      "run 'gmux promote --help' for usage",
+		"reparent":     "run 'gmux reparent --help' for usage",
+		"send":         "run 'gmux send --help' for usage",
+		"agent":        "run 'gmux agent --help' for usage",
+		"agent prompt": "run 'gmux agent --help' for usage",
+	} {
+		if got := helpHint(topic); got != want {
+			t.Errorf("helpHint(%q) = %q, want %q", topic, got, want)
+		}
+		if got := helpHint(topic); strings.Contains(got, "\n") {
+			t.Errorf("helpHint(%q) must be a single line, got %q", topic, got)
+		}
+	}
+}
+
 func TestParseCLIErrors(t *testing.T) {
 	bad := [][]string{
-		{"-d"},                     // detach without command
-		{"-d", "ls"},               // detach only pairs with --
-		{"--"},                     // run with no command
-		{"open", "extra"},          // open takes no args
-		{"attach"},                 // missing id
-		{"attach", "a", "b"},       // too many
-		{"tail"},                   // missing id
-		{"tail", "-n", "0", "abc"}, // non-positive count
-		{"wait"},                   // missing id
-		{"send-keys", "C-c"},     // missing -t
-		{"daemon"},               // missing subcommand
-		{"daemon", "frobnicate"}, // unknown subcommand
-		{"ls", "stray"},          // ls takes no positional
+		{"-d"},                           // detach without command
+		{"-d", "ls"},                     // detach only pairs with --
+		{"--"},                           // run with no command
+		{"open", "extra"},                // open takes no args
+		{"attach"},                       // missing id
+		{"attach", "a", "b"},             // too many
+		{"dismiss"},                      // missing id
+		{"dismiss", "a", "b"},            // too many
+		{"project"},                      // missing subcommand
+		{"project", "unknown"},           // unknown subcommand
+		{"project", "add"},               // missing path
+		{"project", "add", ".", "extra"}, // too many paths
+		{"tail"},                         // missing id
+		{"tail", "-n", "0", "abc"},       // non-positive count
+		{"wait"},                         // missing id
+		{"wait", "abc", "--for-text", "a", "--for-regex", "b"}, // mutually exclusive
+		{"wait", "abc", "def", "--for-text", "a"},              // predicates require one id
+		{"wait", "abc", "def", "--for-regex", "a"},             // predicates require one id
+		{"wait", "abc", "--for-regex", "["},                    // invalid regex
+		{"send-keys", "C-c"},                                   // missing -t
+		{"send", "--timeout", "5", "abc", "x"},                 // --timeout without --wait
+		{"send", "--wait", "--timeout", "0", "abc", "x"},       // non-positive timeout
+		{"send", "--frob", "abc"},                              // unknown leading flag
+		{"send", "--wait"},                                     // missing id (only a flag given)
+		{"send", "--follow-up", "abc", "x"},                    // removed semantic flag, not silently accepted
+		{"send", "--steering", "abc", "x"},                     // removed semantic flag, not silently accepted
+		{"send", "--steering=s1", "abc", "x"},                  // ...in its =value spelling too
+		{"daemon", "frobnicate"},                               // unknown subcommand
+		{"daemon", "state"},                                    // missing state subcommand
+		{"daemon", "state", "frobnicate"},                      // unknown state subcommand
+		{"ls", "stray"},                                        // ls takes no positional
+		{"edit", "a", "b"},                                     // too many files
+		{"edit", "--wait"},                                     // no flags on edit (yet)
+		{"__edit-child", "a", "b"},                             // too many files
 	}
 	for _, args := range bad {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {
@@ -213,6 +515,13 @@ func TestParseCLIMigrationShim(t *testing.T) {
 		{[]string{"--no-attach", "x"}, "gmux -d"},
 		{[]string{"--host=laptop"}, "@<peer>"},
 		{[]string{"pytest", "-q"}, "gmux -- pytest"},
+		{[]string{"workspace", "add", "."}, "gmux project add"},
+		{[]string{"session", "dismiss", "abc"}, "gmux dismiss"},
+		// send's two removed semantic flags have a named replacement one
+		// rename away, so "unknown flag" is the least actionable of the
+		// available errors: name the verb that replaced them.
+		{[]string{"send", "--steering", "s1", "hi"}, "gmux agent prompt --steer"},
+		{[]string{"send", "--follow-up", "s1", "hi"}, "gmux agent prompt --follow-up"},
 	}
 	for _, tc := range cases {
 		t.Run(strings.Join(tc.args, "_"), func(t *testing.T) {

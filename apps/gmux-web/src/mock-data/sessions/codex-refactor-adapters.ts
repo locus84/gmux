@@ -16,13 +16,13 @@ const C9 = '\x1b[0;1;48;2;43;48;53m'
 const C10 = '\x1b[0;2;48;2;43;48;53m'
 
 export default {
-  id: 'sess-4ab4995b',
+  id: '1jd5z9sg',
   created_at: ago(0),
   command: ["codex"],
   cwd: '/home/user/dev/my-project',
   workspace_root: '/home/user/dev/my-project',
   remotes: { origin: 'github.com/acme/my-project' },
-  kind: 'codex',
+  adapter: 'codex',
   alive: true,
   pid: 568143,
   exit_code: null,
@@ -30,10 +30,11 @@ export default {
   exited_at: null,
   title: "refactor adapters",
   subtitle: "",
-  status: { label: "", working: true },
+  status: { active: true },
   unread: false,
-  socket_path: '/tmp/gmux-sessions/sess-4ab4995b.sock',
-  peer: 'laptop',
+  project_slug: 'my-project',
+  last_output_at: ago(0),
+  socket_path: '/tmp/gmux-sessions/1jd5z9sg.sock',
   cursorX: 2,
   cursorY: 70,
   terminal: `

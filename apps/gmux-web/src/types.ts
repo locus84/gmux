@@ -3,9 +3,14 @@
 // Pure interfaces for the frontend data model. No logic, no imports.
 
 export interface SessionStatus {
-  label: string
-  working: boolean
+  /** The agent is working on a turn. */
+  active: boolean
+  /** Orthogonal to `active`: a retryable/attention condition while active,
+   *  or a terminal failure once inactive. */
   error?: boolean
+  /** The last turn was intentionally stopped by a human or agent. Not an
+   *  error: waits report it separately, the sidebar just goes idle. */
+  interrupted?: boolean
 }
 
 export interface Session {
@@ -17,7 +22,23 @@ export interface Session {
   cwd: string
   workspace_root?: string
   remotes?: Record<string, string>
-  kind: string
+  adapter: string
+  /**
+   * Drive mode (ADR 0033): how gmux hosts this harness. Absent means
+   * terminal; 'acp' sessions have no PTY. Server-derived; never inferred
+   * from adapter names.
+   */
+  drive_mode?: 'terminal' | 'acp'
+  /**
+   * Session this one was spawned from (e.g. `gmux edit` invoked as
+   * $EDITOR inside an existing session). Drives adjacent placement in
+   * the sidebar: the child renders directly under its parent.
+   */
+  parent_session_id?: string
+  /** Immutable launch provenance; used only by the Return to family suggestion. */
+  launched_from_session_id?: string
+  /** Server-derived semantic agent capability; never inferred from adapter names. */
+  semantic_agent?: boolean
   alive: boolean
   pid: number | null
   exit_code: number | null
@@ -27,6 +48,7 @@ export interface Session {
   subtitle: string
   status: SessionStatus | null
   unread: boolean
+  unread_token?: string
   resumable?: boolean
   /**
    * RFC3339 timestamp of the session's most recent noteworthy state
@@ -35,17 +57,17 @@ export interface Session {
    * and acts as a stable sort key for activity-ordered views.
    * Unset for brand-new sessions until their first transition.
    */
-  last_activity_at?: string
+  last_output_at?: string
   socket_path: string
   terminal_cols?: number
   terminal_rows?: number
   slug?: string
   /**
    * Conversation file this runner authoritatively writes (session → file,
-   * ADR 0011). Two live sessions sharing a session_file means the same
+   * ADR 0011). Two live sessions sharing a conversation_file means the same
    * conversation is open in multiple tabs — surfaced as a warning.
    */
-  session_file?: string
+  conversation_file?: string
   /** Version string of the gmux runner binary that owns this session. */
   runner_version?: string
   /** SHA-256 of the gmux runner binary (first 8 chars useful for display). */
@@ -119,7 +141,7 @@ export interface MatchRule {
  *
  *   - Owned: `slug` + `match[]` (+ `sessions[]` maintained by server)
  *     A project owned by this host. Match rules drive session
- *     attribution; `sessions[]` is the ordered list of session keys
+ *     attribution; `sessions[]` is the ordered list of session IDs
  *     for sidebar order.
  *   - Reference: `slug` + `peer`
  *     A pointer to a project owned by a peer. The peer's projects.json
@@ -132,10 +154,11 @@ export interface ProjectItem {
   /** Set when this item is a reference to a peer-owned project. */
   peer?: string
   /**
-   * Stable opaque identity (ADR 0007) of the referenced peer, used to
-   * resolve the reference even after the peer is renamed. Set only on
-   * references; opportunistically backfilled once the peer is
-   * reachable. Absent on legacy references and owned projects.
+   * Referenced peer's stable opaque identity (ADR 0007). `peer` (the
+   * display name) is the runtime key the viewer renders and routes by;
+   * node_id is only the liveness anchor (see referencePresence),
+   * keeping a reference matched to the right host across re-adds and
+   * name reuse. Set only on references; absent on owned projects.
    */
   node_id?: string
   /** Owned-project match rules. Empty/absent for references. */
@@ -164,7 +187,7 @@ export interface DiscoveredProject {
    */
   peer?: string
   /**
-   * Most-recent last_activity_at (falling back to created_at) among the
+   * Most-recent last_output_at (falling back to created_at) among the
    * sessions in this group, as an RFC3339 string. Used to sort
    * suggestions by recency.
    */
@@ -178,6 +201,15 @@ export interface PeerInfo {
   status: string // 'connected' | 'connecting' | 'disconnected' | 'offline' (connecting treated as disconnected in UI)
   session_count: number
   last_error?: string
+  /**
+   * Number of session rows this peer's last committed protocol-3 stream
+   * transaction quarantined at the sender (row_too_large, transaction_limit,
+   * …). Non-zero means the peer's sessions in the merged list are knowingly
+   * incomplete. Absent on older daemons and when the projection is complete.
+   */
+  sessions_omitted?: number
+  /** Bounded per-code breakdown of sessions_omitted. */
+  sessions_omitted_codes?: Record<string, number>
   version?: string
   default_launcher?: string
   launchers?: LauncherDef[]

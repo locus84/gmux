@@ -270,11 +270,31 @@ func RenderTail(r io.Reader, cols, rows, n int) ([]string, error) {
 	e.SetScrollbackSize(RenderScrollbackSize)
 	// The emulator writes back responses (e.g. DSR cursor position
 	// reports) into a pipe. Nothing reads them here, and a blocked
-	// write would deadlock our Write below. Drain in the background.
+	// write would deadlock our Write below. Drain in the background,
+	// and unblock the drain on the way out so it sees EOF and exits —
+	// otherwise it blocks on the pipe forever, leaking one goroutine
+	// per render. One-shot tail requests barely noticed; the
+	// output-condition wait re-renders on a ticker and would
+	// accumulate them.
+	//
+	// The unblocking deliberately closes the response pipe's write end
+	// (InputPipe) instead of calling e.Close(): Close sets an
+	// unsynchronized bool that the drain goroutine's concurrent Read
+	// also checks — a data race in the vt package. Closing the
+	// *io.PipeWriter is everything Close does minus that bool, and
+	// io.Pipe is safe for concurrent use.
 	drainDone := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, e)
 		close(drainDone)
+	}()
+	defer func() {
+		if c, ok := e.InputPipe().(io.Closer); ok {
+			_ = c.Close()
+		} else {
+			_ = e.Close() // future-proof fallback; racy only if vt changes InputPipe
+		}
+		<-drainDone
 	}()
 	if _, err := e.Write(raw); err != nil {
 		return nil, fmt.Errorf("replay through emulator: %w", err)
@@ -292,41 +312,70 @@ func RenderTail(r io.Reader, cols, rows, n int) ([]string, error) {
 // screen are dropped because an idle TUI pads the bottom of its
 // viewport with blanks that aren't useful in a log-style tail.
 func extractLines(e *vt.Emulator) []string {
-	var lines []string
+	type row struct {
+		text    string
+		wrapped bool
+	}
+	var rows []row
 	if sb := e.Scrollback(); sb != nil {
-		for _, line := range sb.Lines() {
-			lines = append(lines, plainLine(line))
+		for i, line := range sb.Lines() {
+			wrapped := sb.Wrapped(i)
+			rows = append(rows, row{plainLine(line, wrapped), wrapped})
 		}
 	}
 
 	w, h := e.Width(), e.Height()
-	screenLines := make([]string, h)
+	visible := make([]row, h)
 	for y := 0; y < h; y++ {
-		row := make(uv.Line, w)
+		line := make(uv.Line, w)
 		for x := 0; x < w; x++ {
 			if c := e.CellAt(x, y); c != nil {
-				row[x] = *c
+				line[x] = *c
 			}
 		}
-		screenLines[y] = plainLine(row)
+		wrapped := e.Wrapped(y)
+		visible[y] = row{plainLine(line, wrapped), wrapped}
 	}
-	end := len(screenLines)
-	for end > 0 && strings.TrimSpace(screenLines[end-1]) == "" {
+	end := len(visible)
+	for end > 0 && strings.TrimSpace(visible[end-1].text) == "" {
 		end--
 	}
-	return append(lines, screenLines[:end]...)
+	rows = append(rows, visible[:end]...)
+
+	var lines []string
+	var logical strings.Builder
+	for _, r := range rows {
+		logical.WriteString(r.text)
+		if !r.wrapped {
+			lines = append(lines, logical.String())
+			logical.Reset()
+		}
+	}
+	if logical.Len() > 0 {
+		lines = append(lines, logical.String())
+	}
+	return lines
 }
 
-// plainLine renders a terminal line as plain text (no ANSI styling),
-// right-trimming trailing spaces so short lines don't emit padding.
-func plainLine(line uv.Line) string {
+// plainLine renders a terminal line as plain text (no ANSI styling). Wrapped
+// rows keep their full cell width because every trailing blank was consumed at
+// the wrap boundary; terminating rows still discard unused padding.
+func plainLine(line uv.Line, wrapped bool) string {
 	var b strings.Builder
 	for _, c := range line {
+		if c.IsZero() {
+			// Wide-cell placeholders and synthetic early-wrap skips carry no
+			// plain-text content.
+			continue
+		}
 		if c.Content == "" {
 			b.WriteString(" ")
 		} else {
 			b.WriteString(c.Content)
 		}
+	}
+	if wrapped {
+		return b.String()
 	}
 	return strings.TrimRight(b.String(), " ")
 }

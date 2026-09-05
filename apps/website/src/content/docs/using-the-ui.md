@@ -1,195 +1,46 @@
 ---
 title: Using the UI
-description: What you see in gmux and how to work with it.
+description: A tour of the gmux web UI — from your first session to working from your phone.
 ---
 
-Running `gmux open` opens the dashboard in a dedicated browser window. You can also navigate to **[localhost:8790](http://localhost:8790)** directly; the first time you'll need to authenticate by visiting the login URL from `gmux auth`.
+Running `gmux open` opens gmux in a dedicated browser window. You can also navigate to **[localhost:8790](http://localhost:8790)** directly; the first time you'll need to authenticate by visiting the login URL from `gmux auth`.
 
-## The sidebar
+![The gmux web UI: sessions grouped by project in the sidebar, the Activity feed on the right](../../assets/hero-desktop.png)
 
-The left panel lists your sessions grouped into projects.
+The **sidebar** lists your sessions, grouped into projects. Home is **Activity**: a feed of live sessions across all your hosts, ordered by last output and grouped by day. A session floats up only when it produces new output you haven't seen — status changes its dot, not its position — so the queue stays stable while you work down it. An **Enable notifications** pill in the Activity header opts this browser into notifications for turns that finish while you're elsewhere.
 
-### Logo
+In the sidebar header, the **gmux logo** takes you home (it lights up when a session elsewhere is waiting on you), the **sort button** switches the sidebar between **Projects** and a flat **Activity** view — and can narrow the tab to one host or hide dead sessions — and the **sliders button** opens **Settings**.
 
-Click the **gmux** logo at the top of the sidebar to return to the home screen.
+## Your first project
 
-## Home screen
+A fresh sidebar is empty: gmux discovers sessions but never adds anything to the sidebar on its own.
 
-The home screen shows your hosts, projects, and quick-launch buttons.
+The natural way to fill it: run a gmux command in the folder you work in (`gmux -- pi`), then open **Settings → Projects** — the directory is already waiting under **Discovered**, so adding the project is one click. You can also launch straight from the UI: a fresh install shows a single **+** button (which seeds a default *home* project), and once you have projects, hovering a project name reveals its **+**, with a menu of the agents installed on that host.
 
-### Host cards
+Projects match sessions by filesystem path or git remote URL. Projects on other machines aren't matched by rules — add them under **Settings → Projects → From other hosts** once the host is [connected](/multi-machine/).
 
-Each machine (local and remote) gets a card with a status indicator, session count, and launch buttons.
-
-| Indicator | Meaning |
-|-----------|---------||
-| **Green dot** | Connected, sessions visible |
-| **Pulsing dot** | Connecting to peer |
-| **Red ✗** | Peer disconnected (shows error reason) |
-
-Hosts you add via **Settings → Hosts → Connect to host** persist across restarts and reconnect automatically. gmux does not auto-discover tailnet machines — adding one is an explicit, token-authenticated step (see [Multi-Machine](/multi-machine/) and [ADR 0008](https://github.com/gmuxapp/gmux/blob/main/docs/adr/0008-peer-authentication-via-token.md)).
-
-In **Settings → Hosts**, each host shows an explicit status:
-
-| Status | Meaning |
-|--------|---------|
-| **Online** | Connected and authenticated |
-| **Connecting…** | Handshake in progress |
-| **Auth needed** | Reachable, but the token is missing or wrong — an **Add token** button pre-fills the connect form so you can supply it |
-| **Offline** | Unreachable right now (shows the connection error); it reconnects on its own when the host comes back |
-
-Removing a host also clears the project references that pointed at it, so it leaves nothing behind under **Referenced but not found**.
-
-**Upgrading to 2.0:** hosts you had projects on — that earlier versions auto-discovered on your tailnet — are migrated into the roster as **Auth needed**. Click **Add token** on each and paste its token (run `gmux auth` on that host) to bring it back online. Other tailnet machines aren't carried over; re-add them with **Connect to host** if you want them. Your `projects.json` is backed up to `projects.json.bak` before the upgrade rewrites it.
-
-Connected peers show launch buttons for each configured adapter, just like the local host.
-
-### Projects
-
-Sessions don't appear in the sidebar until you add a project. The first time you open the dashboard, click the **+** button to launch a session. gmux creates a default "home" project that catches sessions started from your home directory. As you work in more repositories, use **Manage projects** to organize sessions by repo.
-
-Click a **project name** to open the [project hub](#project-hub), an overview of all sessions in that project grouped by host and working directory. The active project is highlighted in the sidebar.
-
-Each project has **match rules** that determine which sessions belong to it. Rules can match by filesystem path (`~/dev/gmux` and its subdirectories) or by git remote URL (grouping clones across machines). See [`projects.json`](/reference/projects-json/) for the full reference on rules, precedence, and advanced options like exact matching and host scoping.
-
-You can manage projects at any time via the **Manage projects** button at the bottom of the sidebar. A badge shows when there are running sessions that don't match any project yet. The modal has two sections:
-
-- **Your projects**: configured projects with their match rules. Drag to reorder, click **×** to remove.
-- **Discovered**: directories with running sessions that don't match any project. Type to filter, or enter a path to add directly.
-
-### Sessions
-
-Each session has a dot on the left edge:
-
-| Indicator | Meaning |
-|-----------|---------|
-| **Pulsing ring** | The tool is actively working (building, thinking, running tests) |
-| **Blue dot** | New output you haven't seen yet (viewing the session clears it) |
-| **Muted ring** (brief) | Transient terminal activity, fades after a few seconds |
-| **No dot** | Idle or waiting for input |
-
-Agent sessions (pi, Claude, Codex) only trigger the blue unread dot when the assistant completes a turn, not on every line of output.
-
-Hover over a session to reveal the **×** button. This dismisses the session: live runners are killed, the sidebar/project membership is removed, and persisted runtime metadata is dropped so the session does not come back as resumable. Use **Resume** from a dead session view only when you want to continue it.
-
-## Project hub
-
-Click a project name in the sidebar (or navigate to `/:project`) to see the project hub. This is an overview of every session in the project, grouped first by host, then by working directory.
-
-### Host sections
-
-Each host gets a section with a status indicator and a breadcrumb path showing the topology chain. For example, a devcontainer running on a remote peer might show `workstation › alpine-dev`. Status indicators:
-
-| Indicator | Meaning |
-|-----------|---------|
-| **Accent dot** | Local host |
-| **Green dot** | Connected remote peer |
-| **Pulsing yellow dot** | Reconnecting to peer |
-| **Red dot** | Peer disconnected |
-
-### Folder rows
-
-Within each host, sessions are grouped by their working directory. Each folder row shows a path label and the session cards underneath. A **+** button on each row lets you launch a new session in that directory on that host.
-
-### Session cards
-
-Each card shows a status dot and the session title. Click a card to attach to that session's terminal. The **×** button dismisses the session, killing it first if it is still alive.
-
-### Empty projects
-
-If a project has no sessions yet, the hub shows the project's configured path with a **+** launcher to get started.
+The project's **+** menu also opens **Manage worktrees**. The sheet lists linked Git worktrees, creates branch-backed checkouts, and launches an agent in any checkout. Removal is deliberately conservative: gmux refuses primary, dirty, locked, or session-owning worktrees. The same local workflow is available as `gmux worktree current`, `gmux worktree ps`, and `gmux worktree create`.
 
 ## The terminal
 
-Click a session to attach. You get a full interactive terminal powered by [xterm.js](https://xtermjs.org/). Colors, cursor positioning, mouse support, and images all work. The header bar shows the session title, status label, and a working indicator.
+Click a session to attach a full interactive terminal. **Cmd/Ctrl+F** opens find-in-terminal; the full default keymap and how to override it is in the [settings reference](/reference/settings/#default-keymap).
 
-## Launching sessions
+The **⋮** menu holds the lifecycle action — **Restart** for a live session, **Resume** or **Rerun** for a dead one — plus **Browse files**. The read-only file view stays scoped to the session workspace, previews text and images, and can open paths recognized in terminal output without unmounting the terminal. Dead sessions replay their terminal history read-only: resuming continues an agent conversation where it left off, rerunning starts the command fresh in the same directory.
 
-### From the command line
+To get rid of a session, hover it in the sidebar and click **×**. This stops the session **and every session it launched**, then removes them from the UI — but it isn't data deletion: agent conversations stay in their own tools, and terminal history is kept until gmux eventually cleans it up.
 
-```bash
-gmux -- pi              # coding agent
-gmux -- pytest --watch  # any command
-```
+## Session families
 
-### From the UI
+Sessions launched by an agent — subagents, test runners, watchers — group **under that agent** in the sidebar: one root row stands in for the whole family, with a counts line for what its members are doing and a family panel (the pill next to the session title) mapping the full tree. Viewing a member shows its ancestry as breadcrumbs in the header.
 
-There are several places to launch:
+When a child grows into work you track in its own right, open its **⋮** menu and choose **Promote to root**. The session gets its own sidebar row — placed by its own directory, like any root, so it needs a project that contains that directory (if none does, the menu item says so and stays unavailable until you add one). Its waiting/error states then surface on its own row instead of the family roll-up, and its subtree gets its own [active-subagent budget](/reference/host-toml/). Promotion is a real move, not a display trick: the session leaves the family, so **×** on the former parent no longer stops or removes it, and future unread output is no longer held back while that parent works — a root answers to nobody. A turn that already finished quietly under a busy parent is not re-announced when promoted. Who launched what is still recorded, which is how the same menu can offer **Return to family**: it moves the session back under the agent that launched it, and is available while that family root has a project-backed sidebar row; if that root is outside every project, the item stays visibly unavailable until you add one. A session launched top-level has no recorded launch parent, so after reparenting it elsewhere and promoting it the menu cannot offer **Return to family**; `gmux reparent` still works when you know the target ID. Both actions are available only on the host that owns the session, and from the CLI as [`gmux promote`](/reference/cli/#gmux-promote-id) and [`gmux reparent`](/reference/cli/#gmux-reparent-id-parent-id).
 
-- **Sidebar header**: click the **+** button at the top of the sidebar to launch in the default directory.
-- **Sidebar project**: hover a project name to reveal a **+** button. This launcher is context-aware: it targets the host and directory of whatever you're currently looking at. Select a session on a remote peer, and the **+** targets that peer. Switch to a local session, it targets local.
-- **Project hub**: click the **+** on any folder row to launch in that specific directory on that host. For projects with [peers](/multi-machine), the per-host launcher routes the session to the correct machine.
-- **Home screen**: quick-launch buttons for starting a session without any project context.
+## On your phone
 
-All launch menus show the available adapters (Shell, pi, Claude Code, Codex). The first item aligns with the **+** button so a double-click launches the default adapter instantly.
+Open the same URL on your phone — or from anywhere via [remote access](/remote-access/). The sidebar slides in from the left (tap **☰**), and a bottom toolbar supplies the keys phones don't have: esc, tab, arrows, word-jump, and send. **ctrl** and **alt** arm for the next key — tap **ctrl**, then `c`, for Ctrl+C. Long-press a link in the terminal to copy or open it.
 
-## URL routing
+## Next steps
 
-Every view has a stable URL:
-
-| URL pattern | What it shows |
-|-------------|---------------|
-| `/` | Home: host status, projects, quick launch |
-| `/:project` | Project hub overview |
-| `/:project/:adapter/:slug` | A specific session's terminal |
-
-For example, `/gmux/pi/fix-auth-bug` links directly to a pi session in the gmux project. URLs update as you navigate, work with browser back/forward, and are bookmarkable. Session slugs remain stable across kill and resume.
-
-## Keyboard shortcuts
-
-gmux ships a complete default keymap. Keys not listed here go straight to the terminal.
-
-### All platforms
-
-| Shortcut | Action |
-|----------|--------|
-| **Shift+Enter** | Sends a plain newline (`\n`) instead of Enter |
-| **Ctrl+C** | If text is selected: copy to clipboard. Otherwise: sends SIGINT |
-
-### Linux / Windows
-
-| Shortcut | Action |
-|----------|--------|
-| **Ctrl+Shift+C** | Copy selection to clipboard |
-| **Ctrl+V** | Paste from clipboard |
-| **Ctrl+Shift+V** | Paste from clipboard |
-| **Ctrl+Alt+T** | Sends Ctrl+T (browser steals Ctrl+T) |
-| **Ctrl+Alt+N** | Sends Ctrl+N (browser steals Ctrl+N) |
-| **Ctrl+Alt+W** | Sends Ctrl+W (browser steals Ctrl+W) |
-
-### Mac
-
-| Shortcut | Action |
-|----------|--------|
-| **Cmd+C** | Copy selection to clipboard |
-| **Cmd+V** | Paste from clipboard |
-| **Cmd+A** | Select all terminal content |
-| **Cmd+Left** | Home (beginning of line) |
-| **Cmd+Right** | End (end of line) |
-| **Cmd+Backspace** | Delete to start of line (sends Ctrl+U) |
-| **Cmd+K** | Clear screen (sends Ctrl+L) |
-
-All defaults can be overridden or disabled in [`settings.jsonc`](/reference/settings/#keybinds-guide).
-
-:::note[macCommandIsCtrl]
-If you prefer every Cmd+character to send its Ctrl equivalent (Cmd+A = beginning of line, Cmd+K = kill to end, Cmd+R = reverse search), enable [`macCommandIsCtrl`](/reference/settings/#maccommandisctrl).
-:::
-
-:::tip[App mode]
-`gmux` tries to open in Chrome/Chromium `--app` mode for a standalone window with full keyboard access. If it falls back to a regular browser tab, shortcuts like Ctrl+T, Ctrl+N, and Ctrl+W are intercepted by the browser. The Ctrl+Alt workarounds in the table above cover this case. You can also install gmux as a PWA from the browser menu (⋮ → Install gmux).
-:::
-
-## Mobile
-
-Open the same URL on your phone (or via [remote access](/remote-access)). The sidebar slides in from the left (tap ☰), and a bottom bar provides keys that phones don't have:
-
-| Button | Sends |
-|--------|-------|
-| **esc** | Escape |
-| **tab** | Tab |
-| **ctrl** | Arms Ctrl for the next key (tap ctrl, then c = Ctrl+C) |
-| **alt** | Arms Alt for the next key |
-| **← →** | Arrow keys (hold to repeat) |
-| **▶** | Send (Enter) |
-
-When **ctrl** is armed, the toolbar transforms: **esc** and **tab** become **↑** and **↓** arrow keys, **▶** (send) becomes **paste**, and **← →** switch to word-jump navigation. The toolbar returns to normal after the next keypress or when you tap ctrl again.
+- **[Orchestrating agents](/orchestrating-agents/)** — launch agents from scripts or other agents, prompt them, and harvest their results.
+- **[Devcontainers](/devcontainers/)** — one line in `devcontainer.json` and container sessions appear alongside everything else.
+- **[Remote access](/remote-access/)** — reach gmux from your phone or another machine over your tailnet.

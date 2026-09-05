@@ -29,11 +29,11 @@ func AllAdapters() []adapter.Adapter {
 	return result
 }
 
-// FindByKind returns the adapter with the given name, or nil if not found.
+// FindByAdapter returns the adapter with the given name, or nil if not found.
 // Includes the shell fallback adapter.
-func FindByKind(kind string) adapter.Adapter {
+func FindByAdapter(name string) adapter.Adapter {
 	for _, a := range AllAdapters() {
-		if a.Name() == kind {
+		if a.Name() == name {
 			return a
 		}
 	}
@@ -42,16 +42,19 @@ func FindByKind(kind string) adapter.Adapter {
 
 // Compile-time interface checks.
 var (
-	_ adapter.SessionFiler    = (*Shell)(nil)
-	_ adapter.Resumer         = (*Shell)(nil)
-	_ adapter.CommandTitler   = (*Shell)(nil)
-	_ adapter.SessionRegistrar = (*Shell)(nil)
-	_ adapter.SessionFinalizer = (*Shell)(nil)
+	_ adapter.ConversationDescriber = (*Shell)(nil)
+	_ adapter.Resumer               = (*Shell)(nil)
+	_ adapter.CommandTitler         = (*Shell)(nil)
+	_ adapter.SessionRegistrar      = (*Shell)(nil)
+	_ adapter.SessionFinalizer      = (*Shell)(nil)
 )
 
 // Shell is the fallback adapter. It matches all commands and parses
-// OSC 0/2 title sequences for live sidebar titles. It does not report
-// running/idle status — that's for agent adapters, not plain shells.
+// OSC 0/2 title sequences for live sidebar titles. Busy/idle status
+// comes from the runner's default turn model (adapter.HookDriven):
+// active from launch, upgraded to per-command turns by OSC 133 prompt
+// marks when the shell integration emits them, closed by process exit
+// otherwise.
 type Shell struct{}
 
 func NewShell() *Shell { return &Shell{} }
@@ -83,25 +86,19 @@ func (g *Shell) Launchers() []adapter.Launcher {
 	}}
 }
 
-func (g *Shell) Monitor(_ []byte) *adapter.Event {
-	// Shell title parsing is handled centrally in gmux so all sessions
-	// can use terminal titles as a fallback, not just shell sessions.
-	return nil
-}
-
-// --- SessionFiler ---
+// --- Conversation storage (file-backed: refs are shell state-file paths) ---
 
 // shellSessionsDir returns the directory for shell state files.
 func shellSessionsDir() string {
 	return filepath.Join(paths.StateDir(), "shell-sessions")
 }
 
-func (g *Shell) SessionRootDir() string {
+func (g *Shell) ConversationRootDir() string {
 	return shellSessionsDir()
 }
 
-func (g *Shell) SessionDir(cwd string) string {
-	root := g.SessionRootDir()
+func (g *Shell) ConversationDir(cwd string) string {
+	root := g.ConversationRootDir()
 	if root == "" {
 		return ""
 	}
@@ -121,7 +118,10 @@ type shellStateFile struct {
 	Created time.Time `json:"created"`
 }
 
-func (g *Shell) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
+// DescribeConversation reads a shell state file (the ref is the absolute
+// file path) and returns display metadata.
+func (g *Shell) DescribeConversation(ref string) (*adapter.ConversationInfo, error) {
+	path := ref
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -133,19 +133,25 @@ func (g *Shell) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) 
 	if sf.ID == "" || sf.Cwd == "" {
 		return nil, os.ErrInvalid
 	}
-	return &adapter.SessionFileInfo{
-		ID:       sf.ID,
-		Title:    g.CommandTitle(sf.Command),
-		Slug:     adapter.Slugify(filepath.Base(sf.Cwd)),
-		Cwd:      sf.Cwd,
-		Created:  sf.Created,
-		FilePath: path,
+	return &adapter.ConversationInfo{
+		ID:           sf.ID,
+		Title:        g.CommandTitle(sf.Command),
+		Slug:         adapter.Slugify(filepath.Base(sf.Cwd)),
+		Cwd:          sf.Cwd,
+		Created:      sf.Created,
+		LastActivity: fileLastActivity(path),
+		Ref:          path,
 	}, nil
 }
 
 // --- Resumer ---
 
-func (g *Shell) ResumeCommand(info *adapter.SessionFileInfo) []string {
+// ResumeCommand returns the shell to relaunch, or nil when there is no
+// described shell state to resume.
+func (g *Shell) ResumeCommand(info *adapter.ConversationInfo) []string {
+	if info == nil {
+		return nil
+	}
 	// Resume a shell session by launching the user's default shell in the
 	// original cwd. The cwd is passed via the session metadata, not the
 	// command itself.
@@ -154,11 +160,6 @@ func (g *Shell) ResumeCommand(info *adapter.SessionFileInfo) []string {
 		shell = "/bin/sh"
 	}
 	return []string{shell}
-}
-
-func (g *Shell) CanResume(path string) bool {
-	_, err := g.ParseSessionFile(path)
-	return err == nil
 }
 
 // --- SessionRegistrar ---
@@ -189,7 +190,7 @@ func (g *Shell) OnDismiss(id, cwd string) {
 // after a gmuxd restart.
 func WriteShellStateFile(sessionID, cwd string, command []string) (string, error) {
 	sh := NewShell()
-	dir := sh.SessionDir(cwd)
+	dir := sh.ConversationDir(cwd)
 	if dir == "" {
 		return "", os.ErrInvalid
 	}
@@ -219,7 +220,7 @@ func WriteShellStateFile(sessionID, cwd string, command []string) (string, error
 // Called when a shell session is dismissed.
 func RemoveShellStateFile(sessionID, cwd string) {
 	sh := NewShell()
-	dir := sh.SessionDir(cwd)
+	dir := sh.ConversationDir(cwd)
 	if dir == "" {
 		return
 	}

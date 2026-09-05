@@ -3,10 +3,12 @@ package adapters
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,17 +18,18 @@ import (
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
+	"github.com/gmuxapp/gmux/packages/adapter/filewatch"
 )
 
 // Compile-time interface checks.
 var (
-	_ adapter.Launchable         = (*Codex)(nil)
-	_ adapter.SessionFiler       = (*Codex)(nil)
-	_ adapter.SessionFileLister  = (*Codex)(nil)
-	_ adapter.FileMonitor        = (*Codex)(nil)
-	_ adapter.FileAttributor     = (*Codex)(nil)
-	_ adapter.SessionHookCommand = (*Codex)(nil)
-	_ adapter.Resumer            = (*Codex)(nil)
+	_ adapter.ConversationSource    = (*Codex)(nil)
+	_ adapter.ConversationProber    = (*Codex)(nil)
+	_ adapter.Launchable            = (*Codex)(nil)
+	_ adapter.ConversationDescriber = (*Codex)(nil)
+	_ adapter.ConversationOpener    = (*Codex)(nil)
+	_ adapter.SessionHookCommand    = (*Codex)(nil)
+	_ adapter.Resumer               = (*Codex)(nil)
 )
 
 func init() {
@@ -42,8 +45,8 @@ func init() {
 // hook runs `gmux __codex-hook <Event>` and POSTs to the runner socket on every
 // SessionStart/UserPromptSubmit/Stop — ephemeral, with no mutation of the
 // user's ~/.codex. When codex is too old to support hooks, nothing is injected
-// and the daemon's metadata attribution + FileMonitor parsing
-// (FileAttributor/ParseNewLines) remain the fallback.
+// and the session runs without daemon-reported live state (there is no
+// metadata-attribution fallback).
 type Codex struct {
 	hooksOnce sync.Once
 	hooksOK   bool
@@ -74,6 +77,11 @@ func (c *Codex) Match(cmd []string) bool {
 // Env returns no extra environment variables.
 func (c *Codex) Env(_ adapter.EnvContext) []string { return nil }
 
+// SupportsACPDrive reports that the Codex harness has an ACP drive mode
+// (ADR 0033): semantic control is delivered by the ACP runner, so terminal
+// refusals name the mode boundary rather than a missing capability.
+func (c *Codex) SupportsACPDrive() bool { return true }
+
 func (c *Codex) Launchers() []adapter.Launcher {
 	return []adapter.Launcher{{
 		ID:          "codex",
@@ -83,15 +91,10 @@ func (c *Codex) Launchers() []adapter.Launcher {
 	}}
 }
 
-// Monitor is a no-op — status is driven by FileMonitor.ParseNewLines.
-func (c *Codex) Monitor(_ []byte) *adapter.Event {
-	return nil
-}
+// --- Conversation storage (file-backed: refs are absolute JSONL paths) ---
 
-// --- SessionFiler ---
-
-// SessionRootDir returns Codex's sessions directory.
-func (c *Codex) SessionRootDir() string {
+// ConversationRootDir returns Codex's sessions directory.
+func (c *Codex) ConversationRootDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -99,36 +102,25 @@ func (c *Codex) SessionRootDir() string {
 	return filepath.Join(home, ".codex", "sessions")
 }
 
-// SessionDir returns today's date-nested directory where Codex writes new
-// session files. Codex organizes by date (YYYY/MM/DD), not by cwd.
-// The scanner uses ListSessionFiles() for historical sessions across all dates.
-func (c *Codex) SessionDir(_ string) string {
-	root := c.SessionRootDir()
+// ConversationGone anchors deletion detection on ConversationRootDir
+// (~/.codex/sessions). The date-nested YYYY/MM/DD subtree may be
+// cleaned up around a deleted transcript, so the stable root — not the
+// file's immediate parent — is the right availability anchor. Refs are
+// conversation-file paths for codex.
+func (c *Codex) ConversationGone(ref string) (gone bool, ok bool) {
+	return adapter.ConversationGoneAtRoot(ref, c.ConversationRootDir())
+}
+
+// ConversationDir returns today's date-nested directory where Codex writes new
+// conversation files. Codex organizes by date (YYYY/MM/DD), not by cwd; the
+// ConversationSource walks the whole tree for historical sessions.
+func (c *Codex) ConversationDir(_ string) string {
+	root := c.ConversationRootDir()
 	if root == "" {
 		return ""
 	}
 	now := time.Now()
 	return filepath.Join(root, now.Format("2006"), now.Format("01"), now.Format("02"))
-}
-
-// ListSessionFiles walks the date-nested directory tree
-// (~/.codex/sessions/YYYY/MM/DD/*.jsonl) and returns all session files.
-func (c *Codex) ListSessionFiles() []string {
-	root := c.SessionRootDir()
-	if root == "" {
-		return nil
-	}
-	var files []string
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable dirs
-		}
-		if !d.IsDir() && strings.HasSuffix(d.Name(), ".jsonl") {
-			files = append(files, path)
-		}
-		return nil
-	})
-	return files
 }
 
 // codexSessionMeta is the JSON shape of the session_meta payload.
@@ -138,10 +130,12 @@ type codexSessionMeta struct {
 	Cwd       string `json:"cwd"`
 }
 
-// ParseSessionFile reads a Codex JSONL session file and returns display
-// metadata.
-// Title priority: first user prompt text > "(new)".
-func (c *Codex) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
+// DescribeConversation reads a Codex JSONL conversation file (the ref is the
+// absolute file path) and returns display metadata.
+// Title priority: first user prompt text > "" (no conversation-derived title
+// yet; callers fall back to cwd/adapter).
+func (c *Codex) DescribeConversation(ref string) (*adapter.ConversationInfo, error) {
+	path := ref
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -167,11 +161,12 @@ func (c *Codex) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) 
 	meta := firstLine.Payload
 	created, _ := time.Parse(time.RFC3339Nano, meta.Timestamp)
 
-	info := &adapter.SessionFileInfo{
-		ID:       meta.ID,
-		Cwd:      meta.Cwd,
-		Created:  created,
-		FilePath: path,
+	info := &adapter.ConversationInfo{
+		ID:           meta.ID,
+		Cwd:          meta.Cwd,
+		Created:      created,
+		LastActivity: fileLastActivity(path),
+		Ref:          path,
 	}
 
 	// Scan for user prompts and message count.
@@ -211,80 +206,12 @@ func (c *Codex) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) 
 	case firstUserText != "":
 		info.Title = truncateTitle(firstUserText, 80)
 	default:
-		info.Title = "(new)"
+		info.Title = "" // no message yet
 	}
 
 	info.Slug = adapter.Slugify(info.Title)
 
 	return info, nil
-}
-
-// --- FileMonitor ---
-
-// ParseNewLines receives lines appended to an attributed session file
-// and returns events for meaningful changes.
-//
-// Signals (from event_msg lines):
-//   - user_message → working + title from preceding user response_item
-//   - task_complete or turn_cancelled → idle
-//
-// Signals (from response_item lines):
-//   - role:"user" type:"message" → extract text for title hint
-func (c *Codex) ParseNewLines(lines []string, _ string) []adapter.Event {
-	var events []adapter.Event
-
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		var entry struct {
-			Type    string `json:"type"`
-			Payload struct {
-				Type    string          `json:"type"`
-				Role    string          `json:"role"`
-				Content json.RawMessage `json:"content"`
-			} `json:"payload"`
-		}
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-
-		switch entry.Type {
-		case "session_meta":
-			// Session metadata record — emit the canonical project cwd.
-			var meta struct {
-				Payload struct {
-					Cwd string `json:"cwd"`
-				} `json:"payload"`
-			}
-			if err := json.Unmarshal([]byte(line), &meta); err == nil && meta.Payload.Cwd != "" {
-				events = append(events, adapter.Event{Cwd: meta.Payload.Cwd})
-			}
-		case "event_msg":
-			switch entry.Payload.Type {
-			case "user_message":
-				// User submitted a prompt — assistant will start working.
-				// Title comes from ParseSessionFile on attribution, not here.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{Working: true},
-				})
-
-			case "task_complete":
-				// Agent finished work — clear status, mark unread.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{},
-					Unread: adapter.BoolPtr(true),
-				})
-
-			case "turn_cancelled", "turn_aborted":
-				// User-initiated cancel — clear status but no unread.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{},
-				})
-			}
-		}
-	}
-	return events
 }
 
 // --- SessionHookCommand ---
@@ -293,8 +220,8 @@ func (c *Codex) ParseNewLines(lines []string, _ string) []adapter.Event {
 // By v0.135 codex's command-hook system is documented and stable, and the hook
 // config + per-hook trust-state shapes we depend on (`-c hooks.<Event>=...` and
 // `hooks.state.<key>.trusted_hash`) are present. Below this we inject nothing
-// (an older codex would reject the -c hooks overrides, breaking launch); the
-// daemon's metadata attribution stays in charge instead.
+// (an older codex would reject the -c hooks overrides, breaking launch); such
+// sessions run without daemon-reported live state.
 const codexMinHookVersion = "0.135.0"
 
 // codexHookEvents are the codex hook events the gmux hook subscribes to, mapped
@@ -351,7 +278,7 @@ func (c *Codex) HookCommand(args []string, selfBin string) ([]string, bool) {
 // `trusted_hash` codex computes, so only gmux's own benign reporting hooks are
 // trusted and codex's trust model is preserved for everything else. If our hash
 // ever fails to match (e.g. a codex internal change), the hook is simply
-// Untrusted → skipped → the daemon's metadata attribution takes over. It
+// Untrusted → skipped → the session runs without hook-reported state. It
 // degrades; it never broadens trust.
 //
 // Returns args unchanged if no codex binary token is found.
@@ -473,7 +400,7 @@ func shellQuote(s string) string {
 // stdin (its SessionStart/Stop input carries session_id, transcript_path, cwd).
 //
 // codex has no title/slug field of its own, so this derives them by parsing the
-// transcript's first user prompt (reusing ParseSessionFile) and reports them as
+// transcript's first user prompt (reusing DescribeConversation) and reports them as
 // the session title + an explicit slug — codex's session_id is a UUID that would
 // slugify into an unreadable URL.
 func CodexHookBodies(eventName string, input []byte) [][]byte {
@@ -539,7 +466,7 @@ func codexSessionBody(input []byte) ([]byte, bool) {
 // codexHookTitle returns a codex session's display title — the first non-system
 // user prompt, truncated — or "" if the transcript has none yet.
 //
-// Unlike ParseSessionFile it early-exits at the first user message instead of
+// Unlike DescribeConversation it early-exits at the first user message instead of
 // reading the whole file. This matters because the hook derives the title on
 // every turn-end (codex blocks on the Stop hook), the title never changes after
 // the first prompt, and the transcript grows each turn: a full re-parse would be
@@ -579,19 +506,6 @@ func codexHookTitle(path string) string {
 		}
 	}
 	return ""
-}
-
-// --- FileAttributor ---
-
-// AttributeFile matches a file to a session using the file's session_meta
-// header (cwd + timestamp proximity). Codex uses date-nested directories
-// shared by all sessions, so metadata matching is essential.
-func (c *Codex) AttributeFile(filePath string, candidates []adapter.FileCandidate) string {
-	info, err := c.ParseSessionFile(filePath)
-	if err != nil {
-		return ""
-	}
-	return attributeByMetadata(info, candidates)
 }
 
 // --- semver (codex --version gating) ---
@@ -661,18 +575,18 @@ func semverLess(a, b []int) bool {
 
 // --- Resumer ---
 
-// ResumeCommand returns the command to resume a Codex session.
-func (c *Codex) ResumeCommand(info *adapter.SessionFileInfo) []string {
+// ResumeCommand returns the command to resume a Codex session, or nil when
+// the conversation has no user messages worth resuming.
+func (c *Codex) ResumeCommand(info *adapter.ConversationInfo) []string {
+	if info == nil || info.MessageCount == 0 {
+		return nil
+	}
 	return []string{"codex", "resume", info.ID}
 }
 
-// CanResume checks if a session file has user messages worth resuming.
-func (c *Codex) CanResume(path string) bool {
-	info, err := c.ParseSessionFile(path)
-	if err != nil {
-		return false
-	}
-	return info.MessageCount > 0
+// OpenConversation streams the raw JSONL transcript at ref.
+func (c *Codex) OpenConversation(ref string) (io.ReadCloser, error) {
+	return os.Open(ref)
 }
 
 // --- Helpers ---
@@ -701,12 +615,115 @@ func extractCodexUserText(raw json.RawMessage) string {
 	return ""
 }
 
-// isCodexSystemContext returns true if the text looks like Codex's
-// injected system context rather than the user's actual prompt.
+// codexContextualUserMatchers mirrors Codex's contextual-user-message registry
+// rather than guessing from XML-looking text. Keep this list synchronized with
+// codex-rs/core/src/context/contextual_user_message.rs. The matcher source for
+// each registered form is named beside it so additions upstream are auditable.
+var codexContextualUserMatchers = []func(string) bool{
+	isCodexAgentsInstructions,             // context/user_instructions.rs
+	codexWrapped("environment_context"),   // context/world_state/environment.rs
+	isCodexPermissionsContext,             // context/world_state/permissions.rs
+	codexWrapped("skill"),                 // core-skills/src/skill_instructions.rs
+	codexWrapped("skills_instructions"),   // protocol/src/protocol.rs (legacy)
+	codexWrapped("user_shell_command"),    // context/user_shell_command.rs
+	codexWrapped("turn_aborted"),          // context/turn_aborted.rs
+	codexWrapped("subagent_notification"), // context/subagent_notification.rs
+	isCodexHookPrompt,                     // protocol/src/items.rs
+	isCodexInternalModelContext,           // context/internal_model_context.rs
+	codexWrapped("recommended_plugins"),   // context/recommended_plugins_instructions.rs
+	isCodexLegacyUnifiedExecWarning,       // context/legacy_unified_exec_process_limit_warning.rs
+	isCodexLegacyApplyPatchWarning,        // context/legacy_apply_patch_exec_command_warning.rs
+	isCodexLegacyModelMismatchWarning,     // context/legacy_model_mismatch_warning.rs
+}
+
+// isCodexSystemContext recognizes only complete upstream-generated forms. It
+// deliberately retains unknown XML and broad prefix lookalikes as user prompts.
 func isCodexSystemContext(s string) bool {
-	// Codex injects several system blocks before the user's actual prompt.
-	return strings.HasPrefix(s, "<permissions") ||
-		strings.HasPrefix(s, "<environment_context>") ||
-		strings.HasPrefix(s, "# AGENTS.md") ||
-		strings.HasPrefix(s, "<turn_aborted>")
+	s = strings.TrimSpace(s)
+	for _, matcher := range codexContextualUserMatchers {
+		if matcher(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexWrapped(tag string) func(string) bool {
+	return func(s string) bool {
+		return strings.HasPrefix(s, "<"+tag+">") && strings.HasSuffix(s, "</"+tag+">")
+	}
+}
+
+func isCodexAgentsInstructions(s string) bool {
+	return strings.HasPrefix(s, "# AGENTS.md instructions") &&
+		strings.Contains(s, "\n<INSTRUCTIONS>") && strings.HasSuffix(s, "</INSTRUCTIONS>")
+}
+
+func isCodexPermissionsContext(s string) bool {
+	return codexWrapped("permissions")(s) ||
+		(strings.HasPrefix(s, "<permissions instructions>") && strings.HasSuffix(s, "</permissions instructions>"))
+}
+
+func isCodexHookPrompt(s string) bool {
+	const prefix = `<hook_prompt hook_run_id="`
+	if !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	rest := s[len(prefix):]
+	end := strings.Index(rest, `">`)
+	return end > 0 && strings.HasSuffix(rest[end+2:], "</hook_prompt>")
+}
+
+func isCodexInternalModelContext(s string) bool {
+	if codexWrapped("goal_context")(s) { // legacy accepted by current Codex
+		return true
+	}
+	const prefix = `<codex_internal_context source="`
+	if !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	rest := s[len(prefix):]
+	end := strings.Index(rest, `">`)
+	if end <= 0 || !validCodexContextSource(rest[:end]) {
+		return false
+	}
+	return strings.HasSuffix(rest[end+2:], "</codex_internal_context>")
+}
+
+func validCodexContextSource(source string) bool {
+	for i, r := range source {
+		if (r < 'a' || r > 'z') && (i == 0 || (r < '0' || r > '9') && r != '_') {
+			return false
+		}
+	}
+	return source != ""
+}
+
+func isCodexLegacyUnifiedExecWarning(s string) bool {
+	return strings.HasPrefix(s, "Warning: The maximum number of unified exec processes you can keep open is")
+}
+
+func isCodexLegacyApplyPatchWarning(s string) bool {
+	return strings.HasPrefix(s, "Warning: apply_patch was requested via ") &&
+		strings.HasSuffix(s, "Use the apply_patch tool instead of exec_command.")
+}
+
+func isCodexLegacyModelMismatchWarning(s string) bool {
+	return strings.HasPrefix(s, "Warning: Your account was flagged for potentially high-risk cyber activity")
+}
+
+// --- ConversationSource ---
+
+func (c *Codex) SnapshotConversations(sink adapter.ConversationSink) {
+	filewatch.Snapshot(c.ConversationRootDir(), ".jsonl", sink.Upsert)
+}
+
+func (c *Codex) WatchConversations(ctx context.Context, sink adapter.ConversationSink) error {
+	return filewatch.Watch(ctx, c.ConversationRootDir(), ".jsonl", func(e filewatch.Event) {
+		if e.Removed {
+			sink.Remove(e.Path)
+		} else {
+			sink.Upsert(e.Path)
+		}
+	})
 }

@@ -2,8 +2,11 @@ package store
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -19,7 +22,7 @@ func TestUpsertAndGet(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
 		ID:           "s1",
-		Kind:         "pi",
+		Adapter:      "pi",
 		Alive:        true,
 		AdapterTitle: "test",
 	})
@@ -38,8 +41,8 @@ func TestUpsertAndGet(t *testing.T) {
 
 func TestUpsertOverwrite(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", AdapterTitle: "v1"})
-	s.Upsert(Session{ID: "s1", Kind: "pi", AdapterTitle: "v2"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", AdapterTitle: "v1"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", AdapterTitle: "v2"})
 
 	got, _ := s.Get("s1")
 	if got.Title != "v2" {
@@ -52,7 +55,7 @@ func TestUpsertOverwrite(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi"})
 
 	if !s.Remove("s1") {
 		t.Fatal("expected remove to succeed")
@@ -65,12 +68,117 @@ func TestRemove(t *testing.T) {
 	}
 }
 
+func TestRemoveDeadByConversationRef(t *testing.T) {
+	const file = "/home/u/.claude/projects/abc/conv.jsonl"
+	s := New()
+	// Two dead sessions share the file (N:1, e.g. resumed in two tabs).
+	s.Upsert(Session{ID: "dead-1", Adapter: "claude", Alive: false, ConversationRef: file})
+	s.Upsert(Session{ID: "dead-2", Adapter: "claude", Alive: false, ConversationRef: file})
+	// An unrelated live session must survive (runner still writing). (A live
+	// session on the SAME ref would legitimately take the dead rows over
+	// before this removal runs — that's conversation-lineage takeover.)
+	s.Upsert(Session{ID: "live", Adapter: "claude", Alive: true, ConversationRef: "/home/u/.claude/projects/abc/live.jsonl"})
+	// A peer-owned dead session on the same file is not ours to retire.
+	s.Upsert(Session{ID: "peer", Adapter: "claude", Alive: false, Peer: "box2", ConversationRef: file})
+	// An unrelated dead session must be untouched.
+	s.Upsert(Session{ID: "other", Adapter: "claude", Alive: false, ConversationRef: "/home/u/.claude/projects/xyz/other.jsonl"})
+
+	// Cosmetic path difference must still match (filepath.Clean).
+	removed := s.RemoveDeadByConversationRef("claude", "/home/u/.claude/projects/abc/./conv.jsonl")
+
+	got := map[string]bool{}
+	for _, id := range removed {
+		got[id] = true
+	}
+	if len(removed) != 2 || !got["dead-1"] || !got["dead-2"] {
+		t.Fatalf("expected dead-1+dead-2 removed, got %v", removed)
+	}
+	for _, id := range []string{"live", "peer", "other"} {
+		if _, ok := s.Get(id); !ok {
+			t.Errorf("%s should have survived", id)
+		}
+	}
+	for _, id := range []string{"dead-1", "dead-2"} {
+		if _, ok := s.Get(id); ok {
+			t.Errorf("%s should have been removed", id)
+		}
+	}
+}
+
+// Non-path refs (a DB-backed adapter's row keys — ADR 0022) must match by
+// exact equality within the reporting adapter: the filepath.Clean
+// normalization used for cosmetic path variance has to be the identity for
+// separator-free refs, near-miss refs must not be conflated, and — refs
+// being only unique within an adapter — another adapter's session carrying
+// the same ref string must survive.
+func TestRemoveDeadByConversationRefOpaque(t *testing.T) {
+	s := New()
+	s.Upsert(Session{ID: "dead", Adapter: "dbtool", Alive: false, ConversationRef: "row:42"})
+	s.Upsert(Session{ID: "near", Adapter: "dbtool", Alive: false, ConversationRef: "row:421"})
+	s.Upsert(Session{ID: "other-adapter", Adapter: "othertool", Alive: false, ConversationRef: "row:42"})
+	// Distinct opaque refs that a path-Clean would conflate: the daemon
+	// must not canonicalize non-rooted refs (they're not paths).
+	s.Upsert(Session{ID: "plain", Adapter: "dbtool", Alive: false, ConversationRef: "b"})
+	s.Upsert(Session{ID: "dotted", Adapter: "dbtool", Alive: false, ConversationRef: "a/../b"})
+
+	removed := s.RemoveDeadByConversationRef("dbtool", "row:42")
+	if len(removed) != 1 || removed[0] != "dead" {
+		t.Fatalf("expected exactly [dead] removed, got %v", removed)
+	}
+	if _, ok := s.Get("near"); !ok {
+		t.Error("near-miss ref row:421 must survive a row:42 removal")
+	}
+	if _, ok := s.Get("other-adapter"); !ok {
+		t.Error("another adapter's session with the same ref string must survive")
+	}
+
+	// Removing "a/../b" must not conflate with "b": opaque refs compare
+	// exactly, never path-normalized.
+	removed = s.RemoveDeadByConversationRef("dbtool", "a/../b")
+	if len(removed) != 1 || removed[0] != "dotted" {
+		t.Fatalf("expected exactly [dotted] removed, got %v", removed)
+	}
+	if _, ok := s.Get("plain"); !ok {
+		t.Error("opaque ref \"b\" must survive removal of \"a/../b\"")
+	}
+}
+
+func TestRemoveDeadByConversationRefNoMatch(t *testing.T) {
+	s := New()
+	s.Upsert(Session{ID: "a", Adapter: "claude", Alive: false, ConversationRef: "/x/a.jsonl"})
+	if got := s.RemoveDeadByConversationRef("claude", "/x/missing.jsonl"); got != nil {
+		t.Errorf("no-match should return nil, got %v", got)
+	}
+	if got := s.RemoveDeadByConversationRef("claude", ""); got != nil {
+		t.Errorf("empty path should return nil, got %v", got)
+	}
+	if _, ok := s.Get("a"); !ok {
+		t.Error("unrelated session must survive")
+	}
+}
+
+// TestRemoveDeadByConversationRefBroadcasts pins that retirement emits one
+// session-remove per removed session (so WatchRemovals drops the dir).
+func TestRemoveDeadByConversationRefBroadcasts(t *testing.T) {
+	s := New()
+	s.Upsert(Session{ID: "dead", Adapter: "claude", Alive: false, ConversationRef: "/x/c.jsonl"})
+	ch, cancel := s.Subscribe()
+	defer cancel()
+
+	s.RemoveDeadByConversationRef("claude", "/x/c.jsonl")
+
+	ev, ok := recvEvent(t, ch)
+	if !ok || ev.Type != "session-remove" || ev.ID != "dead" {
+		t.Fatalf("expected session-remove for dead, got %+v ok=%v", ev, ok)
+	}
+}
+
 func TestSubscribe(t *testing.T) {
 	s := New()
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 
 	select {
 	case ev := <-ch:
@@ -120,7 +228,7 @@ func TestUpsertIdenticalSuppressesBroadcast(t *testing.T) {
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
-	sess := Session{ID: "s1", Kind: "pi", Alive: true, Slug: "fix", Cwd: "/work"}
+	sess := Session{ID: "s1", Adapter: "pi", Alive: true, Slug: "fix", Cwd: "/work"}
 	s.Upsert(sess)
 	if ev, ok := recvEvent(t, ch); !ok || ev.Type != "session-upsert" {
 		t.Fatalf("first upsert should broadcast, got ok=%v ev=%+v", ok, ev)
@@ -140,7 +248,7 @@ func TestUpsertRemoteIdenticalSuppressesBroadcast(t *testing.T) {
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
-	sess := Session{ID: "s1@peer", Kind: "pi", Peer: "peer", Alive: true, Slug: "fix", Title: "Fix auth"}
+	sess := Session{ID: "s1@peer", Adapter: "pi", Peer: "peer", Alive: true, Slug: "fix", Title: "Fix auth"}
 	s.UpsertRemote(sess)
 	if _, ok := recvEvent(t, ch); !ok {
 		t.Fatal("first UpsertRemote should broadcast")
@@ -159,7 +267,7 @@ func TestUpsertChangedFieldStillBroadcasts(t *testing.T) {
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
-	sess := Session{ID: "s1", Kind: "pi", Alive: true, Slug: "fix"}
+	sess := Session{ID: "s1", Adapter: "pi", Alive: true, Slug: "fix"}
 	s.Upsert(sess)
 	if _, ok := recvEvent(t, ch); !ok {
 		t.Fatal("first upsert should broadcast")
@@ -186,7 +294,7 @@ func TestUpsertChangedFieldStillBroadcasts(t *testing.T) {
 // re-stamping the same status) must not broadcast.
 func TestUpdateNoOpSuppressesBroadcast(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Slug: "fix"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, Slug: "fix"})
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
@@ -203,7 +311,7 @@ func TestUpdateNoOpSuppressesBroadcast(t *testing.T) {
 // field still broadcasts exactly once with the new value.
 func TestUpdateRealChangeBroadcasts(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Slug: "fix"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, Slug: "fix"})
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
@@ -225,7 +333,7 @@ func TestUpdateRealChangeBroadcasts(t *testing.T) {
 // SetTerminalSize must not fan out a snapshot.
 func TestSetTerminalSizeNoOpSuppressesBroadcast(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 	s.SetTerminalSize("s1", 80, 24)
 	ch, cancel := s.Subscribe()
 	defer cancel()
@@ -250,12 +358,12 @@ func TestSetTerminalSizeNoOpSuppressesBroadcast(t *testing.T) {
 }
 
 // --- Derived field tests ---
-// All dead sessions with a command are resumable, regardless of kind.
+// All dead sessions with a command are resumable, regardless of adapter.
 
 func TestDerivedResumable_AliveSessionNeverResumable(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
-		ID: "s1", Kind: "claude", Alive: true,
+		ID: "s1", Adapter: "claude", Alive: true,
 		Command: []string{"claude"},
 	})
 	got, _ := s.Get("s1")
@@ -267,7 +375,7 @@ func TestDerivedResumable_AliveSessionNeverResumable(t *testing.T) {
 func TestDerivedResumable_DeadWithCommand(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
-		ID: "s1", Kind: "claude", Alive: false,
+		ID: "s1", Adapter: "claude", Alive: false,
 		Command: []string{"claude"},
 	})
 	got, _ := s.Get("s1")
@@ -279,7 +387,7 @@ func TestDerivedResumable_DeadWithCommand(t *testing.T) {
 func TestDerivedResumable_DeadNoCommand(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
-		ID: "s1", Kind: "claude", Alive: false,
+		ID: "s1", Adapter: "claude", Alive: false,
 	})
 	got, _ := s.Get("s1")
 	if got.Resumable {
@@ -290,7 +398,7 @@ func TestDerivedResumable_DeadNoCommand(t *testing.T) {
 func TestDerivedResumable_ShellIsResumable(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
-		ID: "s1", Kind: "shell", Alive: false,
+		ID: "s1", Adapter: "shell", Alive: false,
 		Command: []string{"/bin/bash"},
 	})
 	got, _ := s.Get("s1")
@@ -301,7 +409,7 @@ func TestDerivedResumable_ShellIsResumable(t *testing.T) {
 
 func TestUpdateAtomic(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", AdapterTitle: "original"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", AdapterTitle: "original"})
 
 	ok := s.Update("s1", func(sess *Session) {
 		sess.AdapterTitle = "updated"
@@ -330,9 +438,9 @@ func TestUpdateMissing(t *testing.T) {
 func TestUpdatePreservesOtherFields(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
-		ID: "s1", Kind: "pi",
+		ID: "s1", Adapter: "pi",
 		AdapterTitle: "my title",
-		Status:       &Status{Working: true},
+		Status:       &Status{Active: true},
 	})
 	// Update only the title — status should be preserved.
 	s.Update("s1", func(sess *Session) {
@@ -342,14 +450,14 @@ func TestUpdatePreservesOtherFields(t *testing.T) {
 	if got.AdapterTitle != "new title" {
 		t.Fatalf("expected 'new title', got %q", got.AdapterTitle)
 	}
-	if got.Status == nil || !got.Status.Working {
-		t.Fatal("expected working status to be preserved")
+	if got.Status == nil || !got.Status.Active {
+		t.Fatal("expected active status to be preserved")
 	}
 }
 
 func TestUpdateBroadcasts(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi"})
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
@@ -373,100 +481,74 @@ func TestUpdateBroadcasts(t *testing.T) {
 	}
 }
 
-func TestUpsertAliveSessionRemovesDeadShadowWithSameSlug(t *testing.T) {
+func TestConversationTakeoverSameFileAndUntitled(t *testing.T) {
 	s := New()
-	s.Upsert(Session{
-		ID: "dead-abc", Kind: "pi", Alive: false,
-		Command: []string{"pi"}, Slug: "rk-1", AdapterTitle: "shadow",
-	})
-	s.Upsert(Session{
-		ID: "sess-123", Kind: "pi", Alive: true,
-		Slug: "rk-1", AdapterTitle: "live",
-	})
-
-	items := s.List()
-	if len(items) != 1 {
-		t.Fatalf("expected 1 session, got %d: %+v", len(items), items)
-	}
-	if items[0].ID != "sess-123" {
-		t.Fatalf("expected live session to remain, got %q", items[0].ID)
+	file := "/tmp/pi/conversation.jsonl"
+	s.Upsert(Session{ID: "dead", Adapter: "pi", Alive: false, ConversationRef: file})
+	s.Upsert(Session{ID: "live", Adapter: "pi", Alive: true, ConversationRef: file})
+	if _, ok := s.Get("dead"); ok {
+		t.Fatal("live binder should evict its dead same-file predecessor")
 	}
 }
 
-func TestUpsertDeadShadowSkippedWhenAliveSessionExists(t *testing.T) {
-	s := New()
-	s.Upsert(Session{
-		ID: "sess-123", Kind: "pi", Alive: true,
-		Slug: "rk-1", AdapterTitle: "live",
-	})
-	s.Upsert(Session{
-		ID: "dead-abc", Kind: "pi", Alive: false,
-		Command: []string{"pi"}, Slug: "rk-1", AdapterTitle: "shadow",
-	})
-
-	items := s.List()
-	if len(items) != 1 {
-		t.Fatalf("expected 1 session, got %d: %+v", len(items), items)
+func TestConversationTakeoverClaudeLineage(t *testing.T) {
+	const ancestor = "11111111-1111-4111-8111-111111111111"
+	const resumed = "22222222-2222-4222-8222-222222222222"
+	dir := t.TempDir()
+	newFile := filepath.Join(dir, resumed+".jsonl")
+	if err := os.WriteFile(newFile, []byte(`{"type":"user","sessionId":"`+ancestor+`","message":{"role":"user","content":"hello"}}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if items[0].ID != "sess-123" {
-		t.Fatalf("expected live session to remain, got %q", items[0].ID)
+	// The dead row's transcript exists on disk (it's a resumable session);
+	// its identity comes from DescribeConversation, never from the ref
+	// string — refs are adapter-opaque (ADR 0022).
+	ancestorFile := filepath.Join(dir, ancestor+".jsonl")
+	if err := os.WriteFile(ancestorFile, []byte(`{"type":"user","sessionId":"`+ancestor+`","message":{"role":"user","content":"hello"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	s.Upsert(Session{ID: "dead", Adapter: "claude", Alive: false, ConversationRef: ancestorFile})
+	s.Upsert(Session{ID: "live", Adapter: "claude", Alive: true, ConversationRef: newFile})
+	if _, ok := s.Get("dead"); ok {
+		t.Fatal("live Claude resume should evict a dead ancestor")
 	}
 }
 
-func TestUpdateSlugOnAliveSessionRemovesDeadShadow(t *testing.T) {
+func TestConversationTakeoverIgnoresSameSlug(t *testing.T) {
 	s := New()
-	s.Upsert(Session{
-		ID: "dead-abc", Kind: "pi", Alive: false,
-		Command: []string{"pi"}, Slug: "rk-1", AdapterTitle: "shadow",
-	})
-	s.Upsert(Session{
-		ID: "sess-123", Kind: "pi", Alive: true, AdapterTitle: "live",
-	})
-
-	ok := s.Update("sess-123", func(sess *Session) {
-		sess.Slug = "rk-1"
-	})
-	if !ok {
-		t.Fatal("expected update to succeed")
-	}
-
-	items := s.List()
-	if len(items) != 1 {
-		t.Fatalf("expected 1 session, got %d: %+v", len(items), items)
-	}
-	if items[0].ID != "sess-123" {
-		t.Fatalf("expected live session to remain, got %q", items[0].ID)
-	}
-}
-
-func TestSlugDedup_ScopedToKindAndPeer(t *testing.T) {
-	s := New()
-	// Dead pi session with slug "fix-auth".
-	s.Upsert(Session{ID: "dead-1", Kind: "pi", Alive: false, Command: []string{"pi"}, Slug: "fix-auth"})
-	// Live claude session with the same slug — different kind, should NOT remove the dead pi session.
-	s.Upsert(Session{ID: "live-1", Kind: "claude", Alive: true, Slug: "fix-auth"})
-
+	s.Upsert(Session{ID: "dead", Adapter: "pi", Alive: false, Slug: "same-title", ConversationRef: "/tmp/a.jsonl"})
+	s.Upsert(Session{ID: "live", Adapter: "pi", Alive: true, Slug: "same-title", ConversationRef: "/tmp/b.jsonl"})
 	if len(s.List()) != 2 {
-		t.Fatalf("expected 2 sessions (different kinds coexist), got %d", len(s.List()))
+		t.Fatal("different conversations with the same title must coexist")
 	}
+}
 
-	// Now a live pi session arrives — should remove the dead pi session.
-	s.Upsert(Session{ID: "live-2", Kind: "pi", Alive: true, Slug: "fix-auth"})
-
-	items := s.List()
-	if len(items) != 2 {
-		t.Fatalf("expected 2 sessions (claude + live pi), got %d", len(items))
+func TestConversationTakeoverLiveLiveAndDeadShadow(t *testing.T) {
+	file := "/tmp/pi/conversation.jsonl"
+	s := New()
+	s.Upsert(Session{ID: "live-1", Adapter: "pi", Alive: true, ConversationRef: file})
+	s.Upsert(Session{ID: "live-2", Adapter: "pi", Alive: true, ConversationRef: file})
+	if len(s.List()) != 2 {
+		t.Fatal("live sessions on one conversation must coexist")
 	}
-	for _, item := range items {
-		if item.ID == "dead-1" {
-			t.Error("dead pi session should have been replaced by live pi session")
-		}
+	s.Upsert(Session{ID: "dead", Adapter: "pi", Alive: false, ConversationRef: file})
+	if _, ok := s.Get("dead"); ok {
+		t.Fatal("dead write shadowed by a live conversation owner must be skipped")
+	}
+}
+
+func TestConversationTakeoverDoesNotApplyToShells(t *testing.T) {
+	s := New()
+	s.Upsert(Session{ID: "dead", Adapter: "shell", Alive: false, Slug: "same"})
+	s.Upsert(Session{ID: "live", Adapter: "shell", Alive: true, Slug: "same"})
+	if len(s.List()) != 2 {
+		t.Fatal("sessions without conversation files must not take over")
 	}
 }
 
 func TestBroadcastDoesNotMutateState(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "shell", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "shell", Alive: true})
 	ch, cancel := s.Subscribe()
 	defer cancel()
 
@@ -503,12 +585,12 @@ func TestBroadcastDoesNotMutateState(t *testing.T) {
 //
 // Slug is the single human-readable identifier used for both URL
 // routing and session resumption. The store enforces uniqueness within
-// (kind, peer). Sessions without a Slug (fresh launches before
+// (adapter, peer). Sessions without a Slug (fresh launches before
 // file attribution) are left alone; the frontend falls back to id[:8].
 
 func TestSlugPreserved(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-the-auth-bug"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-the-auth-bug"})
 	got, _ := s.Get("s1")
 	if got.Slug != "fix-the-auth-bug" {
 		t.Fatalf("slug = %q, want %q", got.Slug, "fix-the-auth-bug")
@@ -517,7 +599,7 @@ func TestSlugPreserved(t *testing.T) {
 
 func TestSlugEmptyForFreshLaunch(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi"})
 	got, _ := s.Get("s1")
 	if got.Slug != "" {
 		t.Fatalf("fresh launch should have empty slug, got %q", got.Slug)
@@ -526,9 +608,9 @@ func TestSlugEmptyForFreshLaunch(t *testing.T) {
 
 func TestSlugUniqueness(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-auth"})
-	s.Upsert(Session{ID: "s2", Kind: "pi", Slug: "fix-auth"})
-	s.Upsert(Session{ID: "s3", Kind: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s2", Adapter: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s3", Adapter: "pi", Slug: "fix-auth"})
 
 	s1, _ := s.Get("s1")
 	s2, _ := s.Get("s2")
@@ -541,8 +623,8 @@ func TestSlugUniqueness(t *testing.T) {
 
 func TestSlugUniquenessAcrossKindsAllowed(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-auth"})
-	s.Upsert(Session{ID: "s2", Kind: "claude", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s2", Adapter: "claude", Slug: "fix-auth"})
 
 	s1, _ := s.Get("s1")
 	s2, _ := s.Get("s2")
@@ -554,7 +636,7 @@ func TestSlugUniquenessAcrossKindsAllowed(t *testing.T) {
 
 func TestSlugStableOnUpdate(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-auth"})
 
 	s.Update("s1", func(sess *Session) {
 		sess.Subtitle = "something"
@@ -567,10 +649,10 @@ func TestSlugStableOnUpdate(t *testing.T) {
 
 func TestSlugFreedAfterRemove(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-auth"})
 	s.Remove("s1")
 
-	s.Upsert(Session{ID: "s2", Kind: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s2", Adapter: "pi", Slug: "fix-auth"})
 	s2, _ := s.Get("s2")
 	if s2.Slug != "fix-auth" {
 		t.Fatalf("expected slug reusable after remove, got %q", s2.Slug)
@@ -579,7 +661,7 @@ func TestSlugFreedAfterRemove(t *testing.T) {
 
 func TestSlugSetByAttribution(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi"})
 	before, _ := s.Get("s1")
 	if before.Slug != "" {
 		t.Fatalf("expected empty slug before attribution, got %q", before.Slug)
@@ -598,8 +680,8 @@ func TestSlugSetByAttribution(t *testing.T) {
 func TestEmptySlugsCoexist(t *testing.T) {
 	s := New()
 	// Two fresh launches, neither attributed yet.
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
-	s.Upsert(Session{ID: "s2", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
+	s.Upsert(Session{ID: "s2", Adapter: "pi", Alive: true})
 
 	s1, _ := s.Get("s1")
 	s2, _ := s.Get("s2")
@@ -610,7 +692,7 @@ func TestEmptySlugsCoexist(t *testing.T) {
 
 func TestSlugStableOnTitleChange(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Slug: "fix-auth"})
 
 	s.Update("s1", func(sess *Session) {
 		sess.AdapterTitle = "completely different title"
@@ -623,7 +705,7 @@ func TestSlugStableOnTitleChange(t *testing.T) {
 
 func TestSetTerminalSize(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "shell", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "shell", Alive: true})
 
 	if !s.SetTerminalSize("s1", 120, 40) {
 		t.Fatal("expected terminal size update to succeed")
@@ -647,11 +729,11 @@ func TestSlugUniqueness_ScopedToPeer(t *testing.T) {
 	s := New()
 
 	// Local session with slug "fix-auth".
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Slug: "fix-auth"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, Slug: "fix-auth"})
 
 	// Remote session from "server" with the same slug. Should NOT be
-	// renamed because it's in a different (kind, peer) scope.
-	s.Upsert(Session{ID: "s2@server", Kind: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
+	// renamed because it's in a different (adapter, peer) scope.
+	s.Upsert(Session{ID: "s2@server", Adapter: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
 
 	got, _ := s.Get("s2@server")
 	if got.Slug != "fix-auth" {
@@ -662,8 +744,8 @@ func TestSlugUniqueness_ScopedToPeer(t *testing.T) {
 func TestSlugUniqueness_WithinSamePeer(t *testing.T) {
 	s := New()
 
-	s.Upsert(Session{ID: "s1@server", Kind: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
-	s.Upsert(Session{ID: "s2@server", Kind: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
+	s.Upsert(Session{ID: "s1@server", Adapter: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
+	s.Upsert(Session{ID: "s2@server", Adapter: "pi", Alive: true, Slug: "fix-auth", Peer: "server"})
 
 	got, _ := s.Get("s2@server")
 	if got.Slug != "fix-auth-2" {
@@ -675,10 +757,10 @@ func TestSlugUniqueness_WithinSamePeer(t *testing.T) {
 
 func TestRemoveByPeer(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "local-1", Kind: "pi", Alive: true})
-	s.Upsert(Session{ID: "s1@server", Kind: "pi", Alive: true, Peer: "server"})
-	s.Upsert(Session{ID: "s2@server", Kind: "shell", Alive: true, Peer: "server"})
-	s.Upsert(Session{ID: "s3@dev", Kind: "pi", Alive: true, Peer: "dev"})
+	s.Upsert(Session{ID: "local-1", Adapter: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1@server", Adapter: "pi", Alive: true, Peer: "server"})
+	s.Upsert(Session{ID: "s2@server", Adapter: "shell", Alive: true, Peer: "server"})
+	s.Upsert(Session{ID: "s3@dev", Adapter: "pi", Alive: true, Peer: "dev"})
 
 	removed := s.RemoveByPeer("server")
 	if len(removed) != 2 {
@@ -701,9 +783,9 @@ func TestRemoveByPeer(t *testing.T) {
 
 func TestListByPeer(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "local-1", Kind: "pi", Alive: true})
-	s.Upsert(Session{ID: "s1@server", Kind: "pi", Alive: true, Peer: "server"})
-	s.Upsert(Session{ID: "s2@server", Kind: "shell", Alive: true, Peer: "server"})
+	s.Upsert(Session{ID: "local-1", Adapter: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1@server", Adapter: "pi", Alive: true, Peer: "server"})
+	s.Upsert(Session{ID: "s2@server", Adapter: "shell", Alive: true, Peer: "server"})
 
 	ids := s.ListByPeer("server")
 	if len(ids) != 2 {
@@ -721,7 +803,7 @@ func TestListByPeer(t *testing.T) {
 
 func TestMarshalJSON_PeerField(t *testing.T) {
 	// Peer field present.
-	s := Session{ID: "s1@server", Kind: "pi", Alive: true, Peer: "server"}
+	s := Session{ID: "s1@server", Adapter: "pi", Alive: true, Peer: "server"}
 	data, _ := json.Marshal(s)
 	var wire map[string]interface{}
 	json.Unmarshal(data, &wire)
@@ -730,7 +812,7 @@ func TestMarshalJSON_PeerField(t *testing.T) {
 	}
 
 	// Local session: peer should be omitted.
-	s2 := Session{ID: "s2", Kind: "pi", Alive: true}
+	s2 := Session{ID: "s2", Adapter: "pi", Alive: true}
 	data2, _ := json.Marshal(s2)
 	var wire2 map[string]interface{}
 	json.Unmarshal(data2, &wire2)
@@ -741,10 +823,10 @@ func TestMarshalJSON_PeerField(t *testing.T) {
 
 func TestMarshalJSON_FrontendFields(t *testing.T) {
 	s := Session{
-		ID:        "s1",
-		Kind:      "pi",
-		Alive:     false,
-		Slug: "fix-auth",
+		ID:      "s1",
+		Adapter: "pi",
+		Alive:   false,
+		Slug:    "fix-auth",
 	}
 	data, err := json.Marshal(s)
 	if err != nil {
@@ -776,7 +858,7 @@ func TestUpsertCanonicalizesPaths(t *testing.T) {
 	s := New()
 	s.Upsert(Session{
 		ID:            "s1",
-		Kind:          "pi",
+		Adapter:       "pi",
 		Alive:         true,
 		Cwd:           home + "/dev/gmux/src",
 		WorkspaceRoot: home + "/dev/gmux",
@@ -799,7 +881,7 @@ func TestUpdateCanonicalizesPaths(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Cwd: "/tmp"})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, Cwd: "/tmp"})
 
 	s.Update("s1", func(sess *Session) {
 		sess.Cwd = home + "/projects/app"
@@ -821,17 +903,17 @@ func TestUpsertRemote_PreservesTitle(t *testing.T) {
 	s := New()
 	// A remote session arrives with Title already set (spoke
 	// resolved it) but internal ShellTitle/AdapterTitle empty (those
-	// are off-wire). Upsert would overwrite Title with Kind; UpsertRemote
+	// are off-wire). Upsert would overwrite Title with Adapter; UpsertRemote
 	// must not.
 	s.UpsertRemote(Session{
-		ID:    "sess-123@server",
-		Kind:  "codex",
-		Alive: true,
-		Peer:  "server",
-		Title: "fix remote bug",
+		ID:      "13hlltir@server",
+		Adapter: "codex",
+		Alive:   true,
+		Peer:    "server",
+		Title:   "fix remote bug",
 	})
 
-	got, ok := s.Get("sess-123@server")
+	got, ok := s.Get("13hlltir@server")
 	if !ok {
 		t.Fatal("expected session to exist")
 	}
@@ -847,15 +929,15 @@ func TestUpsertRemote_PreservesResumableFromSpoke(t *testing.T) {
 	// Upsert would derive Resumable from !Alive && len(Command) > 0;
 	// UpsertRemote must preserve the spoke's value.
 	s.UpsertRemote(Session{
-		ID:        "sess-1@server",
-		Kind:      "pi",
+		ID:        "1vshk4fu@server",
+		Adapter:   "pi",
 		Alive:     false,
 		Command:   []string{"pi"},
 		Peer:      "server",
 		Resumable: false, // spoke says not resumable despite command
 		Title:     "archived",
 	})
-	got, _ := s.Get("sess-1@server")
+	got, _ := s.Get("1vshk4fu@server")
 	if got.Resumable {
 		t.Errorf("Resumable = true, want false (UpsertRemote must not re-derive)")
 	}
@@ -866,14 +948,14 @@ func TestUpsertRemote_CanonicalizesPaths(t *testing.T) {
 	t.Setenv("HOME", home)
 	s := New()
 	s.UpsertRemote(Session{
-		ID:    "sess-path@server",
-		Kind:  "shell",
-		Alive: true,
-		Peer:  "server",
-		Title: "ok",
-		Cwd:   home + "/projects/app",
+		ID:      "1kme6umd@server",
+		Adapter: "shell",
+		Alive:   true,
+		Peer:    "server",
+		Title:   "ok",
+		Cwd:     home + "/projects/app",
 	})
-	got, _ := s.Get("sess-path@server")
+	got, _ := s.Get("1kme6umd@server")
 	if got.Cwd != "~/projects/app" {
 		t.Errorf("Cwd = %q, want %q (canonicalization must still run)", got.Cwd, "~/projects/app")
 	}
@@ -882,23 +964,23 @@ func TestUpsertRemote_CanonicalizesPaths(t *testing.T) {
 func TestUpsertRemote_DedupsSlug(t *testing.T) {
 	s := New()
 	s.UpsertRemote(Session{
-		ID:        "sess-1@server",
-		Kind:      "codex",
-		Alive:     true,
-		Peer:      "server",
-		Title:     "a",
-		Slug: "fix-bug",
+		ID:      "1vshk4fu@server",
+		Adapter: "codex",
+		Alive:   true,
+		Peer:    "server",
+		Title:   "a",
+		Slug:    "fix-bug",
 	})
 	s.UpsertRemote(Session{
-		ID:        "sess-2@server",
-		Kind:      "codex",
-		Alive:     true,
-		Peer:      "server",
-		Title:     "b",
-		Slug: "fix-bug",
+		ID:      "155mk8b7@server",
+		Adapter: "codex",
+		Alive:   true,
+		Peer:    "server",
+		Title:   "b",
+		Slug:    "fix-bug",
 	})
 
-	got, _ := s.Get("sess-2@server")
+	got, _ := s.Get("155mk8b7@server")
 	if got.Slug == "fix-bug" {
 		t.Errorf("Slug = %q, want a de-duplicated value (e.g. fix-bug-2)", got.Slug)
 	}
@@ -910,11 +992,11 @@ func TestUpsertRemote_BroadcastsEvent(t *testing.T) {
 	defer cancel()
 
 	s.UpsertRemote(Session{
-		ID:    "sess-1@server",
-		Kind:  "codex",
-		Alive: true,
-		Peer:  "server",
-		Title: "hello from spoke",
+		ID:      "1vshk4fu@server",
+		Adapter: "codex",
+		Alive:   true,
+		Peer:    "server",
+		Title:   "hello from spoke",
 	})
 
 	select {
@@ -930,19 +1012,17 @@ func TestUpsertRemote_BroadcastsEvent(t *testing.T) {
 	}
 }
 
-
-
-
 func TestSessionMarshalJSON_WireFormat(t *testing.T) {
 	s := Session{
-		ID:            "sess-abc",
-		Kind:          "pi",
-		Alive:         true,
-		RunnerVersion: "1.2.0",
-		BinaryHash:    "aabbccdd",
-		ShellTitle:    "internal-only",
-		AdapterTitle:  "internal-only",
-		Slug:          "my-slug",
+		ID:              "1j6y9mx6",
+		Adapter:         "pi",
+		Alive:           true,
+		RunnerVersion:   "1.2.0",
+		BinaryHash:      "aabbccdd",
+		ShellTitle:      "internal-only",
+		AdapterTitle:    "internal-only",
+		Slug:            "my-slug",
+		ConversationRef: "/home/u/.pi/agent/sessions/x/conv.jsonl",
 	}
 	b, err := json.Marshal(s)
 	if err != nil {
@@ -962,6 +1042,22 @@ func TestSessionMarshalJSON_WireFormat(t *testing.T) {
 	}
 	if got := m["slug"]; got != "my-slug" {
 		t.Errorf("slug = %v, want my-slug", got)
+	}
+	// v2 renamed the wire keys: "kind" → "adapter", "session_file" →
+	// "conversation_file". Pin both the new names and the absence of the
+	// old ones — the frontend, peering, and meta.json all consume this
+	// exact shape.
+	if got := m["adapter"]; got != "pi" {
+		t.Errorf("adapter = %v, want pi", got)
+	}
+	if got := m["conversation_file"]; got != "/home/u/.pi/agent/sessions/x/conv.jsonl" {
+		t.Errorf("conversation_file = %v, want the session's conversation file", got)
+	}
+	if _, ok := m["kind"]; ok {
+		t.Error("legacy key \"kind\" must not appear in wire JSON")
+	}
+	if _, ok := m["session_file"]; ok {
+		t.Error("legacy key \"session_file\" must not appear in wire JSON")
 	}
 
 	// Internal fields must not appear on the wire.
@@ -989,7 +1085,7 @@ var internalSessionFields = map[string]struct{}{
 // TestSessionMarshalJSON_AllFieldsAppearOnWire is the gotcha-catcher
 // for "someone added a field to Session with a json tag, but forgot
 // to plumb it through the explicit `wire` struct in MarshalJSON."
-// This is exactly how `last_activity_at` was almost silently dropped
+// This is exactly how `last_output_at` was almost silently dropped
 // during PR #229: the field had a tag on the struct but wasn't
 // enumerated in the wire literal, so it would never have reached
 // any API consumer.
@@ -1041,49 +1137,50 @@ func TestSessionMarshalJSON_AllFieldsAppearOnWire(t *testing.T) {
 func fullyPopulatedSession() Session {
 	exit := 0
 	return Session{
-		ID:             "sess-full",
-		Peer:           "peer-x",
-		CreatedAt:      "2026-01-01T00:00:00Z",
-		Command:        []string{"bash"},
-		Cwd:            "/tmp/work",
-		Kind:           "pi",
-		WorkspaceRoot:  "/tmp/work",
-		Remotes:        map[string]string{"origin": "github.com/x/y"},
-		Alive:          true,
-		Pid:            42,
-		ExitCode:       &exit,
-		StartedAt:      "2026-01-01T00:00:01Z",
-		ExitedAt:       "2026-01-01T00:00:02Z",
-		Title:          "t",
-		Subtitle:       "s",
-		Status:         &Status{Label: "l", Working: true, Error: true},
-		Unread:         true,
-		LastActivityAt: "2026-01-01T00:00:03Z",
-		Resumable:      true,
-		SocketPath:     "/tmp/sock",
-		TerminalCols:   80,
-		TerminalRows:   24,
-		Slug:           "slug",
-		SessionFile:    "/home/u/.pi/sess.jsonl",
-		RunnerVersion:  "v1",
-		BinaryHash:     "hash",
-		ShellTitle:     "shell-internal",
-		AdapterTitle:   "adapter-internal",
-		ProjectSlug:    "proj",
-		ProjectIndex:   3,
+		ID:              "1894363z",
+		Peer:            "peer-x",
+		CreatedAt:       "2026-01-01T00:00:00Z",
+		Command:         []string{"bash"},
+		Cwd:             "/tmp/work",
+		Adapter:         "pi",
+		WorkspaceRoot:   "/tmp/work",
+		Remotes:         map[string]string{"origin": "github.com/x/y"},
+		ParentSessionID: "1rz9lyqa", LaunchedFromSessionID: "launchroot",
+		Alive:           true,
+		Pid:             42,
+		ExitCode:        &exit,
+		StartedAt:       "2026-01-01T00:00:01Z",
+		ExitedAt:        "2026-01-01T00:00:02Z",
+		Title:           "t",
+		Subtitle:        "s",
+		Status:          &Status{Active: true, Error: true},
+		Unread:          true,
+		LastOutputAt:    "2026-01-01T00:00:03Z",
+		Resumable:       true,
+		SocketPath:      "/tmp/sock",
+		TerminalCols:    80,
+		TerminalRows:    24,
+		Slug:            "slug",
+		ConversationRef: "/home/u/.pi/sess.jsonl",
+		RunnerVersion:   "v1",
+		BinaryHash:      "hash",
+		ShellTitle:      "shell-internal",
+		AdapterTitle:    "adapter-internal",
+		ProjectSlug:     "proj",
+		ProjectIndex:    3,
 	}
 }
 
-// TestSessionMarshalJSON_LastActivityAt pins that LastActivityAt
+// TestSessionMarshalJSON_LastOutputAt pins that LastOutputAt
 // makes it onto the wire. The Session type has a custom MarshalJSON
 // (an explicit `wire` struct, not the default struct-tag reflection),
 // so adding a field to the struct alone is silently insufficient:
 // the field has to be enumerated in the wire struct and the
 // json.Marshal call. This test exists specifically to catch that
 // class of regression, not to test the std library's JSON encoder.
-func TestSessionMarshalJSON_LastActivityAt(t *testing.T) {
+func TestSessionMarshalJSON_LastOutputAt(t *testing.T) {
 	ts := "2026-05-23T10:30:00Z"
-	s := Session{ID: "sess-1", Kind: "pi", Alive: true, LastActivityAt: ts}
+	s := Session{ID: "1vshk4fu", Adapter: "pi", Alive: true, LastOutputAt: ts}
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -1092,33 +1189,33 @@ func TestSessionMarshalJSON_LastActivityAt(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got := m["last_activity_at"]; got != ts {
-		t.Fatalf("last_activity_at on wire = %v, want %q", got, ts)
+	if got := m["last_output_at"]; got != ts {
+		t.Fatalf("last_output_at on wire = %v, want %q", got, ts)
 	}
 
 	// And: when unset, the field is omitted (omitempty), not sent as
 	// an empty string. Matters because the frontend treats "" and
 	// absent identically today but might diverge later, and empty
 	// strings on RFC3339 fields are a smell.
-	s2 := Session{ID: "sess-2", Kind: "pi", Alive: true}
+	s2 := Session{ID: "155mk8b7", Adapter: "pi", Alive: true}
 	b2, _ := json.Marshal(s2)
 	var m2 map[string]any
 	json.Unmarshal(b2, &m2)
-	if _, present := m2["last_activity_at"]; present {
-		t.Errorf("unset LastActivityAt should be omitted, got %v", m2["last_activity_at"])
+	if _, present := m2["last_output_at"]; present {
+		t.Errorf("unset LastOutputAt should be omitted, got %v", m2["last_output_at"])
 	}
 }
 
-// TestSessionRoundTrip_LastActivityAt pins the peer-payload path:
+// TestSessionRoundTrip_LastOutputAt pins the peer-payload path:
 // the hub receives a peer session as JSON and json.Unmarshals into
 // store.Session, then UpsertRemote stores it. The default tag-based
-// unmarshal populates LastActivityAt from the wire; this test exists
+// unmarshal populates LastOutputAt from the wire; this test exists
 // because the symmetry between MarshalJSON (custom) and Unmarshal
 // (default) is the kind of asymmetry that breaks silently when
 // someone adds an UnmarshalJSON later.
-func TestSessionRoundTrip_LastActivityAt(t *testing.T) {
+func TestSessionRoundTrip_LastOutputAt(t *testing.T) {
 	ts := "2026-05-23T10:30:00Z"
-	original := Session{ID: "sess-1", Kind: "pi", Alive: true, LastActivityAt: ts}
+	original := Session{ID: "1vshk4fu", Adapter: "pi", Alive: true, LastOutputAt: ts}
 	b, err := json.Marshal(original)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -1127,8 +1224,8 @@ func TestSessionRoundTrip_LastActivityAt(t *testing.T) {
 	if err := json.Unmarshal(b, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.LastActivityAt != ts {
-		t.Fatalf("round-trip LastActivityAt = %q, want %q", decoded.LastActivityAt, ts)
+	if decoded.LastOutputAt != ts {
+		t.Fatalf("round-trip LastOutputAt = %q, want %q", decoded.LastOutputAt, ts)
 	}
 }
 
@@ -1136,8 +1233,8 @@ func TestSessionRoundTrip_LastActivityAt(t *testing.T) {
 
 func TestReconcile_StampsOwnedSessions(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "a", Slug: "alpha", Kind: "k", Alive: true})
-	s.Upsert(Session{ID: "b", Slug: "beta", Kind: "k", Alive: true})
+	s.Upsert(Session{ID: "a", Slug: "alpha", Adapter: "k", Alive: true})
+	s.Upsert(Session{ID: "b", Slug: "beta", Adapter: "k", Alive: true})
 
 	s.Reconcile(func(sess Session) (string, int) {
 		switch sess.Slug {
@@ -1166,7 +1263,7 @@ func TestReconcile_CallerControlsPeerStampPreservation(t *testing.T) {
 	// peers. This test verifies the contract: assignFn sees every
 	// session and its return value is honoured.
 	s := New()
-	s.UpsertRemote(Session{ID: "p1", Slug: "peer-sess", Kind: "k", Peer: "tower", Alive: true, ProjectSlug: "from-origin", ProjectIndex: 3})
+	s.UpsertRemote(Session{ID: "p1", Slug: "peer-sess", Adapter: "k", Peer: "tower", Alive: true, ProjectSlug: "from-origin", ProjectIndex: 3})
 
 	s.Reconcile(func(sess Session) (string, int) {
 		if sess.Peer != "" {
@@ -1187,7 +1284,7 @@ func TestReconcile_DoesNotBroadcast(t *testing.T) {
 	s := New()
 	ch, cancel := s.Subscribe()
 	defer cancel()
-	s.Upsert(Session{ID: "a", Slug: "alpha", Kind: "k", Alive: true})
+	s.Upsert(Session{ID: "a", Slug: "alpha", Adapter: "k", Alive: true})
 	// Drain the upsert event from setup.
 	<-ch
 
@@ -1209,7 +1306,7 @@ func TestReconcile_DoesNotBroadcast(t *testing.T) {
 
 func TestReconcile_NoOpWhenStampsUnchanged(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "a", Slug: "alpha", Kind: "k", Alive: true})
+	s.Upsert(Session{ID: "a", Slug: "alpha", Adapter: "k", Alive: true})
 
 	calls := 0
 	assignFn := func(sess Session) (string, int) {
@@ -1232,7 +1329,7 @@ func TestReconcile_NoOpWhenStampsUnchanged(t *testing.T) {
 func TestSession_MarshalEmitsProjectStamps(t *testing.T) {
 	sess := Session{
 		ID:           "a",
-		Kind:         "k",
+		Adapter:      "k",
 		Alive:        true,
 		ProjectSlug:  "gmux",
 		ProjectIndex: 4,
@@ -1258,7 +1355,7 @@ func TestSession_MarshalOmitsDisclaimedStamps(t *testing.T) {
 	// A disclaimed session (no project match) leaves slug="" and
 	// index=0. Both fields use omitempty so neither appears on the
 	// wire; viewers fall through to their own match rules.
-	sess := Session{ID: "a", Kind: "k", Alive: true}
+	sess := Session{ID: "a", Adapter: "k", Alive: true}
 	b, err := json.Marshal(sess)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -1293,7 +1390,7 @@ func TestSession_WireRoundTripPreservesStamps(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := Session{
 				ID:           "a",
-				Kind:         "k",
+				Adapter:      "k",
 				Alive:        true,
 				ProjectSlug:  tc.slug,
 				ProjectIndex: tc.index,
@@ -1316,61 +1413,108 @@ func TestSession_WireRoundTripPreservesStamps(t *testing.T) {
 	}
 }
 
-// TestLastActivityAt_NewSessionDoesNotBump pins option (a): brand-new
-// sessions arrive with LastActivityAt unset. This is what keeps
+// TestLastOutputAt_NewSessionDoesNotBump pins option (a): brand-new
+// sessions arrive with LastOutputAt unset. This is what keeps
 // sessionmeta rehydrate at daemon startup from timestamping every
 // resumable dead session to "now".
-func TestLastActivityAt_NewSessionDoesNotBump(t *testing.T) {
+func TestLastOutputAt_NewSessionDoesNotBump(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 	got, _ := s.Get("s1")
-	if got.LastActivityAt != "" {
-		t.Fatalf("new session should not bump LastActivityAt, got %q", got.LastActivityAt)
+	if got.LastOutputAt != "" {
+		t.Fatalf("new session should not bump LastOutputAt, got %q", got.LastOutputAt)
 	}
 }
 
-// TestLastActivityAt_BumpOnTransitions pins the exact set of state
-// transitions that bump: exited, unread on, working on, error on.
-// Each subtest starts from an alive-and-idle baseline and applies
-// one transition.
-func TestLastActivityAt_BumpOnTransitions(t *testing.T) {
+// TestActivitySeed_ReseedsEmptyStamp pins the restart-recovery fix: a
+// session upserted with no LastOutputAt (the alive-across-restart
+// re-register case) is seeded from the activitySeed hook. This is the
+// regression — without the hook the stamp stays empty and the UI falls
+// back to created_at ("3 days ago").
+func TestActivitySeed_ReseedsEmptyStamp(t *testing.T) {
+	seed := "2026-01-02T03:04:05Z"
+	s := New()
+	s.SetActivitySeed(func(Session) string { return seed })
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
+	got, _ := s.Get("s1")
+	if got.LastOutputAt != seed {
+		t.Fatalf("expected reseed to %q, got %q", seed, got.LastOutputAt)
+	}
+}
+
+// TestActivitySeed_DoesNotOverwriteExistingStamp pins that the seed is
+// a floor, not an override: a session that already carries a stamp (a
+// live value, or one restored from sessionmeta) keeps it.
+func TestActivitySeed_DoesNotOverwriteExistingStamp(t *testing.T) {
+	existing := "2026-05-05T05:05:05Z"
+	s := New()
+	s.SetActivitySeed(func(Session) string { return "2020-01-01T00:00:00Z" })
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, LastOutputAt: existing})
+	got, _ := s.Get("s1")
+	if got.LastOutputAt != existing {
+		t.Fatalf("expected existing stamp %q preserved, got %q", existing, got.LastOutputAt)
+	}
+}
+
+// TestActivitySeed_SkippedForPeer pins that peer sessions (UpsertRemote)
+// are not reseeded: the owning daemon stamps its own, and the mtime
+// source lives on the owning host.
+func TestActivitySeed_SkippedForPeer(t *testing.T) {
+	s := New()
+	s.SetActivitySeed(func(Session) string { return "2026-01-02T03:04:05Z" })
+	s.UpsertRemote(Session{ID: "s1", Adapter: "pi", Alive: true, Peer: "host2"})
+	got, _ := s.Get("s1")
+	if got.LastOutputAt != "" {
+		t.Fatalf("peer session should not be reseeded, got %q", got.LastOutputAt)
+	}
+}
+
+// TestLastOutputAt_BumpOnTransitions pins the output-only bump policy:
+// only unread false→true stamps LastOutputAt. The user's own input
+// (active on), exit, and error deliberately do NOT bump — see the
+// LastOutputAt docstring. Each subtest starts from an alive-and-idle
+// baseline and applies one transition.
+func TestLastOutputAt_BumpOnTransitions(t *testing.T) {
 	cases := []struct {
-		name string
-		next func(*Session)
+		name     string
+		next     func(*Session)
+		wantBump bool
 	}{
-		{"exited", func(s *Session) { s.Alive = false }},
-		{"unread", func(s *Session) { s.Unread = true }},
-		{"working", func(s *Session) { s.Status = &Status{Working: true} }},
-		{"error", func(s *Session) { s.Status = &Status{Error: true} }},
+		{"unread", func(s *Session) { s.Unread = true }, true},
+		{"exited", func(s *Session) { s.Alive = false }, false},
+		{"active", func(s *Session) { s.Status = &Status{Active: true} }, false},
+		{"error", func(s *Session) { s.Status = &Status{Error: true} }, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New()
-			s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+			s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 			before, _ := s.Get("s1")
-			if before.LastActivityAt != "" {
-				t.Fatalf("baseline should be unset, got %q", before.LastActivityAt)
+			if before.LastOutputAt != "" {
+				t.Fatalf("baseline should be unset, got %q", before.LastOutputAt)
 			}
-			ok := s.Update("s1", tc.next)
-			if !ok {
+			if ok := s.Update("s1", tc.next); !ok {
 				t.Fatal("update failed")
 			}
 			after, _ := s.Get("s1")
-			if after.LastActivityAt == "" {
-				t.Fatalf("transition %q should bump LastActivityAt", tc.name)
+			bumped := after.LastOutputAt != ""
+			if bumped != tc.wantBump {
+				t.Fatalf("transition %q: bumped=%v, want %v (got %q)", tc.name, bumped, tc.wantBump, after.LastOutputAt)
 			}
-			if _, err := time.Parse(time.RFC3339, after.LastActivityAt); err != nil {
-				t.Fatalf("LastActivityAt %q is not RFC3339: %v", after.LastActivityAt, err)
+			if tc.wantBump {
+				if _, err := time.Parse(time.RFC3339, after.LastOutputAt); err != nil {
+					t.Fatalf("LastOutputAt %q is not RFC3339: %v", after.LastOutputAt, err)
+				}
 			}
 		})
 	}
 }
 
-// TestLastActivityAt_NoBumpOnNoise pins that benign updates do not
-// bump: title changes, slug changes, cwd changes, status label-only
+// TestLastOutputAt_NoBumpOnNoise pins that benign updates do not
+// bump: title changes, slug changes, cwd changes, no-op status
 // changes. Without this, the recency list would jitter on every
 // adapter title refresh.
-func TestLastActivityAt_NoBumpOnNoise(t *testing.T) {
+func TestLastOutputAt_NoBumpOnNoise(t *testing.T) {
 	cases := []struct {
 		name string
 		next func(*Session)
@@ -1378,16 +1522,16 @@ func TestLastActivityAt_NoBumpOnNoise(t *testing.T) {
 		{"title", func(s *Session) { s.AdapterTitle = "renamed" }},
 		{"slug", func(s *Session) { s.Slug = "new-slug" }},
 		{"cwd", func(s *Session) { s.Cwd = "/tmp/elsewhere" }},
-		{"status-label", func(s *Session) { s.Status = &Status{Label: "running"} }},
+		{"status-noop", func(s *Session) { s.Status = &Status{} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New()
-			s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, AdapterTitle: "orig"})
-			// Pre-seed a LastActivityAt by transitioning to unread.
+			s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, AdapterTitle: "orig"})
+			// Pre-seed a LastOutputAt by transitioning to unread.
 			s.Update("s1", func(sess *Session) { sess.Unread = true })
 			seeded, _ := s.Get("s1")
-			stamp := seeded.LastActivityAt
+			stamp := seeded.LastOutputAt
 			if stamp == "" {
 				t.Fatal("expected baseline bump from unread transition")
 			}
@@ -1396,143 +1540,228 @@ func TestLastActivityAt_NoBumpOnNoise(t *testing.T) {
 			time.Sleep(1100 * time.Millisecond)
 			s.Update("s1", tc.next)
 			after, _ := s.Get("s1")
-			if after.LastActivityAt != stamp {
-				t.Fatalf("noise update %q should not bump (was %q, now %q)", tc.name, stamp, after.LastActivityAt)
+			if after.LastOutputAt != stamp {
+				t.Fatalf("noise update %q should not bump (was %q, now %q)", tc.name, stamp, after.LastOutputAt)
 			}
 		})
 	}
 }
 
-// TestLastActivityAt_OnlyTransitionEdgeBumps pins that staying in
+// TestLastOutputAt_OnlyTransitionEdgeBumps pins that staying in
 // the same noteworthy state does not re-bump on every Update. A
 // session that is unread, gets another Update while still unread,
 // should keep its existing timestamp.
-func TestLastActivityAt_OnlyTransitionEdgeBumps(t *testing.T) {
+func TestLastOutputAt_OnlyTransitionEdgeBumps(t *testing.T) {
 	s := New()
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 	s.Update("s1", func(sess *Session) { sess.Unread = true })
 	first, _ := s.Get("s1")
 	time.Sleep(1100 * time.Millisecond)
 	s.Update("s1", func(sess *Session) { sess.AdapterTitle = "still unread" })
 	second, _ := s.Get("s1")
-	if second.LastActivityAt != first.LastActivityAt {
-		t.Fatalf("staying unread should not re-bump (was %q, now %q)", first.LastActivityAt, second.LastActivityAt)
+	if second.LastOutputAt != first.LastOutputAt {
+		t.Fatalf("staying unread should not re-bump (was %q, now %q)", first.LastOutputAt, second.LastOutputAt)
 	}
 }
 
-// TestLastActivityAt_UpsertOnExistingBumps pins that the bump
+// TestLastOutputAt_UpsertOnExistingBumps pins that the bump
 // machinery fires on Upsert (not just Update). Adapters call Upsert
 // repeatedly with the same ID as they refresh metadata; when one of
 // those refreshes carries a noteworthy transition (e.g. status going
-// to working), it must stamp LastActivityAt the same way Update does.
-func TestLastActivityAt_UpsertOnExistingBumps(t *testing.T) {
+// to active), it must stamp LastOutputAt the same way Update does.
+func TestLastOutputAt_UpsertOnExistingBumps(t *testing.T) {
 	cases := []struct {
-		name string
-		mutate func(*Session)
+		name     string
+		mutate   func(*Session)
+		wantBump bool
 	}{
-		{"exited", func(s *Session) { s.Alive = false }},
-		{"unread", func(s *Session) { s.Unread = true }},
-		{"working", func(s *Session) { s.Status = &Status{Working: true} }},
-		{"error", func(s *Session) { s.Status = &Status{Error: true} }},
+		{"unread", func(s *Session) { s.Unread = true }, true},
+		{"exited", func(s *Session) { s.Alive = false }, false},
+		{"active", func(s *Session) { s.Status = &Status{Active: true} }, false},
+		{"error", func(s *Session) { s.Status = &Status{Error: true} }, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := New()
-			baseline := Session{ID: "s1", Kind: "pi", Alive: true}
+			baseline := Session{ID: "s1", Adapter: "pi", Alive: true}
 			s.Upsert(baseline)
 			before, _ := s.Get("s1")
-			if before.LastActivityAt != "" {
-				t.Fatalf("baseline should be unset, got %q", before.LastActivityAt)
+			if before.LastOutputAt != "" {
+				t.Fatalf("baseline should be unset, got %q", before.LastOutputAt)
 			}
 			next := baseline
 			tc.mutate(&next)
 			s.Upsert(next)
 			after, _ := s.Get("s1")
-			if after.LastActivityAt == "" {
-				t.Fatalf("Upsert transition %q should bump LastActivityAt", tc.name)
+			bumped := after.LastOutputAt != ""
+			if bumped != tc.wantBump {
+				t.Fatalf("Upsert transition %q: bumped=%v, want %v (got %q)", tc.name, bumped, tc.wantBump, after.LastOutputAt)
 			}
-			if _, err := time.Parse(time.RFC3339, after.LastActivityAt); err != nil {
-				t.Fatalf("LastActivityAt %q is not RFC3339: %v", after.LastActivityAt, err)
+			if tc.wantBump {
+				if _, err := time.Parse(time.RFC3339, after.LastOutputAt); err != nil {
+					t.Fatalf("LastOutputAt %q is not RFC3339: %v", after.LastOutputAt, err)
+				}
 			}
 		})
 	}
 }
 
-// TestLastActivityAt_UpsertNoBumpPreservesStamp pins that a no-bump
+// TestLastOutputAt_UpsertNoBumpPreservesStamp pins that a no-bump
 // Upsert (routine title / cwd / slug refresh from an adapter) does
-// NOT clobber a previously stamped LastActivityAt. Adapters build
-// fresh Session structs from runner state without LastActivityAt;
+// NOT clobber a previously stamped LastOutputAt. Adapters build
+// fresh Session structs from runner state without LastOutputAt;
 // without an explicit carry-forward we'd silently zero the field on
 // every metadata refresh and break Recent ordering.
-func TestLastActivityAt_UpsertNoBumpPreservesStamp(t *testing.T) {
+func TestLastOutputAt_UpsertNoBumpPreservesStamp(t *testing.T) {
 	s := New()
 	// Seed with a stamped session via a transition.
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true})
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true})
 	s.Update("s1", func(sess *Session) { sess.Unread = true })
 	before, _ := s.Get("s1")
-	stamp := before.LastActivityAt
+	stamp := before.LastOutputAt
 	if stamp == "" {
-		t.Fatal("baseline transition should have stamped LastActivityAt")
+		t.Fatal("baseline transition should have stamped LastOutputAt")
 	}
 	// Routine refresh: same state, only adapter title changed. No
-	// transition fires; LastActivityAt is absent from the payload.
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Unread: true, AdapterTitle: "renamed"})
+	// transition fires; LastOutputAt is absent from the payload.
+	s.Upsert(Session{ID: "s1", Adapter: "pi", Alive: true, Unread: true, AdapterTitle: "renamed"})
 	after, _ := s.Get("s1")
-	if after.LastActivityAt != stamp {
-		t.Fatalf("no-bump Upsert must preserve LastActivityAt (was %q, now %q)", stamp, after.LastActivityAt)
+	if after.LastOutputAt != stamp {
+		t.Fatalf("no-bump Upsert must preserve LastOutputAt (was %q, now %q)", stamp, after.LastOutputAt)
 	}
 }
 
-// TestLastActivityAt_PointerAliasingDoesNotHideTransition is a
-// regression test for a real bug in an earlier draft: Update did
-// `sess := prev` (shallow copy), so prev.Status and sess.Status
-// pointed to the same Status struct. A mutator that wrote through
-// the pointer (e.g. flipped sess.Status.Working from false to true)
-// would silently mutate prev too, hiding the false→true transition
-// from the bump check. This test pins that the bump fires correctly
-// when a mutator constructs a new Status pointer in place of a nil
-// one (the common pattern in subscribe.go), AND would have failed
-// under the previous implementation if the mutator modified the
-// pointer's pointee directly. Snapshotting the activity booleans
-// before fn runs sidesteps the alias entirely.
-func TestLastActivityAt_PointerAliasingDoesNotHideTransition(t *testing.T) {
-	s := New()
-	// Seed with a Status pointer present (label only, not working).
-	s.Upsert(Session{ID: "s1", Kind: "pi", Alive: true, Status: &Status{Label: "idle"}})
-
-	// Mutator writes Working=true through the existing Status pointer
-	// rather than allocating a new Status. This is the alias-risk
-	// shape.
-	ok := s.Update("s1", func(sess *Session) {
-		if sess.Status != nil {
-			sess.Status.Working = true
-		}
-	})
-	if !ok {
-		t.Fatal("update failed")
-	}
-	after, _ := s.Get("s1")
-	if after.LastActivityAt == "" {
-		t.Fatal("working false→true through aliased pointer must still bump LastActivityAt")
-	}
-}
-
-// TestLastActivityAt_UpsertRemotePreserves pins that peer payloads
-// (UpsertRemote) carry through LastActivityAt as-received: the
+// TestLastOutputAt_UpsertRemotePreserves pins that peer payloads
+// (UpsertRemote) carry through LastOutputAt as-received: the
 // owning daemon stamped it, the hub must not recompute.
-func TestLastActivityAt_UpsertRemotePreserves(t *testing.T) {
+func TestLastOutputAt_UpsertRemotePreserves(t *testing.T) {
 	s := New()
 	wired := "2026-01-01T12:00:00Z"
-	s.UpsertRemote(Session{ID: "s1", Kind: "pi", Peer: "remote", Alive: true, LastActivityAt: wired})
+	s.UpsertRemote(Session{ID: "s1", Adapter: "pi", Peer: "remote", Alive: true, LastOutputAt: wired})
 	got, _ := s.Get("s1")
-	if got.LastActivityAt != wired {
-		t.Fatalf("UpsertRemote should preserve LastActivityAt (want %q, got %q)", wired, got.LastActivityAt)
+	if got.LastOutputAt != wired {
+		t.Fatalf("UpsertRemote should preserve LastOutputAt (want %q, got %q)", wired, got.LastOutputAt)
 	}
 	// Even a transition arriving via UpsertRemote must not recompute:
 	// it's the spoke's job to stamp, not ours.
-	s.UpsertRemote(Session{ID: "s1", Kind: "pi", Peer: "remote", Alive: false, LastActivityAt: wired})
+	s.UpsertRemote(Session{ID: "s1", Adapter: "pi", Peer: "remote", Alive: false, LastOutputAt: wired})
 	got2, _ := s.Get("s1")
-	if got2.LastActivityAt != wired {
-		t.Fatalf("UpsertRemote alive→false should preserve peer-supplied timestamp (want %q, got %q)", wired, got2.LastActivityAt)
+	if got2.LastOutputAt != wired {
+		t.Fatalf("UpsertRemote alive→false should preserve peer-supplied timestamp (want %q, got %q)", wired, got2.LastOutputAt)
+	}
+}
+
+// TestUpdateBindDoesNotResurrectRemovedSession pins the fix for a race in
+// Update's first-bind path: describing a conversation (adapter I/O) must not
+// run under s.mu, but dropping the lock and writing the pre-drop copy back
+// afterwards could resurrect a session dismissed during the window. Update now
+// warms the lineage cache outside the lock and RETRIES from fresh state, so a
+// concurrent Remove wins.
+//
+// A FIFO makes the race deterministic: claude's DescribeConversation blocks
+// reading it, and opening the write end succeeds exactly when the reader has
+// the FIFO open — i.e. while Update is inside the unlocked window.
+func TestUpdateBindDoesNotResurrectRemovedSession(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "33333333-3333-4333-8333-333333333333.jsonl")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	s := New()
+	s.Upsert(Session{ID: "1kc5cwpd", Adapter: "claude", Alive: true})
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- s.Update("1kc5cwpd", func(sess *Session) {
+			sess.ConversationRef = fifo
+		})
+	}()
+
+	// Blocks until the describe's ReadFile has the FIFO open for reading —
+	// Update is now past the unlock.
+	w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open fifo writer: %v", err)
+	}
+
+	// Dismiss the session while Update is stuck describing.
+	if !s.Remove("1kc5cwpd") {
+		t.Fatal("remove should have found the session")
+	}
+
+	// Unblock the describe (EOF → parse failure → cached), letting Update
+	// retry and observe the removal.
+	w.Close()
+	if got := <-done; got {
+		t.Fatal("Update should report false after a concurrent Remove")
+	}
+	if _, ok := s.Get("1kc5cwpd"); ok {
+		t.Fatal("removed session must not be resurrected by a stale bind write-back")
+	}
+}
+
+// TestLineageRecoversAfterLateTranscriptFlush pins the fix for permanent
+// negative caching: a resumed transcript that is absent at first bind (describe
+// fails) must NOT poison the ref — once the file lands, a later bind learns the
+// lineage and takeover fires. Regression for the adversarial-review P1.
+func TestLineageRecoversAfterLateTranscriptFlush(t *testing.T) {
+	const ancestor = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	const resumed = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	dir := t.TempDir()
+	ancestorFile := filepath.Join(dir, ancestor+".jsonl")
+	if err := os.WriteFile(ancestorFile, []byte(`{"type":"user","sessionId":"`+ancestor+`","message":{"role":"user","content":"hi"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newFile := filepath.Join(dir, resumed+".jsonl") // not on disk yet
+
+	s := New()
+	s.Upsert(Session{ID: "dead", Adapter: "claude", Alive: false, ConversationRef: ancestorFile})
+	s.Upsert(Session{ID: "live", Adapter: "claude", Alive: true})
+
+	// First bind: the resumed transcript hasn't been flushed — describe fails.
+	s.Update("live", func(sess *Session) { sess.ConversationRef = newFile })
+	if _, ok := s.Get("dead"); !ok {
+		t.Fatal("dead row should survive a bind whose transcript is not yet readable")
+	}
+
+	// Claude flushes the replayed history + the ancestor's line id.
+	if err := os.WriteFile(newFile, []byte(`{"type":"user","sessionId":"`+ancestor+`","message":{"role":"user","content":"hi"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A later genuine bind to the same ref (e.g. switch away and back) must
+	// now learn the lineage and evict the ancestor.
+	s.Update("live", func(sess *Session) { sess.ConversationRef = "" })
+	s.Update("live", func(sess *Session) { sess.ConversationRef = newFile })
+	if _, ok := s.Get("dead"); ok {
+		t.Fatal("takeover should fire once the transcript is readable (no permanent negative cache)")
+	}
+}
+
+// TestLineageCacheScopedByAdapter pins that the lineage cache is keyed by
+// (adapter, ref): two adapters sharing an opaque ref string must not inherit
+// each other's cached identity. Regression for the adversarial-review P2.
+func TestLineageCacheScopedByAdapter(t *testing.T) {
+	dir := t.TempDir()
+	// Same bare ref string, different adapters, different content.
+	ref := filepath.Join(dir, "shared.jsonl")
+	if err := os.WriteFile(ref, []byte(`{"type":"user","sessionId":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","message":{"role":"user","content":"x"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	// pi binds the ref first (pi's describer sees pi content; here it just
+	// populates the pi-scoped cache entry).
+	s.Upsert(Session{ID: "pi-live", Adapter: "pi", Alive: true, ConversationRef: ref})
+	// A claude dead row with a DIFFERENT ref must not be evicted by a claude
+	// live bind to the shared ref just because pi cached something for it.
+	claudeDead := filepath.Join(dir, "dddddddd-dddd-4ddd-8ddd-dddddddddddd.jsonl")
+	if err := os.WriteFile(claudeDead, []byte(`{"type":"user","sessionId":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","message":{"role":"user","content":"y"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Upsert(Session{ID: "claude-dead", Adapter: "claude", Alive: false, ConversationRef: claudeDead})
+	s.Upsert(Session{ID: "claude-live", Adapter: "claude", Alive: true})
+	s.Update("claude-live", func(sess *Session) { sess.ConversationRef = ref })
+	if _, ok := s.Get("claude-dead"); !ok {
+		t.Fatal("claude dead row must survive: pi's cache entry for the shared ref must not leak into claude's identity")
 	}
 }

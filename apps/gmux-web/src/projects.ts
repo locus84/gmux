@@ -1,10 +1,11 @@
 // --- Project-session matching and topology ---
 //
 // Maps sessions to projects using match rules (path prefix, git remote).
-// Builds sidebar folders and project hub topology. Pure functions with
+// Builds sidebar folders and session-ID host-path helpers. Pure functions with
 // no side effects or signal dependencies.
 
-import type { Session, Folder, ProjectItem, PeerInfo, DiscoveredProject } from './types'
+import type { Worktree } from '@gmux/protocol'
+import type { Session, Folder, ProjectItem, DiscoveredProject } from './types'
 
 // --- Remote normalization (mirrors Go NormalizeRemote) ---
 
@@ -31,7 +32,7 @@ function pathUnder(candidate: string | undefined, base: string): boolean {
 
 /**
  * Whether a session should be visible in this project's UI (sidebar
- * folder, project hub page).
+ * folder).
  *
  * Under the references model, stamps are the sole authority for folder
  * membership. A session arrives in a folder because its origin host
@@ -59,6 +60,19 @@ export function isSessionVisibleInProject(session: Session, _project: ProjectIte
  * (~/... form), so string comparison works without $HOME expansion.
  * Does not check rule.hosts (host scoping is server-side only).
  */
+/** Return the local catalog entry that can bucket a stamped session into a
+ * sidebar folder. This deliberately follows `buildProjectFolders`: a
+ * disclaimed session may be URL-matchable, but it has no sidebar row until the
+ * daemon stamps it. Promotion eligibility must use this predicate rather than
+ * a looser routing-only match. */
+export function sidebarProjectForSession(
+  session: Session,
+  projects: ProjectItem[],
+): ProjectItem | null {
+  if (!session.project_slug || session.peer) return null
+  return projects.find(project => !project.peer && project.slug === session.project_slug) ?? null
+}
+
 export function matchSession(
   session: Session,
   projects: ProjectItem[],
@@ -167,7 +181,7 @@ export function mostCommonRemote(sessions: Session[]): string {
 
 /** Discover suggested projects from the viewer's OWN (local) sessions.
  *
- * Discovery is host-authoritative (ADR 0002/0005): each host runs its
+ * Discovery is host-authoritative (ADR 0002/0025): each host runs its
  * own match rules over its own sessions and decides which are unclaimed.
  * This function therefore handles local sessions only — peer sessions
  * are discovered by their owning host and relayed verbatim (merged in
@@ -175,7 +189,7 @@ export function mostCommonRemote(sessions: Session[]): string {
  *
  * A session is in scope iff it is local (`s.peer` empty, or a Local
  * peer / devcontainer whose project assignment the parent owns — see
- * ADR 0005), it is disclaimed (`s.project_slug` empty), and it doesn't
+ * ADR 0025), it is disclaimed (`s.project_slug` empty), and it doesn't
  * match a local owned project (those get stamped imminently by
  * auto-assign, so surfacing them as discovered would just flicker).
  *
@@ -191,10 +205,10 @@ export function discoverProjects(
   const byKey = new Map<string, { peer: string; dir: string; group: Session[] }>()
   for (const s of sessions) {
     if (s.project_slug) continue // claimed by origin
-    // Discovery is host-authoritative (ADR 0002/0005): this viewer only
+    // Discovery is host-authoritative (ADR 0002/0025): this viewer only
     // discovers its OWN (local) sessions. Peer sessions are discovered
     // by their owning host and relayed verbatim (see store.discovered).
-    // Local-peer/devcontainer sessions count as local: per ADR 0005
+    // Local-peer/devcontainer sessions count as local: per ADR 0025
     // their project assignment is owned by the parent's rules, so they
     // flow through the parent's local discovery, not the container's.
     const rawPeer = s.peer ?? ''
@@ -220,12 +234,12 @@ export function discoverProjects(
     let suggested = remote ? slugFromRemote(remote) : ''
     if (!suggested) suggested = slugFromPath(dir)
     if (!suggested) suggested = 'project'
-    // Mirror the server-side sessionLastActive: prefer last_activity_at,
+    // Mirror the server-side sessionLastActive: prefer last_output_at,
     // fall back to created_at, so local rows sort consistently against
     // peer-advertised ones.
     let lastActive = ''
     for (const s of group) {
-      const t = s.last_activity_at || s.created_at
+      const t = s.last_output_at || s.created_at
       if (t > lastActive) lastActive = t
     }
     const dp: DiscoveredProject = {
@@ -328,15 +342,27 @@ export function countUnmatchedActive(
  * renders on the session row so the user knows it's a container
  * session.
  */
+export interface TemporaryPresentationPlacement {
+  ownerPeer: string
+  slug: string
+}
+
 export function buildProjectFolders(
   projects: ProjectItem[],
   sessions: Session[],
   isLocalPeer?: (peerName: string) => boolean,
   peerProjects?: Record<string, { slug: string; launch_cwd?: string }[]>,
-  // Resolve a reference (by its stored peer+slug) to the live host's
-  // current name and whether it's in the roster at all. When omitted,
-  // references resolve to their stored name (legacy behavior). (refs #270)
-  resolveRef?: (peer: string, slug: string) => { effectivePeer: string; resolved: boolean } | undefined,
+  // Liveness predicate: is a reference's host in the roster? (ADR 0017).
+  // `peer` is a frozen viewer-owned label, so references bucket/label by
+  // it directly; this only sets the unresolved flag. Omitted ⇒ present.
+  isPresent?: (peer: string, nodeId?: string) => boolean,
+  // Presentation roots that must remain locatable (for example when a live
+  // child is selected but its root itself is inactive).
+  forceVisible?: ReadonlySet<string>,
+  // Ephemeral placement for an unstamped presentation root whose relevant
+  // child already resolves to a folder. This affects only this projection;
+  // the root's authoritative project/peer facts remain untouched.
+  temporaryPlacements?: ReadonlyMap<string, TemporaryPresentationPlacement>,
 ): Folder[] {
   // Bucket every stamped session by `${ownerPeer}::${slug}`.
   // ownerPeer is '' for sessions owned by the viewer (local sessions,
@@ -351,7 +377,11 @@ export function buildProjectFolders(
   }
 
   for (const s of sessions) {
-    if (!s.project_slug) continue // unstamped: surfaces via discovery only
+    if (!s.project_slug) {
+      const temporary = temporaryPlacements?.get(s.id)
+      if (temporary) bucket(temporary.ownerPeer, temporary.slug, s)
+      continue // all other unstamped sessions surface via discovery only
+    }
     const sessionPeer = s.peer ?? ''
     const ownerPeer = sessionPeer && !(isLocalPeer?.(sessionPeer))
       ? sessionPeer
@@ -361,23 +391,16 @@ export function buildProjectFolders(
 
   const folders: Folder[] = []
   for (const project of projects) {
-    const storedPeer = project.peer ?? ''
-    // For references, resolve to the live host's current name (which
-    // may differ from the stored name after a rename) and learn
-    // whether the host is in the roster at all. Owned projects pass
-    // through unchanged.
-    let ownerPeer = storedPeer
-    let unresolved = false
-    if (storedPeer !== '' && resolveRef) {
-      const r = resolveRef(storedPeer, project.slug)
-      if (r) {
-        ownerPeer = r.effectivePeer
-        unresolved = !r.resolved
-      }
-    }
+    // `peer` is the runtime key (viewer-owned, frozen — ADR 0007 §7), so
+    // bucket and label references by it directly. The only roster
+    // question is liveness, which also blocks a reused name from
+    // adopting a stale reference (node_id mismatch).
+    const ownerPeer = project.peer ?? ''
+    const unresolved = ownerPeer !== '' && !!isPresent && !isPresent(ownerPeer, project.node_id)
     const ss = buckets.get(`${ownerPeer}::${project.slug}`) ?? []
-    const visible = ss.filter(s => s.alive || s.resumable === true)
+    const visible = ss.filter(s => s.alive || s.resumable === true || forceVisible?.has(s.id))
     visible.sort(compareFolderSessions)
+    placeChildSessions(visible)
     // Owned: derive launchCwd from the project's first path rule.
     // Reference: pull launchCwd from peer_projects so the launch
     // button works even when the folder is empty (no session to
@@ -418,6 +441,128 @@ export function buildProjectFolders(
   }
 
   return folders
+}
+
+export interface CheckoutGroup {
+  key: string
+  path: string
+  label: string
+  primary: boolean
+  sessions: Session[]
+  worktree?: Worktree
+  fallback?: boolean
+}
+
+/** Group visible sessions by the deepest Git checkout containing their cwd. */
+export function groupSessionsByCheckout(
+  folder: Folder,
+  worktrees?: readonly Worktree[],
+  primaryPath?: string,
+): CheckoutGroup[] {
+  const inventory = worktrees?.length
+    ? [...worktrees]
+    : primaryPath
+      ? [{ path: primaryPath, primary: true, detached: false, bare: false, locked: false, prunable: false }]
+      : []
+  const listed = inventory.sort((a, b) => {
+    if (a.primary !== b.primary) return a.primary ? -1 : 1
+    return checkoutLabel(a).localeCompare(checkoutLabel(b)) || a.path.localeCompare(b.path)
+  })
+  if (listed.length === 0) return approximateCheckoutGroups(folder)
+
+  const groups: CheckoutGroup[] = listed.map(worktree => ({
+    key: `checkout:${worktree.path}`,
+    path: worktree.path,
+    label: worktree.primary ? 'Main' : checkoutLabel(worktree),
+    primary: worktree.primary,
+    sessions: [],
+    worktree,
+  }))
+  const unmatched = new Map<string, CheckoutGroup>()
+  for (const session of folder.sessions) {
+    const sameFilesystemOwner = (folder.peer ?? '') === (session.peer ?? '')
+    const match = sameFilesystemOwner ? deepestCheckout(groups, session.cwd) : undefined
+    if (match) {
+      match.sessions.push(session)
+      continue
+    }
+    const path = session.cwd || folder.launchCwd || ''
+    const owner = session.peer ?? ''
+    const key = `fallback:${owner}:${path || session.id}`
+    let group = unmatched.get(key)
+    if (!group) {
+      group = { key, path, label: `${checkoutPathLabel(path) || 'Other checkout'}${owner ? ` · ${owner}` : ''}`, primary: false, sessions: [], fallback: true }
+      unmatched.set(key, group)
+    }
+    group.sessions.push(session)
+  }
+  return [...groups, ...[...unmatched.values()].sort((a, b) => a.label.localeCompare(b.label) || a.path.localeCompare(b.path))]
+}
+
+function approximateCheckoutGroups(folder: Folder): CheckoutGroup[] {
+  const primaryPath = folder.launchCwd ?? ''
+  const primary: CheckoutGroup = { key: `primary:${primaryPath}`, path: primaryPath, label: 'Main', primary: true, sessions: [], fallback: true }
+  const linked = new Map<string, CheckoutGroup>()
+  for (const session of folder.sessions) {
+    if (checkoutPathContains(primaryPath, session.cwd)) {
+      primary.sessions.push(session)
+      continue
+    }
+    const path = session.cwd || ''
+    let group = linked.get(path)
+    if (!group) {
+      group = { key: `approx:${path || session.id}`, path, label: checkoutPathLabel(path) || 'Other checkout', primary: false, sessions: [], fallback: true }
+      linked.set(path, group)
+    }
+    group.sessions.push(session)
+  }
+  return [primary, ...[...linked.values()].sort((a, b) => a.label.localeCompare(b.label) || a.path.localeCompare(b.path))]
+}
+
+function deepestCheckout(groups: CheckoutGroup[], cwd: string): CheckoutGroup | undefined {
+  let best: CheckoutGroup | undefined
+  for (const group of groups) {
+    if (checkoutPathContains(group.path, cwd) && (!best || normalizeCheckoutPath(group.path).length > normalizeCheckoutPath(best.path).length)) best = group
+  }
+  return best
+}
+
+export function checkoutPathContains(root: string, candidate: string): boolean {
+  root = normalizeCheckoutPath(root)
+  candidate = normalizeCheckoutPath(candidate)
+  if (!root || !candidate) return false
+  if (candidate === root || candidate.startsWith(root.endsWith('/') ? root : `${root}/`)) return true
+
+  // Daemon worktree inventory intentionally uses portable ~/ paths, while
+  // newly registered v2 sessions report an absolute cwd. Match the same home
+  // suffix without teaching the browser the daemon user's home directory.
+  if (root.startsWith('~/') && candidate.startsWith('/')) {
+    const homeRelative = root.slice(1)
+    const offset = candidate.indexOf(homeRelative)
+    if (offset > 0) {
+      const absoluteRoot = candidate.slice(0, offset) + homeRelative
+      return candidate === absoluteRoot || candidate.startsWith(`${absoluteRoot}/`)
+    }
+  }
+  return false
+}
+
+function normalizeCheckoutPath(path: string): string {
+  if (!path) return ''
+  path = path.replaceAll('\\', '/').replace(/\/{2,}/g, '/')
+  if (path.length > 1) path = path.replace(/\/$/, '')
+  if (/^[A-Za-z]:\//.test(path)) return path.toLowerCase()
+  return path
+}
+
+function checkoutLabel(worktree: Worktree): string {
+  return worktree.branch || (worktree.detached ? `detached ${worktree.head?.slice(0, 7) || ''}`.trim() : checkoutPathLabel(worktree.path)) || 'checkout'
+}
+
+function checkoutPathLabel(path: string): string {
+  const normalized = normalizeCheckoutPath(path)
+  if (!normalized || normalized === '/') return normalized
+  return normalized.slice(normalized.lastIndexOf('/') + 1)
 }
 
 /**
@@ -462,6 +607,30 @@ export function projectAvailability(
  * server hands out distinct indices) but we fall back to `created_at`
  * then `id` so the order is deterministic across snapshot re-emits.
  */
+/**
+ * Re-place sessions that declare a parent (`parent_session_id`, e.g.
+ * an editor session spawned by `gmux edit` as $EDITOR inside another
+ * session) directly after that parent, when the parent is in the same
+ * folder. Runs after compareFolderSessions so index order is the base;
+ * children keep their relative order. Sessions whose parent isn't
+ * present stay where the base sort put them. Deliberately one level —
+ * a full hierarchy/tree UI is out of scope.
+ */
+export function placeChildSessions(sessions: Session[]): void {
+  const ids = new Set(sessions.map(s => s.id))
+  const children = sessions.filter(
+    s => s.parent_session_id && ids.has(s.parent_session_id) && s.parent_session_id !== s.id,
+  )
+  for (const child of children) {
+    const from = sessions.indexOf(child)
+    sessions.splice(from, 1)
+    // After the parent and after any earlier-placed siblings.
+    let at = sessions.findIndex(s => s.id === child.parent_session_id) + 1
+    while (at < sessions.length && sessions[at].parent_session_id === child.parent_session_id) at++
+    sessions.splice(at, 0, child)
+  }
+}
+
 function compareFolderSessions(a: Session, b: Session): number {
   const idx = (a.project_index ?? 0) - (b.project_index ?? 0)
   if (idx !== 0) return idx
@@ -470,44 +639,15 @@ function compareFolderSessions(a: Session, b: Session): number {
   return a.id.localeCompare(b.id)
 }
 
-// --- Project hub topology ---
-
-/** Sessions in a single working directory on a host. */
-export interface FolderNode {
-  cwd: string
-  sessions: Session[]
-}
-
-/** A host (local or peer) with all its project sessions, grouped by cwd. */
-export interface HostNode {
-  /**
-   * Path from the outermost peer down to this host (root-first). Empty
-   * array for the local gmuxd. E.g. `['workstation']` for a direct peer,
-   * `['workstation', 'alpine-dev']` for a devcontainer nested on that peer.
-   */
-  path: string[]
-
-  /**
-   * Connection state. Local hosts report 'local'; direct peers mirror
-   * `/v1/peers`. Nested hosts inherit their root peer's status since the
-   * hub only sees the outermost hop directly.
-   */
-  status: 'local' | 'connected' | 'connecting' | 'disconnected'
-
-  /** Free-form display hint (peer URL for remote, 'local' for local). */
-  meta: string
-
-  /** Folders grouped by cwd, sorted alphabetically. */
-  folders: FolderNode[]
-}
+// --- Session-ID host-path parsing ---
 
 /**
  * Parse a (possibly namespaced) session ID into its original identity and
  * host path.
  *
- *   "sess-abc"            -> { originalId: "sess-abc", path: [] }
- *   "sess-abc@spoke"      -> { originalId: "sess-abc", path: ["spoke"] }
- *   "sess-abc@dev@spoke"  -> { originalId: "sess-abc", path: ["spoke", "dev"] }
+ *   "1j6y9mx6"            -> { originalId: "1j6y9mx6", path: [] }
+ *   "1j6y9mx6@spoke"      -> { originalId: "1j6y9mx6", path: ["spoke"] }
+ *   "1j6y9mx6@dev@spoke"  -> { originalId: "1j6y9mx6", path: ["spoke", "dev"] }
  *
  * The `@` chain is innermost-first (peering.NamespaceID *appends* when
  * propagating up), so reversing gives the outermost-first path a human
@@ -530,16 +670,15 @@ export function parseSessionHostPath(sessionId: string): { originalId: string; p
  *     sending them would add phantom entries on the daemon's next
  *     ReorderSessions merge.
  *
- *  2. Key sessions appropriately for the owning daemon's projects.json:
+ *  2. Key sessions by the owning daemon's session IDs:
  *     - For references (folder.peer set, not a Local peer): the peer's
  *       projects.json keys by the original (unnamespaced) id, so we
- *       strip `@<peer>` from slugless ids before sending.
+ *       strip `@<peer>` before sending.
  *     - For local folders (folder.peer absent or Local): the parent's
  *       projects.json keys may include namespaced ids for Local-peer
  *       sessions, since the parent owns project assignment for them.
  *       We keep `@<peer>` for those sessions and strip nothing for
  *       genuinely local sessions.
- *     Slugged sessions always key by `s.slug`, which is never namespaced.
  *
  * Returns an empty array when no session in the request belongs to
  * the folder owner: caller should skip the PATCH entirely so the
@@ -562,7 +701,6 @@ export function reorderKeysForFolder(
       return sessionPeer === folderPeer
     })
     .map(s => {
-      if (s.slug) return s.slug
       const sessionPeer = s.peer ?? ''
       // For Local-peer sessions in a local folder, the parent keys by
       // the namespaced id since the namespace is part of the session's
@@ -572,123 +710,4 @@ export function reorderKeysForFolder(
       }
       return parseSessionHostPath(s.id).originalId
     })
-}
-
-/**
- * Build the host topology for a single project. Sessions that match the
- * project are bucketed by their host path (derived from the session id
- * chain), then by cwd within each host. Used by the project hub page.
- *
- * Returns an empty array when the project slug is unknown or has no
- * sessions. The caller can render a project-is-empty state for that case.
- */
-export function buildProjectTopology(
-  projectSlug: string,
-  sessions: Session[],
-  projects: ProjectItem[],
-  peers: PeerInfo[],
-  projectPeer?: string,
-  isLocalPeer?: (peerName: string) => boolean,
-): HostNode[] {
-  // Find the matching items[] entry. The hub can be reached at
-  // `/<slug>` (local owned) or `/@<peer>/<slug>` (reference); the
-  // caller passes `projectPeer` for the latter.
-  const ownerPeer = projectPeer ?? ''
-  const project = projects.find(p =>
-    p.slug === projectSlug && (p.peer ?? '') === ownerPeer,
-  )
-  if (!project) return []
-
-  // Match the sidebar bucketing: a session belongs in this project's
-  // hub iff its stamp matches AND its effective owner matches the
-  // project's owner. For owned projects, the owner is the viewer
-  // (Local-peer sessions count as owned by the viewer because their
-  // stamps come from the parent's rules). For references, the owner
-  // is the named peer.
-  const projectSessions = sessions.filter(s => {
-    if (s.project_slug !== projectSlug) return false
-    const sessionPeer = s.peer ?? ''
-    const effectiveOwner = sessionPeer && !(isLocalPeer?.(sessionPeer))
-      ? sessionPeer
-      : ''
-    if (effectiveOwner !== ownerPeer) return false
-    return isSessionVisibleInProject(s, project)
-  })
-
-  // Bucket by host path. The session id chain encodes the namespace
-  // hops innermost-first; parseSessionHostPath reverses them so the
-  // path reads root → leaf. We strip any leading Local-peer hop:
-  // those peers are co-tenants of the viewer, so their sessions live
-  // in the viewer's local host node, not a separate peer node.
-  const hostBuckets = new Map<string, { path: string[]; sessions: Session[] }>()
-  for (const s of projectSessions) {
-    const { path } = parseSessionHostPath(s.id)
-    const effectivePath = path.length > 0 && isLocalPeer?.(path[0])
-      ? path.slice(1)
-      : path
-    const key = effectivePath.join('\0')
-    let bucket = hostBuckets.get(key)
-    if (!bucket) {
-      bucket = { path: effectivePath, sessions: [] }
-      hostBuckets.set(key, bucket)
-    }
-    bucket.sessions.push(s)
-  }
-
-  // Convert each bucket -> HostNode with cwd-grouped folders.
-  const hosts: HostNode[] = []
-  for (const bucket of hostBuckets.values()) {
-    const folderMap = new Map<string, Session[]>()
-    for (const s of bucket.sessions) {
-      const cwd = s.cwd || ''
-      let list = folderMap.get(cwd)
-      if (!list) { list = []; folderMap.set(cwd, list) }
-      list.push(s)
-    }
-    const folders: FolderNode[] = [...folderMap.entries()]
-      .map(([cwd, ss]) => ({ cwd, sessions: sortHubSessions(ss) }))
-      .sort((a, b) => a.cwd.localeCompare(b.cwd))
-
-    const { status, meta } = resolveHostStatusAndMeta(bucket.path, peers)
-    hosts.push({ path: bucket.path, status, meta, folders })
-  }
-
-  // Local first, then peers alphabetically by full path.
-  hosts.sort((a, b) => {
-    if (a.path.length === 0 && b.path.length > 0) return -1
-    if (b.path.length === 0 && a.path.length > 0) return 1
-    return a.path.join('/').localeCompare(b.path.join('/'))
-  })
-
-  return hosts
-}
-
-function resolveHostStatusAndMeta(
-  path: string[],
-  peers: PeerInfo[],
-): { status: HostNode['status']; meta: string } {
-  if (path.length === 0) return { status: 'local', meta: 'local' }
-  const rootPeerName = path[0]
-  const peer = peers.find(p => p.name === rootPeerName)
-  if (!peer) return { status: 'disconnected', meta: '' }
-  const raw = peer.status
-  const status: HostNode['status']
-    = raw === 'connected' || raw === 'connecting' || raw === 'disconnected'
-      ? raw
-      : 'disconnected'
-  return { status, meta: peer.url }
-}
-
-function sortHubSessions(sessions: Session[]): Session[] {
-  // Alive first, then newest-first. Tiebreak on id so sessions that
-  // share a second-precision created_at (e.g. v1-spoke entries
-  // rehydrated together on startup) keep a stable order across
-  // snapshot.sessions re-emits.
-  return [...sessions].sort((a, b) => {
-    if (a.alive !== b.alive) return a.alive ? -1 : 1
-    const ta = new Date(a.created_at || 0).getTime()
-    const tb = new Date(b.created_at || 0).getTime()
-    if (ta !== tb) return tb - ta
-    return a.id.localeCompare(b.id)
-  })
 }
