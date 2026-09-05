@@ -40,61 +40,56 @@ export function formatTarget(target: LaunchTarget): string {
 
 // ── Menu positioning ──
 
-/** A button rect (the subset of DOMRect we need). */
-export interface Rect {
-  top: number
+export interface LauncherMenuViewport {
   left: number
+  top: number
+  width: number
+  height: number
 }
 
-/** Viewport bounds for clamping. */
-export interface Viewport {
-  innerWidth: number
+export interface LauncherMenuPosition {
+  left: number
+  top: number
+  maxWidth: number
+  maxHeight: number
 }
 
-/** Margin kept between the menu and the viewport edges (px). */
-const MENU_VIEWPORT_MARGIN = 8
+/** Keep the measured menu inside the visual viewport, including keyboard offsets. */
+export function launcherMenuPosition(
+  anchor: { left: number; top: number; right: number },
+  menu: { width: number; height: number },
+  viewport: LauncherMenuViewport,
+  targetOffset: number,
+  gutter = 8,
+  gap = 4,
+): LauncherMenuPosition {
+  const maxWidth = Math.max(0, viewport.width - gutter * 2)
+  const maxHeight = Math.max(0, viewport.height - gutter * 2)
+  const width = Math.min(menu.width, maxWidth)
+  const height = Math.min(menu.height, maxHeight)
+  const minLeft = viewport.left + gutter
+  const maxLeft = viewport.left + viewport.width - gutter - width
+  const minTop = viewport.top + gutter
+  const maxTop = viewport.top + viewport.height - gutter - height
 
-/**
- * Clamp a menu's left coordinate so a menu of `width` stays inside the
- * viewport: right edge first, then left edge (which wins if the menu is
- * wider than the viewport).
- */
-export function clampMenuLeft(left: number, width: number, innerWidth: number): number {
-  const maxLeft = innerWidth - MENU_VIEWPORT_MARGIN - width
-  if (left > maxLeft) left = maxLeft
-  if (left < MENU_VIEWPORT_MARGIN) left = MENU_VIEWPORT_MARGIN
-  return left
+  let top = anchor.top - 4 - targetOffset
+  if (top + height > viewport.top + viewport.height - gutter) {
+    top = anchor.top - height - gap
+  }
+
+  return {
+    left: Math.min(maxLeft, Math.max(minLeft, anchor.right - width)),
+    top: Math.min(maxTop, Math.max(minTop, top)),
+    maxWidth,
+    maxHeight,
+  }
 }
-/** How far left of the button the menu's left edge sits (px). */
-const MENU_LEFT_OFFSET = 6
 
-/**
- * Compute the fixed position for the launch menu.
- *
- * Horizontal: anchor the menu's LEFT edge slightly left of the button so the
- * text appears right where the user just clicked, growing rightward, clamped
- * to the viewport so it never overflows either edge.
- *
- * Vertical: lift the menu so its default item (first adapter) lands directly
- * under the button — enabling open-then-double-click on the default. The menu
- * has 4px padding-top; a shown target line adds ~32px (line + divider) that we
- * offset so the first adapter stays aligned. The lift is clamped so the menu
- * never pokes above the viewport (e.g. a button in the very first sidebar row
- * on mobile, where the sidebar has no header above the project list).
- */
-export function computeMenuPos(
-  rect: Rect,
-  viewport: Viewport,
-  showTarget: boolean,
-  menuWidth = 180,
-): { top: number; left: number } {
-  const targetOffset = showTarget ? 32 : 0
-  let top = rect.top - 4 - targetOffset // 4px = menu padding-top
-  if (top < MENU_VIEWPORT_MARGIN) top = MENU_VIEWPORT_MARGIN
-
-  const left = clampMenuLeft(rect.left - MENU_LEFT_OFFSET, menuWidth, viewport.innerWidth)
-
-  return { top, left }
+function visibleViewport(): LauncherMenuViewport {
+  const viewport = window.visualViewport
+  return viewport
+    ? { left: viewport.offsetLeft, top: viewport.offsetTop, width: viewport.width, height: viewport.height }
+    : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }
 }
 
 // ── LaunchButton ──
@@ -130,7 +125,7 @@ export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, 
   const showTarget = target.cwd !== ''
 
   const [state, setState] = useState<'idle' | 'open' | 'launching'>('idle')
-  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
+  const [menuPos, setMenuPos] = useState<LauncherMenuPosition | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const btnRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -138,23 +133,56 @@ export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, 
   // Read launcher config from the store (populated by /v1/health).
   const hasLaunchers = launchersSignal.value.length > 0
 
-  /** Position the menu (fixed, so it escapes overflow:hidden parents). */
+  const targetOffset = showTarget ? 32 : 0
+
+  /** Seed a fixed position; the layout effect corrects it after measuring. */
   const positionMenu = () => {
     const btn = btnRef.current
     if (!btn) return
-    const r = btn.getBoundingClientRect()
-    setMenuPos(computeMenuPos(r, { innerWidth: window.innerWidth }, showTarget))
+    setMenuPos(launcherMenuPosition(
+      btn.getBoundingClientRect(),
+      { width: 180, height: 0 },
+      visibleViewport(),
+      targetOffset,
+    ))
   }
 
-  // computeMenuPos clamps with the menu's *minimum* width (180px); nowrap
-  // items can render it wider, overflowing the right edge on narrow screens.
-  // Re-clamp with the real width once the menu is in the DOM — layout effect,
-  // so the correction lands in the same paint as the initial position.
   useLayoutEffect(() => {
-    if (state !== 'open' || !menuRef.current || !menuPos) return
-    const left = clampMenuLeft(menuPos.left, menuRef.current.offsetWidth, window.innerWidth)
-    if (left !== menuPos.left) setMenuPos({ top: menuPos.top, left })
-  }, [state, menuPos])
+    if (state !== 'open') return
+
+    const reposition = () => {
+      const btn = btnRef.current
+      const menu = menuRef.current
+      if (!btn || !menu) return
+      const rect = menu.getBoundingClientRect()
+      const next = launcherMenuPosition(
+        btn.getBoundingClientRect(),
+        { width: Math.max(rect.width, menu.scrollWidth), height: Math.max(rect.height, menu.scrollHeight) },
+        visibleViewport(),
+        targetOffset,
+      )
+      setMenuPos(current => current
+        && current.left === next.left
+        && current.top === next.top
+        && current.maxWidth === next.maxWidth
+        && current.maxHeight === next.maxHeight
+        ? current
+        : next)
+    }
+
+    reposition()
+    const viewport = window.visualViewport
+    window.addEventListener('resize', reposition)
+    window.addEventListener('scroll', reposition, true)
+    viewport?.addEventListener('resize', reposition)
+    viewport?.addEventListener('scroll', reposition)
+    return () => {
+      window.removeEventListener('resize', reposition)
+      window.removeEventListener('scroll', reposition, true)
+      viewport?.removeEventListener('resize', reposition)
+      viewport?.removeEventListener('scroll', reposition)
+    }
+  }, [state, targetOffset, target.peer, launchersSignal.value.length])
 
   const handleClick = (e: MouseEvent) => {
     e.stopPropagation()
@@ -242,7 +270,13 @@ export function LaunchButton({ className, onLaunch, footerAction, beforeLaunch, 
         <div
           ref={menuRef}
           class="launch-inline-menu"
-          style={{ top: menuPos.top, left: menuPos.left }}
+          style={{
+            top: menuPos.top,
+            left: menuPos.left,
+            minWidth: Math.min(180, menuPos.maxWidth),
+            maxWidth: menuPos.maxWidth,
+            maxHeight: menuPos.maxHeight,
+          }}
         >
           {showTarget && (
             <>

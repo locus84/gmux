@@ -678,7 +678,9 @@ body {
   max-width: calc(100vw - 16px);
   z-index: 1000;
   padding: 4px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .launch-target-line {
@@ -3382,6 +3384,17 @@ body {
 }
 /* Configured-projects manage-list (Settings → Projects). Management
  * only: drag-to-reorder + remove, no navigation, no launch. */
+.mp-push-error {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklch, var(--status-error) 35%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--status-error) 9%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .mp-configured-list {
   display: flex;
   flex-direction: column;

@@ -201,6 +201,10 @@ export function SettingsModal({
           </div>
         ) : (
         <div class="modal-body">
+          {webPushError.value && (
+            <div class="mp-push-error" role="status">{webPushError.value}</div>
+          )}
+
           {/* ── Configured projects (manage: reorder + remove) ── */}
           <ConfiguredProjectsSection configured={configured} />
 

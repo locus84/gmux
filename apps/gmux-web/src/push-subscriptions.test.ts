@@ -102,6 +102,29 @@ describe('web push state coordination', () => {
     expect(webPushProjectSlugs.value).toEqual(new Set(['alpha', 'beta']))
   })
 
+  it('retains an actionable enable error while Settings refreshes an absent subscription', async () => {
+    stubPushBrowser(async () => null)
+    webPushError.value = 'Notifications are blocked for this site. Enable them in browser settings first.'
+
+    await refreshWebPushState()
+
+    expect(webPushError.value).toBe('Notifications are blocked for this site. Enable them in browser settings first.')
+  })
+
+  it('clears a transient lookup error after a later successful lookup', async () => {
+    const subscription = { endpoint: 'https://push.example/sub' } as PushSubscription
+    stubPushBrowser(async () => subscription)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: { found: true, subscription: { projects: ['alpha'] } },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+    webPushError.value = 'Could not load push subscription.'
+
+    await refreshWebPushState()
+
+    expect(webPushError.value).toBeNull()
+    expect(webPushProjectSlugs.value).toEqual(new Set(['alpha']))
+  })
+
   it('ignores a lookup response that became stale during a project update', async () => {
     const lookup = deferred<Response>()
     const subscription = { endpoint: 'https://push.example/sub' } as PushSubscription

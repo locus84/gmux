@@ -66,7 +66,6 @@ export async function refreshWebPushState(): Promise<void> {
     && activeWebPushOperations === 0
 
   webPushSupported.value = isWebPushAvailable()
-  webPushError.value = null
   if (!webPushSupported.value) {
     webPushEnabled.value = false
     webPushProjectSlugs.value = new Set()
@@ -94,6 +93,9 @@ export async function refreshWebPushState(): Promise<void> {
     const stored = body.data?.subscription
     webPushEnabled.value = !!body.data?.found
     webPushProjectSlugs.value = new Set(stored?.projects ?? [])
+    // Clear a transient refresh failure after a later successful lookup, but
+    // retain actionable permission/enable failures until the user retries.
+    if (webPushError.value === 'Could not load push subscription.') webPushError.value = null
   } catch (err) {
     if (!canApply()) return
     console.warn('web push state refresh failed:', err)

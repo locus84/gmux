@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { launchersForPeer, formatTarget, computeMenuPos, clampMenuLeft } from './launcher'
+import { launchersForPeer, formatTarget, launcherMenuPosition } from './launcher'
 import type { LauncherDef, PeerInfo } from './types'
 
 const localLaunchers: LauncherDef[] = [
@@ -43,56 +43,45 @@ describe('launchersForPeer', () => {
   })
 })
 
-describe('computeMenuPos', () => {
-  const viewport = { innerWidth: 1000, innerHeight: 800 }
+describe('launcherMenuPosition', () => {
+  const viewport = { left: 0, top: 0, width: 390, height: 844 }
 
-  test('anchors left edge slightly left of the button', () => {
-    const pos = computeMenuPos({ top: 100, left: 200 }, viewport, false)
-    expect(pos.left).toBe(200 - 6)
+  test('right-aligns to the anchor and offsets the target line', () => {
+    expect(launcherMenuPosition(
+      { left: 300, right: 324, top: 120 },
+      { width: 180, height: 120 },
+      viewport,
+      32,
+    )).toEqual({ left: 144, top: 84, maxWidth: 374, maxHeight: 828 })
   })
 
-  test('clamps right edge inside the viewport for buttons near the right', () => {
-    const pos = computeMenuPos({ top: 100, left: 980 }, viewport, false, 180)
-    // maxLeft = 1000 - 8 - 180 = 812
-    expect(pos.left).toBe(812)
+  test('clamps all edges inside an offset visual viewport', () => {
+    expect(launcherMenuPosition(
+      { left: 400, right: 424, top: 560 },
+      { width: 260, height: 400 },
+      { left: 20, top: 200, width: 390, height: 300 },
+      32,
+    )).toEqual({ left: 142, top: 208, maxWidth: 374, maxHeight: 284 })
   })
 
-  test('clamps to left margin when menu is wider than viewport', () => {
-    const narrow = { innerWidth: 120, innerHeight: 800 }
-    const pos = computeMenuPos({ top: 100, left: 10 }, narrow, false, 180)
-    expect(pos.left).toBe(8)
+  test('moves a bottom-edge menu above its anchor', () => {
+    const pos = launcherMenuPosition(
+      { left: 340, right: 364, top: 820 },
+      { width: 180, height: 180 },
+      viewport,
+      0,
+    )
+    expect(pos.top).toBe(636)
+    expect(pos.left).toBe(184)
   })
 
-  test('lifts the menu so the default item lands under the button (no target line)', () => {
-    const pos = computeMenuPos({ top: 100, left: 200 }, viewport, false)
-    expect(pos.top).toBe(100 - 4)
-  })
-
-  test('offsets for the target line + divider so the default stays under the button', () => {
-    const pos = computeMenuPos({ top: 100, left: 200 }, viewport, true)
-    expect(pos.top).toBe(100 - 4 - 32)
-  })
-
-  test('clamps the top so a button in the first row never lifts the menu off-screen', () => {
-    // rect.top 11 (first sidebar row on mobile): 11 - 4 - 32 = -25 unclamped.
-    const pos = computeMenuPos({ top: 11, left: 200 }, viewport, true)
-    expect(pos.top).toBe(8)
-  })
-})
-
-describe('clampMenuLeft', () => {
-  test('re-clamps with the real (wider than min) menu width', () => {
-    // Menu opened at left=202 assuming 180px wide; real width 240 on a
-    // 390px viewport must pull it left so the right edge stays inside.
-    expect(clampMenuLeft(202, 240, 390)).toBe(390 - 8 - 240)
-  })
-
-  test('keeps position when it already fits', () => {
-    expect(clampMenuLeft(100, 180, 1000)).toBe(100)
-  })
-
-  test('left margin wins when menu is wider than viewport', () => {
-    expect(clampMenuLeft(50, 500, 390)).toBe(8)
+  test('constrains oversized menus to the viewport', () => {
+    expect(launcherMenuPosition(
+      { left: 4, right: 28, top: 4 },
+      { width: 600, height: 1000 },
+      viewport,
+      0,
+    )).toEqual({ left: 8, top: 8, maxWidth: 374, maxHeight: 828 })
   })
 })
 
