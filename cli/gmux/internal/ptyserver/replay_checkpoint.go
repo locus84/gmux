@@ -147,6 +147,23 @@ func (r *rawReplay) invalidate() {
 	r.valid = false
 }
 
+// geometryChanged discards bytes captured at the old terminal dimensions.
+// Keep the stream parser in place so an opaque control string split across the
+// resize boundary is still parsed safely, but poison an open synchronized
+// candidate so it cannot later commit a frame spanning two geometries.
+func (r *rawReplay) geometryChanged() {
+	r.invalidate()
+	r.candidate = nil
+	if r.candidateOpen {
+		r.candidateTooLarge = true
+		return
+	}
+	r.candidateTooLarge = false
+	r.candidateErase = false
+	r.candidateHome = false
+	r.candidateScrollback = false
+}
+
 func (r *rawReplay) abandonUnsafe() {
 	r.invalidate()
 	r.parser = terminalStreamParser{}

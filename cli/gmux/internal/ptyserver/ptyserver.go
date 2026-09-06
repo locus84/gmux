@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -666,21 +667,33 @@ type Server struct {
 
 	shutdownOnce sync.Once
 
-	mu             sync.Mutex
-	clients        map[*wsClient]struct{}
-	localOut       io.Writer      // optional local terminal output sink
-	scrollback     io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
-	ptyCols        uint16         // last applied PTY cols (guarded by mu)
-	ptyRows        uint16         // last applied PTY rows (guarded by mu)
-	cursorHidden   bool           // tracks DECTCEM via callback (guarded by mu)
-	ptmxClosed     bool           // true once ptmx is closed by Shutdown (guarded by mu)
-	screenPending  []byte         // raw PTY data not yet fed to screen (guarded by mu)
-	replay         rawReplay      // image-capable raw reconnect checkpoint (guarded by mu)
-	lastClientLeft time.Time      // when the last WS client disconnected (guarded by mu)
+	resizeMu           sync.Mutex // serializes geometry, state, and resize broadcasts
+	geometryGeneration atomic.Uint64
+	mu                 sync.Mutex
+	clients            map[*wsClient]struct{}
+	localOut           io.Writer      // optional local terminal output sink
+	scrollback         io.WriteCloser // optional persistent scrollback sink (closed in waitChild)
+	ptyCols            uint16         // last applied PTY cols (guarded by mu)
+	ptyRows            uint16         // last applied PTY rows (guarded by mu)
+	// hiddenReconnectShrink means ptyCols is exactly one below the logical
+	// size. It is a one-shot fallback for streams without a raw image replay.
+	hiddenReconnectShrink bool
+	cursorHidden          bool      // tracks DECTCEM via callback (guarded by mu)
+	ptmxClosed            bool      // true once ptmx is closed by Shutdown (guarded by mu)
+	screenPending         []byte    // raw PTY data not yet fed to screen (guarded by mu)
+	replay                rawReplay // image-capable raw reconnect checkpoint (guarded by mu)
+	lastClientLeft        time.Time // when the last WS client disconnected (guarded by mu)
 
-	done    chan struct{} // closed when child exits
-	ptyDone chan struct{} // closed when readPTY finishes draining
-	err     error         // child exit error
+	done        chan struct{}      // closed when child exits
+	ptyDone     chan struct{}      // closed when readPTY finishes draining
+	screenFlush chan chan struct{} // barriers for geometry transitions
+	err         error              // child exit error
+}
+
+type wsWrite struct {
+	typ  websocket.MessageType
+	data []byte
+	done chan error
 }
 
 type wsClient struct {
@@ -688,13 +701,58 @@ type wsClient struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	readonly bool
-	writeMu  sync.Mutex
+	writes   chan wsWrite
+}
+
+func (c *wsClient) runWriter() {
+	for {
+		select {
+		case req := <-c.writes:
+			// Bound each frame independently. Replay is chunked to <=1 MiB, so a
+			// client that upgrades and stops reading cannot hold server geometry
+			// locks or strand later attaches indefinitely.
+			writeCtx, cancelWrite := context.WithTimeout(c.ctx, 15*time.Second)
+			err := c.conn.Write(writeCtx, req.typ, req.data)
+			cancelWrite()
+			if req.done != nil {
+				req.done <- err
+			}
+			if err != nil {
+				c.cancel()
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *wsClient) write(typ websocket.MessageType, data []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.Write(c.ctx, typ, data)
+	done := make(chan error, 1)
+	select {
+	case c.writes <- wsWrite{typ: typ, data: data, done: done}:
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+// enqueue preserves per-client publication order without holding Server.mu
+// across a potentially stalled network write.
+func (c *wsClient) enqueue(typ websocket.MessageType, data []byte) bool {
+	select {
+	case c.writes <- wsWrite{typ: typ, data: data}:
+		return true
+	case <-c.ctx.Done():
+		return false
+	default:
+		c.cancel()
+		return false
+	}
 }
 
 const replayMessageLimit = 1 << 20
@@ -873,6 +931,7 @@ func New(cfg Config) (*Server, error) {
 		ptyRows:     cfg.Rows,
 		done:        make(chan struct{}),
 		ptyDone:     make(chan struct{}),
+		screenFlush: make(chan chan struct{}),
 		incarnation: newIncarnation(),
 
 		adapter:     cfg.Adapter,
@@ -1791,12 +1850,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		conn:   conn,
 		ctx:    ctx,
 		cancel: cancel,
+		writes: make(chan wsWrite, 64),
 	}
+	go client.runWriter()
+
+	// Serialize the flush barrier and restoration with concurrent viewer
+	// resizes; neither may slip output between another barrier and mutation.
+	s.resizeMu.Lock()
+	s.flushScreenBeforeGeometry()
 
 	// A PTY flush can split an opaque Kitty/Sixel/IIP payload. Wait for a
 	// legal stream boundary before taking the replay snapshot; this returns
 	// with s.mu held so live output cannot overtake replay registration.
 	if !s.lockReplayBoundary(ctx) {
+		s.resizeMu.Unlock()
 		conn.Close(websocket.StatusTryAgainLater, "terminal output frame is incomplete")
 		cancel()
 		return
@@ -1818,6 +1885,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Browser buffer selection is separate metadata so `gmux attach` never
 	// receives browser-specific 1049 bytes.
 	browserClient := r.URL.Query().Get("client") == "browser"
+	// Restore the runner-owned one-column fallback before declaring replay
+	// geometry. There were no viewers when it was created, and handleWS holds
+	// s.mu until this client is registered, so no user resize can race or be
+	// overwritten. Raw checkpoints never take this path.
+	if s.hiddenReconnectShrink {
+		s.hiddenReconnectShrink = false
+		s.applyGeometryLocked(&pty.Winsize{Cols: s.ptyCols + 1, Rows: s.ptyRows})
+	}
 	s.drainScreenLocked()
 	checkpoint, suffix := s.replay.parts()
 	frame := snapshotFrameWithScreen(s.screen, s.cursorHidden, !browserClient || !s.screen.IsAltScreen())
@@ -1841,6 +1916,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		metaBytes, _ := json.Marshal(meta)
 		if err := client.write(websocket.MessageText, metaBytes); err != nil {
 			s.mu.Unlock()
+			s.rearmFailedAttach()
+			s.resizeMu.Unlock()
 			conn.Close(websocket.StatusNormalClosure, "")
 			cancel()
 			return
@@ -1849,12 +1926,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if len(checkpoint) > 0 {
 		if err := client.writeRawReplay(checkpoint, suffix); err != nil {
 			s.mu.Unlock()
+			s.rearmFailedAttach()
+			s.resizeMu.Unlock()
 			conn.Close(websocket.StatusNormalClosure, "")
 			cancel()
 			return
 		}
 	} else if err := client.write(websocket.MessageBinary, frame); err != nil {
 		s.mu.Unlock()
+		s.rearmFailedAttach()
+		s.resizeMu.Unlock()
 		conn.Close(websocket.StatusNormalClosure, "")
 		cancel()
 		return
@@ -1862,6 +1943,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.clients[client] = struct{}{}
 	s.lastClientLeft = time.Time{} // reset: we have an active viewer
 	s.mu.Unlock()
+	s.resizeMu.Unlock()
 
 	// Client connected — they'll see the scrollback, so clear unread
 	if s.state != nil {
@@ -1930,6 +2012,72 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 //
 // State and resize broadcasts are intentionally skipped: the shrunk size
 // is an internal detail, not a real terminal size change.
+//
+// flushScreenBeforeGeometry commits PTY bytes already accepted by readPTY so
+// the emulator and replay parser consume them before a geometry transition.
+func (s *Server) flushScreenBeforeGeometry() {
+	if s.screenFlush == nil {
+		return
+	}
+	ack := make(chan struct{})
+	select {
+	case s.screenFlush <- ack:
+	case <-s.ptyDone:
+		return
+	}
+	select {
+	case <-ack:
+	case <-s.ptyDone:
+	}
+}
+
+// applyGeometryLocked drains bytes at the old geometry, invalidates raw replay
+// state from that geometry, and serializes state/emulator/kernel PTY changes.
+// The caller must hold s.mu.
+func (s *Server) applyGeometryLocked(ws *pty.Winsize) {
+	s.drainScreenLocked()
+	s.replay.geometryChanged()
+	s.geometryGeneration.Add(1)
+	s.ptyCols = ws.Cols
+	s.ptyRows = ws.Rows
+	s.screen.Resize(int(ws.Cols), int(ws.Rows))
+	if s.margins != nil {
+		s.margins.reset(int(ws.Rows))
+	}
+	if !s.ptmxClosed {
+		_ = pty.Setsize(s.ptmx, ws)
+		if s.cmd.Process != nil {
+			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGWINCH)
+		}
+	}
+}
+
+// shrinkForReconnectLocked applies the one-shot fallback when eligible. The
+// caller must hold s.mu. It returns whether a shrink was applied.
+func (s *Server) shrinkForReconnectLocked() bool {
+	// A complete raw redraw already preserves inline graphics and geometry;
+	// shrinking it would only make its retained dimensions stale. Never shrink
+	// more than once if several failed attach attempts disconnect in succession.
+	if s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil ||
+		s.replay.valid || s.hiddenReconnectShrink {
+		return false
+	}
+	cols, rows := s.ptyCols-1, s.ptyRows
+	s.applyGeometryLocked(&pty.Winsize{Cols: cols, Rows: rows})
+	s.hiddenReconnectShrink = true
+	return true
+}
+
+// rearmFailedAttach is called with resizeMu held after a restored attach fails
+// before registration. Flush output accumulated during the replay write, then
+// recreate the one-shot fallback only if no valid raw redraw replaced it.
+func (s *Server) rearmFailedAttach() {
+	s.flushScreenBeforeGeometry()
+	s.mu.Lock()
+	s.shrinkForReconnectLocked()
+	s.mu.Unlock()
+}
+
 func (s *Server) shrinkForReconnect() {
 	// Don't bother if the child has exited.
 	select {
@@ -1938,25 +2086,12 @@ func (s *Server) shrinkForReconnect() {
 	default:
 	}
 
+	s.resizeMu.Lock()
+	defer s.resizeMu.Unlock()
+	s.flushScreenBeforeGeometry()
 	s.mu.Lock()
-	if s.ptyCols <= 1 || s.ptyRows == 0 || len(s.clients) > 0 || s.localOut != nil {
-		s.mu.Unlock()
-		return
-	}
-	s.ptyCols--
-	cols := s.ptyCols
-	rows := s.ptyRows
-	s.drainScreenLocked()
-	s.screen.Resize(int(cols), int(rows))
-	if s.margins != nil {
-		s.margins.reset(int(rows))
-	}
+	s.shrinkForReconnectLocked()
 	s.mu.Unlock()
-
-	s.setPtySize(&pty.Winsize{Cols: cols, Rows: rows})
-	if s.cmd.Process != nil {
-		syscall.Kill(-s.cmd.Process.Pid, syscall.SIGWINCH)
-	}
 }
 
 func (s *Server) resize(msg ResizeMsg) {
@@ -1964,47 +2099,6 @@ func (s *Server) resize(msg ResizeMsg) {
 		return
 	}
 
-	// Check if the PTY size actually changed. Skipping redundant SIGWINCH
-	// prevents TUI apps from redrawing their entire screen unnecessarily,
-	// which is the main source of "rewrite the entire log" slowness on
-	// reconnect or duplicate resize events.
-	s.mu.Lock()
-	sizeChanged := msg.Cols != s.ptyCols || msg.Rows != s.ptyRows
-	if sizeChanged {
-		s.ptyCols = msg.Cols
-		s.ptyRows = msg.Rows
-		if s.margins != nil {
-			s.margins.reset(int(msg.Rows))
-		}
-		// Drain pending data first so the emulator processes it at the
-		// old size before switching to the new dimensions.
-		s.drainScreenLocked()
-		s.screen.Resize(int(msg.Cols), int(msg.Rows))
-	}
-	s.mu.Unlock()
-
-	if sizeChanged {
-		s.setPtySize(&pty.Winsize{
-			Cols: msg.Cols,
-			Rows: msg.Rows,
-			X:    msg.PixelWidth,
-			Y:    msg.PixelHeight,
-		})
-
-		// Send SIGWINCH to the child process group.
-		if s.cmd.Process != nil {
-			syscall.Kill(-s.cmd.Process.Pid, syscall.SIGWINCH)
-		}
-	}
-
-	// Always update state and broadcast so all clients stay in sync,
-	// even if the PTY size didn't change (idempotent metadata update).
-	if s.state != nil {
-		s.state.SetTerminalSize(msg.Cols, msg.Rows)
-	}
-
-	// Broadcast terminal_resize to all connected WS clients so every browser
-	// can update its xterm size and the proxy can update ownership/store.
 	payload, err := json.Marshal(map[string]any{
 		"type":   "terminal_resize",
 		"cols":   msg.Cols,
@@ -2015,17 +2109,40 @@ func (s *Server) resize(msg ResizeMsg) {
 		return
 	}
 
+	s.resizeMu.Lock()
+	defer s.resizeMu.Unlock()
+	s.flushScreenBeforeGeometry()
+
+	// Check if the PTY size actually changed. Skipping redundant SIGWINCH
+	// prevents TUI apps from redrawing their entire screen unnecessarily,
+	// which is the main source of "rewrite the entire log" slowness on
+	// reconnect or duplicate resize events.
 	s.mu.Lock()
-	clients := make([]*wsClient, 0, len(s.clients))
+	sizeChanged := msg.Cols != s.ptyCols || msg.Rows != s.ptyRows
+	// Any explicit or runner-owned restore resolves the hidden implementation
+	// detail, including an idempotent resize choosing the shrunken width.
+	s.hiddenReconnectShrink = false
+	if sizeChanged {
+		s.applyGeometryLocked(&pty.Winsize{
+			Cols: msg.Cols,
+			Rows: msg.Rows,
+			X:    msg.PixelWidth,
+			Y:    msg.PixelHeight,
+		})
+	}
+
+	// Enqueue while s.mu still fences readPTY. Each client's sole writer emits
+	// terminal_resize before bytes produced at the new geometry, without a
+	// network write under the global lock.
 	for c := range s.clients {
-		clients = append(clients, c)
+		c.enqueue(websocket.MessageText, payload)
 	}
 	s.mu.Unlock()
 
-	for _, c := range clients {
-		if err := c.write(websocket.MessageText, payload); err != nil {
-			c.cancel()
-		}
+	// Always update durable state even for an idempotent resize. resizeMu keeps
+	// concurrent viewer updates ordered through state and broadcast publication.
+	if s.state != nil {
+		s.state.SetTerminalSize(msg.Cols, msg.Rows)
 	}
 }
 
@@ -2044,11 +2161,28 @@ const coalesceMaxBytes = 32 * 1024
 // during bursts (e.g. TUI redraws after SIGWINCH).
 const coalesceInterval = 8 * time.Millisecond
 
+type ptyReadChunk struct {
+	data       []byte
+	generation uint64
+	crossed    bool
+}
+
 func (s *Server) readPTY() {
 	defer close(s.ptyDone)
 
 	buf := make([]byte, 32*1024)
 	var accum []byte
+	var accumGeneration uint64
+	var accumGeometryUnsafe bool
+	appendChunk := func(chunk ptyReadChunk) {
+		if len(accum) == 0 {
+			accumGeneration = chunk.generation
+		} else if accumGeneration != chunk.generation {
+			accumGeometryUnsafe = true
+		}
+		accumGeometryUnsafe = accumGeometryUnsafe || chunk.crossed
+		accum = append(accum, chunk.data...)
+	}
 	timer := time.NewTimer(coalesceInterval)
 	timer.Stop()
 
@@ -2057,7 +2191,11 @@ func (s *Server) readPTY() {
 			return
 		}
 		data := accum
+		generation := accumGeneration
+		unsafeGeometry := accumGeometryUnsafe
 		accum = nil
+		accumGeneration = 0
+		accumGeometryUnsafe = false
 
 		// Process adapter/title hooks on the accumulated chunk.
 		if title := adapters.ParseOSCTitle(data); title != "" {
@@ -2072,13 +2210,20 @@ func (s *Server) readPTY() {
 		// atomically so new clients always see their replay frame first.
 		s.mu.Lock()
 		s.replay.write(data)
+		if unsafeGeometry || generation != s.geometryGeneration.Load() {
+			// Preserve parser continuity, but never retain a candidate or suffix
+			// containing bytes read across an old/new geometry boundary.
+			s.replay.geometryChanged()
+		}
 		s.screenPending = append(s.screenPending, data...)
 		localOut := s.localOut
-		clients := make([]*wsClient, 0, len(s.clients))
+		hasRemoteClients := len(s.clients) > 0
+		// Enqueue under s.mu so a concurrent resize cannot publish its event
+		// before these bytes, which were parsed at the old geometry. enqueue is
+		// bounded and never performs network I/O under the global lock.
 		for c := range s.clients {
-			clients = append(clients, c)
+			c.enqueue(websocket.MessageBinary, data)
 		}
-		hasRemoteClients := len(clients) > 0
 		lastLeft := s.lastClientLeft
 		s.mu.Unlock()
 
@@ -2100,25 +2245,22 @@ func (s *Server) readPTY() {
 			s.scrollback.Write(data)
 		}
 
-		for _, c := range clients {
-			if err := c.write(websocket.MessageBinary, data); err != nil {
-				c.cancel()
-			}
-		}
 	}
 
-	readCh := make(chan []byte, 4)
+	readCh := make(chan ptyReadChunk, 4)
 	readDone := make(chan error, 1)
 
 	// Separate goroutine for blocking PTY reads so we can select on
 	// both incoming data and the coalesce timer.
 	go func() {
 		for {
+			before := s.geometryGeneration.Load()
 			n, err := s.ptmx.Read(buf)
+			after := s.geometryGeneration.Load()
 			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				readCh <- chunk
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				readCh <- ptyReadChunk{data: data, generation: after, crossed: before != after}
 			}
 			if err != nil {
 				readDone <- err
@@ -2129,8 +2271,23 @@ func (s *Server) readPTY() {
 
 	for {
 		select {
+		case ack := <-s.screenFlush:
+			// Drain chunks already accepted from the PTY before flushing the
+			// coalescer. Geometry mutation waits for this barrier.
+			draining := true
+			for draining {
+				select {
+				case chunk := <-readCh:
+					appendChunk(chunk)
+				default:
+					draining = false
+				}
+			}
+			flush()
+			close(ack)
+
 		case chunk := <-readCh:
-			accum = append(accum, chunk...)
+			appendChunk(chunk)
 			if len(accum) >= coalesceMaxBytes {
 				timer.Stop()
 				flush()
@@ -2151,7 +2308,7 @@ func (s *Server) readPTY() {
 			for {
 				select {
 				case chunk := <-readCh:
-					accum = append(accum, chunk...)
+					appendChunk(chunk)
 				default:
 					break drain
 				}

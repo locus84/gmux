@@ -45,6 +45,23 @@ func TestRawReplayMarkersAcrossEveryWriteBoundary(t *testing.T) {
 	}
 }
 
+func TestRawReplayGeometryChangePoisonsOpenCandidate(t *testing.T) {
+	var replay rawReplay
+	prefix := append(bytes.Clone(replayBSU), []byte("\x1b[2J\x1b[H\x1b[3Jbefore")...)
+	replay.write(prefix)
+	replay.geometryChanged()
+	replay.write(append([]byte("after"), replayESU...))
+	if got := replay.bytes(); got != nil {
+		t.Fatalf("cross-geometry candidate committed: %q", got)
+	}
+
+	fresh := replayFullFrame([]byte("fresh"))
+	replay.write(fresh)
+	if got := replay.bytes(); !bytes.Equal(got, fresh) {
+		t.Fatalf("fresh post-resize replay = %q, want %q", got, fresh)
+	}
+}
+
 func TestRawReplayKeepsFragmentedKittyPayloadAtomic(t *testing.T) {
 	// Marker-shaped bytes inside APC payload are opaque and must not start or
 	// finish a synchronized frame.
@@ -235,8 +252,25 @@ func TestPTYServerAttachUsesRawReplayCheckpointForMultipleClients(t *testing.T) 
 		}
 		conn.Close(websocket.StatusNormalClosure, "")
 		cancel()
+		time.Sleep(20 * time.Millisecond)
+		srv.mu.Lock()
+		cols, hidden := srv.ptyCols, srv.hiddenReconnectShrink
+		srv.mu.Unlock()
+		if cols != 80 || hidden {
+			t.Fatalf("client %d disconnect changed raw replay geometry: cols=%d hidden=%v", i, cols, hidden)
+		}
 		if !bytes.Equal(got, want) {
 			t.Fatalf("client %d first frame mismatch\n got: %q\nwant: %q", i, got, want)
 		}
+	}
+
+	// A real geometry change invalidates a redraw captured at the old width;
+	// the next complete synchronized frame may establish a fresh checkpoint.
+	srv.resize(ResizeMsg{Type: "resize", Cols: 81, Rows: 24, Source: "test"})
+	srv.mu.Lock()
+	valid := srv.replay.valid
+	srv.mu.Unlock()
+	if valid {
+		t.Fatal("raw replay remained valid after terminal geometry changed")
 	}
 }

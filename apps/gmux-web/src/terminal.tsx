@@ -23,6 +23,14 @@ import type { ResolvedTerminalOptions } from './settings-schema'
 import { keyboardOpen, navigate, terminalFindOpen, terminalScrolledUp, terminalScrollToBottom, urlSearch, vsCodeServerUrl } from './store'
 import { type CheckpointMargins, prepareBrowserCheckpoint } from './terminal-checkpoint'
 import { fetchAuthoritativeReconnectSize, shouldReassertReconnectSize } from './terminal-connection'
+import {
+  shouldCoalesceTerminalWake,
+  shouldReconnectAfterVisibility,
+  shouldReconnectFromPageShow,
+  TERMINAL_RECONNECT_STALL_MS,
+  TERMINAL_REPLAY_COMMIT_STALL_MS,
+  terminalReconnectDelay,
+} from './terminal-reconnect'
 import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
 import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext } from './terminal-file-link'
@@ -462,7 +470,7 @@ export function TerminalView({
   const processViewportResize = useCallback((forceDrive = false) => {
     const term = termRef.current
     const shell = shellRef.current
-    if (!term || !shell) return
+    if (!term || !shell || !inputClaimedRef.current) return
 
     const newVp = measureTerminalFit(term, shell)
     const gate = resizeEchoGateRef.current
@@ -499,6 +507,15 @@ export function TerminalView({
   }, [applyOwnedResize, queueResize])
 
   processViewportResizeRef.current = processViewportResize
+
+  const refreshPassiveViewport = useCallback(() => {
+    const term = termRef.current
+    const shell = shellRef.current
+    if (!term || !shell) return
+    const size = measureTerminalFit(term, shell)
+    setViewportSize(size)
+    viewportSizeRef.current = size
+  }, [])
 
   // Resize xterm to fit the viewport and announce the new size to the backend.
   const fitAndResize = useCallback(() => {
@@ -1236,9 +1253,10 @@ export function TerminalView({
     // to fit this browser's viewport. Auto-reconnects (same session.id) skip
     // the claim, so we don't steal ownership from another driver after a
     // network blip. User can reclaim by clicking the pill if needed.
-    let isFirstConnect = true
+    let initialClaimComplete = false
     let attempt = 0
     let intentionalClose = false
+    const connectionDeadlines = new Set<ReturnType<typeof setTimeout>>()
     // Pending retry for a first claim whose measurement returned null.
     // Cancelled on socket replacement, reconnect, session switch, unmount.
     let cancelClaimRetry: (() => void) | null = null
@@ -1266,8 +1284,29 @@ export function TerminalView({
 
     setTermLoading(true)
 
+    function clearReconnectTimer() {
+      if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
+      reconnectTimer.current = null
+    }
+
+    function scheduleReconnect(delay: number, replaceCurrent = false) {
+      if (disposed.current || intentionalClose || currentSessionId.current !== session.id) return
+      clearReconnectTimer()
+      if (replaceCurrent && connectionRef.current) {
+        const stale = connectionRef.current
+        connectionRef.current = null
+        stale.ws.close()
+      }
+      inputClaimedRef.current = false
+      setWsState('lost')
+      reconnectTimer.current = setTimeout(() => {
+        reconnectTimer.current = null
+        connect()
+      }, delay)
+    }
+
     function connect() {
-      if (disposed.current) return
+      if (disposed.current || intentionalClose || currentSessionId.current !== session.id) return
       // A dropped socket can strand an unmatched BSU. Preserve the user's
       // mode, but clear parser/transient fences before each replay attempt.
       scrollAnchorRef.current?.reset()
@@ -1276,8 +1315,9 @@ export function TerminalView({
       cancelClaimRetry = null
 
       if (connectionRef.current) {
-        connectionRef.current.ws.close()
+        const stale = connectionRef.current
         connectionRef.current = null
+        stale.ws.close()
       }
 
       // The runner's binary frame is shared with `gmux attach`, so browser
@@ -1287,13 +1327,13 @@ export function TerminalView({
       let checkpointAlt: boolean | null = null
       let checkpointMargins: CheckpointMargins | null = null
       let checkpointCols: number | undefined
-      let checkpointRawReplay = false
       // Keep post-checkpoint bytes out of TerminalIO until the initial replay
       // has committed and xterm has claimed the browser geometry.
-      let attachPhase: 'replay' | 'claiming' | 'claimed' = isFirstConnect ? 'replay' : 'claimed'
+      let attachPhase: 'replay' | 'claiming' | 'claimed' = initialClaimComplete ? 'claimed' : 'replay'
       const postClaimWrites: Uint8Array[] = []
       let claimFallbackTimer: ReturnType<typeof setTimeout> | null = null
       let reconnectSizePromise: Promise<TerminalSize | null> | null = null
+      let replayNetworkComplete = false
       const finishPostClaimWrite = () => {
         if (claimFallbackTimer !== null) clearTimeout(claimFallbackTimer)
         claimFallbackTimer = null
@@ -1301,6 +1341,12 @@ export function TerminalView({
       }
       const replay = createReplayBuffer((chunks) => {
         const prepared = prepareBrowserCheckpoint(chunks, checkpointAlt, checkpointMargins)
+        // Network replay is complete; allow throttled mobile xterm parsing a
+        // longer bounded commit window instead of restarting a healthy large
+        // replay on the shorter no-progress deadline. Suffix/live frames must
+        // not shorten this window again.
+        replayNetworkComplete = true
+        armEstablishmentDeadline(TERMINAL_REPLAY_COMMIT_STALL_MS)
         const claiming = attachPhase === 'replay'
         if (claiming) attachPhase = 'claiming'
         // New runners declare the exact geometry used to render this frame.
@@ -1320,6 +1366,12 @@ export function TerminalView({
           if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
           scrollAnchorRef.current?.follow()
           if (!claiming) {
+            inputClaimedRef.current = true
+            markAttachUsable()
+            // Refresh pill geometry passively. Automatic reconnect must never
+            // infer ownership from a stale pre-sleep viewport and resize the
+            // shared PTY; the user can explicitly reclaim through the pill.
+            refreshPassiveViewport()
             const logicalSize = reconnectSizePromise
             const localSession = !sessionRef.current.peer
             if (!logicalSize || !localSession) {
@@ -1336,7 +1388,7 @@ export function TerminalView({
               if (connectionRef.current !== connection
                 || connection.ws.readyState !== WebSocket.OPEN
                 || termEpochRef.current !== epoch) return
-              if (!checkpointRawReplay && size && shouldReassertReconnectSize(
+              if (size && shouldReassertReconnectSize(
                 declaredCheckpointSize,
                 size,
                 ptySizeRef.current,
@@ -1349,13 +1401,14 @@ export function TerminalView({
             return
           }
 
-          isFirstConnect = false
           const proceedWithClaim = (claimSize: TerminalSize) => {
             barrierClaimResizeRef.current = claimSize
             const onClaimResized = () => {
               if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
               attachPhase = 'claimed'
+              initialClaimComplete = true
               inputClaimedRef.current = true
+              markAttachUsable()
               claimFallbackTimer = setTimeout(() => {
                 if (connectionRef.current !== connection || termEpochRef.current !== epoch) return
                 claimFallbackTimer = null
@@ -1401,7 +1454,9 @@ export function TerminalView({
               // its size until a real measurement exists (the pill lets the
               // user reclaim, and any later resize path re-measures).
               attachPhase = 'claimed'
+              initialClaimComplete = true
               inputClaimedRef.current = true
+              markAttachUsable()
               const heldWrites = postClaimWrites.splice(0)
               if (heldWrites.length === 0) {
                 setTermLoading(false)
@@ -1427,14 +1482,41 @@ export function TerminalView({
       ws.binaryType = 'arraybuffer'
       const connection: SessionConnection = { sessionId: session.id, ws }
       connectionRef.current = connection
+      let attachUsable = false
+      let establishmentDeadline: ReturnType<typeof setTimeout>
+      const armEstablishmentDeadline = (stallMs = TERMINAL_RECONNECT_STALL_MS) => {
+        if (attachUsable || connectionRef.current !== connection) return
+        if (establishmentDeadline !== undefined) {
+          clearTimeout(establishmentDeadline)
+          connectionDeadlines.delete(establishmentDeadline)
+        }
+        establishmentDeadline = setTimeout(() => {
+          connectionDeadlines.delete(establishmentDeadline)
+          if (connectionRef.current !== connection || attachUsable) return
+          // OPEN only proves the browser↔gmuxd upgrade. Require replay and any
+          // initial geometry claim to finish before resetting backoff or
+          // enabling the terminal. Each backend frame refreshes this stall
+          // deadline so a large replay may make bounded forward progress.
+          const delay = terminalReconnectDelay(attempt)
+          attempt++
+          scheduleReconnect(delay, true)
+        }, stallMs)
+        connectionDeadlines.add(establishmentDeadline)
+      }
+      const markAttachUsable = () => {
+        if (attachUsable || connectionRef.current !== connection) return
+        attachUsable = true
+        clearTimeout(establishmentDeadline)
+        connectionDeadlines.delete(establishmentDeadline)
+        attempt = 0
+        setWsState('open')
+      }
+      armEstablishmentDeadline()
 
       ws.onopen = () => {
         if (connectionRef.current !== connection) return
-        attempt = 0
-        setWsState('open')
 
-        if (isFirstConnect) return
-        inputClaimedRef.current = true
+        if (!initialClaimComplete) return
 
         // Start a fresh logical-size read, but apply it only after the
         // checkpoint replay commits. The checkpoint then provides positive
@@ -1451,9 +1533,10 @@ export function TerminalView({
 
       ws.onmessage = (ev) => {
         if (connectionRef.current !== connection) return
-        // Safety net: live output proves the connection works. Never show the
-        // disconnected pill while data is flowing on the current socket.
-        setWsState(wsStateOnOutput)
+        if (!replayNetworkComplete) armEstablishmentDeadline()
+        // Once replay/claim has completed, later output keeps presentation
+        // open. Metadata or partial replay alone must not declare success.
+        if (attachUsable) setWsState(wsStateOnOutput)
         if (typeof ev.data === 'string') {
           try {
             const msg = JSON.parse(ev.data)
@@ -1461,7 +1544,6 @@ export function TerminalView({
             // Use it to initialize ptySize if we don't have one yet.
             if (msg.type === 'terminal_checkpoint') {
               checkpointAlt = msg.active_buffer === 'alternate'
-              checkpointRawReplay = msg.raw_replay === true
               checkpointCols = Number.isInteger(msg.cols) && msg.cols > 0 ? msg.cols : undefined
               if (Number.isInteger(msg.scroll_top) && Number.isInteger(msg.scroll_bottom) && Number.isInteger(msg.rows)) {
                 checkpointMargins = { top: msg.scroll_top, bottom: msg.scroll_bottom, rows: msg.rows }
@@ -1524,10 +1606,13 @@ export function TerminalView({
         // fires *after* the replacement socket opened, and marking the
         // connection 'lost' then would leave the pill stuck on screen
         // forever while the live socket streams output behind it.
+        clearTimeout(establishmentDeadline)
+        connectionDeadlines.delete(establishmentDeadline)
         const isCurrent = connectionRef.current === connection
         setWsState(prev => wsStateOnClose(prev, isCurrent))
         if (isCurrent) onModifiersCancelled()
         if (!isCurrent) return
+        connectionRef.current = null
         if (claimFallbackTimer !== null) clearTimeout(claimFallbackTimer)
         claimFallbackTimer = null
         cancelClaimRetry?.()
@@ -1536,15 +1621,52 @@ export function TerminalView({
         if (disposed.current || intentionalClose) return
         if (currentSessionId.current !== session.id) return
 
-        const delay = Math.min(500 * Math.pow(2, attempt), 8000)
+        const delay = terminalReconnectDelay(attempt)
         attempt++
-        reconnectTimer.current = setTimeout(connect, delay)
+        scheduleReconnect(delay)
       }
 
       ws.onerror = () => {
         // errors surface via onclose; nothing to do here
       }
     }
+
+    // Browser WebSockets can remain superficially OPEN across mobile sleep,
+    // network handoff, or BFCache restoration. Foreground/network recovery is
+    // positive evidence that the route may have changed, so replace the socket
+    // immediately rather than waiting indefinitely for a close callback.
+    let hiddenAt: number | null = document.visibilityState === 'hidden' ? Date.now() : null
+    let lastWakeReconnectAt = 0
+    const reconnectOnWake = () => {
+      const now = Date.now()
+      // Mobile resume commonly emits visibility, pageshow, and online as one
+      // cluster. Replace at most once; a later close still uses normal backoff.
+      if (shouldCoalesceTerminalWake(lastWakeReconnectAt, now)) return
+      lastWakeReconnectAt = now
+      scheduleReconnect(0, true)
+    }
+    const reconnectWhenVisible = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now()
+        return
+      }
+      const now = Date.now()
+      const previousHiddenAt = hiddenAt
+      hiddenAt = null
+      // Avoid replaying a healthy multi-megabyte terminal on brief app/tab
+      // switches. A meaningful suspension can leave WebSocket.OPEN stale.
+      if (shouldReconnectAfterVisibility(
+        previousHiddenAt,
+        now,
+        connectionRef.current?.ws.readyState === WebSocket.OPEN,
+      )) reconnectOnWake()
+    }
+    const reconnectFromPageShow = (event: PageTransitionEvent) => {
+      if (shouldReconnectFromPageShow(event.persisted)) reconnectOnWake()
+    }
+    window.addEventListener('online', reconnectOnWake)
+    window.addEventListener('pageshow', reconnectFromPageShow)
+    document.addEventListener('visibilitychange', reconnectWhenVisible)
 
     connect()
 
@@ -1556,13 +1678,17 @@ export function TerminalView({
       termEpochRef.current = epoch + 1
       termIoRef.current?.reset(termEpochRef.current)
       scrollAnchorRef.current?.reset()
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
-      reconnectTimer.current = null
+      window.removeEventListener('online', reconnectOnWake)
+      window.removeEventListener('pageshow', reconnectFromPageShow)
+      document.removeEventListener('visibilitychange', reconnectWhenVisible)
+      clearReconnectTimer()
+      for (const deadline of connectionDeadlines) clearTimeout(deadline)
+      connectionDeadlines.clear()
       resetResizeEchoGate()
       connectionRef.current?.ws.close()
       connectionRef.current = null
     }
-  }, [announceViewportClaim, queueData, queueMany, queueResize, releaseResizeEchoGate, resetResizeEchoGate, session.id, fontReady])
+  }, [announceViewportClaim, queueData, queueMany, queueResize, refreshPassiveViewport, releaseResizeEchoGate, resetResizeEchoGate, session.id, fontReady])
 
   // Pill is purely derived from size mismatch. No "driving" flag: we claim
   // on every fresh session select (first ws.onopen), and fitAndResize sets

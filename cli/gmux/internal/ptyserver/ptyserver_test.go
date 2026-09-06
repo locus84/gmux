@@ -1256,19 +1256,27 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	// Wait for the shrink SIGWINCH to be delivered and processed.
 	time.Sleep(300 * time.Millisecond)
 
+	// A failed attach cleanup must not accumulate another hidden column.
+	srv.shrinkForReconnect()
+	srv.mu.Lock()
+	if srv.ptyCols != 79 || !srv.hiddenReconnectShrink {
+		t.Fatalf("repeated hidden shrink = %d, pending=%v; want 79, true", srv.ptyCols, srv.hiddenReconnectShrink)
+	}
+	srv.mu.Unlock()
+
 	// Clear output buffer: the shrink's SIGWINCH will have fired WINCH_FIRED.
 	mu.Lock()
 	allOutput = nil
 	mu.Unlock()
 
-	// Phase 2: reconnect and send resize with the original (pre-shrink) size.
-	// This should trigger a genuine SIGWINCH because the PTY is at 79 cols.
+	// Phase 2: reconnect. The runner owns the hidden shrink and restores the
+	// logical size before declaring checkpoint geometry, without a browser
+	// resize heuristic.
 	conn2 := dial()
 	defer conn2.Close(websocket.StatusNormalClosure, "")
 
-	// Browser checkpoint geometry must expose exactly the runner's hidden
-	// one-column shrink. The web reconnect guard deliberately relies on this
-	// contract before reasserting the logical 80x25 size.
+	// Browser checkpoint geometry exposes the restored logical size; the
+	// internal 79-column implementation detail never escapes the runner.
 	typ, data, err := conn2.Read(ctx)
 	if err != nil {
 		t.Fatalf("read checkpoint metadata: %v", err)
@@ -1280,8 +1288,8 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
 		t.Fatalf("decode checkpoint metadata: %v", err)
 	}
-	if checkpoint.Cols != 79 || checkpoint.Rows != 25 {
-		t.Fatalf("checkpoint size = %dx%d, want hidden shrink 79x25", checkpoint.Cols, checkpoint.Rows)
+	if checkpoint.Cols != 80 || checkpoint.Rows != 25 {
+		t.Fatalf("checkpoint size = %dx%d, want restored 80x25", checkpoint.Cols, checkpoint.Rows)
 	}
 	if typ, _, err = conn2.Read(ctx); err != nil || typ != websocket.MessageBinary {
 		t.Fatalf("read checkpoint frame: type=%v err=%v", typ, err)
@@ -1299,12 +1307,6 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 		}
 	}()
 
-	// Send resize with original dimensions (80x25).
-	msg, _ := json.Marshal(ResizeMsg{Type: "resize", Cols: 80, Rows: 25})
-	if err := conn2.Write(ctx, websocket.MessageText, msg); err != nil {
-		t.Fatalf("write resize: %v", err)
-	}
-
 	deadline = time.After(2 * time.Second)
 	for {
 		time.Sleep(50 * time.Millisecond)
@@ -1312,11 +1314,11 @@ func TestPTYServerShrinkForReconnect(t *testing.T) {
 		fired := contains(allOutput, "WINCH_FIRED")
 		mu.Unlock()
 		if fired {
-			return // success: reconnect resize triggered SIGWINCH
+			return // success: runner-owned reconnect restore triggered SIGWINCH
 		}
 		select {
 		case <-deadline:
-			t.Fatal("expected reconnect resize to trigger SIGWINCH, but WINCH_FIRED never appeared")
+			t.Fatal("expected runner reconnect restore to trigger SIGWINCH, but WINCH_FIRED never appeared")
 		default:
 		}
 	}

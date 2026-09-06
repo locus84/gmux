@@ -409,7 +409,12 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 	// Never forward arbitrary hub query parameters across the authenticated
 	// peer boundary.
 	browserAttach := browserAttachQuery(r.URL.Query())
-	spokeConn, err := c.DialWS(r.Context(), sessionID, browserAttach)
+	// Bound the post-upgrade peer dial. Without a deadline the browser sees an
+	// OPEN hub socket that can remain silent forever while the spoke route is
+	// blackholed, so its reconnect loop has no failure to react to.
+	dialCtx, cancelDial := context.WithTimeout(r.Context(), 12*time.Second)
+	spokeConn, err := c.DialWS(dialCtx, sessionID, browserAttach)
+	cancelDial()
 	if err != nil {
 		log.Printf("apiclient ProxyWS: dial %s: %v", sessionID, err)
 		clientConn.Close(websocket.StatusInternalError, "peer unavailable")
@@ -441,7 +446,7 @@ func (c *Client) pipeWS(parent context.Context, clientConn, spokeConn *websocket
 	defer cancel()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	// Keepalive on the browser-facing hop, mirroring the local-session
 	// proxy. Runs alongside the client read loop below (which delivers
@@ -449,6 +454,15 @@ func (c *Client) pipeWS(parent context.Context, clientConn, spokeConn *websocket
 	go func() {
 		defer wg.Done()
 		wskeepalive.Run(ctx, clientConn,
+			wskeepalive.DefaultInterval, wskeepalive.DefaultTimeout, cancel)
+	}()
+
+	// The browser↔hub hop can stay healthy while the hub↔spoke route dies
+	// after sleep or a tailnet transition. Ping the spoke independently so a
+	// stale peer tunnel tears down and becomes a browser-visible close.
+	go func() {
+		defer wg.Done()
+		wskeepalive.Run(ctx, spokeConn,
 			wskeepalive.DefaultInterval, wskeepalive.DefaultTimeout, cancel)
 	}()
 
