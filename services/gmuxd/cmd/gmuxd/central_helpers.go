@@ -64,7 +64,7 @@ type sessionEncodeMemo struct {
 
 	mu           sync.Mutex
 	peerFiltered *wire.SessionsPayload
-	proto2       map[bool][]byte               // peer-filtered? -> marshaled payload
+	proto2       map[bool][]byte                // peer-filtered? -> marshaled payload
 	proto3       map[bool][]sessionstream.Event // peer-filtered? -> transaction events
 }
 
@@ -293,7 +293,7 @@ func projectStateFromWorld(world *wire.WorldPayload) projects.State {
 	}
 	state.Items = make([]projects.Item, 0, len(world.Projects))
 	for _, item := range world.Projects {
-		p := projects.Item{Slug: item.Slug, Peer: item.Peer, Sessions: append([]string(nil), item.Sessions...), NodeID: item.NodeID}
+		p := projects.Item{Slug: item.Slug, Peer: item.Peer, Favorite: item.Favorite, Sessions: append([]string(nil), item.Sessions...), NodeID: item.NodeID}
 		for _, rule := range item.Match {
 			p.Match = append(p.Match, projects.MatchRule{Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact})
 		}
@@ -332,10 +332,10 @@ func projectSpecsFromState(state projects.State) []centralstore.ProjectEntrySpec
 	specs := make([]centralstore.ProjectEntrySpec, 0, len(state.Items))
 	for _, item := range state.Items {
 		if item.Peer != "" {
-			specs = append(specs, centralstore.ProjectEntrySpec{Reference: &centralstore.ProjectReference{PeerKey: centralstore.PeerKey(item.Peer), Slug: item.Slug, NodeID: item.NodeID}})
+			specs = append(specs, centralstore.ProjectEntrySpec{BindIdentity: true, Reference: &centralstore.ProjectReference{PeerKey: centralstore.PeerKey(item.Peer), Slug: item.Slug, NodeID: item.NodeID}})
 			continue
 		}
-		spec := centralstore.ProjectEntrySpec{Owned: &centralstore.OwnedProjectSpec{Slug: item.Slug}}
+		spec := centralstore.ProjectEntrySpec{BindIdentity: true, Owned: &centralstore.OwnedProjectSpec{Slug: item.Slug}}
 		for _, rule := range item.Match {
 			spec.Owned.Rules = append(spec.Owned.Rules, centralstore.MatchRule{Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact})
 		}
@@ -364,8 +364,8 @@ func centralSessionToLegacy(row centralstore.Session) compatSession {
 		Title:           row.Title,
 		Subtitle:        row.Subtitle,
 		Status:          status,
-		Unread:           row.Unread,
-		UnreadToken: row.UnreadToken,
+		Unread:          row.Unread,
+		UnreadToken:     row.UnreadToken,
 		TerminalCols:    uint16Value(row.TerminalCols),
 		TerminalRows:    uint16Value(row.TerminalRows),
 		Slug:            row.Slug,
@@ -397,8 +397,8 @@ func legacySessionFromWire(s wire.Session) compatSession {
 		Title:           s.Title,
 		Subtitle:        s.Subtitle,
 		Status:          status,
-		Unread:           s.Unread,
-		UnreadToken: s.UnreadToken,
+		Unread:          s.Unread,
+		UnreadToken:     s.UnreadToken,
 		Resumable:       s.Resumable,
 		SocketPath:      s.SocketPath,
 		TerminalCols:    s.TerminalCols,
@@ -440,7 +440,7 @@ func uint16Value(v *uint16) uint16 {
 func ownedProjectStateFromCatalog(catalog centralstore.ProjectCatalog) *projects.State {
 	state := &projects.State{Version: 4}
 	for _, entry := range catalog {
-		item := projects.Item{Slug: entry.Slug, Peer: string(entry.PeerKey), NodeID: entry.NodeID}
+		item := projects.Item{Slug: entry.Slug, Peer: string(entry.PeerKey), NodeID: entry.NodeID, Favorite: entry.Favorite}
 		for _, rule := range entry.Rules {
 			item.Match = append(item.Match, projects.MatchRule{Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact})
 		}

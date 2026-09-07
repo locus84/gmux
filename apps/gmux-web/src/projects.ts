@@ -342,6 +342,11 @@ export function countUnmatchedActive(
  * renders on the session row so the user knows it's a container
  * session.
  */
+/** Pin favorites first without disturbing either group's catalog order. */
+export function favoriteProjectsFirst(items: readonly ProjectItem[]): ProjectItem[] {
+  return [...items.filter(item => item.favorite), ...items.filter(item => !item.favorite)]
+}
+
 export interface TemporaryPresentationPlacement {
   ownerPeer: string
   slug: string
@@ -390,7 +395,7 @@ export function buildProjectFolders(
   }
 
   const folders: Folder[] = []
-  for (const project of projects) {
+  for (const project of favoriteProjectsFirst(projects)) {
     // `peer` is the runtime key (viewer-owned, frozen — ADR 0007 §7), so
     // bucket and label references by it directly. The only roster
     // question is liveness, which also blocks a reused name from
@@ -433,6 +438,7 @@ export function buildProjectFolders(
       slug: project.slug,
       name: project.slug,
       peer: ownerPeer || undefined,
+      favorite: project.favorite || undefined,
       launchCwd,
       missing: missing || undefined,
       unresolved: unresolved || undefined,

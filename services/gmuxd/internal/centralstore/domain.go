@@ -119,6 +119,7 @@ var (
 	// ErrSessionNotFound marks a mutation targeting a session row that does
 	// not exist. Session() keeps its (value, ok, err) shape instead.
 	ErrSessionNotFound    = errors.New("centralstore: session not found")
+	ErrProjectNotFound    = errors.New("centralstore: project not found")
 	ErrSessionParentSelf  = errors.New("session cannot parent itself")
 	ErrSessionParentCycle = errors.New("session parent cycle")
 	// ErrCatalogHasPlacements marks the bootstrap-only catalog boundary. This
@@ -145,9 +146,13 @@ type ProjectReference struct {
 	NodeID string
 }
 type ProjectEntrySpec struct {
-	ID        ProjectEntryID
-	Owned     *OwnedProjectSpec
-	Reference *ProjectReference
+	ID ProjectEntryID
+	// BindIdentity asks catalog replacement to resolve this ID-less wire item
+	// against an existing stable (kind, slug, peer) identity.
+	BindIdentity bool
+	Favorite     bool
+	Owned        *OwnedProjectSpec
+	Reference    *ProjectReference
 }
 type ProjectEntryKind string
 
@@ -157,10 +162,11 @@ const (
 )
 
 type ProjectEntry struct {
-	ID      ProjectEntryID
-	Kind    ProjectEntryKind
-	Slug    string
-	PeerKey PeerKey
+	ID       ProjectEntryID
+	Kind     ProjectEntryKind
+	Slug     string
+	PeerKey  PeerKey
+	Favorite bool
 	// NodeID is set only on references (ADR 0017 liveness anchor).
 	NodeID               string
 	Rules                []MatchRule
@@ -846,9 +852,9 @@ func normalizeSpecs(in []ProjectEntrySpec) ([]ProjectEntrySpec, error) {
 }
 func specEntry(e ProjectEntrySpec) ProjectEntry {
 	if e.Owned != nil {
-		return ProjectEntry{ID: e.ID, Kind: ProjectEntryOwned, Slug: e.Owned.Slug, Rules: e.Owned.Rules}
+		return ProjectEntry{ID: e.ID, Kind: ProjectEntryOwned, Slug: e.Owned.Slug, Favorite: e.Favorite, Rules: e.Owned.Rules}
 	}
-	return ProjectEntry{ID: e.ID, Kind: ProjectEntryReference, Slug: e.Reference.Slug, PeerKey: e.Reference.PeerKey, NodeID: e.Reference.NodeID}
+	return ProjectEntry{ID: e.ID, Kind: ProjectEntryReference, Slug: e.Reference.Slug, PeerKey: e.Reference.PeerKey, NodeID: e.Reference.NodeID, Favorite: e.Favorite}
 }
 func catalogFromQueries(ctx context.Context, q *db.Queries) (ProjectCatalog, error) {
 	entries, err := q.ListProjectEntries(ctx)
@@ -872,8 +878,8 @@ func catalogFromQueries(ctx context.Context, q *db.Queries) (ProjectCatalog, err
 	}
 	out := make(ProjectCatalog, 0, len(entries))
 	for _, e := range entries {
-		x := ProjectEntry{ID: ProjectEntryID(e.ID), Kind: ProjectEntryKind(e.EntryKind), Slug: e.Slug, PeerKey: PeerKey(e.PeerKey.String), NodeID: e.NodeID.String, Rules: by[e.ID], CreatedAt: UnixMillis(e.CreatedAtMs), UpdatedAt: UnixMillis(e.UpdatedAtMs)}
-		if e.ID <= 0 || e.SidebarOrder < 0 || e.CreatedAtMs < 0 || e.UpdatedAtMs < 0 || x.Slug == "" {
+		x := ProjectEntry{ID: ProjectEntryID(e.ID), Kind: ProjectEntryKind(e.EntryKind), Slug: e.Slug, PeerKey: PeerKey(e.PeerKey.String), NodeID: e.NodeID.String, Favorite: e.Favorite == 1, Rules: by[e.ID], CreatedAt: UnixMillis(e.CreatedAtMs), UpdatedAt: UnixMillis(e.UpdatedAtMs)}
+		if e.ID <= 0 || e.SidebarOrder < 0 || e.CreatedAtMs < 0 || e.UpdatedAtMs < 0 || (e.Favorite != 0 && e.Favorite != 1) || x.Slug == "" {
 			return nil, errors.New("centralstore: corrupt project value")
 		}
 		if x.Kind != ProjectEntryOwned && x.Kind != ProjectEntryReference {
@@ -891,6 +897,36 @@ func catalogFromQueries(ctx context.Context, q *db.Queries) (ProjectCatalog, err
 }
 func (s *Store) ListProjectCatalog(ctx context.Context) (ProjectCatalog, error) {
 	return catalogFromQueries(ctx, s.queries)
+}
+
+// SetProjectFavorite mutates viewer-owned project presentation without
+// replacing the catalog or touching placements/session order.
+func (s *Store) SetProjectFavorite(ctx context.Context, slug string, peer PeerKey, favorite bool, at UnixMillis) (MutationResult, error) {
+	if slug == "" || at < 0 {
+		return MutationResult{}, errors.New("centralstore: invalid project favorite")
+	}
+	n, err := s.queries.SetProjectFavorite(ctx, db.SetProjectFavoriteParams{
+		Favorite: boolInt(favorite), UpdatedAtMs: int64(at), Slug: slug, PeerKey: nullString(string(peer)),
+	})
+	if err != nil {
+		return MutationResult{}, err
+	}
+	if n == 1 {
+		return MutationResult{Changed: true, WorldDirty: true}, nil
+	}
+	if n != 0 {
+		return MutationResult{}, errors.New("centralstore: project favorite changed multiple rows")
+	}
+	catalog, err := s.ListProjectCatalog(ctx)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	for _, entry := range catalog {
+		if entry.Slug == slug && entry.PeerKey == peer {
+			return MutationResult{}, nil
+		}
+	}
+	return MutationResult{}, ErrProjectNotFound
 }
 
 func assertCatalogOrder(ctx context.Context, q *db.Queries) error {
@@ -918,7 +954,7 @@ func assertCatalogOrder(ctx context.Context, q *db.Queries) error {
 }
 
 func sameProjectShape(a, b ProjectEntry) bool {
-	return a.ID == b.ID && a.Kind == b.Kind && a.Slug == b.Slug && a.PeerKey == b.PeerKey && a.NodeID == b.NodeID && reflect.DeepEqual(a.Rules, b.Rules)
+	return a.ID == b.ID && a.Kind == b.Kind && a.Slug == b.Slug && a.PeerKey == b.PeerKey && a.NodeID == b.NodeID && a.Favorite == b.Favorite && reflect.DeepEqual(a.Rules, b.Rules)
 }
 
 // ReplaceProjectCatalog is a bootstrap ordering primitive, not an
@@ -984,6 +1020,37 @@ func replaceCatalogInTx(ctx context.Context, q *db.Queries, in []ProjectEntrySpe
 		byID[e.ID] = e
 		oldIndex[e.ID] = i
 	}
+	// Browser/API catalog payloads intentionally expose stable project
+	// identity, not database IDs. Bind unchanged identities back to their rows
+	// before diffing so a favorite or settings PUT cannot delete/recreate every
+	// entry and cascade away user-authored session order.
+	used := map[ProjectEntryID]bool{}
+	for _, entry := range in {
+		if entry.ID != 0 {
+			used[entry.ID] = true
+		}
+	}
+	for i := range in {
+		if in[i].ID != 0 || !in[i].BindIdentity {
+			continue
+		}
+		want := specEntry(in[i])
+		for _, old := range current {
+			if used[old.ID] || old.Kind != want.Kind || old.Slug != want.Slug {
+				continue
+			}
+			if want.Kind == ProjectEntryReference && old.PeerKey != want.PeerKey {
+				continue
+			}
+			in[i].ID = old.ID
+			// Favorites have a dedicated identity-targeted mutation. A full
+			// catalog PUT may have been assembled before that PATCH (or come from
+			// an older client), so never let it overwrite the newer preference.
+			in[i].Favorite = old.Favorite
+			used[old.ID] = true
+			break
+		}
+	}
 	changedEntry := map[ProjectEntryID]bool{}
 	changedRules := map[ProjectEntryID]bool{}
 	unchanged := len(current) == len(in)
@@ -1001,7 +1068,7 @@ func replaceCatalogInTx(ctx context.Context, q *db.Queries, in []ProjectEntrySpe
 				(want.Kind == ProjectEntryReference && old.Slug != want.Slug) {
 				return nil, false, errors.New("centralstore: project identity is immutable")
 			}
-			changedEntry[e.ID] = oldIndex[e.ID] != i || old.Slug != want.Slug || old.NodeID != want.NodeID || !reflect.DeepEqual(old.Rules, want.Rules)
+			changedEntry[e.ID] = oldIndex[e.ID] != i || old.Slug != want.Slug || old.NodeID != want.NodeID || old.Favorite != want.Favorite || !reflect.DeepEqual(old.Rules, want.Rules)
 			changedRules[e.ID] = !reflect.DeepEqual(old.Rules, want.Rules)
 			unchanged = unchanged && oldIndex[e.ID] == i && sameProjectShape(old, want)
 		} else {
@@ -1060,7 +1127,7 @@ func replaceCatalogInTx(ctx context.Context, q *db.Queries, in []ProjectEntrySpe
 	for i, e := range in {
 		entry := specEntry(e)
 		if e.ID == 0 {
-			id, er := q.InsertProjectEntry(ctx, db.InsertProjectEntryParams{SidebarOrder: int64(i), EntryKind: string(entry.Kind), Slug: entry.Slug, PeerKey: nullString(string(entry.PeerKey)), NodeID: nullString(entry.NodeID), CreatedAtMs: int64(at), UpdatedAtMs: int64(at)})
+			id, er := q.InsertProjectEntry(ctx, db.InsertProjectEntryParams{SidebarOrder: int64(i), EntryKind: string(entry.Kind), Slug: entry.Slug, PeerKey: nullString(string(entry.PeerKey)), NodeID: nullString(entry.NodeID), Favorite: boolInt(entry.Favorite), CreatedAtMs: int64(at), UpdatedAtMs: int64(at)})
 			if er != nil {
 				return nil, false, er
 			}
@@ -1069,7 +1136,7 @@ func replaceCatalogInTx(ctx context.Context, q *db.Queries, in []ProjectEntrySpe
 			changedEntry[e.ID] = true
 			changedRules[e.ID] = e.Owned != nil
 		} else if changedEntry[e.ID] {
-			n, er := q.UpdateProjectEntry(ctx, db.UpdateProjectEntryParams{SidebarOrder: int64(i), Slug: entry.Slug, NodeID: nullString(entry.NodeID), UpdatedAtMs: int64(at), ID: int64(e.ID)})
+			n, er := q.UpdateProjectEntry(ctx, db.UpdateProjectEntryParams{SidebarOrder: int64(i), Slug: entry.Slug, NodeID: nullString(entry.NodeID), Favorite: boolInt(entry.Favorite), UpdatedAtMs: int64(at), ID: int64(e.ID)})
 			if er != nil {
 				return nil, false, er
 			}
@@ -1178,6 +1245,7 @@ func recKey(r *placementRec) string {
 	}
 	return "p:" + escape(r.peer) + ":" + escape(r.session)
 }
+
 // placementKeyIndex answers "is recKey k placed in project p" in O(1). Built
 // once per pass so desiredScope stays O(1) per record instead of scanning
 // every placement (O(P²) per rewrite once children exist).

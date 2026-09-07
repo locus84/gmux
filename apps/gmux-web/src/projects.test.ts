@@ -17,8 +17,22 @@ import {
   placeChildSessions,
   groupSessionsByCheckout,
   checkoutPathContains,
+  favoriteProjectsFirst,
 } from './projects'
 import { makeSession } from './test-helpers'
+
+describe('project favorites', () => {
+  it('pins favorites while preserving order within both groups', () => {
+    const items: ProjectItem[] = [
+      { slug: 'one' },
+      { slug: 'two', favorite: true },
+      { slug: 'three' },
+      { slug: 'four', favorite: true },
+    ]
+    expect(favoriteProjectsFirst(items).map(item => item.slug)).toEqual(['two', 'four', 'one', 'three'])
+    expect(items.map(item => item.slug)).toEqual(['one', 'two', 'three', 'four'])
+  })
+})
 
 describe('worktree checkout grouping', () => {
   const folder = (sessions: ReturnType<typeof makeSession>[]) => ({ key: '::backend', slug: 'backend', name: 'backend', launchCwd: '~/WorkSpace/backend', sessions })

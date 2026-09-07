@@ -56,9 +56,10 @@ type MatchRule struct {
 //
 // Validate enforces exactly one of {Match present, Peer present}.
 type Item struct {
-	Slug  string      `json:"slug"`
-	Peer  string      `json:"peer,omitempty"`
-	Match []MatchRule `json:"match,omitempty"`
+	Slug     string      `json:"slug"`
+	Peer     string      `json:"peer,omitempty"`
+	Favorite bool        `json:"favorite,omitempty"`
+	Match    []MatchRule `json:"match,omitempty"`
 	// Sessions holds ordered session IDs only (v4). Hand-edited slug keys are
 	// unsupported; legacy slug keys are converted once during v3 → v4 Load.
 	Sessions []string `json:"sessions,omitempty"`

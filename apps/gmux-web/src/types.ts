@@ -105,6 +105,8 @@ export interface Folder {
    * button's `peer=` argument.
    */
   peer?: string
+  /** Whether this project is pinned above ordinary projects. */
+  favorite?: boolean
   /** Filesystem path hint for launching new sessions in this folder. */
   launchCwd?: string
   /**
@@ -151,6 +153,8 @@ export interface MatchRule {
  */
 export interface ProjectItem {
   slug: string
+  /** Viewer-owned project pin, persisted by this daemon. */
+  favorite?: boolean
   /** Set when this item is a reference to a peer-owned project. */
   peer?: string
   /**

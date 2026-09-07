@@ -12,7 +12,7 @@ import {
   projects, promoteSession, promotionAnnouncements, promotionPending,
   PROMOTION_PENDING_TTL_MS, reconcilePromotionPending, removeSession, reorderSessions,
   reparentSession, resumeSession, selectedFamilyChild, selectedId, sessions, sessionsLoaded,
-  sessionStaleness, setAliveOnly, setFilterSelectors, setHostFilter, setNavigate,
+  sessionStaleness, setAliveOnly, setFilterSelectors, setHostFilter, setNavigate, setProjectFavorite,
   setSidebarMode, settlePromotion, sidebarActivity, sidebarMode, sidebarSessions, tabHref,
   toUISession, unreadCount, upsertSession, urlHash, urlPath, urlSearch, view, worldLoaded,
 } from './store'
@@ -176,6 +176,22 @@ describe('reorder failures are surfaced, never silent', () => {
     await reorderSessions('gmux', ['y', 'x'])
     expect(toasts.value).toHaveLength(0)
     expect(_pendingMutations.value).toHaveLength(0)
+  })
+})
+
+describe('project favorites', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('patches only the matching owned or referenced project identity', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await setProjectFavorite('same', 'tower', true)
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/projects/same/favorite', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ peer: 'tower', favorite: true }),
+    }))
   })
 })
 

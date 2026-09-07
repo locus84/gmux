@@ -35,6 +35,7 @@ type projectItem struct {
 	Slug     string        `json:"slug"`
 	Peer     string        `json:"peer,omitempty"`
 	NodeID   string        `json:"node_id,omitempty"`
+	Favorite bool          `json:"favorite,omitempty"`
 	Match    []projectRule `json:"match,omitempty"`
 	Sessions []string      `json:"sessions,omitempty"`
 	// Original/unversioned and v1 shape, migrated in memory only.
@@ -143,14 +144,14 @@ func Load(stateDir string, infos []conversations.Info) (centralstore.LegacyImpor
 			return centralstore.LegacyImport{}, Report{}, errors.New("legacy import: project slug is empty")
 		}
 		if item.Peer != "" {
-			out.Projects = append(out.Projects, centralstore.ProjectEntrySpec{Reference: &centralstore.ProjectReference{PeerKey: centralstore.PeerKey(item.Peer), Slug: item.Slug, NodeID: item.NodeID}})
+			out.Projects = append(out.Projects, centralstore.ProjectEntrySpec{Favorite: item.Favorite, Reference: &centralstore.ProjectReference{PeerKey: centralstore.PeerKey(item.Peer), Slug: item.Slug, NodeID: item.NodeID}})
 			continue
 		}
 		rules := make([]centralstore.MatchRule, 0, len(item.Match))
 		for _, rule := range item.Match {
 			rules = append(rules, centralstore.MatchRule{Path: rule.Path, Remote: rule.Remote, Exact: rule.Exact})
 		}
-		out.Projects = append(out.Projects, centralstore.ProjectEntrySpec{Owned: &centralstore.OwnedProjectSpec{Slug: item.Slug, Rules: rules}})
+		out.Projects = append(out.Projects, centralstore.ProjectEntrySpec{Favorite: item.Favorite, Owned: &centralstore.OwnedProjectSpec{Slug: item.Slug, Rules: rules}})
 	}
 
 	meta, err := loadMetaSessions(filepath.Join(stateDir, "sessions"))

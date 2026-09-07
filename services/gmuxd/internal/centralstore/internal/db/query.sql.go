@@ -395,8 +395,8 @@ func (q *Queries) InsertManualPeer(ctx context.Context, arg InsertManualPeerPara
 
 const insertProjectEntry = `-- name: InsertProjectEntry :one
 INSERT INTO project_entries
-(sidebar_order, entry_kind, slug, peer_key, node_id, created_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+(sidebar_order, entry_kind, slug, peer_key, node_id, favorite, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id
 `
 
@@ -406,6 +406,7 @@ type InsertProjectEntryParams struct {
 	Slug         string
 	PeerKey      sql.NullString
 	NodeID       sql.NullString
+	Favorite     int64
 	CreatedAtMs  int64
 	UpdatedAtMs  int64
 }
@@ -417,6 +418,7 @@ func (q *Queries) InsertProjectEntry(ctx context.Context, arg InsertProjectEntry
 		arg.Slug,
 		arg.PeerKey,
 		arg.NodeID,
+		arg.Favorite,
 		arg.CreatedAtMs,
 		arg.UpdatedAtMs,
 	)
@@ -689,7 +691,7 @@ func (q *Queries) ListPlacements(ctx context.Context) ([]ListPlacementsRow, erro
 }
 
 const listProjectEntries = `-- name: ListProjectEntries :many
-SELECT id, sidebar_order, entry_kind, slug, peer_key, node_id, created_at_ms, updated_at_ms FROM project_entries ORDER BY sidebar_order
+SELECT id, sidebar_order, entry_kind, slug, peer_key, node_id, created_at_ms, updated_at_ms, favorite FROM project_entries ORDER BY sidebar_order
 `
 
 func (q *Queries) ListProjectEntries(ctx context.Context) ([]ProjectEntry, error) {
@@ -710,6 +712,7 @@ func (q *Queries) ListProjectEntries(ctx context.Context) ([]ProjectEntry, error
 			&i.NodeID,
 			&i.CreatedAtMs,
 			&i.UpdatedAtMs,
+			&i.Favorite,
 		); err != nil {
 			return nil, err
 		}
@@ -926,6 +929,33 @@ func (q *Queries) SessionVersion(ctx context.Context, id string) (int64, error) 
 	return row_version, err
 }
 
+const setProjectFavorite = `-- name: SetProjectFavorite :execrows
+UPDATE project_entries
+SET favorite = ?1, updated_at_ms = ?2
+WHERE slug = ?3 AND peer_key IS ?4
+  AND favorite <> ?1
+`
+
+type SetProjectFavoriteParams struct {
+	Favorite    int64
+	UpdatedAtMs int64
+	Slug        string
+	PeerKey     sql.NullString
+}
+
+func (q *Queries) SetProjectFavorite(ctx context.Context, arg SetProjectFavoriteParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setProjectFavorite,
+		arg.Favorite,
+		arg.UpdatedAtMs,
+		arg.Slug,
+		arg.PeerKey,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setSessionParent = `-- name: SetSessionParent :execrows
 UPDATE local_sessions
 SET parent_session_id = ?, row_version = row_version + 1
@@ -1088,7 +1118,7 @@ func (q *Queries) UpdateManualPeer(ctx context.Context, arg UpdateManualPeerPara
 
 const updateProjectEntry = `-- name: UpdateProjectEntry :execrows
 UPDATE project_entries
-SET sidebar_order = ?, slug = ?, node_id = ?, updated_at_ms = ?
+SET sidebar_order = ?, slug = ?, node_id = ?, favorite = ?, updated_at_ms = ?
 WHERE id = ?
 `
 
@@ -1096,6 +1126,7 @@ type UpdateProjectEntryParams struct {
 	SidebarOrder int64
 	Slug         string
 	NodeID       sql.NullString
+	Favorite     int64
 	UpdatedAtMs  int64
 	ID           int64
 }
@@ -1105,6 +1136,7 @@ func (q *Queries) UpdateProjectEntry(ctx context.Context, arg UpdateProjectEntry
 		arg.SidebarOrder,
 		arg.Slug,
 		arg.NodeID,
+		arg.Favorite,
 		arg.UpdatedAtMs,
 		arg.ID,
 	)

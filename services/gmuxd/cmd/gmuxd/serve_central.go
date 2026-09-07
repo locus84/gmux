@@ -567,6 +567,26 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			}
 			writeJSON(w, map[string]any{"ok": true, "data": map[string]any{"slug": item.Slug, "match": item.Match, "existing": false}})
 		})
+		mux.HandleFunc("PATCH /v1/projects/{slug}/favorite", func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Peer     string `json:"peer"`
+				Favorite *bool  `json:"favorite"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Favorite == nil {
+				writeError(w, http.StatusBadRequest, "bad_request", "favorite boolean required")
+				return
+			}
+			if err := boot.Coordinator.SetProjectFavorite(r.Context(), r.PathValue("slug"), centralstore.PeerKey(req.Peer), *req.Favorite); err != nil {
+				if errors.Is(err, centralstore.ErrProjectNotFound) {
+					writeError(w, http.StatusNotFound, "not_found", "project not found")
+					return
+				}
+				log.Printf("project favorite: %v", err)
+				writeError(w, http.StatusInternalServerError, "internal", "failed to save favorite")
+				return
+			}
+			writeJSON(w, map[string]any{"ok": true})
+		})
 		mux.HandleFunc("GET /v1/projects/{slug}/files", func(w http.ResponseWriter, r *http.Request) {
 			workspaceProjectFilesListHandler(w, r, r.PathValue("slug"), boot.Store)
 		})

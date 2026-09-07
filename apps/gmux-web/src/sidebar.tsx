@@ -20,11 +20,12 @@ import { WorktreeSheet } from './worktree-sheet'
 import { SheetBackdrop } from './sheet'
 import { readCheckoutExpanded, writeCheckoutExpanded } from './checkout-fold'
 import { useArrivalPulse } from './use-arrival-pulse'
+import { pushError } from './toasts'
 import {
   folders, familySelectedId, sessions,
   activityMap, projects, connState, health, peers,
   collapsedFolders, toggleFolderCollapsed,
-  updateProjects, reorderSessions,
+  updateProjects, setProjectFavorite, reorderSessions,
   peerStatusByName, isSessionUnavailable, localPeerNames, ownDotState, selectedId,
   familyActivityById, familySlotById, type FamilySlot,
   unreadCount, localHostLabel, unresolvedHosts, duplicateConversationFiles,
@@ -72,20 +73,6 @@ export const IconSettings = () => (
   </svg>
 )
 
-export const IconVSCode = () => (
-  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M11.5 2.5 5 7.8l6.5 5.7 2-1V3.5l-2-1Z" />
-    <path d="M5 7.8 2.8 5.7 2 6.3v3l.8.6L5 7.8Z" />
-  </svg>
-)
-
-export const IconFiles = () => (
-  <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M2.5 4.5h4l1.2 1.4h5.8v6.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1Z" />
-    <path d="M2.5 4.5V3.8a1 1 0 0 1 1-1h2.7l1.1 1.2" />
-  </svg>
-)
-
 export const IconRefresh = () => (
   <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
     <path d="M13 5.2A5.2 5.2 0 0 0 3.4 4" />
@@ -94,34 +81,6 @@ export const IconRefresh = () => (
     <path d="M3 13.5v-2.7h2.7" />
   </svg>
 )
-
-function ProjectFilesButton({ folder, onClick }: { folder: Folder; onClick?: () => void }) {
-  return (
-    <a
-      class="folder-file-btn"
-      href={projectFileBrowserPath(folder.slug, folder.peer)}
-      title={`Browse ${folder.launchCwd || folder.name}`}
-      aria-label={`Browse ${folder.name} files`}
-      onClick={() => onClick?.()}
-    >
-      <IconFiles />
-    </a>
-  )
-}
-
-function VSCodeServerButton({ href, workspacePath }: { href: string; workspacePath: string }) {
-  return (
-    <button
-      class="folder-vscode-btn"
-      type="button"
-      title={`Open ${workspacePath} in VS Code Server`}
-      aria-label={`Open ${workspacePath} in VS Code Server`}
-      onClick={event => { event.preventDefault(); event.stopPropagation(); window.open(href, '_blank', 'noopener,noreferrer') }}
-    >
-      <IconVSCode />
-    </button>
-  )
-}
 
 const IconArrange = () => (
   <svg viewBox="0 0 16 16" width="15" height="15" {...bellStroke}>
@@ -628,6 +587,7 @@ function FolderGroup({
 }) {
   const [drag, setDrag] = useState<DragState | null>(null)
   const [worktreesOpen, setWorktreesOpen] = useState(false)
+  const [favoritePending, setFavoritePending] = useState(false)
   const ownerStatus = folder.peer ? peerStatus.get(folder.peer) : 'local'
   useEffect(() => {
     if (!location.search.includes('mock') && !folder.unresolved && !folder.missing && (ownerStatus === 'local' || ownerStatus === 'connected')) {
@@ -635,6 +595,18 @@ function FolderGroup({
     }
   }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
   const inventory = projectWorktreeInventories.value[projectWorktreeInventoryKey(folder.slug, folder.peer)]
+  const toggleFavorite = async () => {
+    if (favoritePending) return
+    setFavoritePending(true)
+    try {
+      await setProjectFavorite(folder.slug, folder.peer, !folder.favorite)
+    } catch (error) {
+      if (error instanceof TypeError) console.debug('project favorite: network error (reconnecting pill owns connectivity)')
+      else pushError(`Favorite failed: ${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setFavoritePending(false)
+    }
+  }
   // Snapshot-wide family derivations, read once per folder render. All
   // three are O(n) maps built once per session-list identity in the
   // store, so a folder's rows stay O(rows) lookups.
@@ -754,24 +726,37 @@ function FolderGroup({
             <span class="folder-unresolved-icon" title="Host not found — fix in Settings → Hosts">!</span>
           )}
         </button>
-        {!folder.unresolved && !folder.missing && (
-          <>
-            {folder.launchCwd && <ProjectFilesButton folder={folder} onClick={onClick} />}
-            {codeHref && <VSCodeServerButton href={codeHref} workspacePath={workspacePath} />}
-          </>
-        )}
-        {!folder.unresolved && (
-          <LaunchButton
-            // Project-row "+" always launches in the project's canonical
-            // dir (the first match-rule path, carried by launchCwd), never
-            // a recently-used session's cwd. peer stays authoritative for
-            // references.
-            cwd={folder.launchCwd ?? ''}
-            peer={folder.peer}
-            className="folder-launch-btn"
-            footerAction={{ label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }}
-          />
-        )}
+        <LaunchButton
+          // The project row's single context menu owns infrequent project
+          // actions and session launchers, keeping narrow headers readable.
+          cwd={folder.launchCwd ?? ''}
+          peer={folder.peer}
+          className="folder-launch-btn"
+          triggerContent="⋮"
+          triggerLabel={`Project actions for ${folder.name}${folder.peer ? ` on ${folder.peer}` : ''}`}
+          showLaunchers={!folder.unresolved && !folder.missing}
+          menuActions={[
+            {
+              label: folder.favorite ? 'Remove from favorites' : 'Add to favorites',
+              disabled: favoritePending,
+              onSelect: () => void toggleFavorite(),
+            },
+            ...(!folder.unresolved && !folder.missing && folder.launchCwd ? [{
+              label: 'Browse files',
+              onSelect: () => {
+                onClick?.()
+                navigate(projectFileBrowserPath(folder.slug, folder.peer))
+              },
+            }] : []),
+            ...(!folder.missing && codeHref ? [{
+              label: 'Open in VS Code Server',
+              onSelect: () => window.open(codeHref, '_blank', 'noopener,noreferrer'),
+            }] : []),
+          ]}
+          footerAction={!folder.unresolved && !folder.missing
+            ? { label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }
+            : undefined}
+        />
       </div>
       {(!collapsed || shown.length > 0) && (
         <div class="folder-checkouts" aria-busy={inventory?.loading || undefined}>

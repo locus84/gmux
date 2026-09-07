@@ -117,6 +117,7 @@ type MatchRule struct {
 type ProjectItem struct {
 	Slug     string      `json:"slug"`
 	Peer     string      `json:"peer,omitempty"`
+	Favorite bool        `json:"favorite,omitempty"`
 	Match    []MatchRule `json:"match,omitempty"`
 	Sessions []string    `json:"sessions,omitempty"`
 	NodeID   string      `json:"node_id,omitempty"`

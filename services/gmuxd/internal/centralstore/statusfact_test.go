@@ -159,9 +159,9 @@ func specs2(cat ProjectCatalog) []ProjectEntrySpec {
 	out := make([]ProjectEntrySpec, len(cat))
 	for i, e := range cat {
 		if e.Kind == ProjectEntryOwned {
-			out[i] = ProjectEntrySpec{ID: e.ID, Owned: &OwnedProjectSpec{Slug: e.Slug, Rules: e.Rules}}
+			out[i] = ProjectEntrySpec{ID: e.ID, Favorite: e.Favorite, Owned: &OwnedProjectSpec{Slug: e.Slug, Rules: e.Rules}}
 		} else {
-			out[i] = ProjectEntrySpec{ID: e.ID, Reference: &ProjectReference{PeerKey: e.PeerKey, Slug: e.Slug, NodeID: e.NodeID}}
+			out[i] = ProjectEntrySpec{ID: e.ID, Favorite: e.Favorite, Reference: &ProjectReference{PeerKey: e.PeerKey, Slug: e.Slug, NodeID: e.NodeID}}
 		}
 	}
 	return out

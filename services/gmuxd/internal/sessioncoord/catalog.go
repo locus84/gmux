@@ -55,6 +55,23 @@ func (c *Coordinator) ReorderSiblingScopes(ctx context.Context, scopes []central
 	return result, err
 }
 
+func (c *Coordinator) SetProjectFavorite(ctx context.Context, slug string, peer centralstore.PeerKey, favorite bool) error {
+	c.mu.Lock()
+	mutator, ok := c.durable.(interface {
+		SetProjectFavorite(context.Context, string, centralstore.PeerKey, bool, centralstore.UnixMillis) (centralstore.MutationResult, error)
+	})
+	if !ok {
+		c.mu.Unlock()
+		return fmt.Errorf("sessioncoord: durable store does not support project favorites")
+	}
+	result, err := mutator.SetProjectFavorite(ctx, slug, peer, favorite, c.now())
+	c.mu.Unlock()
+	if err == nil {
+		c.publish(ctx, result)
+	}
+	return err
+}
+
 func (c *Coordinator) ReplaceCatalog(ctx context.Context, specs []centralstore.ProjectEntrySpec) (centralstore.ProjectCatalog, error) {
 	c.mu.Lock()
 	var peers []centralstore.LocalPeerMatchInput

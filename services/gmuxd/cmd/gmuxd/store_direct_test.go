@@ -77,6 +77,9 @@ func TestStoreDirectReadYourWrites(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err := st.SetProjectFavorite(ctx, "test-proj", "", true, centralstore.UnixMillis(time.Now().UnixMilli())); err != nil {
+			t.Fatal(err)
+		}
 
 		batch, err := central.RenderAll(ctx, st,
 			central.RuntimeSourceFunc(func() map[centralstore.SessionID]central.RuntimeFacts { return nil }),
@@ -90,7 +93,7 @@ func TestStoreDirectReadYourWrites(t *testing.T) {
 		found := false
 		for _, p := range batch.Projects.Projects {
 			if p.Slug == "test-proj" {
-				found = true
+				found = p.Favorite
 				break
 			}
 		}

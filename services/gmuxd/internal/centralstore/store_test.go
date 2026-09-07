@@ -26,8 +26,8 @@ func TestOpenFreshAndReopen(t *testing.T) {
 	if got, want := store.database.Stats().MaxOpenConnections, 1; got != want {
 		t.Fatalf("MaxOpenConnections = %d, want %d", got, want)
 	}
-	if version, err := store.SchemaVersion(ctx); err != nil || version != 5 {
-		t.Fatalf("schema version = %d, %v; want 5 (v5: single axis promotion)", version, err)
+	if version, err := store.SchemaVersion(ctx); err != nil || version != 6 {
+		t.Fatalf("schema version = %d, %v; want 6 (v6: project favorites)", version, err)
 	}
 	if err := store.queries.PutMetadata(ctx, db.PutMetadataParams{Key: "kept", Value: "yes"}); err != nil {
 		t.Fatal(err)

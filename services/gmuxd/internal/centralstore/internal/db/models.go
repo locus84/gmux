@@ -66,6 +66,7 @@ type ProjectEntry struct {
 	NodeID       sql.NullString
 	CreatedAtMs  int64
 	UpdatedAtMs  int64
+	Favorite     int64
 }
 
 type ProjectMatchRule struct {

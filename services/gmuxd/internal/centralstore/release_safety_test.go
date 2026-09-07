@@ -353,36 +353,30 @@ func TestOpenRejectsCommittedMigrationForeignKeyViolation(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	v1, err := fs.ReadFile(migrationFiles, "migrations/00001_initial_schema.sql")
-	if err != nil {
-		t.Fatal(err)
+	files := fstest.MapFS{}
+	for _, name := range []string{
+		"00001_initial_schema.sql", "00002_drive_mode.sql",
+		"00003_session_parent_provenance.sql", "00004_unread_token.sql",
+		"00005_single_axis_promotion.sql", "00006_project_favorites.sql",
+	} {
+		data, readErr := fs.ReadFile(migrationFiles, "migrations/"+name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		files["migrations/"+name] = &fstest.MapFile{Data: data}
 	}
-	v2, err := fs.ReadFile(migrationFiles, "migrations/00002_drive_mode.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	v3, err := fs.ReadFile(migrationFiles, "migrations/00003_session_parent_provenance.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := fstest.MapFS{
-		"migrations/00001_initial_schema.sql":            {Data: v1},
-		"migrations/00002_drive_mode.sql":                {Data: v2},
-		"migrations/00003_session_parent_provenance.sql": {Data: v3},
-		"migrations/00004_unread_token.sql":              {Data: []byte("-- +goose Up\nALTER TABLE local_sessions ADD COLUMN unread_token TEXT NOT NULL DEFAULT '';\n")},
-		"migrations/00006_orphan.sql":                    {Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nCREATE TABLE migration_parent (id INTEGER PRIMARY KEY);\nCREATE TABLE migration_child (parent_id INTEGER REFERENCES migration_parent(id));\nPRAGMA foreign_keys=OFF;\nINSERT INTO migration_child VALUES (99);\nPRAGMA foreign_keys=ON;\n")},
-	}
+	files["migrations/00007_orphan.sql"] = &fstest.MapFile{Data: []byte("-- +goose NO TRANSACTION\n-- +goose Up\nCREATE TABLE migration_parent (id INTEGER PRIMARY KEY);\nCREATE TABLE migration_child (parent_id INTEGER REFERENCES migration_parent(id));\nPRAGMA foreign_keys=OFF;\nINSERT INTO migration_child VALUES (99);\nPRAGMA foreign_keys=ON;\n")}
 	_, err = openWithMigrationFS(ctx, dir, files)
 	if !errors.Is(err, ErrForeignKeyIntegrity) {
 		t.Fatalf("open error = %v, want ErrForeignKeyIntegrity", err)
 	}
-	backups, globErr := filepath.Glob(filepath.Join(dir, "backups", "state-pre-migration-v5-to-v6-*.db"))
+	backups, globErr := filepath.Glob(filepath.Join(dir, "backups", "state-pre-migration-v6-to-v7-*.db"))
 	if globErr != nil || len(backups) != 1 || !strings.Contains(err.Error(), backups[0]) {
 		t.Fatalf("error/backups = %v / %v / %v; want retained path in post-migration diagnostic", err, backups, globErr)
 	}
 	database := openReleaseTestDB(t, DatabasePath(dir))
 	defer database.Close()
-	assertDBVersion(t, database, 6)
+	assertDBVersion(t, database, 7)
 }
 
 func TestQuickCheckFailureCarriesMigrationBackupPath(t *testing.T) {

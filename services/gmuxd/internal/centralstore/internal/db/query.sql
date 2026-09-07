@@ -99,14 +99,20 @@ UPDATE project_entries SET sidebar_order = sidebar_order + ?;
 
 -- name: InsertProjectEntry :one
 INSERT INTO project_entries
-(sidebar_order, entry_kind, slug, peer_key, node_id, created_at_ms, updated_at_ms)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+(sidebar_order, entry_kind, slug, peer_key, node_id, favorite, created_at_ms, updated_at_ms)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id;
 
 -- name: UpdateProjectEntry :execrows
 UPDATE project_entries
-SET sidebar_order = ?, slug = ?, node_id = ?, updated_at_ms = ?
+SET sidebar_order = ?, slug = ?, node_id = ?, favorite = ?, updated_at_ms = ?
 WHERE id = ?;
+
+-- name: SetProjectFavorite :execrows
+UPDATE project_entries
+SET favorite = sqlc.arg(favorite), updated_at_ms = sqlc.arg(updated_at_ms)
+WHERE slug = sqlc.arg(slug) AND peer_key IS sqlc.narg(peer_key)
+  AND favorite <> sqlc.arg(favorite);
 
 -- name: ParkProjectEntrySlug :execrows
 UPDATE project_entries SET slug = ? WHERE id = ?;

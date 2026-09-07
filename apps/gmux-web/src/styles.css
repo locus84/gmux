@@ -593,31 +593,13 @@ body {
   margin-left: auto;
 }
 
-.folder-file-btn,
-.folder-vscode-btn {
-  width: var(--launch-btn-size);
-  min-width: var(--launch-btn-size);
-  height: var(--launch-btn-size);
-  padding: 0;
-  border: 0;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  flex-shrink: 0;
-}
-.folder-file-btn:hover,
-.folder-vscode-btn:hover { background: var(--bg-selected); color: var(--text); }
-
 .launch-container.folder-launch-btn {
   opacity: 0;
   transition: opacity 0.1s;
 }
 
 .folder-header:hover .launch-container.folder-launch-btn,
+.launch-container.folder-launch-btn:focus-within,
 /* Keep the button fully opaque while launching or while the menu is open —
    otherwise leaving the folder row's hover fades the button out from under
    the cursor. (The open menu itself is portaled to <body>, so it never
@@ -691,6 +673,15 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   font-family: 'Fira Code', monospace;
+}
+
+.launch-inline-section-label {
+  padding: 5px 10px 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 
 .launch-inline-item {
@@ -1729,11 +1720,16 @@ body {
   font-weight: 500;
 }
 
-/* On touch devices (no hover), show interactive buttons permanently */
-@media (hover: none) {
+/* On touch devices (no hover), show project controls permanently. */
+@media (hover: none), (pointer: coarse) {
   .launch-container.folder-launch-btn { opacity: 1; }
-  .folder-file-btn,
-  .folder-vscode-btn { width: 44px; min-width: 44px; height: 44px; }
+  .launch-container.folder-launch-btn .launch-btn {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    padding: 0;
+  }
+  .launch-inline-item { min-height: 44px; }
   .session-close-btn { opacity: 1; }
 }
 

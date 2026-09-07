@@ -17,7 +17,7 @@ func TestGetProjectsRouteKeepsAdvertisingHostBoundary(t *testing.T) {
 			{ID: "container@dev", Peer: "dev", Adapter: "shell", Cwd: "/work/container", Alive: true},
 			{ID: "remote@node-c", Peer: "node-c", Adapter: "shell", Cwd: "/work/remote", Alive: true},
 		}},
-		World: &wire.WorldPayload{Projects: []wire.ProjectItem{{Slug: "configured"}}},
+		World: &wire.WorldPayload{Projects: []wire.ProjectItem{{Slug: "configured", Favorite: true}}},
 	}
 	mux := http.NewServeMux()
 	registerGetProjectsRoute(mux, func(*http.Request) (wire.Frames, error) { return frames, nil }, func(name string) bool { return name == "dev" })
@@ -38,7 +38,7 @@ func TestGetProjectsRouteKeepsAdvertisingHostBoundary(t *testing.T) {
 	if err := json.NewDecoder(recorder.Body).Decode(&envelope); err != nil {
 		t.Fatal(err)
 	}
-	if !envelope.OK || len(envelope.Data.Configured) != 1 || envelope.Data.Configured[0].Slug != "configured" {
+	if !envelope.OK || len(envelope.Data.Configured) != 1 || envelope.Data.Configured[0].Slug != "configured" || !envelope.Data.Configured[0].Favorite {
 		t.Fatalf("configured projects changed: %#v", envelope)
 	}
 	gotPaths := make(map[string]bool, len(envelope.Data.Discovered))

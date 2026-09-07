@@ -2064,6 +2064,16 @@ export async function updateProjects(items: ProjectItem[]): Promise<void> {
   await putProjects(items)
 }
 
+/** Persist a viewer-owned project favorite without replacing the catalog. */
+export async function setProjectFavorite(slug: string, peer: string | undefined, favorite: boolean): Promise<void> {
+  const resp = await fetch(`/v1/projects/${encodeURIComponent(slug)}/favorite`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ peer: peer ?? '', favorite }),
+  })
+  if (!resp.ok) throw new Error(await errorMessageFromResponse(resp))
+}
+
 /**
  * Persist a new session order for a project. The `sessionKeys` array
  * contains session IDs in the desired display order.

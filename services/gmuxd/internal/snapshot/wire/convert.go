@@ -270,7 +270,7 @@ func (c *Converter) World(local *central.SessionsPayload, world *central.Project
 
 	items := make([]ProjectItem, 0, len(world.Projects))
 	for _, e := range world.Projects {
-		item := ProjectItem{Slug: e.Slug}
+		item := ProjectItem{Slug: e.Slug, Favorite: e.Favorite}
 		if e.Kind == centralstore.ProjectEntryReference {
 			item.Peer = string(e.PeerKey)
 			item.NodeID = e.NodeID

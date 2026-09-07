@@ -33,9 +33,9 @@ func specsFromCatalog(cat ProjectCatalog) []ProjectEntrySpec {
 	for i, e := range cat {
 		if e.Kind == ProjectEntryOwned {
 			rules := append([]MatchRule(nil), e.Rules...)
-			out[i] = ProjectEntrySpec{ID: e.ID, Owned: &OwnedProjectSpec{Slug: e.Slug, Rules: rules}}
+			out[i] = ProjectEntrySpec{ID: e.ID, Favorite: e.Favorite, Owned: &OwnedProjectSpec{Slug: e.Slug, Rules: rules}}
 		} else {
-			out[i] = ProjectEntrySpec{ID: e.ID, Reference: &ProjectReference{PeerKey: e.PeerKey, Slug: e.Slug}}
+			out[i] = ProjectEntrySpec{ID: e.ID, Favorite: e.Favorite, Reference: &ProjectReference{PeerKey: e.PeerKey, Slug: e.Slug}}
 		}
 	}
 	return out
@@ -53,6 +53,76 @@ func localPlacementOf(t *testing.T, s *Store, id string) *placementRec {
 		}
 	}
 	return nil
+}
+
+func TestSetProjectFavoriteTargetsIdentityWithoutCatalogReplacement(t *testing.T) {
+	ctx := context.Background()
+	s := openKernelStore(t)
+	cat, _, err := s.ReplaceProjectCatalog(ctx, []ProjectEntrySpec{
+		owned("same", "/local"),
+		{Reference: &ProjectReference{PeerKey: "tower", Slug: "same"}},
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.SetProjectFavorite(ctx, "same", "tower", true, 2)
+	if err != nil || !result.Changed || !result.WorldDirty || result.SessionsDirty {
+		t.Fatalf("favorite result=%#v err=%v", result, err)
+	}
+	out, err := s.ListProjectCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[0].Favorite || !out[1].Favorite || out[0].ID != cat[0].ID || out[1].ID != cat[1].ID {
+		t.Fatalf("targeted favorite catalog=%#v", out)
+	}
+	if noOp, err := s.SetProjectFavorite(ctx, "same", "tower", true, 3); err != nil || noOp.Changed {
+		t.Fatalf("favorite no-op=%#v err=%v", noOp, err)
+	}
+	if _, err := s.SetProjectFavorite(ctx, "missing", "", true, 4); !errors.Is(err, ErrProjectNotFound) {
+		t.Fatalf("missing favorite err=%v", err)
+	}
+}
+
+func TestIDLessCatalogPutPreservesNewerFavoritePlacementsAndOrder(t *testing.T) {
+	ctx := context.Background()
+	s := openKernelStore(t)
+	cat, _, err := s.ReplaceProjectCatalog(ctx, []ProjectEntrySpec{owned("a", "/a"), owned("b", "/b")}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addSessionCwd(t, s, "s1", "", "/a/x", 1)
+	addSessionCwd(t, s, "s2", "", "/a/y", 2)
+	placeLocal(t, s, "s1", cat[0].ID)
+	placeLocal(t, s, "s2", cat[0].ID)
+	if _, err := s.ReorderSiblings(ctx, cat[0].ID, ParentRef{}, []SubjectRef{{LocalSessionID: "s2"}, {LocalSessionID: "s1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetProjectFavorite(ctx, "b", "", true, 2); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a stale production PUT assembled before the PATCH: it contains
+	// identities but no database IDs and still says favorite=false. Reordering
+	// the projects must preserve the newer favorite and placement order.
+	specs := specsFromCatalog(cat)
+	specs[0], specs[1] = specs[1], specs[0]
+	for i := range specs {
+		specs[i].ID = 0
+		specs[i].BindIdentity = true
+	}
+	out, result, err := s.ReplaceProjectCatalogAndRematch(ctx, specs, nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed || !result.SessionsDirty || !result.WorldDirty {
+		t.Fatalf("favorite result = %#v", result)
+	}
+	if !out[0].Favorite || out[1].Favorite || out[0].Slug != "b" || out[1].Slug != "a" {
+		t.Fatalf("favorite catalog = %#v", out)
+	}
+	if got := rootOrder(t, s, cat[0].ID); !reflect.DeepEqual(got, []string{"l:s2", "l:s1"}) {
+		t.Fatalf("placement changed = %v", got)
+	}
 }
 
 // TestCatalogRematchMovesRetargetedSessionsAndPreservesSurvivorOrder pins the

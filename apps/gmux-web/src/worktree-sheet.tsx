@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks'
+import { useEffect, useRef, useState } from 'preact/hooks'
 import { LaunchButton } from './launcher'
 import { SheetBackdrop } from './sheet'
 import {
@@ -17,6 +17,12 @@ export function WorktreeSheet({ slug, peer, onClose }: { slug: string; peer?: st
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [confirmPath, setConfirmPath] = useState('')
+  const closeRef = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => closeRef.current?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [])
 
   useEffect(() => { void ensureProjectWorktrees(slug, peer) }, [slug, peer])
   useEffect(() => {
@@ -65,7 +71,7 @@ export function WorktreeSheet({ slug, peer, onClose }: { slug: string; peer?: st
             <h2>Worktrees</h2>
             <p>{slug}{peer ? ` on ${peer}` : ''}</p>
           </div>
-          <button type="button" class="worktree-close" onClick={onClose} aria-label="Close">×</button>
+          <button ref={closeRef} type="button" class="worktree-close" onClick={onClose} aria-label="Close">×</button>
         </header>
 
         <div class="worktree-list">

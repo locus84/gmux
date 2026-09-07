@@ -335,7 +335,7 @@ func TestWorldConversion(t *testing.T) {
 	world := &central.ProjectsPayload{
 		Projects: centralstore.ProjectCatalog{
 			{Kind: centralstore.ProjectEntryOwned, Slug: "proj", Rules: []centralstore.MatchRule{{Path: "/x", Exact: true}}},
-			{Kind: centralstore.ProjectEntryReference, Slug: "remote", PeerKey: "tower", NodeID: "node-tower"},
+			{Kind: centralstore.ProjectEntryReference, Slug: "remote", PeerKey: "tower", NodeID: "node-tower", Favorite: true},
 		},
 		LocalPeerPlacements: []central.LocalPeerPlacementRow{lpPlacement("box", "c-1", "proj", "r", 1)},
 		Health:              health,
@@ -356,7 +356,7 @@ func TestWorldConversion(t *testing.T) {
 		t.Fatalf("match rules: %+v", owned.Match)
 	}
 	ref := got.Projects[1]
-	if ref.Peer != "tower" || ref.NodeID != "node-tower" || ref.Sessions != nil || ref.Match != nil {
+	if ref.Peer != "tower" || ref.NodeID != "node-tower" || !ref.Favorite || ref.Sessions != nil || ref.Match != nil {
 		t.Fatalf("reference item: %+v", ref)
 	}
 	want := central.SessionCounts{LocalAlive: 1, RemoteAlive: 1, Dead: 2}
