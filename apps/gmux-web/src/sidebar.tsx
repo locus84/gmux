@@ -726,37 +726,46 @@ function FolderGroup({
             <span class="folder-unresolved-icon" title="Host not found — fix in Settings → Hosts">!</span>
           )}
         </button>
-        <LaunchButton
-          // The project row's single context menu owns infrequent project
-          // actions and session launchers, keeping narrow headers readable.
-          cwd={folder.launchCwd ?? ''}
-          peer={folder.peer}
-          className="folder-launch-btn"
-          triggerContent="⋮"
-          triggerLabel={`Project actions for ${folder.name}${folder.peer ? ` on ${folder.peer}` : ''}`}
-          showLaunchers={!folder.unresolved && !folder.missing}
-          menuActions={[
-            {
-              label: folder.favorite ? 'Remove from favorites' : 'Add to favorites',
-              disabled: favoritePending,
-              onSelect: () => void toggleFavorite(),
-            },
-            ...(!folder.unresolved && !folder.missing && folder.launchCwd ? [{
-              label: 'Browse files',
-              onSelect: () => {
-                onClick?.()
-                navigate(projectFileBrowserPath(folder.slug, folder.peer))
+        <div class="folder-actions">
+          {!folder.unresolved && !folder.missing && (
+            <LaunchButton
+              // Keep new-session creation as a dedicated one-tap affordance.
+              cwd={folder.launchCwd ?? ''}
+              peer={folder.peer}
+              className="folder-launch-btn"
+            />
+          )}
+          <LaunchButton
+            // Infrequent project actions share a separate context menu.
+            cwd={folder.launchCwd ?? ''}
+            peer={folder.peer}
+            className="folder-launch-btn"
+            triggerContent="⋮"
+            triggerLabel={`Project actions for ${folder.name}${folder.peer ? ` on ${folder.peer}` : ''}`}
+            showLaunchers={false}
+            menuActions={[
+              {
+                label: folder.favorite ? 'Remove from favorites' : 'Add to favorites',
+                disabled: favoritePending,
+                onSelect: () => void toggleFavorite(),
               },
-            }] : []),
-            ...(!folder.missing && codeHref ? [{
-              label: 'Open in VS Code Server',
-              onSelect: () => window.open(codeHref, '_blank', 'noopener,noreferrer'),
-            }] : []),
-          ]}
-          footerAction={!folder.unresolved && !folder.missing
-            ? { label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }
-            : undefined}
-        />
+              ...(!folder.unresolved && !folder.missing && folder.launchCwd ? [{
+                label: 'Browse files',
+                onSelect: () => {
+                  onClick?.()
+                  navigate(projectFileBrowserPath(folder.slug, folder.peer))
+                },
+              }] : []),
+              ...(!folder.missing && codeHref ? [{
+                label: 'Open in VS Code Server',
+                onSelect: () => window.open(codeHref, '_blank', 'noopener,noreferrer'),
+              }] : []),
+            ]}
+            footerAction={!folder.unresolved && !folder.missing
+              ? { label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }
+              : undefined}
+          />
+        </div>
       </div>
       {(!collapsed || shown.length > 0) && (
         <div class="folder-checkouts" aria-busy={inventory?.loading || undefined}>

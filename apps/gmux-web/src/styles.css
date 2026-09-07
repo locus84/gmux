@@ -584,6 +584,13 @@ body {
 
 /* ── Launch button + inline menu ── */
 
+.folder-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
 .launch-container {
   position: relative;
   flex-shrink: 0;

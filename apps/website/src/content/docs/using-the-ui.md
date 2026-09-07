@@ -19,7 +19,7 @@ The natural way to fill it: run a gmux command in the folder you work in (`gmux 
 
 Projects match sessions by filesystem path or git remote URL. Projects on other machines aren't matched by rules — add them under **Settings → Projects → From other hosts** once the host is [connected](/multi-machine/).
 
-Open a project's **⋮** menu and choose **Add to favorites** to pin it. Favorite projects stay above ordinary projects while preserving the existing order within each group; use **Remove from favorites** to unpin one. Favorites are stored by the daemon, so the same pins appear on desktop and mobile. The setting applies to projects, not individual sessions. The same menu contains project file, VS Code Server, session-launcher, and worktree actions when available.
+Open a project's **⋮** menu and choose **Add to favorites** to pin it. Favorite projects stay above ordinary projects while preserving the existing order within each group; use **Remove from favorites** to unpin one. Favorites are stored by the daemon, so the same pins appear on desktop and mobile. The setting applies to projects, not individual sessions. The same menu contains project file, VS Code Server, and worktree actions when available. Use the adjacent **+** button to create a new session.
 
 The project's **+** menu also opens **Manage worktrees**. The sheet lists linked Git worktrees, creates branch-backed checkouts, and launches an agent in any checkout. Removal is deliberately conservative: gmux refuses primary, dirty, locked, or session-owning worktrees. The same local workflow is available as `gmux worktree current`, `gmux worktree ps`, and `gmux worktree create`.
 
