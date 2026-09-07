@@ -546,8 +546,14 @@ function CheckoutSection({ group, folder, selectedId, resumingId, am, peerStatus
     }
   }
 
+  // The primary checkout is the project itself, so repeating its branch/path
+  // as a nested “default” row adds hierarchy without adding information.
+  // Render those sessions at the project's normal session indentation while
+  // keeping linked worktrees as explicit, foldable checkout groups.
+  if (group.primary) return <div class="primary-checkout-sessions">{children}</div>
+
   return (
-    <div class={`checkout-group${group.primary ? ' primary' : ''}${group.fallback ? ' fallback' : ''}`}>
+    <div class={`checkout-group${group.fallback ? ' fallback' : ''}`}>
       <div class="checkout-header" title={group.path || group.label}>
         <button
           type="button"
