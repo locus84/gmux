@@ -39,6 +39,14 @@ their valid range (not rejected). Unknown keys produce a console warning.
 
 ## Fields
 
+### `uiScale`
+
+Overall web UI scale multiplier. Affects gmux chrome and scales the terminal font size.
+
+- **Type:** `number`
+- **Default:** `1`
+- **Range:** 0.7–2
+
 ### `fontSize`
 
 Terminal font size in pixels.
@@ -174,6 +182,20 @@ Characters treated as word boundaries for double-click selection.
 - **Type:** `string`
 - **Default:** <code>" ()[]{}',&quot;`:;"</code>
 
+### `vsCodeServerUrl`
+
+Base URL of a VS Code Server/code-server instance used for workspace links and loopback port proxying.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
+
+### `vsCodeServerHomeDir`
+
+Absolute home directory on the VS Code Server host, used to expand workspace paths beginning with ~/.
+
+- **Type:** `string`
+- **Default:** <code>""</code>
+
 ### `keybinds`
 
 Key-to-action mappings. Layered on top of platform-specific defaults.
@@ -202,6 +224,7 @@ Action to perform.
 | `copy` | Copy selection to clipboard. Does nothing if no text is selected. |
 | `paste` | Read system clipboard and send contents to the PTY. |
 | `selectAll` | Select all terminal content. |
+| `find` | Open the find-in-terminal search bar. |
 | `none` | Disable this key combo (removes a built-in default). |
 
 #### `args`
@@ -220,7 +243,48 @@ On macOS, remap every Cmd+character to its Ctrl equivalent. Cmd+arrow/backspace 
 
 gmux ships a complete default keymap. Every key combo that does something other than "send bytes to the terminal" is listed explicitly; nothing relies on implicit browser or xterm.js passthrough.
 
-Your `keybinds` array layers on top: same-key entries override the defaults, and the `none` action disables a default. See [Keyboard shortcuts](/using-the-ui#keyboard-shortcuts) for the full default keymap.
+Your `keybinds` array layers on top: same-key entries override the defaults, and the `none` action disables a default.
+
+### Default keymap
+
+Keys not listed here go straight to the terminal.
+
+**All platforms**
+
+| Shortcut | Action |
+|----------|--------|
+| **Shift+Enter** | Sends a plain newline (`\n`) instead of Enter |
+| **Ctrl+C** | If text is selected: copy to clipboard. Otherwise: sends SIGINT |
+| **Cmd/Ctrl+F** | Open find-in-terminal (replaces the browser's in-page find) |
+
+**Linux / Windows**
+
+| Shortcut | Action |
+|----------|--------|
+| **Ctrl+Shift+C** | Copy selection to clipboard |
+| **Ctrl+V** | Paste from clipboard |
+| **Ctrl+Shift+V** | Paste from clipboard |
+| **Ctrl+Alt+T** | Sends Ctrl+T (browser steals Ctrl+T) |
+| **Ctrl+Alt+N** | Sends Ctrl+N (browser steals Ctrl+N) |
+| **Ctrl+Alt+W** | Sends Ctrl+W (browser steals Ctrl+W) |
+| **Ctrl+Backspace** | Delete word backward |
+| **Ctrl+Delete** | Delete word forward |
+
+**Mac**
+
+| Shortcut | Action |
+|----------|--------|
+| **Cmd+C** | Copy selection to clipboard |
+| **Cmd+V** | Paste from clipboard |
+| **Cmd+A** | Select all terminal content |
+| **Cmd+Left** | Home (beginning of line) |
+| **Cmd+Right** | End (end of line) |
+| **Cmd+Backspace** | Delete to start of line (sends Ctrl+U) |
+| **Cmd+K** | Clear screen (sends Ctrl+L) |
+
+:::tip[App mode]
+`gmux` tries to open in Chrome/Chromium `--app` mode for a standalone window with full keyboard access. If it falls back to a regular browser tab, shortcuts like Ctrl+T, Ctrl+N, and Ctrl+W are intercepted by the browser — the Ctrl+Alt workarounds above cover this case. You can also install gmux as a PWA from the browser menu (⋮ → Install gmux).
+:::
 
 ### Key format
 
@@ -309,6 +373,16 @@ These are ready to paste into `settings.jsonc`.
 {
   "keybinds": [
     { "key": "ctrl+c", "action": "none" }
+  ]
+}
+```
+
+**Restore browser find** -- gmux binds `secondary+f` (Cmd+F on macOS, Ctrl+F elsewhere) to open the find-in-terminal search bar, replacing the browser's in-page find (which can't see into a canvas-rendered terminal). To get browser find back:
+
+```jsonc
+{
+  "keybinds": [
+    { "key": "secondary+f", "action": "none" }
   ]
 }
 ```

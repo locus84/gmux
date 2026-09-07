@@ -25,9 +25,10 @@ Created by gmuxd. Lives under `~/.local/state/gmux` (or `$XDG_STATE_HOME/gmux`).
 |------|---------|
 | `~/.local/state/gmux/gmuxd.sock` | Daemon Unix socket (local IPC between gmux CLI and gmuxd) |
 | `~/.local/state/gmux/auth-token` | Bearer token for TCP authentication |
-| `~/.local/state/gmux/projects.json` | User-curated project list (sidebar grouping, ordering) |
-| `~/.local/state/gmux/projects.json.bak` | Snapshot of `projects.json` taken before a schema migration rewrites it (notably the 2.0 upgrade) |
-| `~/.local/state/gmux/peers.json` | Hosts you connected to via **Connect to host** — URL, token, and node id (0600; it carries a token) |
+| `~/.local/state/gmux/state.db`, `state.db-wal`, `state.db-shm` | Central SQLite database (ADR 0026) — sessions, projects, peers, and their tokens. Owner-only (0600); backups contain peer tokens and must be treated as secrets. Use `gmux daemon state backup <path>` for consistent online backups |
+| `~/.local/state/gmux/node-id` | Stable, opaque per-node identity (ADR 0007), generated on first start. Not a secret, but back it up with `auth-token` — if it changes, peers see a different host |
+| `~/.local/state/gmux/sessions/<session-id>/scrollback`, `scrollback.0` | Terminal scrollback (written by the runner). For dead sessions this is a cache: an aggregate budget (`sessions.scrollback_cache_mb` in `host.toml`, default 256 MB) evicts oldest-first while the session row in `state.db` survives |
+| `~/.local/state/gmux/shell-sessions/` | Shell adapter per-session state files |
 | `~/.local/state/gmux/gmuxd.log` | Daemon log (when started via `gmux daemon start`) |
 | `~/.local/state/gmux/tsnet/` | Tailscale state directory (when remote access is enabled) |
 
@@ -37,18 +38,33 @@ Created by `gmux` (the CLI) for each running session. gmuxd connects to these to
 
 | Path | Purpose |
 |------|---------|
-| `/tmp/gmux-sessions/<session-id>.sock` | Per-session Unix socket |
+| `~/.local/state/gmux/run/sessions/<session-id>.sock` | Per-session Unix socket |
 
-Override the directory with `GMUX_SOCKET_DIR`.
+Override the directory with `GMUX_SOCKET_DIR`. The default deliberately lives under the state dir rather than `$XDG_RUNTIME_DIR`: runtime dirs are torn down by logind when your last login session ends, which would unlink the sockets of still-running sessions.
+
+During the 2.0 transition, gmuxd also scans the legacy locations (`$XDG_RUNTIME_DIR/gmux/sessions` and the per-uid temp dir) so runners started under older versions stay discoverable; this shim is dropped in v2.1 and is disabled when `GMUX_SOCKET_DIR` is set.
 
 ## Adapter-specific paths
 
 | Path | Purpose | Used by |
 |------|---------|---------|
-| `~/.pi/agent/sessions/` | Pi conversation files (JSONL) | Pi adapter (session discovery and resume) |
+| `~/.pi/agent/sessions/` | Pi conversation files (JSONL). Root overridable with `PI_CODING_AGENT_DIR` | Pi adapter (conversation discovery and resume) |
+| `~/.claude/projects/<encoded-cwd>/` | Claude Code conversation files (JSONL) | Claude adapter |
+| `~/.codex/sessions/YYYY/MM/DD/` | Codex conversation files (JSONL) | Codex adapter |
+
+gmux only reads these directories — agent hooks are injected per launch, never written into `~/.claude` or `~/.codex`.
+
+## Temporary files
+
+| Path | Purpose |
+|------|---------|
+| `$TMPDIR/paste-<n>.<ext>` | Image/binary pastes from the web UI (created 0600) |
 
 ## Logs
 
 | Path | Purpose |
 |------|---------|
-| `~/.local/state/gmux/gmuxd.log` | Daemon log when started via `gmux daemon start` or auto-started by `gmux` |
+| `~/.local/state/gmux/gmuxd.log` | Daemon log for both explicit start and CLI autostart; appended and size-bounded |
+| `~/.local/state/gmux/gmuxd.log.1` | Previous bounded log after rotation |
+
+`gmux daemon log-path` prints the active log path.

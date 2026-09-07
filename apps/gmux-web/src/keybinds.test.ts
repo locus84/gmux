@@ -64,8 +64,9 @@ describe('keyComboToSequence', () => {
     expect(keyComboToSequence('esc')).toBe('\x1b')
   })
 
-  it('converts tab', () => {
+  it('converts tab and physical Shift+Tab to terminal sequences', () => {
     expect(keyComboToSequence('tab')).toBe('\t')
+    expect(keyComboToSequence('shift+tab')).toBe('\x1b[Z')
   })
 
   it('converts backspace', () => {
@@ -103,8 +104,8 @@ describe('keyComboToSequence', () => {
     expect(keyComboToSequence('ctrl+shift+right')).toBe('\x1b[1;6C')
   })
 
-  it('converts ctrl+backspace to BS (\x08)', () => {
-    expect(keyComboToSequence('ctrl+backspace')).toBe('\x08')
+  it('converts ctrl+backspace to backward-kill-word (ESC DEL)', () => {
+    expect(keyComboToSequence('ctrl+backspace')).toBe('\x1b\x7f')
   })
 
   it('encodes alt in CSI parameter, not as ESC prefix', () => {
@@ -133,6 +134,43 @@ describe('resolveKeybinds', () => {
     expect(keys).toContain('shift+enter')
     expect(keys).toContain('ctrl+c')
     expect(keys).toContain('ctrl+alt+t')
+  })
+
+  it('includes the find keybind on secondary+f', () => {
+    const resolved = resolveKeybinds(null)
+    const find = resolved.find(r => r.action === 'find')
+    expect(find).toBeDefined()
+    expect(find!.baseKey).toBe('f')
+    // "secondary" resolves to exactly one platform modifier.
+    expect(find!.ctrl || find!.meta).toBe(true)
+    expect(find!.ctrl && find!.meta).toBe(false)
+  })
+
+  // Closes the loop on the reported bug: pressing Ctrl+Backspace (secondary on
+  // Linux, where these tests run) must resolve to a *word* delete, not the old
+  // \x08 char-delete. Drives a real KeyboardEvent through the same match path
+  // the keyboard handler uses.
+  it('resolves a real secondary+Backspace event to backward-kill-word', () => {
+    const resolved = resolveKeybinds(null)
+    const ev = { ctrlKey: true, shiftKey: false, altKey: false, metaKey: false, key: 'Backspace' } as KeyboardEvent
+    const match = resolved.find(kb => eventMatchesKeybind(ev, kb))
+    expect(match).toBeDefined()
+    expect(match!.action).toBe('sendText')
+    expect(match!.args).toBe('\x1b\x7f')
+  })
+
+  it('resolves a real secondary+Delete event to forward-kill-word', () => {
+    const resolved = resolveKeybinds(null)
+    const ev = { ctrlKey: true, shiftKey: false, altKey: false, metaKey: false, key: 'Delete' } as KeyboardEvent
+    const match = resolved.find(kb => eventMatchesKeybind(ev, kb))
+    expect(match).toBeDefined()
+    expect(match!.action).toBe('sendText')
+    expect(match!.args).toBe('\x1bd')
+  })
+
+  it('allows disabling the find keybind', () => {
+    const resolved = resolveKeybinds([{ key: 'secondary+f', action: 'none' }])
+    expect(resolved.find(r => r.action === 'find')).toBeUndefined()
   })
 
   it('adds new user keybinds', () => {

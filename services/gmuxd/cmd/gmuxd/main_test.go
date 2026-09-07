@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,9 +15,9 @@ import (
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/config"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/peering"
-	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/unixipc"
 )
 
@@ -29,7 +30,6 @@ func (a discoverTestAdapter) Name() string                      { return a.name 
 func (a discoverTestAdapter) Discover() bool                    { return a.available }
 func (a discoverTestAdapter) Match(_ []string) bool             { return false }
 func (a discoverTestAdapter) Env(_ adapter.EnvContext) []string { return nil }
-func (a discoverTestAdapter) Monitor(_ []byte) *adapter.Event   { return nil }
 func (a discoverTestAdapter) Launchers() []adapter.Launcher {
 	return []adapter.Launcher{{ID: a.name, Label: a.name}}
 }
@@ -506,10 +506,10 @@ func TestComposePeerProjectsSkipsLocalPeers(t *testing.T) {
 	}))
 	defer spoke.Close()
 
-	mgr := peering.NewManager([]config.PeerConfig{
+	mgr := peering.NewProjectionManager([]config.PeerConfig{
 		{Name: "tower", URL: spoke.URL},
 		{Name: "devcontainer", URL: spoke.URL, Local: true},
-	}, store.New(), "test-host")
+	}, "test-host", nil, peering.EventHooks{})
 	mgr.Start()
 	defer mgr.Stop()
 
@@ -553,18 +553,18 @@ func TestShouldForwardActivity(t *testing.T) {
 		want      bool
 	}{
 		// Browser sees everything, regardless of namespace.
-		{"browser local session", false, "sess-1", true},
-		{"browser devcontainer session", false, "sess-1@dc", true},
-		{"browser network-peer session", false, "sess-1@hub-b", true},
+		{"browser local session", false, "1vshk4fu", true},
+		{"browser devcontainer session", false, "1vshk4fu@dc", true},
+		{"browser network-peer session", false, "1vshk4fu@hub-b", true},
 
 		// Hub (asPeer) only sees activity for sessions this node owns.
-		{"asPeer local session", true, "sess-1", true},
-		{"asPeer devcontainer session", true, "sess-1@dc", true},
-		{"asPeer network-peer session dropped", true, "sess-1@hub-b", false},
+		{"asPeer local session", true, "1vshk4fu", true},
+		{"asPeer devcontainer session", true, "1vshk4fu@dc", true},
+		{"asPeer network-peer session dropped", true, "1vshk4fu@hub-b", false},
 
 		// Defense: nil isLocalPeer means “no locals”, so any namespaced
 		// id is dropped for asPeer (e.g. peerManager not yet wired).
-		{"asPeer nil isLocalPeer drops namespaced", true, "sess-1@dc", false},
+		{"asPeer nil isLocalPeer drops namespaced", true, "1vshk4fu@dc", false},
 	}
 
 	for _, tc := range cases {
@@ -592,8 +592,16 @@ func TestIsAllowedPeerProxyPath(t *testing.T) {
 		// Allowed: project session reorder.
 		{"reorder allowed", http.MethodPatch, "v1/projects/gmux/sessions", true},
 		{"reorder allowed weird slug", http.MethodPatch, "v1/projects/with-dash/sessions", true},
+		{"worktree list allowed", http.MethodGet, "v1/projects/gmux/worktrees", true},
+		{"worktree create allowed", http.MethodPost, "v1/projects/gmux/worktrees", true},
+		{"worktree delete allowed", http.MethodDelete, "v1/projects/gmux/worktrees", true},
+		{"worktree patch denied", http.MethodPatch, "v1/projects/gmux/worktrees", false},
+		{"project files allowed", http.MethodGet, "v1/projects/gmux/files", true},
+		{"project file allowed", http.MethodGet, "v1/projects/gmux/file", true},
+		{"project file write denied", http.MethodPost, "v1/projects/gmux/file", false},
+		{"project file suffix denied", http.MethodGet, "v1/projects/gmux/file/extra", false},
 
-		// Method must be PATCH.
+		// Session reorder method must be PATCH.
 		{"GET denied", http.MethodGet, "v1/projects/gmux/sessions", false},
 		{"POST denied", http.MethodPost, "v1/projects/gmux/sessions", false},
 		{"DELETE denied", http.MethodDelete, "v1/projects/gmux/sessions", false},
@@ -602,7 +610,7 @@ func TestIsAllowedPeerProxyPath(t *testing.T) {
 		{"reorder root denied", http.MethodPatch, "v1/projects", false},
 		{"reorder add denied", http.MethodPatch, "v1/projects/add", false},
 		{"projects bare denied", http.MethodPatch, "v1/projects/gmux", false},
-		{"sessions endpoint denied", http.MethodPatch, "v1/sessions/sess-1/kill", false},
+		{"sessions endpoint denied", http.MethodPatch, "v1/sessions/1vshk4fu/kill", false},
 		{"unrelated path denied", http.MethodPatch, "v1/health", false},
 
 		// Defense: never allow without the v1/ prefix even if shape matches.
@@ -635,10 +643,10 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("restart: directives precede --, then the command", func(t *testing.T) {
-		got := buildLaunchArgs("sess-abc", 142, 47, cmd)
+		got := buildLaunchArgs("1j6y9mx6", 142, 47, cmd)
 		want := []string{
 			"__run",
-			"--resume-id=sess-abc",
+			"--resume-id=1j6y9mx6",
 			"--initial-cols=142",
 			"--initial-rows=47",
 			"--",
@@ -650,8 +658,8 @@ func TestBuildLaunchArgs(t *testing.T) {
 	})
 
 	t.Run("zero dims omit the size flags", func(t *testing.T) {
-		got := buildLaunchArgs("sess-1", 0, 0, cmd)
-		want := append([]string{"__run", "--resume-id=sess-1", "--"}, cmd...)
+		got := buildLaunchArgs("1vshk4fu", 0, 0, cmd)
+		want := append([]string{"__run", "--resume-id=1vshk4fu", "--"}, cmd...)
 		if !slices.Equal(got, want) {
 			t.Errorf("got %v, want %v", got, want)
 		}
@@ -660,10 +668,10 @@ func TestBuildLaunchArgs(t *testing.T) {
 	t.Run("command flags survive intact (-- terminator)", func(t *testing.T) {
 		// The `--` terminator delivers the command verbatim even when its
 		// own args look like directive flags.
-		got := buildLaunchArgs("sess-1", 80, 24, []string{"weirdcli", "--resume-id=evil"})
+		got := buildLaunchArgs("1vshk4fu", 80, 24, []string{"weirdcli", "--resume-id=evil"})
 		want := []string{
 			"__run",
-			"--resume-id=sess-1",
+			"--resume-id=1vshk4fu",
 			"--initial-cols=80",
 			"--initial-rows=24",
 			"--",
@@ -673,4 +681,122 @@ func TestBuildLaunchArgs(t *testing.T) {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	})
+}
+
+// sendSSE must surface write errors so the events handler can treat
+// them as a client disconnect and tear the subscriber down (#243).
+func TestSendSSEPropagatesWriteError(t *testing.T) {
+	if err := sendSSE(failWriter{}, "snapshot.sessions", map[string]int{"a": 1}); err == nil {
+		t.Fatal("expected write error to propagate")
+	}
+	var buf bytes.Buffer
+	if err := sendSSE(&buf, "snapshot.sessions", map[string]int{"a": 1}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "event: snapshot.sessions\ndata: {\"a\":1}\n\n"
+	if buf.String() != want {
+		t.Errorf("got %q, want %q", buf.String(), want)
+	}
+	// A marshal failure skips the frame; it is a payload bug, not a
+	// connection problem, so no error is returned.
+	if err := sendSSE(failWriter{}, "x", make(chan int)); err != nil {
+		t.Errorf("marshal failure should not report a connection error, got %v", err)
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// fakeSSEWriter implements the optional ResponseController interfaces
+// (FlushError, SetWriteDeadline) so frame-level behavior — fresh
+// deadline per write, flush errors surfacing as disconnects — can be
+// verified without a real connection.
+type fakeSSEWriter struct {
+	buf       bytes.Buffer
+	writeErr  error
+	flushErr  error
+	deadlines []time.Time
+}
+
+func (f *fakeSSEWriter) Header() http.Header { return http.Header{} }
+func (f *fakeSSEWriter) WriteHeader(int)     {}
+func (f *fakeSSEWriter) Write(p []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.buf.Write(p)
+}
+func (f *fakeSSEWriter) FlushError() error { return f.flushErr }
+func (f *fakeSSEWriter) SetWriteDeadline(t time.Time) error {
+	f.deadlines = append(f.deadlines, t)
+	return nil
+}
+
+// Every SSE write (frame or heartbeat) must arm a fresh write deadline
+// and surface write/flush failures so the events handler tears the
+// subscriber down instead of leaking it on a half-dead client (#243).
+func TestSSEFrameDeadlineAndErrorPropagation(t *testing.T) {
+	fw := &fakeSSEWriter{}
+	rc := http.NewResponseController(fw)
+
+	if err := sendSSEFrame(rc, fw, "snapshot.sessions", map[string]int{"a": 1}); err != nil {
+		t.Fatalf("healthy write: %v", err)
+	}
+	if err := sendSSEComment(rc, fw); err != nil {
+		t.Fatalf("healthy heartbeat: %v", err)
+	}
+	if got := len(fw.deadlines); got != 2 {
+		t.Fatalf("expected a fresh deadline per write, got %d", got)
+	}
+	if !fw.deadlines[1].After(time.Now().Add(sseWriteTimeout - time.Minute)) {
+		t.Errorf("deadline not re-armed into the future: %v", fw.deadlines[1])
+	}
+	if !strings.HasSuffix(fw.buf.String(), ":\n\n") {
+		t.Errorf("heartbeat comment missing, got %q", fw.buf.String())
+	}
+
+	fw = &fakeSSEWriter{writeErr: errors.New("broken pipe")}
+	rc = http.NewResponseController(fw)
+	if err := sendSSEFrame(rc, fw, "x", 1); err == nil {
+		t.Error("frame write error not propagated")
+	}
+	if err := sendSSEComment(rc, fw); err == nil {
+		t.Error("heartbeat write error not propagated")
+	}
+
+	fw = &fakeSSEWriter{flushErr: errors.New("deadline exceeded")}
+	rc = http.NewResponseController(fw)
+	if err := sendSSEFrame(rc, fw, "x", 1); err == nil {
+		t.Error("frame flush error not propagated")
+	}
+	if err := sendSSEComment(rc, fw); err == nil {
+		t.Error("heartbeat flush error not propagated")
+	}
+}
+
+func TestManualPeerResponsePreservesBareWebContract(t *testing.T) {
+	peer := centralstore.ManualPeer{Name: "host"}
+	for _, tc := range []struct {
+		outcome centralstore.PeerUpsertOutcome
+		key     string
+	}{
+		{centralstore.PeerUnchanged, "already_connected"},
+		{centralstore.PeerUpdated, "updated"},
+	} {
+		b, err := json.Marshal(manualPeerResponse(peer, tc.outcome))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["peer"] == nil || got[tc.key] == nil {
+			t.Fatalf("response=%s", b)
+		}
+		if got["ok"] != nil || got["data"] != nil {
+			t.Fatalf("wrapped response=%s", b)
+		}
+	}
 }

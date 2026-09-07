@@ -10,8 +10,8 @@ import (
 
 func TestShellImplementsInterfaces(t *testing.T) {
 	var s adapter.Adapter = NewShell()
-	if _, ok := s.(adapter.SessionFiler); !ok {
-		t.Fatal("Shell should implement SessionFiler")
+	if _, ok := s.(adapter.ConversationDescriber); !ok {
+		t.Fatal("Shell should implement ConversationDescriber")
 	}
 	if _, ok := s.(adapter.Resumer); !ok {
 		t.Fatal("Shell should implement Resumer")
@@ -25,6 +25,11 @@ func TestShellImplementsInterfaces(t *testing.T) {
 	if _, ok := s.(adapter.SessionFinalizer); !ok {
 		t.Fatal("Shell should implement SessionFinalizer")
 	}
+	// A shell has no agent turn to steer, queue behind, or interrupt,
+	// so it has no semantic actions at all (ADR 0027).
+	if _, ok := s.(adapter.AgentActionEncoder); ok {
+		t.Fatal("Shell should NOT implement AgentActionEncoder")
+	}
 }
 
 func TestShellWriteAndParseStateFile(t *testing.T) {
@@ -32,7 +37,7 @@ func TestShellWriteAndParseStateFile(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
 
-	path, err := WriteShellStateFile("sess-abc123", "/home/user/dev/project", []string{"fish"})
+	path, err := WriteShellStateFile("16y0lfv7", "/home/user/dev/project", []string{"fish"})
 	if err != nil {
 		t.Fatalf("WriteShellStateFile: %v", err)
 	}
@@ -42,13 +47,13 @@ func TestShellWriteAndParseStateFile(t *testing.T) {
 	}
 
 	sh := NewShell()
-	info, err := sh.ParseSessionFile(path)
+	info, err := sh.DescribeConversation(path)
 	if err != nil {
-		t.Fatalf("ParseSessionFile: %v", err)
+		t.Fatalf("DescribeConversation: %v", err)
 	}
 
-	if info.ID != "sess-abc123" {
-		t.Errorf("ID = %q, want %q", info.ID, "sess-abc123")
+	if info.ID != "16y0lfv7" {
+		t.Errorf("ID = %q, want %q", info.ID, "16y0lfv7")
 	}
 	if info.Cwd != "/home/user/dev/project" {
 		t.Errorf("Cwd = %q, want %q", info.Cwd, "/home/user/dev/project")
@@ -56,8 +61,8 @@ func TestShellWriteAndParseStateFile(t *testing.T) {
 	if info.Title != "fish" {
 		t.Errorf("Title = %q, want %q", info.Title, "fish")
 	}
-	if info.FilePath != path {
-		t.Errorf("FilePath = %q, want %q", info.FilePath, path)
+	if info.Ref != path {
+		t.Errorf("FilePath = %q, want %q", info.Ref, path)
 	}
 	// Slug derived from cwd basename.
 	if info.Slug != "project" {
@@ -65,30 +70,38 @@ func TestShellWriteAndParseStateFile(t *testing.T) {
 	}
 }
 
-func TestShellCanResume(t *testing.T) {
+func TestShellResumeCommandResumability(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
 
-	path, err := WriteShellStateFile("sess-resume1", "/home/user/work", []string{"bash"})
+	path, err := WriteShellStateFile("1rhfrwzz", "/home/user/work", []string{"bash"})
 	if err != nil {
 		t.Fatalf("WriteShellStateFile: %v", err)
 	}
 
 	sh := NewShell()
-	if !sh.CanResume(path) {
-		t.Error("CanResume should return true for valid state file")
+	info, err := sh.DescribeConversation(path)
+	if err != nil {
+		t.Fatalf("DescribeConversation: %v", err)
+	}
+	if cmd := sh.ResumeCommand(info); len(cmd) != 1 {
+		t.Errorf("valid state file should be resumable, got %v", cmd)
 	}
 
+	// A missing state file never describes, so there is no info to resume.
 	badPath := filepath.Join(tmp, "nonexistent.json")
-	if sh.CanResume(badPath) {
-		t.Error("CanResume should return false for missing file")
+	if _, err := sh.DescribeConversation(badPath); err == nil {
+		t.Error("missing state file should not describe")
+	}
+	if cmd := sh.ResumeCommand(nil); cmd != nil {
+		t.Errorf("nil info should not be resumable, got %v", cmd)
 	}
 }
 
 func TestShellResumeCommand(t *testing.T) {
 	t.Setenv("SHELL", "/usr/bin/fish")
 	sh := NewShell()
-	cmd := sh.ResumeCommand(&adapter.SessionFileInfo{
+	cmd := sh.ResumeCommand(&adapter.ConversationInfo{
 		Cwd: "/home/user/project",
 	})
 	if len(cmd) != 1 || cmd[0] != "/usr/bin/fish" {
@@ -96,15 +109,15 @@ func TestShellResumeCommand(t *testing.T) {
 	}
 }
 
-func TestShellSessionDir(t *testing.T) {
+func TestShellConversationDir(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
 
 	sh := NewShell()
-	dir := sh.SessionDir("/home/user/dev/project")
+	dir := sh.ConversationDir("/home/user/dev/project")
 	expected := filepath.Join(tmp, "gmux", "shell-sessions", "--home-user-dev-project--")
 	if dir != expected {
-		t.Errorf("SessionDir = %q, want %q", dir, expected)
+		t.Errorf("ConversationDir = %q, want %q", dir, expected)
 	}
 }
 
@@ -112,7 +125,7 @@ func TestShellRemoveStateFile(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", tmp)
 
-	path, err := WriteShellStateFile("sess-remove1", "/home/user/dev", []string{"zsh"})
+	path, err := WriteShellStateFile("1eke8b59", "/home/user/dev", []string{"zsh"})
 	if err != nil {
 		t.Fatalf("WriteShellStateFile: %v", err)
 	}
@@ -121,7 +134,7 @@ func TestShellRemoveStateFile(t *testing.T) {
 		t.Fatalf("state file should exist: %v", err)
 	}
 
-	RemoveShellStateFile("sess-remove1", "/home/user/dev")
+	RemoveShellStateFile("1eke8b59", "/home/user/dev")
 
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Error("state file should be removed after RemoveShellStateFile")
@@ -145,7 +158,7 @@ func TestAllAdaptersIncludesShell(t *testing.T) {
 func TestFindByKind(t *testing.T) {
 	// Shell is the fallback — not in All — so FindByKind is the only way
 	// to look it up by name without a match call.
-	shell := FindByKind("shell")
+	shell := FindByAdapter("shell")
 	if shell == nil {
 		t.Fatal("FindByKind(\"shell\") returned nil")
 	}
@@ -153,8 +166,8 @@ func TestFindByKind(t *testing.T) {
 		t.Errorf("got adapter name %q, want \"shell\"", shell.Name())
 	}
 
-	// Unknown kind should return nil.
-	if got := FindByKind("nonexistent"); got != nil {
+	// Unknown adapter should return nil.
+	if got := FindByAdapter("nonexistent"); got != nil {
 		t.Errorf("FindByKind(\"nonexistent\") = %v, want nil", got)
 	}
 }
@@ -164,13 +177,13 @@ func TestShellOnRegister(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", tmp)
 
 	sh := NewShell()
-	info, err := sh.OnRegister("sess-reg1", "/home/user/dev/myproject", []string{"bash"})
+	info, err := sh.OnRegister("127iehs4", "/home/user/dev/myproject", []string{"bash"})
 	if err != nil {
 		t.Fatalf("OnRegister: %v", err)
 	}
 
 	// State file should exist so the session can be rediscovered after restart.
-	statePath := filepath.Join(sh.SessionDir("/home/user/dev/myproject"), "sess-reg1.json")
+	statePath := filepath.Join(sh.ConversationDir("/home/user/dev/myproject"), "127iehs4.json")
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("state file not created at %s: %v", statePath, err)
 	}
@@ -187,16 +200,16 @@ func TestShellOnDismiss(t *testing.T) {
 
 	sh := NewShell()
 	// Register creates the state file.
-	if _, err := sh.OnRegister("sess-dis1", "/home/user/dev/proj", []string{"zsh"}); err != nil {
+	if _, err := sh.OnRegister("1moiukxc", "/home/user/dev/proj", []string{"zsh"}); err != nil {
 		t.Fatalf("OnRegister: %v", err)
 	}
-	statePath := filepath.Join(sh.SessionDir("/home/user/dev/proj"), "sess-dis1.json")
+	statePath := filepath.Join(sh.ConversationDir("/home/user/dev/proj"), "1moiukxc.json")
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("state file should exist before dismiss: %v", err)
 	}
 
 	// Dismiss removes it.
-	sh.OnDismiss("sess-dis1", "/home/user/dev/proj")
+	sh.OnDismiss("1moiukxc", "/home/user/dev/proj")
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Error("state file should be gone after OnDismiss")
 	}

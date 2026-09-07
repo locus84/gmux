@@ -3,8 +3,9 @@
 // Maps between URL paths and the app's view model. Pure functions with
 // no side effects or signal dependencies.
 
-import type { Session, ProjectItem } from './types'
-import { matchSession } from './projects'
+import { familyRoot } from './family'
+import { matchSession, sidebarProjectForSession } from './projects'
+import type { ProjectItem, Session } from './types'
 
 // --- URL parsing ---
 
@@ -70,20 +71,19 @@ export function parseSessionPath(path: string): {
  */
 export function sessionPath(
   projectSlug: string,
-  session: { kind: string; slug?: string; id: string; peer?: string },
+  session: { adapter: string; slug?: string; id: string; peer?: string },
   projectPeer?: string,
+  forceId = false,
 ): string {
-  const slug = session.slug || session.id.slice(0, 8)
+  // Slugs occupy the plain session slot. The URL-only `~` sigil gives an
+  // immutable ID a disjoint, exact-match form for untitled sessions and slug
+  // collisions; it is deliberately not CLI syntax because shells expand `~`.
+  const slug = !forceId && session.slug ? session.slug : `~${session.id}`
   const ownerPrefix = projectPeer ? `/@${projectPeer}` : ''
   // Mid-path session-host segment is needed only when the session
   // lives on a different host than the project owner.
   const sessionHost = session.peer && session.peer !== projectPeer ? `/@${session.peer}` : ''
-  return `${ownerPrefix}/${projectSlug}${sessionHost}/${session.kind}/${slug}`
-}
-
-/** Build the URL for a project hub (no session). */
-export function projectPath(slug: string, peer?: string): string {
-  return peer ? `/@${peer}/${slug}` : `/${slug}`
+  return `${ownerPrefix}/${projectSlug}${sessionHost}/${session.adapter}/${slug}`
 }
 
 /**
@@ -105,15 +105,19 @@ export function resolveSessionFromPath(
   // (used when a local folder contains adopted peer sessions).
   const filterHost = parsed.host
   const projectSessions = sessions.filter(s => {
+    // Unpromoted children are presented in their root's project. Promotion
+    // makes familyRoot return the session itself, so normal matching applies
+    // with no provenance fallback.
+    const presentation = familyRoot(s, sessions)
     if (parsed.projectPeer) {
-      // Peer-owned project: trust the stamp.
-      if (s.peer !== parsed.projectPeer) return false
-      if (s.project_slug !== parsed.project) return false
+      // Peer-owned project: trust the presentation root's stamp.
+      if (presentation.peer !== parsed.projectPeer) return false
+      if (presentation.project_slug !== parsed.project) return false
     } else {
       // Local project: claimed-local OR disclaimed-adopted.
-      const claimedHere = !s.peer && s.project_slug === parsed.project
-      const adoptedHere = !s.project_slug
-        && matchSession(s, projects)?.slug === parsed.project
+      const claimedHere = !presentation.peer && presentation.project_slug === parsed.project
+      const adoptedHere = !presentation.project_slug
+        && matchSession(presentation, projects)?.slug === parsed.project
       if (!claimedHere && !adoptedHere) return false
     }
     if (filterHost !== undefined && s.peer !== filterHost) return false
@@ -141,7 +145,7 @@ export function resolveSessionFromPath(
   }
 
   // Filter by adapter kind.
-  const adapterSessions = projectSessions.filter(s => s.kind === parsed.adapter)
+  const adapterSessions = projectSessions.filter(s => s.adapter === parsed.adapter)
 
   if (!parsed.slug) {
     // /:project/:adapter only - return first alive, or first.
@@ -149,13 +153,14 @@ export function resolveSessionFromPath(
     return alive?.id ?? adapterSessions[0]?.id ?? null
   }
 
-  // Full match: /:project/:adapter/:slug
-  // Try exact slug match first, then prefix match on session ID.
-  const exact = adapterSessions.find(s => s.slug === parsed.slug)
-  if (exact) return exact.id
-
-  const byId = adapterSessions.find(s => s.id.startsWith(parsed.slug!))
-  return byId?.id ?? null
+  // Full match: a leading `~` is the exact immutable-ID form; every other
+  // value is an exact human slug. IDs are never prefix-scanned in URLs.
+  if (parsed.slug.startsWith('~')) {
+    const id = parsed.slug.slice(1)
+    return adapterSessions.find(s => s.id === id)?.id ?? null
+  }
+  const exact = adapterSessions.filter(s => s.slug === parsed.slug)
+  return exact.length === 1 ? exact[0].id : null
 }
 
 // --- View state model ---
@@ -164,14 +169,15 @@ export function resolveSessionFromPath(
  * The top-level thing the app is currently showing. Derived from the URL
  * and drives what the main panel renders.
  *
- *  - `home`: overview / landing (host status, projects, quick-launch)
- *  - `project`: the project hub page for a single project. `projectPeer`
- *    is set for peer-owned projects (ADR 0002); absent for local.
+ *  - `home`: overview / landing (activity dashboard, quick-launch)
  *  - `session`: a specific terminal session, by id.
+ *
+ * There is no project-hub view: project navigation lives entirely in the
+ * sidebar (folders collapse/expand in place), and a bare `/:project` URL
+ * redirects to home.
  */
 export type View =
   | { kind: 'home' }
-  | { kind: 'project'; projectSlug: string; projectPeer?: string }
   | { kind: 'session'; sessionId: string }
 
 /** Structural equality for views. */
@@ -179,10 +185,6 @@ export function viewsEqual(a: View, b: View): boolean {
   if (a.kind !== b.kind) return false
   switch (a.kind) {
     case 'home': return true
-    case 'project': {
-      const bp = b as { projectSlug: string; projectPeer?: string }
-      return a.projectSlug === bp.projectSlug && a.projectPeer === bp.projectPeer
-    }
     case 'session': return a.sessionId === (b as { sessionId: string }).sessionId
   }
 }
@@ -192,11 +194,10 @@ export function viewsEqual(a: View, b: View): boolean {
  *
  * Rules:
  *  - `/` (or unparseable / internal) -> home
- *  - `/:project` where project is unknown -> home
- *  - `/:project` where project exists -> project (hub page)
+ *  - `/:project` (no adapter) -> home (project hubs are retired; folder
+ *    navigation lives in the sidebar)
  *  - `/:project/:adapter[/:slug]` where a session resolves -> session view
- *  - `/:project/:adapter[/:slug]` with no matching session but project
- *    exists -> project view (hub)
+ *  - `/:project/:adapter[/:slug]` with no matching session -> home
  */
 export function resolveViewFromPath(
   path: string,
@@ -206,34 +207,15 @@ export function resolveViewFromPath(
   const parsed = parseSessionPath(path)
   if (!parsed.project) return { kind: 'home' }
 
-  // Validate that the addressed project exists in the viewer's view.
-  if (parsed.projectPeer) {
-    // Peer-owned: project exists iff at least one session carries the
-    // matching `(peer, slug)` stamp. We don't sync peer projects
-    // separately (ADR 0002); empty peer projects don't render.
-    const hasOne = sessions.some(
-      s => s.peer === parsed.projectPeer && s.project_slug === parsed.project,
-    )
-    if (!hasOne) return { kind: 'home' }
-  } else {
-    if (!projects.find(p => p.slug === parsed.project)) return { kind: 'home' }
-  }
+  // A bare project URL no longer has a destination of its own — send it
+  // home. Only session URLs (with an adapter segment) resolve to a view.
+  if (!parsed.adapter) return { kind: 'home' }
 
-  const projectView: View = {
-    kind: 'project',
-    projectSlug: parsed.project,
-    ...(parsed.projectPeer ? { projectPeer: parsed.projectPeer } : {}),
-  }
-
-  // /:project alone goes straight to the project hub.
-  if (!parsed.adapter) return projectView
-
-  // /:project/:adapter[/:slug] resolves to a concrete session when possible.
+  // /:project/:adapter[/:slug] resolves to a concrete session when
+  // possible; anything else (project gone, session gone) falls to home.
   const sessionId = resolveSessionFromPath(parsed, projects, sessions)
   if (sessionId) return { kind: 'session', sessionId }
-
-  // URL pointed at a session that no longer exists -> fall back to hub.
-  return projectView
+  return { kind: 'home' }
 }
 
 /**
@@ -241,6 +223,34 @@ export function resolveViewFromPath(
  * serialized (e.g., session view pointing at a session we no longer have
  * in the store). Callers should leave the URL alone in that case.
  */
+export function hasSessionSlugCollision(session: Session, sessions: Session[], projects: ProjectItem[]): boolean {
+  if (!session.slug) return false
+  // A family child routes through its presentation root's project while
+  // retaining its own host/adapter/slug. Collision detection must use that
+  // same namespace or two children can serialize to one ambiguous URL.
+  const namespace = (candidate: Session): string => {
+    const presentation = familyRoot(candidate, sessions)
+    if (presentation.peer && presentation.project_slug) {
+      // Match sessionPath's actual mid-path host segment. Both an owner-hosted
+      // child (peer === project owner) and a local child (peer absent) omit it,
+      // so they share one URL namespace and must collide on equal slugs.
+      const serializedHost = candidate.peer && candidate.peer !== presentation.peer
+        ? candidate.peer
+        : ''
+      return `peer:${presentation.peer}:${presentation.project_slug}:host:${serializedHost}`
+    }
+    const projectSlug = presentation.project_slug ?? matchSession(presentation, projects)?.slug ?? ''
+    return `local:${projectSlug}:host:${candidate.peer ?? ''}`
+  }
+  const targetNamespace = namespace(session)
+  return sessions.some(candidate =>
+    candidate.id !== session.id
+    && candidate.adapter === session.adapter
+    && candidate.slug === session.slug
+    && namespace(candidate) === targetNamespace,
+  )
+}
+
 export function viewToPath(
   view: View,
   projects: ProjectItem[],
@@ -249,24 +259,26 @@ export function viewToPath(
   switch (view.kind) {
     case 'home':
       return '/'
-    case 'project':
-      return projectPath(view.projectSlug, view.projectPeer)
     case 'session': {
       const sess = sessions.find(s => s.id === view.sessionId)
       if (!sess) return null
-      // Peer-owned project (ADR 0002): URL is peer-prefixed; session
-      // lives on the project's owner.
-      if (sess.project_slug && sess.peer) {
-        return sessionPath(sess.project_slug, sess, sess.peer)
+      const presentation = familyRoot(sess, sessions)
+      // Peer-owned project (ADR 0002): URL is peer-prefixed; a nested
+      // session keeps its own adapter/slug but uses the root's project.
+      if (presentation.project_slug && presentation.peer) {
+        return sessionPath(presentation.project_slug, sess, presentation.peer, hasSessionSlugCollision(sess, sessions, projects))
       }
-      // Local-claimed: project owner is the viewer.
-      if (sess.project_slug && !sess.peer) {
-        return sessionPath(sess.project_slug, sess)
+      // Local-claimed: project owner is the viewer. Use the same stamp-backed
+      // catalog predicate as sidebar bucketing; an unknown stamp is not a
+      // recoverable URL even if it looks serializable.
+      const placedProject = sidebarProjectForSession(presentation, projects)
+      if (placedProject) {
+        return sessionPath(placedProject.slug, sess, undefined, hasSessionSlugCollision(sess, sessions, projects))
       }
       // Disclaimed: viewer's match rules decide the local folder.
-      const project = matchSession(sess, projects)
+      const project = matchSession(presentation, projects)
       if (!project) return null
-      return sessionPath(project.slug, sess)
+      return sessionPath(project.slug, sess, undefined, hasSessionSlugCollision(sess, sessions, projects))
     }
   }
 }

@@ -7,11 +7,13 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +24,17 @@ import (
 	"github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
+
+// ErrInvalidSessionID reports that a runner registered under an id that
+// fails paths.IsValidSessionID. It is a permanent verdict, not a
+// transient gateway hiccup: the id can never be accepted (it would be
+// unsafe as a path segment under SessionsDir), so callers surface it as
+// a 4xx rather than a 502, letting the runner distinguish "gmuxd will
+// never accept me" (exit) from "gmuxd is unreachable" (retry). This is
+// the seam the orphaned-resume bug turned up: a convIndex-rehydrated
+// agent session is keyed by its conversation UUID, which is not a
+// 8-character base36 ID, so its resume runner used to retry-then-linger forever.
+var ErrInvalidSessionID = errors.New("register: invalid session id")
 
 // ExpectedRunnerHash is the sha256 hash of the gmux binary that gmuxd
 // would launch for new sessions. Set by main at startup. Exposed via
@@ -51,11 +64,10 @@ type OnDeadFunc func(sess store.Session)
 //
 // onFirstScan, if non-nil, runs once after the initial Scan completes.
 // This is the right point to invoke work that depends on live sessions
-// being registered with the FileMonitor (e.g. applying persisted
-// attributions to freshly-rehydrated runners).
-func Watch(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDead OnDeadFunc, onFirstScan func(), interval time.Duration, stop <-chan struct{}) {
+// being registered (e.g. cleaning up orphaned project session refs).
+func Watch(sessions *store.Store, subs *Subscriptions, onDead OnDeadFunc, onFirstScan func(), interval time.Duration, stop <-chan struct{}) {
 	// Initial scan immediately
-	Scan(sessions, subs, fileMon, onDead)
+	Scan(sessions, subs, onDead)
 	if onFirstScan != nil {
 		onFirstScan()
 	}
@@ -69,7 +81,7 @@ func Watch(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onD
 			subs.UnsubscribeAll()
 			return
 		case <-ticker.C:
-			Scan(sessions, subs, fileMon, onDead)
+			Scan(sessions, subs, onDead)
 		}
 	}
 }
@@ -77,14 +89,30 @@ func Watch(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onD
 // Scan finds all .sock files and queries each runner's /meta endpoint.
 // Reachable sockets → upsert session + subscribe to /events.
 // Unreachable → remove + cleanup + unsubscribe.
-func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDead OnDeadFunc) {
-	dir := socketDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("discovery: read dir: %v", err)
+func Scan(sessions *store.Store, subs *Subscriptions, onDead OnDeadFunc) {
+	// Primary dir first, then legacy dirs (pre-upgrade runners outlive
+	// a gmuxd upgrade and keep their sockets where they bound them; see
+	// paths.LegacySessionSocketDirs). Entries carry their absolute path
+	// so the rest of the scan is location-agnostic.
+	type sockEntry struct {
+		path  string
+		entry os.DirEntry
+	}
+	var socks []sockEntry
+	for _, dir := range append([]string{socketDir()}, paths.LegacySessionSocketDirs()...) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("discovery: read dir %s: %v", dir, err)
+			}
+			continue
 		}
-		return
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sock") {
+				continue
+			}
+			socks = append(socks, sockEntry{path: filepath.Join(dir, entry.Name()), entry: entry})
+		}
 	}
 
 	// Index existing store entries by SocketPath so Phase 1 can
@@ -117,15 +145,12 @@ func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDe
 
 	// Phase 1: discover new sockets → Register is the single entry
 	// point for creating/merging sessions.
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sock") {
-			continue
-		}
-		sockPath := filepath.Join(dir, entry.Name())
+	for _, se := range socks {
+		sockPath := se.path
 		if t, ok := tracked[sockPath]; ok && t.alive && subs.IsActive(t.id) {
 			continue // already current — runner is alive and we're streaming /events
 		}
-		if err := Register(sessions, subs, fileMon, sockPath, onDead); err != nil {
+		if err := Register(sessions, subs, sockPath, onDead); err != nil {
 			// Only remove sockets old enough to be genuinely stale.
 			// Two ways Register can land here:
 			//
@@ -139,7 +164,7 @@ func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDe
 			// The 10s ModTime threshold is generous for the first case
 			// (a runner takes milliseconds to listen) and irrelevant
 			// for the second (the file is hours / days old).
-			if info, serr := entry.Info(); serr == nil && time.Since(info.ModTime()) > 10*time.Second {
+			if info, serr := se.entry.Info(); serr == nil && time.Since(info.ModTime()) > 10*time.Second {
 				os.Remove(sockPath)
 			}
 		}
@@ -156,9 +181,7 @@ func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDe
 	// the dying listener; see ADR 0003); during that window the path
 	// is gone but the SSE subscription is still streaming the runner's
 	// final exit event. Treating the missing path as a death signal
-	// would race ahead of the exit event and call NotifySessionDied,
-	// dropping the file→session attribution that resume / restart
-	// expects to keep across the seam.
+	// would race ahead of that authoritative exit event.
 	//
 	// Only when the subscription itself has dropped do we fall back to
 	// stat / probe to distinguish a stale path from a live runner whose
@@ -173,13 +196,17 @@ func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDe
 		if _, err := os.Stat(s.SocketPath); err == nil && probeSocket(s.SocketPath) {
 			continue // path exists and responds — subscription will reconnect
 		}
-		// Socket gone or unresponsive — mark dead.
+		// Socket gone or unresponsive — mark dead. Preserve the last
+		// observed Status: the turn state at death is the wait verdict
+		// (ADR 0023 §invariant) and must not depend on how death was
+		// detected. Clearing it here made a cleanly-closed turn reaped
+		// via stale socket resolve as "died", and lost the open-turn
+		// evidence a mid-turn crash needs. A nil Status (session never
+		// reported) legitimately stays nil — terminalReason treats that
+		// as "died" already.
 		s.Alive = false
-		s.Status = nil
-		if fileMon != nil {
-			if cmd := fileMon.ResolveResumeCommand(&s); cmd != nil {
-				s.Command = cmd
-			}
+		if cmd := ResolveResumeCommand(&s); len(cmd) > 0 {
+			s.Command = cmd
 		}
 		sessions.Upsert(s)
 		if onDead != nil {
@@ -187,9 +214,6 @@ func Scan(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, onDe
 		}
 		if subs != nil {
 			subs.Unsubscribe(s.ID)
-		}
-		if fileMon != nil {
-			fileMon.NotifySessionDied(s.ID)
 		}
 	}
 }
@@ -213,8 +237,7 @@ func probeSocket(socketPath string) bool {
 // Two paths, distinguished by whether the runner-reported id is
 // already known to the store:
 //
-//   - **Re-registration** (id already in store). Resume — where the
-//     daemon passed GMUX_RESUME_ID to the runner per ADR 0003 — and
+//   - **Re-registration** (id already in store). Resumed sessions and
 //     daemon-restart-with-surviving-runner both land here. The
 //     existing record is mutated in place: runtime fields (alive,
 //     pid, socket, status, started/exit times, binary hash, runner
@@ -234,7 +257,7 @@ func probeSocket(socketPath string) bool {
 // arrives, so the /meta payload reports alive=false. In that case
 // Register is the session's only landing point in the store, and
 // onDead fires after the Upsert so the record is persisted to disk.
-func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, socketPath string, onDead OnDeadFunc) error {
+func Register(sessions *store.Store, subs *Subscriptions, socketPath string, onDead OnDeadFunc) error {
 	newSess, err := queryMeta(socketPath)
 	if err != nil {
 		return err
@@ -242,19 +265,22 @@ func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, 
 
 	// The runner's /meta supplies the session ID, which is then used
 	// as a path segment for persisted metadata and scrollback. Reject
-	// anything that isn't a well-formed sess-<hex> ID so a crafted
+	// anything that isn't a well-formed 8-character base36 ID so a crafted
 	// socket_path cannot steer writes outside the sessions dir.
 	if !paths.IsValidSessionID(newSess.ID) {
-		return fmt.Errorf("register: invalid session id %q from %s", newSess.ID, socketPath)
+		return fmt.Errorf("%w %q from %s", ErrInvalidSessionID, newSess.ID, socketPath)
 	}
 
 	if existing, ok := sessions.Get(newSess.ID); ok {
 		// Re-registration. The runner reports fresh runtime state;
 		// the store has the historical and attribution-derived
 		// state from before the seam. Merge by overwriting only the
-		// runtime-owned fields so anything the runner doesn't know
-		// about (slug, created_at, FileMonitor-attributed title /
-		// subtitle, workspace metadata) survives.
+		// runtime-owned fields so the rest (created_at, hook-reported
+		// title / subtitle, workspace metadata, and the slug) survives
+		// this handshake. The slug is runner-owned (ADR 0011) but its
+		// /register /meta snapshot may predate the session hook, so we
+		// keep the stored value here and let the /events replay converge
+		// it (handleEvents replays the authoritative slug on subscribe).
 		existing.Alive = newSess.Alive
 		existing.Pid = newSess.Pid
 		existing.SocketPath = socketPath
@@ -271,15 +297,15 @@ func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, 
 		// re-registration means alive, so always clear.
 		existing.Resumable = false
 		*newSess = existing
-		log.Printf("register: re-registered %s session %s (slug=%s)", newSess.Kind, newSess.ID, newSess.Slug)
-	} else if a := adapters.FindByKind(newSess.Kind); a != nil {
+		log.Printf("register: re-registered %s session %s (slug=%s)", newSess.Adapter, newSess.ID, newSess.Slug)
+	} else if a := adapters.FindByAdapter(newSess.Adapter); a != nil {
 		if reg, ok := a.(adapter.SessionRegistrar); ok {
 			info, err := reg.OnRegister(newSess.ID, newSess.Cwd, newSess.Command)
 			if err != nil {
-				log.Printf("register: %s adapter OnRegister failed for %s: %v", newSess.Kind, newSess.ID, err)
+				log.Printf("register: %s adapter OnRegister failed for %s: %v", newSess.Adapter, newSess.ID, err)
 			} else if info.Slug != "" {
 				newSess.Slug = info.Slug
-				log.Printf("register: %s registered session %s (slug=%s)", newSess.Kind, newSess.ID, info.Slug)
+				log.Printf("register: %s registered session %s (slug=%s)", newSess.Adapter, newSess.ID, info.Slug)
 			}
 		}
 	}
@@ -292,9 +318,6 @@ func Register(sessions *store.Store, subs *Subscriptions, fileMon *FileMonitor, 
 	}
 	if subs != nil {
 		subs.Subscribe(newSess.ID, socketPath)
-	}
-	if fileMon != nil {
-		fileMon.NotifyNewSession(newSess.ID)
 	}
 	return nil
 }
@@ -317,6 +340,24 @@ func queryMeta(socketPath string) (*store.Session, error) {
 		return nil, err
 	}
 
+	// Legacy-read shim: pre-v2 runners report "kind" and "session_file"
+	// in /meta. Long-lived runners survive daemon upgrades, so accept the
+	// old keys for one release. TODO(v2.1): drop this shim.
+	if sess.Adapter == "" || sess.ConversationRef == "" {
+		var legacy struct {
+			Kind        string `json:"kind"`
+			SessionFile string `json:"session_file"`
+		}
+		if err := json.Unmarshal(body, &legacy); err == nil {
+			if sess.Adapter == "" {
+				sess.Adapter = legacy.Kind
+			}
+			if sess.ConversationRef == "" {
+				sess.ConversationRef = legacy.SessionFile
+			}
+		}
+	}
+
 	// Ensure socket_path is set (runner might not include it)
 	if sess.SocketPath == "" {
 		sess.SocketPath = socketPath
@@ -329,11 +370,139 @@ func queryMeta(socketPath string) (*store.Session, error) {
 // to SIGTERM its child process. The runner's normal exit lifecycle
 // handles the rest.
 func KillSession(socketPath string) error {
-	resp, err := runnerRequest(context.Background(), socketPath, http.MethodPost, "/kill", nil)
+	return KillSessionContext(context.Background(), socketPath, "")
+}
+
+// KillSessionContext is the cancellation-aware production transport for an
+// explicit stop. Endpoint mapping is deliberately fixed to POST /kill.
+//
+// expectIncarnation, when set, names the runner process the caller means. A
+// runner that understands the protocol compares it with its own identity and
+// answers 409 Conflict rather than dying for somebody else's verdict; a runner
+// that predates the protocol ignores the header and stops, which is the
+// behaviour `gmux kill` has always had. That is why a decision made earlier
+// about one specific process must use ReapSessionContext instead: this route
+// cannot refuse on behalf of a runner that has never heard of it.
+func KillSessionContext(ctx context.Context, socketPath, expectIncarnation string) error {
+	var header http.Header
+	if expectIncarnation != "" {
+		header = http.Header{expectIncarnationHeader: []string{expectIncarnation}}
+	}
+	resp, err := runnerRequestHeaders(ctx, socketPath, http.MethodPost, "/kill", nil, header)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("%w: %s", ErrRunnerIncarnationMismatch, resp.Status)
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("runner /kill: %s", resp.Status)
+	}
+	return nil
+}
+
+// ReapSessionContext asks the runner at socketPath to terminate itself, but
+// only if it is the named incarnation. Endpoint mapping is deliberately fixed
+// to POST /reap, a route that exists precisely so that a runner predating the
+// protocol cannot act on the request at all: the safety of a delayed reap
+// decision cannot rest on an occupant honouring a header it has never heard
+// of.
+//
+// It reports ErrRunnerReapUnsupported for the statuses that mean "no such
+// operation here" (see reapUnsupportedStatus -- a real pre-protocol runner
+// answers 426, not 404, because its WebSocket catch-all handles the path),
+// ErrRunnerIncarnationMismatch for a 409, and leaves the occupant untouched in
+// both cases. An empty expectIncarnation is a programming error: an
+// unconditional reap is not an operation this transport offers.
+func ReapSessionContext(ctx context.Context, socketPath, expectIncarnation string) error {
+	if expectIncarnation == "" {
+		return fmt.Errorf("discovery: reap of %s requires an expected incarnation", socketPath)
+	}
+	header := http.Header{expectIncarnationHeader: []string{expectIncarnation}}
+	resp, err := runnerRequestHeaders(ctx, socketPath, http.MethodPost, "/reap", nil, header)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("%w: %s", ErrRunnerIncarnationMismatch, resp.Status)
+	}
+	if reapUnsupportedStatus(resp.StatusCode) {
+		return fmt.Errorf("%w: %s", ErrRunnerReapUnsupported, resp.Status)
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("runner /reap: %s", resp.Status)
+	}
+	return nil
+}
+
+// reapUnsupportedStatus reports whether a status means "this endpoint has no
+// conditional reap", as opposed to "the reap was refused" or "something went
+// wrong".
+//
+// 404 is the obvious one, but it is not what a real pre-protocol runner
+// answers: those register a catch-all "/" route for the WebSocket terminal, so
+// POST /reap reaches the WebSocket handshake, which rejects a request without
+// the upgrade headers -- 426 Upgrade Required from nhooyr.io/websocket, and 405
+// or 501 from other plausible shapes of the same "wrong protocol at this path"
+// verdict.
+//
+// Every status here shares two properties, which is what makes lumping them
+// together honest: the runner reported that it cannot perform this operation,
+// and it demonstrably did not perform it. 409 is deliberately excluded -- that
+// is a runner that understands the request and refuses it -- and so is 400,
+// which is this transport's own fault for sending no expectation.
+func reapUnsupportedStatus(code int) bool {
+	switch code {
+	case http.StatusNotFound, // no such route
+		http.StatusMethodNotAllowed, // route exists, not for POST
+		http.StatusUpgradeRequired,  // route exists only as a WebSocket upgrade
+		http.StatusNotImplemented:   // route exists, operation does not
+		return true
+	}
+	return false
+}
+
+// ErrRunnerIncarnationMismatch reports that the runner answering an endpoint
+// refused because it is not the process the caller named. It is a success for
+// the safety property, not a transport failure: the intended target is already
+// gone and its pathname belongs to somebody else.
+var ErrRunnerIncarnationMismatch = errors.New("discovery: runner declined a request meant for another incarnation")
+
+// ErrRunnerReapUnsupported reports that the runner answering an endpoint does
+// not implement conditional reaping, i.e. it predates the protocol. It was left
+// untouched.
+var ErrRunnerReapUnsupported = errors.New("discovery: runner does not implement conditional reaping")
+
+var ErrRunnerUnreadTokenChanged = errors.New("discovery: runner unread token changed")
+
+// expectIncarnationHeader must match ptyserver.ExpectIncarnationHeader.
+const expectIncarnationHeader = "X-Gmux-Expect-Incarnation"
+
+// AcknowledgeUnread clears the unread bit owned by one exact live runner.
+// The incarnation requirement prevents a recycled socket path from consuming
+// a replacement generation's result.
+func AcknowledgeUnread(ctx context.Context, socketPath, expectIncarnation, token string) error {
+	if expectIncarnation == "" {
+		return errors.New("discovery: runner read acknowledgement requires an expected incarnation")
+	}
+	header := http.Header{expectIncarnationHeader: []string{expectIncarnation}}
+	resp, err := runnerRequestHeaders(ctx, socketPath, http.MethodPost, "/read?token="+url.QueryEscape(token), nil, header)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode == http.StatusConflict {
+			if strings.Contains(string(msg), "unread token changed") {
+				return ErrRunnerUnreadTokenChanged
+			}
+			return ErrRunnerIncarnationMismatch
+		}
+		return fmt.Errorf("runner /read: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
 	return nil
 }
 

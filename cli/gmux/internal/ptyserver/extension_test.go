@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gmuxapp/gmux/cli/gmux/internal/session"
+	"github.com/gmuxapp/gmux/packages/adapter"
 	"github.com/gmuxapp/gmux/packages/adapter/adapters"
 )
 
@@ -49,19 +50,19 @@ func postSessionEvent(t *testing.T, sockPath, body string) {
 	resp.Body.Close()
 }
 
-// TestReconnectReplaysSessionFile checks that a newly-connected /events
-// subscriber (a reconnecting daemon) is replayed the bound session file, so
+// TestReconnectReplaysConversationRef checks that a newly-connected /events
+// subscriber (a reconnecting daemon) is replayed the bound conversation file, so
 // attribution survives a daemon restart without persisted state.
-func TestReconnectReplaysSessionFile(t *testing.T) {
+func TestReconnectReplaysConversationRef(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not available")
 	}
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test.sock")
-	sessFile := filepath.Join(dir, "2026-06-19_sess-reconnect.jsonl")
+	sessFile := filepath.Join(dir, "2026-06-19_16zvlmc6.jsonl")
 
-	st := session.New(session.Config{ID: "s1", Kind: "pi", SocketPath: sockPath})
+	st := session.New(session.Config{ID: "s1", Adapter: "pi", SocketPath: sockPath})
 	srv, err := New(Config{
 		Command:    []string{node, "-e", "setTimeout(()=>{},3000)"},
 		Cwd:        dir,
@@ -77,10 +78,10 @@ func TestReconnectReplaysSessionFile(t *testing.T) {
 
 	postSessionEvent(t, sockPath, `{"op":"session","path":`+strconv.Quote(sessFile)+`}`)
 	deadline := time.After(5 * time.Second)
-	for st.SessionFileSnapshot() != sessFile {
+	for st.ConversationRefSnapshot() != sessFile {
 		select {
 		case <-deadline:
-			t.Fatalf("runner never recorded session file; got %q", st.SessionFileSnapshot())
+			t.Fatalf("runner never recorded conversation file; got %q", st.ConversationRefSnapshot())
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -102,10 +103,73 @@ func TestReconnectReplaysSessionFile(t *testing.T) {
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		if strings.Contains(sc.Text(), sessFile) {
-			return // success: session_file replayed
+			return // success: conversation_file replayed
 		}
 	}
-	t.Error("reconnecting subscriber did not receive replayed session_file")
+	t.Error("reconnecting subscriber did not receive replayed conversation_file")
+}
+
+// TestReconnectReplaysSlug pins that a (re)connecting /events subscriber
+// re-learns the authoritative slug — so a slug set/rename/clear emitted while
+// the daemon was down is not lost (SetSlug dedups, so it never re-emits on its
+// own). Without the replay the store keeps a stale slug across a daemon
+// restart.
+func TestReconnectReplaysSlug(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+	sessFile := filepath.Join(dir, "2026-06-19_1g8mkjz8.jsonl")
+
+	st := session.New(session.Config{ID: "s1", Adapter: "pi", SocketPath: sockPath})
+	srv, err := New(Config{
+		Command:    []string{node, "-e", "setTimeout(()=>{},3000)"},
+		Cwd:        dir,
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+		Adapter:    adapters.NewPi(),
+		State:      st,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	// Bind a titled conversation, then wait for the slug to land.
+	postSessionEvent(t, sockPath,
+		`{"op":"session","path":`+strconv.Quote(sessFile)+`,"id":"id-x","slug":"fix the auth bug"}`)
+	deadline := time.After(5 * time.Second)
+	for st.SlugSnapshot() != "fix-the-auth-bug" {
+		select {
+		case <-deadline:
+			t.Fatalf("runner never recorded slug; got %q", st.SlugSnapshot())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", sockPath)
+		},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://unix/events", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("connect /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		if strings.Contains(sc.Text(), "fix-the-auth-bug") {
+			return // success: slug replayed on subscribe
+		}
+	}
+	t.Error("reconnecting subscriber did not receive replayed slug")
 }
 func TestSessionEventIsAuthoritative(t *testing.T) {
 	node, err := exec.LookPath("node")
@@ -114,15 +178,15 @@ func TestSessionEventIsAuthoritative(t *testing.T) {
 	}
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test.sock")
-	fileA := filepath.Join(dir, "2026-06-19_sess-A.jsonl")
-	fileB := filepath.Join(dir, "2026-06-19_sess-B.jsonl")
+	fileA := filepath.Join(dir, "2026-06-19_10qld4kp.jsonl")
+	fileB := filepath.Join(dir, "2026-06-19_1ktpfl72.jsonl")
 	for _, f := range []string{fileA, fileB} {
 		if err := os.WriteFile(f, []byte(`{"type":"session"}`+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	st := session.New(session.Config{ID: "s1", Kind: "pi", SocketPath: sockPath})
+	st := session.New(session.Config{ID: "s1", Adapter: "pi", SocketPath: sockPath})
 	srv, err := New(Config{
 		Command:    []string{node, "-e", "setTimeout(()=>{},2000)"},
 		Cwd:        dir,
@@ -150,10 +214,10 @@ func TestSessionEventIsAuthoritative(t *testing.T) {
 	waitFor := func(want string) {
 		t.Helper()
 		deadline := time.After(2 * time.Second)
-		for st.SessionFileSnapshot() != want {
+		for st.ConversationRefSnapshot() != want {
 			select {
 			case <-deadline:
-				t.Fatalf("runner did not bind to %q; got %q", want, st.SessionFileSnapshot())
+				t.Fatalf("runner did not bind to %q; got %q", want, st.ConversationRefSnapshot())
 			case <-time.After(20 * time.Millisecond):
 			}
 		}
@@ -167,7 +231,7 @@ func TestSessionEventIsAuthoritative(t *testing.T) {
 }
 
 // TestTurnEventDrivesState checks the extension turn path: a "turn" start goes
-// working, and a "turn" end with outcome "completed" goes idle + unread and
+// active, and a "turn" end with outcome "completed" goes idle + unread and
 // applies the title — no file parsing. The outcome→state policy lives in the
 // runner (applyTurnEnd), so this is also its mapping test.
 func TestTurnEventDrivesState(t *testing.T) {
@@ -177,7 +241,7 @@ func TestTurnEventDrivesState(t *testing.T) {
 	}
 	dir := t.TempDir()
 	sockPath := filepath.Join(dir, "test.sock")
-	st := session.New(session.Config{ID: "s1", Kind: "pi", SocketPath: sockPath})
+	st := session.New(session.Config{ID: "s1", Adapter: "pi", SocketPath: sockPath})
 	srv, err := New(Config{
 		Command:    []string{node, "-e", "setTimeout(()=>{},2000)"},
 		Cwd:        dir,
@@ -204,10 +268,10 @@ func TestTurnEventDrivesState(t *testing.T) {
 
 	post(`{"op":"turn","phase":"start"}`)
 	deadline := time.After(2 * time.Second)
-	for s := st.StatusSnapshot(); s == nil || !s.Working; s = st.StatusSnapshot() {
+	for s := st.StatusSnapshot(); s == nil || !s.Active; s = st.StatusSnapshot() {
 		select {
 		case <-deadline:
-			t.Fatalf("status never went working; got %+v", st.StatusSnapshot())
+			t.Fatalf("status never went active; got %+v", st.StatusSnapshot())
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -216,7 +280,7 @@ func TestTurnEventDrivesState(t *testing.T) {
 	deadline = time.After(2 * time.Second)
 	for {
 		s := st.StatusSnapshot()
-		if s != nil && !s.Working && st.Title() == "my chat" && st.UnreadSnapshot() {
+		if s != nil && !s.Active && st.Title() == "my chat" && st.UnreadSnapshot() {
 			break
 		}
 		select {
@@ -227,21 +291,23 @@ func TestTurnEventDrivesState(t *testing.T) {
 	}
 }
 
-// TestSessionSlugPrefersExplicitSlug pins, through the real /hook/event
-// handler, that an explicit slug in a session event wins over Slugify(id) — the
-// codex path reports a title-derived slug because its session id is a UUID that
-// slugifies badly — while a session event with only an id still slugifies the
-// id (pi's behavior, unchanged).
-func TestSessionSlugPrefersExplicitSlug(t *testing.T) {
+// TestSessionSlugFromExplicitSourceOnly pins, through the real /hook/event
+// handler, that the runner sets the slug ONLY from an explicit title-derived
+// source and never synthesizes one from the adapter session id: ev.ID is a
+// UUID for every real adapter, and slugifying it produces an unreadable
+// full-UUID URL that also defeats the web's session-id fallback (the
+// pre-title-window regression behind #360's follow-up). With no slug
+// source the runner leaves Slug empty for the web layer to fill.
+func TestSessionSlugFromExplicitSourceOnly(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not available")
 	}
-	check := func(name, body, wantSlug string) {
+	newSrv := func(t *testing.T) (*Server, *session.State, string) {
 		t.Helper()
 		dir := t.TempDir()
 		sockPath := filepath.Join(dir, "test.sock")
-		st := session.New(session.Config{ID: "s1", Kind: "codex", SocketPath: sockPath})
+		st := session.New(session.Config{ID: "s1", Adapter: "codex", SocketPath: sockPath})
 		srv, err := New(Config{
 			Command:    []string{node, "-e", "setTimeout(()=>{},2000)"},
 			Cwd:        dir,
@@ -251,44 +317,160 @@ func TestSessionSlugPrefersExplicitSlug(t *testing.T) {
 			State:      st,
 		})
 		if err != nil {
-			t.Fatalf("%s: new server: %v", name, err)
+			t.Fatalf("new server: %v", err)
 		}
-		defer srv.Shutdown()
-		postSessionEvent(t, sockPath, body)
+		t.Cleanup(srv.Shutdown)
+		return srv, st, sockPath
+	}
+
+	// A real title-derived slug is slugified and recorded.
+	t.Run("explicit-slug", func(t *testing.T) {
+		_, st, sockPath := newSrv(t)
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/x.jsonl","id":"019cfb54-dead-beef","slug":"fix the auth bug"}`)
 		deadline := time.After(2 * time.Second)
-		for st.SlugSnapshot() != wantSlug {
+		for st.SlugSnapshot() != "fix-the-auth-bug" {
 			select {
 			case <-deadline:
-				t.Fatalf("%s: slug = %q, want %q", name, st.SlugSnapshot(), wantSlug)
+				t.Fatalf("slug = %q, want %q", st.SlugSnapshot(), "fix-the-auth-bug")
 			case <-time.After(20 * time.Millisecond):
 			}
 		}
-	}
-	check("explicit-slug",
-		`{"op":"session","path":"/x.jsonl","id":"019cfb54-dead-beef","slug":"fix the auth bug"}`,
-		"fix-the-auth-bug")
-	check("id-fallback",
-		`{"op":"session","path":"/y.jsonl","id":"my-chat"}`,
-		"my-chat")
+	})
+
+	// A pre-title bind (only an id, no slug) must leave the slug EMPTY so the
+	// web fallback applies. Poll for a settle window to catch a synthesized
+	// slug that arrives slightly after the POST returns.
+	t.Run("no-slug-source-stays-empty", func(t *testing.T) {
+		_, st, sockPath := newSrv(t)
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/y.jsonl","id":"019f2c75-5279-7012-b054-ce2a71441a4e"}`)
+		deadline := time.After(500 * time.Millisecond)
+		for {
+			if got := st.SlugSnapshot(); got != "" {
+				t.Fatalf("slug = %q, want empty (no title source → web owns the fallback)", got)
+			}
+			select {
+			case <-deadline:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
+
+	// An untitled re-bind must EMIT the empty-slug clear even when the runner
+	// state is already empty (fresh runner after a daemon re-register that
+	// preserved a stale slug). A dedup'd SetSlug would emit nothing and leave
+	// the daemon stale; BindSlug on the rebind path fixes it.
+	t.Run("untitled-rebind-emits-clear-even-when-state-empty", func(t *testing.T) {
+		_, st, sockPath := newSrv(t)
+		ch := st.Subscribe()
+		defer st.Unsubscribe(ch)
+		// First bind, untitled: runner state is already "" here.
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/fresh.jsonl","id":"019f2c75-5279-7012-b054-ce2a71441a4e"}`)
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case <-deadline:
+				t.Fatal("no empty-slug meta event emitted on untitled bind")
+			case e := <-ch:
+				if e.Type != "meta" {
+					continue
+				}
+				m, ok := e.Data.(map[string]string)
+				if !ok {
+					continue
+				}
+				if v, present := m["slug"]; present {
+					if v != "" {
+						t.Fatalf("slug event = %q, want empty clear", v)
+					}
+					return // success
+				}
+			}
+		}
+	})
+
+	// A same-conversation refresh (claude/codex re-send the bind on every turn
+	// end) with a transiently empty slug source must NOT clear an established
+	// slug — that would flap the URL on a parse hiccup. Re-bind is detected by
+	// a changed conversation path, so the same path must preserve the slug.
+	t.Run("same-conversation-refresh-keeps-slug", func(t *testing.T) {
+		_, st, sockPath := newSrv(t)
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/c.jsonl","id":"id-c","slug":"fix the auth bug"}`)
+		deadline := time.After(2 * time.Second)
+		for st.SlugSnapshot() != "fix-the-auth-bug" {
+			select {
+			case <-deadline:
+				t.Fatalf("setup: slug = %q, want %q", st.SlugSnapshot(), "fix-the-auth-bug")
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		// Same path, no slug source (transient title-derivation failure).
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/c.jsonl","id":"id-c","reason":"activity"}`)
+		deadline = time.After(500 * time.Millisecond)
+		for {
+			if got := st.SlugSnapshot(); got != "fix-the-auth-bug" {
+				t.Fatalf("slug = %q, want %q preserved on same-conversation refresh", got, "fix-the-auth-bug")
+			}
+			select {
+			case <-deadline:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
+
+	// A bind is authoritative: switching from a titled conversation to a
+	// fresh untitled one (pi re-binds through the same runner on
+	// new/switch/resume/fork) must CLEAR the old slug, not keep serving it.
+	t.Run("no-slug-source-clears-prior-slug", func(t *testing.T) {
+		_, st, sockPath := newSrv(t)
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/a.jsonl","id":"id-a","slug":"fix the auth bug"}`)
+		deadline := time.After(2 * time.Second)
+		for st.SlugSnapshot() != "fix-the-auth-bug" {
+			select {
+			case <-deadline:
+				t.Fatalf("setup: slug = %q, want %q", st.SlugSnapshot(), "fix-the-auth-bug")
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		postSessionEvent(t, sockPath,
+			`{"op":"session","path":"/b.jsonl","id":"019f2c75-5279-7012-b054-ce2a71441a4e","reason":"new"}`)
+		deadline = time.After(2 * time.Second)
+		for st.SlugSnapshot() != "" {
+			select {
+			case <-deadline:
+				t.Fatalf("slug = %q, want cleared after untitled re-bind", st.SlugSnapshot())
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	})
 }
 
 // TestApplyTurnEnd pins the outcome→sidebar-state policy directly (no node).
 func TestApplyTurnEnd(t *testing.T) {
 	cases := []struct {
-		outcome    string
-		wantUnread bool
-		wantError  bool
+		outcome         string
+		wantUnread      bool
+		wantError       bool
+		wantInterrupted bool
 	}{
-		{"completed", true, false},
-		{"aborted", false, false},
-		{"error", false, true},
+		{"completed", true, false, false},
+		{"interrupted", false, false, true},
+		{"error", true, true, false},
 	}
 	for _, tc := range cases {
-		st := session.New(session.Config{ID: "s1", Kind: "pi"})
+		st := session.New(session.Config{ID: "s1", Adapter: "pi"})
 		srv := &Server{state: st}
-		srv.applyTurnEnd(tc.outcome, "")
+		st.SetStatus(&adapter.Status{Active: true}) // open the turn first
+		srv.applyTurnEnd(hookEvent{Outcome: tc.outcome})
 		status := st.StatusSnapshot()
-		if status == nil || status.Working {
+		if status == nil || status.Active {
 			t.Errorf("%s: expected idle, got %+v", tc.outcome, status)
 		}
 		if st.UnreadSnapshot() != tc.wantUnread {
@@ -297,5 +479,92 @@ func TestApplyTurnEnd(t *testing.T) {
 		if status != nil && status.Error != tc.wantError {
 			t.Errorf("%s: error=%v want %v", tc.outcome, status.Error, tc.wantError)
 		}
+		if status != nil && status.Interrupted != tc.wantInterrupted {
+			t.Errorf("%s: interrupted=%v want %v", tc.outcome, status.Interrupted, tc.wantInterrupted)
+		}
 	}
+}
+
+// TestTurnStartClearsInterruption pins that a new turn wipes the previous
+// turn's terminal facts: an interrupted turn must not leave a stale
+// "interrupted" (or error) on the session once the agent starts working
+// again. SetStatus replaces the status wholesale, so this is a property of
+// the runner's turn policy, not of a per-field merge.
+func TestTurnStartClearsInterruption(t *testing.T) {
+	st := session.New(session.Config{ID: "s1", Adapter: "pi"})
+	srv := &Server{state: st}
+	st.SetStatus(&adapter.Status{Active: true})
+	srv.applyTurnEnd(hookEvent{Outcome: "interrupted"})
+	if s := st.StatusSnapshot(); s == nil || !s.Interrupted {
+		t.Fatalf("status = %+v, want interrupted after an intentional stop", s)
+	}
+	st.SetStatus(&adapter.Status{Active: true}) // op "turn" phase start
+	if s := st.StatusSnapshot(); s == nil || !s.Active || s.Interrupted || s.Error {
+		t.Fatalf("status = %+v, want a clean active turn", s)
+	}
+	srv.applyTurnEnd(hookEvent{Outcome: "completed"})
+	if s := st.StatusSnapshot(); s == nil || s.Active || s.Interrupted || s.Error {
+		t.Fatalf("status = %+v, want completion to clear interruption", s)
+	}
+	if !st.UnreadSnapshot() {
+		t.Error("completed turn must set unread")
+	}
+}
+
+// TestReconnectReplaysStatus pins that a (re)connecting /events
+// subscriber is replayed the current Status snapshot. Status emitted
+// before the daemon subscribed would otherwise be invisible until the
+// next transition — which for the default turn model's launch-time
+// Active=true (one transition per lifetime) means never: the daemon
+// would see every one-shot as stateless until it exited.
+func TestReconnectReplaysStatus(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+
+	st := session.New(session.Config{ID: "s1", Adapter: "shell", SocketPath: sockPath})
+	srv, err := New(Config{
+		Command:    []string{"sleep", "3"},
+		Cwd:        dir,
+		Listener:   mustBindSocket(t, sockPath),
+		SocketPath: sockPath,
+		Adapter:    adapters.NewShell(),
+		State:      st,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Shutdown()
+
+	// Status set BEFORE anyone subscribes — as run.go does at launch.
+	// No other writer exists in this test, so the only way a subscriber
+	// can learn it is the replay.
+	st.SetStatus(&adapter.Status{Active: true})
+
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return net.Dial("unix", sockPath)
+		},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://unix/events", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("connect /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	sc := bufio.NewScanner(resp.Body)
+	sawStatusEvent := false
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.HasPrefix(line, "event: status") {
+			sawStatusEvent = true
+			continue
+		}
+		if sawStatusEvent && strings.Contains(line, `"active":true`) {
+			return // success: status snapshot replayed on subscribe
+		}
+	}
+	t.Error("reconnecting subscriber did not receive the replayed status snapshot")
 }

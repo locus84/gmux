@@ -190,6 +190,111 @@ func TestDetectRootNoVCS(t *testing.T) {
 	}
 }
 
+func TestDetectGitLayout(t *testing.T) {
+	t.Run("repository from subdirectory", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		subdir := filepath.Join(root, "src")
+		if err := os.Mkdir(subdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		got := Detect(subdir)
+		if got.Root != root || got.GitLayout != GitLayoutRepository {
+			t.Fatalf("Detect() = %+v, want root %q and repository", got, root)
+		}
+	})
+
+	t.Run("linked worktree", func(t *testing.T) {
+		dir := t.TempDir()
+		mainRoot := filepath.Join(dir, "main")
+		worktreeRoot := filepath.Join(dir, "worktree")
+		gitdir := filepath.Join(mainRoot, ".git", "worktrees", "wt")
+		if err := os.MkdirAll(gitdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(worktreeRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(gitdir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktreeRoot, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := Detect(filepath.Join(worktreeRoot, "missing-subdir"))
+		// filepath.Abs accepts a missing leaf; detection still walks to the marker.
+		if got.Root != mainRoot || got.GitLayout != GitLayoutWorktree {
+			t.Fatalf("Detect() = %+v, want root %q and worktree", got, mainRoot)
+		}
+	})
+
+	t.Run("broken gitdir marker leaves layout unknown", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got := Detect(root)
+		if got.Root != root || got.GitLayout != "" {
+			t.Fatalf("Detect() = %+v, want root with unknown layout", got)
+		}
+	})
+
+	t.Run("gitdir file without worktree layout is repository", func(t *testing.T) {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "submodule")
+		gitdir := filepath.Join(dir, "parent", ".git", "modules", "submodule")
+		if err := os.MkdirAll(gitdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		got := Detect(root)
+		if got.Root != root || got.GitLayout != GitLayoutRepository {
+			t.Fatalf("Detect() = %+v, want gitdir-backed repository", got)
+		}
+	})
+
+	t.Run("jj only", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, ".jj", "repo"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got := Detect(root)
+		if got.Root != root || got.GitLayout != "" {
+			t.Fatalf("Detect() = %+v, want jj root with no Git layout", got)
+		}
+	})
+
+	t.Run("colocated jj and git", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, ".jj", "repo"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		got := Detect(root)
+		if got.Root != root || got.GitLayout != GitLayoutRepository {
+			t.Fatalf("Detect() = %+v, want colocated repository", got)
+		}
+	})
+
+	t.Run("no vcs", func(t *testing.T) {
+		if got := Detect(t.TempDir()); got != (Detection{}) {
+			t.Fatalf("Detect() = %+v, want zero value", got)
+		}
+	})
+}
+
 func TestDetectRootEmptyString(t *testing.T) {
 	// Empty string should not panic
 	got := DetectRoot("")

@@ -4,11 +4,11 @@
 // The protocol has two snapshot kinds plus one bare event:
 //
 //   - snapshot.sessions  full list of owned sessions (replaces the
-//                        per-event session-upsert / session-remove
-//                        stream of protocol 1).
+//     per-event session-upsert / session-remove
+//     stream of protocol 1).
 //   - snapshot.world     bundle of projects, peers, health, launchers
-//                        (replaces projects-update / peer-status).
-//                        Not sent to peer consumers.
+//     (replaces projects-update / peer-status).
+//     Not sent to peer consumers.
 //   - session-activity   bare {id} ping; lossy, not coalesced.
 //
 // Snapshots are composed lazily at emit time by a per-kind coalescer
@@ -76,7 +76,7 @@ type WorldPayload struct {
 	// PeerDiscovered carries each connected peer's self-advertised
 	// discovered list (sessions the peer owns but no project of its own
 	// claims), keyed by peer name. Discovery is host-authoritative
-	// (ADR 0002/0005): the owning host runs its own match rules over
+	// (ADR 0002/0025): the owning host runs its own match rules over
 	// its own sessions, so the viewer renders these rows verbatim
 	// rather than recomputing peer discovery blind (which could offer a
 	// project the peer already owns by a rule the viewer can't see).

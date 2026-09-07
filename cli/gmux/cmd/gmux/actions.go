@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gmuxapp/gmux/cli/gmux/internal/localterm"
 )
@@ -16,28 +21,64 @@ import (
 // session is the subset of gmuxd's Session model that the CLI cares
 // about. Defined locally to avoid pulling in the gmuxd store package.
 type cliSession struct {
-	ID         string `json:"id"`
-	Peer       string `json:"peer,omitempty"`
-	Cwd        string `json:"cwd,omitempty"`
-	Kind       string `json:"kind"`
-	Alive      bool   `json:"alive"`
-	Pid        int    `json:"pid,omitempty"`
-	Title      string `json:"title,omitempty"`
-	Slug       string `json:"slug,omitempty"`
-	SocketPath string `json:"socket_path,omitempty"`
-	Command    []string `json:"command,omitempty"`
-	StartedAt  string `json:"started_at,omitempty"`
-	ExitedAt   string `json:"exited_at,omitempty"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
+	ID      string `json:"id"`
+	Peer    string `json:"peer,omitempty"`
+	Cwd     string `json:"cwd,omitempty"`
+	Adapter string `json:"adapter"`
+	// DriveMode is how gmux hosts this harness (ADR 0033). Absent on the
+	// wire means terminal; "acp" sessions have no PTY. Round-trips through
+	// `gmux ls --json` so scripts can see the mode axis.
+	DriveMode     string `json:"drive_mode,omitempty"`
+	Alive         bool   `json:"alive"`
+	Pid           int    `json:"pid,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Slug          string `json:"slug,omitempty"`
+	RunnerVersion string `json:"runner_version,omitempty"`
+	// ParentSessionID links a session to the one it was spawned from
+	// (e.g. `gmux edit` as $EDITOR inside a session). Must round-trip
+	// through `gmux ls --json` for scripts to see the relationship.
+	ParentSessionID string   `json:"parent_session_id,omitempty"`
+	UnreadToken     string   `json:"unread_token,omitempty"`
+	SocketPath      string   `json:"socket_path,omitempty"`
+	Command         []string `json:"command,omitempty"`
+	StartedAt       string   `json:"started_at,omitempty"`
+	ExitedAt        string   `json:"exited_at,omitempty"`
+	ExitCode        *int     `json:"exit_code,omitempty"`
+}
+
+// MarshalJSON adds the authoritative, directly reusable session reference to
+// the daemon projection. ref is derived here rather than trusted from the API,
+// so it cannot disagree with the id/peer decomposition.
+func (s cliSession) MarshalJSON() ([]byte, error) {
+	type wireSession cliSession
+	s.UnreadToken = ""
+	return json.Marshal(struct {
+		Ref string `json:"ref"`
+		wireSession
+	}{
+		Ref:         displayID(s),
+		wireSession: wireSession(s),
+	})
 }
 
 // fetchSessions queries gmuxd for the full session list. Starts gmuxd
 // if it's not already running so management commands work on a cold
 // machine, the same way `gmux <cmd>` does.
 func fetchSessions() ([]cliSession, error) {
-	ensureGmuxd()
+	return fetchSessionsContext(context.Background())
+}
+
+func fetchSessionsContext(ctx context.Context) ([]cliSession, error) {
+	ensureGmuxdContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	client := gmuxdClient()
-	resp, err := client.Get(gmuxdBaseURL() + "/v1/sessions")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gmuxdBaseURL()+"/v1/sessions", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build sessions request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("contact gmuxd: %w", err)
 	}
@@ -53,27 +94,72 @@ func fetchSessions() ([]cliSession, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("decode sessions: %w", err)
 	}
+	for _, s := range envelope.Data {
+		if s.Peer != "" && !validPeerName.MatchString(s.Peer) {
+			return nil, fmt.Errorf("decode sessions: invalid peer name %q", s.Peer)
+		}
+	}
 	return envelope.Data, nil
 }
 
 // resolveSession fetches the session list from gmuxd and finds the one
 // the user's reference points to. See matchSession for the matching
 // rules.
+//
+// A just-launched session may not yet be visible in the composed
+// snapshot served by GET /v1/sessions (the compose loop runs
+// asynchronously after the registration commit). To close this
+// read-your-writes window, resolveSession retries a few times with
+// short backoff when the first attempt yields "no session matches".
+// The retry is bounded (≤600ms total) so interactive commands stay
+// snappy, and only fires on a clean miss — ambiguous/malformed refs
+// fail immediately.
 func resolveSession(ref string) (cliSession, error) {
-	sessions, err := fetchSessions()
-	if err != nil {
-		return cliSession{}, err
+	return resolveSessionContext(context.Background(), ref)
+}
+
+func resolveSessionContext(ctx context.Context, ref string) (cliSession, error) {
+	const (
+		maxRetries = 6
+		retryDelay = 100 * time.Millisecond
+	)
+	for attempt := 0; ; attempt++ {
+		sessions, err := fetchSessionsContext(ctx)
+		if err != nil {
+			return cliSession{}, err
+		}
+		sess, err := matchSession(sessions, ref)
+		if err == nil {
+			return sess, nil
+		}
+		// Only retry on a clean miss ("no session matches"). Ambiguous
+		// refs, empty refs, and peer-hint misses are not transient.
+		if attempt >= maxRetries || !isNoMatchError(err) {
+			return cliSession{}, err
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return cliSession{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return matchSession(sessions, ref)
+}
+
+// isNoMatchError returns true when the error is the specific "no
+// session matches" sentinel from matchSession — the only case where
+// a retry can help (the session exists in the store but the composed
+// snapshot hasn't caught up yet).
+func isNoMatchError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "no session matches")
 }
 
 // matchSession resolves a user-supplied reference to a single session.
 //
 // A reference can be:
-//   - the full session ID ("sess-abcd1234") or full slug
-//   - the short form shown by `gmux ls` ("abcd1234", i.e. the ID with
-//     its "sess-" prefix stripped)
-//   - a unique prefix of any of the above
+//   - the full 8-character session ID or full slug
+//   - a unique prefix of either
 //   - any of the above with an "@<peer>" suffix to target a peer
 //
 // Local-by-default (ADR 0009): without an @suffix the lookup is scoped
@@ -116,7 +202,7 @@ func matchSession(sessions []cliSession, ref string) (cliSession, error) {
 	if len(candidates) > 1 {
 		ids := make([]string, 0, len(candidates))
 		for _, c := range candidates {
-			ids = append(ids, shortID(c.ID))
+			ids = append(ids, displayID(c))
 		}
 		return cliSession{}, fmt.Errorf("ambiguous session %q matches: %s", ref, strings.Join(ids, ", "))
 	}
@@ -136,15 +222,15 @@ func matchSession(sessions []cliSession, ref string) (cliSession, error) {
 		hint, peerCandidates := lookupInPool(peerPool, ref)
 		switch {
 		case hint != nil:
-			return cliSession{}, fmt.Errorf("session %q not found locally. Did you mean %s@%s?",
-				ref, shortID(hint.ID), hint.Peer)
+			return cliSession{}, fmt.Errorf("session %q not found locally. Did you mean %s?",
+				ref, displayID(*hint))
 		case len(peerCandidates) > 1:
 			// More than one peer session matches: don't pick a
 			// favorite, list them so the user knows exactly which
 			// qualified forms work.
 			qualified := make([]string, 0, len(peerCandidates))
 			for _, c := range peerCandidates {
-				qualified = append(qualified, shortID(c.ID)+"@"+c.Peer)
+				qualified = append(qualified, displayID(c))
 			}
 			return cliSession{}, fmt.Errorf("session %q not found locally; matches peer sessions: %s",
 				ref, strings.Join(qualified, ", "))
@@ -182,21 +268,31 @@ func filterByHost(sessions []cliSession, host string) []cliSession {
 // Returning a pointer for the match keeps the "not found" sentinel
 // distinct from a zero-value session (which is a valid match shape).
 func lookupInPool(pool []cliSession, ref string) (*cliSession, []cliSession) {
-	// Pass 1: exact matches take precedence.
+	// Pass 1a: an exact immutable ID wins over every slug match.
 	for i := range pool {
-		s := pool[i]
-		if s.ID == ref || s.Slug == ref || shortID(s.ID) == ref {
-			return &s, nil
+		if pool[i].ID == ref {
+			return &pool[i], nil
 		}
+	}
+	// Pass 1b: duplicate exact slugs are ambiguous rather than pool-order
+	// dependent.
+	var exactSlugs []cliSession
+	for _, s := range pool {
+		if s.Slug == ref {
+			exactSlugs = append(exactSlugs, s)
+		}
+	}
+	if len(exactSlugs) == 1 {
+		return &exactSlugs[0], nil
+	}
+	if len(exactSlugs) > 1 {
+		return nil, exactSlugs
 	}
 
 	// Pass 2: unique prefix match.
 	var matches []cliSession
 	for _, s := range pool {
-		switch {
-		case strings.HasPrefix(s.ID, ref),
-			strings.HasPrefix(shortID(s.ID), ref),
-			s.Slug != "" && strings.HasPrefix(s.Slug, ref):
+		if strings.HasPrefix(s.ID, ref) || (s.Slug != "" && strings.HasPrefix(s.Slug, ref)) {
 			matches = append(matches, s)
 		}
 	}
@@ -210,27 +306,18 @@ func lookupInPool(pool []cliSession, ref string) (*cliSession, []cliSession) {
 	}
 }
 
-// shortID returns the 8-char display form of a session id, matching
-// what the web UI uses.
-func shortID(id string) string {
-	const prefix = "sess-"
-	trimmed := strings.TrimPrefix(id, prefix)
-	if len(trimmed) > 8 {
-		trimmed = trimmed[:8]
-	}
-	return trimmed
-}
+// Peer names are normalized at creation by both manual-peer and devcontainer
+// discovery. Pin that grammar at the CLI boundary too: in particular, '@'
+// cannot occur and make the authoritative id@peer reference ambiguous.
+var validPeerName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
-// displayID returns the user-visible address for a session: shortID for
-// local sessions, shortID@peer for peer sessions. Use it in error
-// messages so the printed id matches what the user typed (and what
-// `gmux ls` shows), instead of dropping the @peer suffix and leaving them
-// wondering which session the message refers to.
+// displayID returns the one canonical user-visible session address: the full
+// ID, qualified with @peer when the session is remote.
 func displayID(s cliSession) string {
 	if s.Peer == "" {
-		return shortID(s.ID)
+		return s.ID
 	}
-	return shortID(s.ID) + "@" + s.Peer
+	return s.ID + "@" + s.Peer
 }
 
 // cmdList implements `gmux ls [--all] [--json]`.
@@ -241,7 +328,7 @@ func displayID(s cliSession) string {
 // send, kill, etc.
 //
 // Rows are grouped alive-first then by start time; columns are kept
-// shallow (id, status, kind, title, cwd) so the output stays readable
+// shallow (id, status, adapter, title, cwd) so the output stays readable
 // in a narrow terminal.
 func cmdList(all bool, asJSON bool) int {
 	sessions, err := fetchSessions()
@@ -257,6 +344,10 @@ func cmdList(all bool, asJSON bool) int {
 		sessions = filterByHost(sessions, "")
 	}
 
+	// Both renderings have the same deterministic order: alive first, then
+	// newest started_at, then canonical ref for equal/unknown timestamps.
+	sortSessions(sessions)
+
 	if asJSON {
 		return emitSessionsJSON(sessions)
 	}
@@ -266,23 +357,15 @@ func cmdList(all bool, asJSON bool) int {
 		return 0
 	}
 
-	// Alive first; within each group, newest first.
-	sort.SliceStable(sessions, func(i, j int) bool {
-		if sessions[i].Alive != sessions[j].Alive {
-			return sessions[i].Alive
-		}
-		return sessions[i].StartedAt > sessions[j].StartedAt
-	})
-
 	// Measure columns.
-	idW, statusW, kindW := len("ID"), len("STATUS"), len("KIND")
+	idW, statusW, adapterW := len("ID"), len("STATUS"), len("ADAPTER")
 	rows := make([][5]string, 0, len(sessions))
 	for _, s := range sessions {
 		status := "dead"
 		if s.Alive {
 			status = "alive"
 		}
-		id := shortID(s.ID)
+		id := s.ID
 		if s.Peer != "" {
 			// The @peer suffix is part of the addressable ID, not just
 			// status flavor: copy-pasting this row's ID into
@@ -293,7 +376,14 @@ func cmdList(all bool, asJSON bool) int {
 		if title == "" {
 			title = strings.Join(s.Command, " ")
 		}
-		row := [5]string{id, status, s.Kind, title, s.Cwd}
+		// The mode rides the adapter cell rather than adding a column: it
+		// is exceptional (terminal is the default and stays unmarked), and
+		// a copy-pasteable table should not grow a column for it.
+		adapterCell := s.Adapter
+		if s.DriveMode == "acp" {
+			adapterCell += " (acp)"
+		}
+		row := [5]string{id, status, adapterCell, title, s.Cwd}
 		rows = append(rows, row)
 		if n := len(row[0]); n > idW {
 			idW = n
@@ -301,20 +391,41 @@ func cmdList(all bool, asJSON bool) int {
 		if n := len(row[1]); n > statusW {
 			statusW = n
 		}
-		if n := len(row[2]); n > kindW {
-			kindW = n
+		if n := len(row[2]); n > adapterW {
+			adapterW = n
 		}
 	}
 
-	fmt.Printf("%-*s  %-*s  %-*s  %s\n", idW, "ID", statusW, "STATUS", kindW, "KIND", "TITLE")
+	fmt.Printf("%-*s  %-*s  %-*s  %s\n", idW, "ID", statusW, "STATUS", adapterW, "ADAPTER", "TITLE")
 	for _, r := range rows {
-		line := fmt.Sprintf("%-*s  %-*s  %-*s  %s", idW, r[0], statusW, r[1], kindW, r[2], r[3])
+		line := fmt.Sprintf("%-*s  %-*s  %-*s  %s", idW, r[0], statusW, r[1], adapterW, r[2], r[3])
 		if r[4] != "" {
 			line += "  (" + r[4] + ")"
 		}
 		fmt.Println(line)
 	}
 	return 0
+}
+
+func sortSessions(sessions []cliSession) {
+	sort.SliceStable(sessions, func(i, j int) bool {
+		a, b := sessions[i], sessions[j]
+		if a.Alive != b.Alive {
+			return a.Alive
+		}
+		aTime, aErr := time.Parse(time.RFC3339Nano, a.StartedAt)
+		bTime, bErr := time.Parse(time.RFC3339Nano, b.StartedAt)
+		switch {
+		case aErr == nil && bErr == nil && !aTime.Equal(bTime):
+			return aTime.After(bTime)
+		case (aErr == nil) != (bErr == nil):
+			return aErr == nil
+		case displayID(a) != displayID(b):
+			return displayID(a) < displayID(b)
+		default:
+			return a.Adapter < b.Adapter
+		}
+	})
 }
 
 // cmdKill implements `gmux kill <id>`.
@@ -351,62 +462,238 @@ func cmdKill(ref string) int {
 	return 0
 }
 
-// cmdTail implements `gmux tail <id> [-n N] [--raw]`.
-//
-// Routes through gmuxd's scrollback broker rather than the per-session
-// Unix socket so the same code path serves four cases uniformly:
-// local-live (broker reads from disk; the runner tees output there),
-// local-dead (broker still reads from disk), peer-live (broker forwards
-// to the owning gmuxd), and peer-dead (forward-then-disk on the peer).
-// Output is raw PTY bytes including ANSI; pipe through your favorite
-// stripper if you want plain text.
-func cmdTail(ref string, n int, raw bool) int {
+// cmdDismiss hides a retained session after stopping it if needed. The
+// default is leaf-only; --tree makes recursive family scope explicit at the
+// command boundary.
+func cmdDismiss(ref string, tree bool) int {
 	sess, err := resolveSession(ref)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
 		return 1
 	}
+	if sess.Peer != "" && !tree {
+		fmt.Fprintf(os.Stderr, "gmux: leaf-only dismissal cannot be verified across daemon versions; run gmux on %s or explicitly use --tree\n", sess.Peer)
+		return 1
+	}
+	endpoint := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/dismiss"
+	if !tree {
+		endpoint += "?leaf=1"
+	}
+	resp, err := gmuxdClient().Post(endpoint, "application/json", strings.NewReader("{}"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode != http.StatusOK {
+		message := extractMessage(body)
+		if message == "" {
+			message = resp.Status
+		}
+		if errorCode(body) == "has_children" {
+			message += "; rerun with --tree to dismiss the full family"
+		}
+		fmt.Fprintln(os.Stderr, "gmux:", message)
+		return 1
+	}
+	if tree {
+		fmt.Printf("dismissed session tree %s\n", displayID(sess))
+	} else {
+		fmt.Printf("dismissed %s\n", displayID(sess))
+	}
+	return 0
+}
 
-	data, code := fetchScrollback(sess, n)
+func cmdPromote(ref string) int {
+	return cmdReparentMutation(ref, "", true)
+}
+
+func cmdReparent(ref, parentRef string) int {
+	return cmdReparentMutation(ref, parentRef, false)
+}
+
+func cmdReparentMutation(ref, parentRef string, promote bool) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	verb := "reparent"
+	if promote {
+		verb = "promote"
+	}
+	if sess.Peer != "" {
+		fmt.Fprintf(os.Stderr, "gmux: %s requires a session owned by this daemon; run gmux on the owning host\n", verb)
+		return 1
+	}
+	var parentID any
+	if !promote {
+		parent, resolveErr := resolveSession(parentRef)
+		if resolveErr != nil {
+			fmt.Fprintln(os.Stderr, "gmux:", resolveErr)
+			return 1
+		}
+		if parent.Peer != "" {
+			fmt.Fprintln(os.Stderr, "gmux: parent session must be owned by this daemon; cross-peer reparenting is not supported")
+			return 1
+		}
+		parentID = parent.ID
+	}
+	body, err := json.Marshal(map[string]any{"parent_session_id": parentID})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/reparent"
+	resp, err := gmuxdClient().Post(url, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	responseBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		message := extractMessage(responseBody)
+		if message == "" {
+			message = resp.Status
+		}
+		fmt.Fprintln(os.Stderr, "gmux:", message)
+		return 1
+	}
+	if promote {
+		fmt.Printf("promoted %s to a root\n", displayID(sess))
+	} else {
+		fmt.Printf("reparented %s under %s\n", displayID(sess), parentRef)
+	}
+	return 0
+}
+
+// cmdTail implements `gmux tail <id> [-n N]`: the last n lines of the
+// session's terminal output, for any session, always.
+//
+// tail answers one question — "what is on its screen" — and answers it
+// the same way for a shell, a one-shot command and an agent. The
+// conversation-markdown view it defaulted to between 2.1 and this
+// release now lives at `gmux agent logs` ("what has it been doing"),
+// because a verb whose output shape depended on the session's adapter
+// could not be scripted without first knowing what was running in it.
+//
+// Output is plain text: scrollback requests are rendered through a
+// terminal emulator in the broker, so ANSI escapes never survive the
+// server side, and stripANSI below is a belt-and-braces pass.
+//
+// Everything routes through gmuxd rather than the per-session Unix
+// socket so the same code path serves local-live, local-dead,
+// peer-live, and peer-dead uniformly (scrollback requests are
+// forwarded to the owning gmuxd for peer sessions).
+func cmdTail(ref string, n int) int {
+	return cmdTailTo(ref, n, os.Stdout)
+}
+
+func cmdTailTo(ref string, n int, stdout io.Writer) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	data, token, code := fetchScrollback(sess, n)
 	if code != 0 {
 		return code
 	}
-	if !raw {
-		data = stripANSI(data)
-	}
-	if _, err := os.Stdout.Write(data); err != nil {
+	data = stripANSI(data)
+	if _, err := stdout.Write(data); err != nil {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+	if err := consumeSession(sess, token); err != nil {
+		fmt.Fprintf(os.Stderr, "gmux: tail could not mark %s read: %v\n", displayID(sess), err)
 		return 1
 	}
 	return 0
 }
 
+const unreadTokenHeader = "X-Gmux-Unread-Token"
+
+// consumeSession marks a successfully observed session result read. It routes
+// through gmuxd so local/peer and live/dead ownership use one contract.
+func consumeSession(sess cliSession, tokens ...string) error {
+	token := sess.UnreadToken
+	if len(tokens) > 0 {
+		token = tokens[0]
+	}
+	client := gmuxdClient()
+	endpoint := fmt.Sprintf("%s/v1/sessions/%s/read?token=%s", gmuxdBaseURL(), sess.ID, url.QueryEscape(token))
+	resp, err := client.Post(endpoint, "application/json", http.NoBody)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		// The observed result was consumed, but a newer result won the race and
+		// correctly remains unread. That is success for this read operation.
+		if resp.StatusCode == http.StatusConflict && errorCode(body) == "result_changed" {
+			return nil
+		}
+		return fmt.Errorf("%s: %s", resp.Status, extractMessage(body))
+	}
+	return nil
+}
+
+// errorCode extracts the machine-readable code from a gmuxd error
+// envelope ({"ok":false,"error":{"code":...}}); "" if the body isn't one.
+func errorCode(body []byte) string {
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return ""
+	}
+	return env.Error.Code
+}
+
 // fetchScrollback pulls the last n lines of a session's scrollback from
 // gmuxd's broker. Returns the raw bytes and a process exit code (0 ok).
-func fetchScrollback(sess cliSession, n int) ([]byte, int) {
+func fetchScrollback(sess cliSession, n int) ([]byte, string, int) {
 	client := gmuxdClient()
 	url := fmt.Sprintf("%s/v1/sessions/%s/scrollback?tail=%d", gmuxdBaseURL(), sess.ID, n)
 	resp, err := client.Get(url)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
-		return nil, 1
+		return nil, "", 1
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusNotFound {
 			fmt.Fprintf(os.Stderr, "gmux: session %s not found\n", displayID(sess))
-			return nil, 1
+			return nil, "", 1
+		}
+		if resp.StatusCode == http.StatusUnprocessableEntity {
+			// A capability refusal (e.g. an ACP session has no terminal
+			// screen, ADR 0033) arrives with a self-contained message.
+			if msg := extractMessage(body); msg != "" {
+				fmt.Fprintf(os.Stderr, "gmux: %s\n", msg)
+				return nil, "", 1
+			}
 		}
 		fmt.Fprintf(os.Stderr, "gmux: tail failed: %s: %s\n", resp.Status, strings.TrimSpace(string(body)))
-		return nil, 1
+		return nil, "", 1
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil && !errors.Is(err, io.EOF) {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
-		return nil, 1
+		return nil, "", 1
 	}
-	return data, 0
+	values := resp.Header.Values(unreadTokenHeader)
+	if len(values) == 0 {
+		fmt.Fprintln(os.Stderr, "gmux: daemon response has no unread token; restart gmuxd to resolve version skew")
+		return nil, "", 1
+	}
+	return data, values[0], 0
 }
 
 // cmdSend implements `gmux send <id> [text] [Key...]`.
@@ -414,7 +701,10 @@ func fetchScrollback(sess cliSession, n int) ([]byte, int) {
 // Sends bytes to the session's PTY as if typed at the terminal: the
 // inline text (or piped stdin) followed by any trailing key tokens.
 // Submission is explicit (ADR 0009) — a trailing `Enter` key, or a \r
-// in piped bytes — so there is no implicit carriage return.
+// in piped bytes — so there is no implicit carriage return. send is
+// raw and adapter-blind: nothing here depends on which agent runs in
+// the session. Semantic, adapter-aware submission (steer a turn, queue
+// a follow-up, interrupt) belongs to the agent layer of ADR 0027.
 //
 // When text is provided inline it is sent verbatim; when it is omitted
 // and stdin is a pipe, stdin is read until EOF (`echo hi | gmux send
@@ -426,7 +716,13 @@ func fetchScrollback(sess cliSession, n int) ([]byte, int) {
 // peer sessions (gmuxd forwards to the owning peer transparently).
 // Access control inherits from gmuxd: local IPC is owner-only, and
 // peers honor their own `tailscale.allow` config.
-func cmdSend(ref string, text *string, keys []string) int {
+func cmdSend(ref string, text *string, keys []string, wait bool, timeoutSecs int) int {
+	sess, err := resolveSession(ref)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gmux:", err)
+		return 1
+	}
+
 	// Read stdin only when no inline text was given AND stdin is a pipe.
 	// The tty guard is essential: without it, `gmux send <id> Enter` typed
 	// interactively would block reading the terminal. With it, piped input
@@ -436,7 +732,35 @@ func cmdSend(ref string, text *string, keys []string) int {
 	if text == nil && !localterm.IsInteractive() {
 		stdin = os.Stdin
 	}
-	return sendBytes(ref, buildSendBody(text, keys, stdin))
+	body := buildSendBody(text, keys, stdin)
+	if !wait {
+		return postInput(sess, body, "")
+	}
+
+	// `gmux send --wait`: one request delivers the input AND blocks
+	// until the turn it triggers completes. gmuxd subscribes to session
+	// events *before* forwarding the bytes to the runner, so unlike the
+	// `gmux send X && gmux wait X` composition it cannot mistake the
+	// previous turn's idle state for the reply (#218).
+	//
+	// Exit codes are `gmux wait`'s, through the same mapping (ADR 0027 §8):
+	// 0 the turn completed, 2 it was intentionally interrupted, 1 anything
+	// else — a failed turn, a death, a timeout, a usage/transport error.
+	// Unlike `gmux wait`, no result is printed: raw input makes no claim
+	// about which agent turn the bytes belong to.
+	if sess.Peer != "" {
+		// Same scope rule as `gmux wait`: the wait half needs the
+		// owning daemon's event stream, which peers don't expose to
+		// the CLI yet. Bare shortID: the message names the peer itself.
+		fmt.Fprintf(os.Stderr, "gmux: send --wait is only supported for local sessions (%s is on peer %q)\n",
+			sess.ID, sess.Peer)
+		return 1
+	}
+	query := "?wait=idle"
+	if timeoutSecs > 0 {
+		query += "&timeout=" + strconv.Itoa(timeoutSecs)
+	}
+	return postInput(sess, body, query)
 }
 
 // cmdSendKeys implements the tmux-compatible `gmux send-keys -t <id>
@@ -453,14 +777,21 @@ func sendBytes(ref string, body io.Reader) int {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
 		return 1
 	}
+	return postInput(sess, body, "")
+}
 
+// postInput POSTs body to the session's input endpoint. With an empty
+// query this is fire-and-forget (204). With "?wait=idle..." gmuxd
+// holds the response until the triggered turn completes and answers
+// with a wait-style reason payload, mapped to `gmux wait` exit codes.
+func postInput(sess cliSession, body io.Reader, query string) int {
 	client := gmuxdClient()
 	// Stdin may be paced by a human or upstream process; the default
 	// 5s timeout would cut off legitimately slow inputs. gmuxd buffers
 	// the whole body before forwarding to the runner, so a long-lived
 	// connection here is fine.
 	client.Timeout = 0
-	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/input"
+	url := gmuxdBaseURL() + "/v1/sessions/" + sess.ID + "/input" + query
 	req, err := http.NewRequest(http.MethodPost, url, body)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gmux:", err)
@@ -481,12 +812,35 @@ func sendBytes(ref string, body io.Reader) int {
 			fmt.Fprintf(os.Stderr, "gmux: session %s not found\n", displayID(sess))
 		case http.StatusConflict:
 			fmt.Fprintf(os.Stderr, "gmux: session %s is not running\n", displayID(sess))
+		case http.StatusRequestTimeout:
+			fmt.Fprintln(os.Stderr, "gmux: session did not become idle within --timeout")
+			// A timeout is an error under the global taxonomy (ADR 0027 §8);
+			// it no longer has a code of its own.
+			return waitExitError
+		case http.StatusUnprocessableEntity:
+			fmt.Fprintf(os.Stderr, "gmux: %s\n", extractMessage(msg))
 		default:
 			fmt.Fprintf(os.Stderr, "gmux: send failed: %s: %s\n", resp.Status, strings.TrimSpace(string(msg)))
 		}
 		return 1
 	}
-	return 0
+	if query == "" {
+		return 0
+	}
+	// wait=idle response: the same conclusion payload `gmux wait` gets
+	// ({reason, outcome, cause}), minus any result. Mapping it with the same
+	// function is what keeps an intentionally interrupted turn from exiting 0
+	// through this path while `gmux wait` exits 2 for the identical turn.
+	// io.Discard + quiet is not a stylistic choice: it is how this path stays
+	// result-free while sharing every exit decision.
+	var env struct {
+		Data waitResult `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		fmt.Fprintln(os.Stderr, "gmux: decode send --wait response:", err)
+		return 1
+	}
+	return reportWaitResult(env.Data, false, true, false, io.Discard)
 }
 
 // maxSendBytes caps the number of bytes read from stdin for a single
@@ -494,21 +848,11 @@ func sendBytes(ref string, body io.Reader) int {
 // fast on the client side rather than letting the server truncate us.
 const maxSendBytes = 1 << 20 // 1 MiB
 
-// buildSendBody assembles the bytes that --send writes to the session's
-// PTY input. When text is non-nil it is sent verbatim; otherwise stdin
-// is read up to maxSendBytes. Unless noSubmit is set, a trailing \r is
-// appended — that's what xterm sends for Enter and what every PTY
-// (agent or shell) treats as "submit this line." \n alone is not
-// enough: most agents see it as a literal newline and keep buffering,
-// which is how `gmux --send <id> < prompt.txt` ended up silently
-// failing for users who expected `cat`-style behavior. A redundant \r
-// in the input is harmless (submits an empty line at most), so we don't
-// try to detect and dedupe.
 // buildSendBody assembles the bytes to write to the session PTY: the
 // message body (inline text, else piped stdin if provided) followed by
 // any trailing key sequences. stdin is nil unless the caller determined
 // it is a pipe to read (see cmdSend). Submission is explicit — a
-// trailing Enter key, or a \r in the piped bytes.
+// trailing Enter key or a \r in the piped bytes; send never appends one.
 func buildSendBody(text *string, keys []string, stdin io.Reader) io.Reader {
 	readers := make([]io.Reader, 0, 2)
 	switch {
@@ -540,45 +884,12 @@ func emitSessionsJSON(sessions []cliSession) int {
 }
 
 // stripANSI removes ANSI/VT escape sequences from PTY output so the
-// default `gmux tail` is grep-friendly plain text. `--raw` bypasses
-// this. Handles CSI (ESC [ ... letter), OSC (ESC ] ... BEL/ST), and
-// lone two-byte escapes; this is a pragmatic stripper, not a full
-// terminal emulator.
+// scrollback view of `gmux tail` is grep-friendly text. The broker already
+// renders tail responses through a terminal emulator, so this is
+// belt-and-braces for whatever survives that pass. Reuse the foreground
+// relay's parser so tail and `gmux -- <cmd>` cannot drift in what they strip.
 func stripANSI(b []byte) []byte {
-	out := make([]byte, 0, len(b))
-	for i := 0; i < len(b); {
-		c := b[i]
-		if c != 0x1b { // not ESC
-			if c != '\r' { // collapse bare CRs that survive re-render
-				out = append(out, c)
-			}
-			i++
-			continue
-		}
-		// ESC sequence.
-		if i+1 >= len(b) {
-			break
-		}
-		switch b[i+1] {
-		case '[': // CSI: ESC [ params... final-byte (0x40-0x7e)
-			j := i + 2
-			for j < len(b) && (b[j] < 0x40 || b[j] > 0x7e) {
-				j++
-			}
-			i = j + 1
-		case ']': // OSC: ESC ] ... (BEL | ESC \)
-			j := i + 2
-			for j < len(b) && b[j] != 0x07 {
-				if b[j] == 0x1b && j+1 < len(b) && b[j+1] == '\\' {
-					j++
-					break
-				}
-				j++
-			}
-			i = j + 1
-		default: // two-byte escape
-			i += 2
-		}
-	}
-	return out
+	var out strings.Builder
+	_, _ = newANSIStrippingWriter(&out).Write(b) // strings.Builder never fails
+	return []byte(out.String())
 }

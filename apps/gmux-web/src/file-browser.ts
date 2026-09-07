@@ -1,0 +1,156 @@
+export interface FileEntry {
+  name: string
+  path: string
+  type: 'dir' | 'file' | 'symlink'
+  size?: number
+  mod_time?: string
+  hidden?: boolean
+  symlink?: boolean
+  too_large?: boolean
+}
+
+export interface FileListData {
+  root: string
+  path: string
+  abs_path: string
+  entries: FileEntry[]
+  truncated?: boolean
+}
+
+export interface FileContentData {
+  root: string
+  path: string
+  abs_path: string
+  name: string
+  size: number
+  mod_time?: string
+  mime?: string
+  kind?: 'text' | 'image'
+  content: string
+  truncated?: boolean
+}
+
+export function fileBrowserPath(sessionId: string, path = '', currentPath = location.pathname, currentSearch = location.search): string {
+  return fileBrowserTargetPath('files', sessionId, path, currentPath, currentSearch)
+}
+
+export function projectFileBrowserPath(projectSlug: string, peer?: string, path = '', currentPath = location.pathname, currentSearch = location.search): string {
+  const target = fileBrowserTargetPath('projectFiles', projectSlug, path, currentPath, currentSearch)
+  const url = new URL(target, 'http://gmux.local')
+  if (peer) url.searchParams.set('projectFilesPeer', peer)
+  return `${url.pathname}?${url.searchParams.toString()}`
+}
+
+export function pasteFileBrowserPath(sessionId: string, name: string, currentPath = location.pathname, currentSearch = location.search): string {
+  return fileBrowserTargetPath('pasteFile', sessionId, name, currentPath, currentSearch)
+}
+
+function fileBrowserTargetPath(key: 'files' | 'projectFiles' | 'pasteFile', value: string, path: string, currentPath: string, currentSearch: string): string {
+  const params = new URLSearchParams(currentSearch)
+  params.delete('files')
+  params.delete('projectFiles')
+  params.delete('projectFilesPeer')
+  params.delete('pasteFile')
+  params.set(key, value)
+  if (path) params.set('filePath', path)
+  else params.delete('filePath')
+  return `${currentPath}?${params.toString()}`
+}
+
+export function closeFileBrowserPath(currentPath = location.pathname, currentSearch = location.search): string {
+  const params = new URLSearchParams(currentSearch)
+  params.delete('files')
+  params.delete('projectFiles')
+  params.delete('projectFilesPeer')
+  params.delete('pasteFile')
+  params.delete('filePath')
+  const qs = params.toString()
+  return qs ? `${currentPath}?${qs}` : currentPath
+}
+
+export type FileApiTarget = { sessionId: string } | { projectSlug: string; peer?: string }
+
+export function fileApiPath(kind: 'list' | 'content' | 'raw', target: FileApiTarget, path = ''): string {
+  const params = new URLSearchParams()
+  if (path) params.set('path', path)
+  if (kind === 'raw') params.set('raw', '1')
+  const endpoint = kind === 'list' ? 'files' : 'file'
+  const qs = params.toString()
+  const base = 'sessionId' in target
+    ? `/v1/sessions/${encodeURIComponent(target.sessionId)}/${endpoint}`
+    : `${target.peer ? `/v1/peers/${encodeURIComponent(target.peer)}` : ''}/v1/projects/${encodeURIComponent(target.projectSlug)}/${endpoint}`
+  return `${base}${qs ? `?${qs}` : ''}`
+}
+
+export function tempFileApiPath(kind: 'content' | 'raw', sessionId: string, name: string): string {
+  const params = new URLSearchParams({ name })
+  if (kind === 'raw') params.set('raw', '1')
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/temp-file?${params.toString()}`
+}
+
+export function parentPath(path: string): string {
+  const clean = path.replace(/^\/+|\/+$/g, '')
+  if (!clean) return ''
+  const idx = clean.lastIndexOf('/')
+  return idx < 0 ? '' : clean.slice(0, idx)
+}
+
+export function pathSegments(path: string): Array<{ name: string; path: string }> {
+  const parts = path.split('/').filter(Boolean)
+  let acc = ''
+  return parts.map(name => {
+    acc = acc ? `${acc}/${name}` : name
+    return { name, path: acc }
+  })
+}
+
+export type ImageSizingMode = 'fit' | 'actual' | 'fill'
+
+export const imageZoomMin = 0.25
+export const imageZoomMax = 5
+export const imageWheelZoomStep = 0.05
+
+export function imageSizeForMode(
+  mode: ImageSizingMode,
+  naturalWidth: number,
+  naturalHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } | null {
+  if (naturalWidth <= 0 || naturalHeight <= 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
+  if (mode === 'actual') return { width: naturalWidth, height: naturalHeight }
+  const ratio = mode === 'fill'
+    ? Math.max(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
+    : Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight)
+  return { width: naturalWidth * ratio, height: naturalHeight * ratio }
+}
+
+export function coverImageSize(
+  naturalWidth: number,
+  naturalHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { width: number; height: number } | null {
+  return imageSizeForMode('fill', naturalWidth, naturalHeight, viewportWidth, viewportHeight)
+}
+
+export function clampImageZoom(zoom: number): number {
+  return Math.min(imageZoomMax, Math.max(imageZoomMin, zoom))
+}
+
+export function wheelImageZoom(zoom: number, deltaY: number): number {
+  if (deltaY === 0) return clampImageZoom(zoom)
+  return clampImageZoom(zoom + (deltaY < 0 ? imageWheelZoomStep : -imageWheelZoomStep))
+}
+
+export function formatBytes(bytes?: number): string {
+  if (!bytes) return bytes === 0 ? '0 B' : ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let n = bytes
+  let idx = 0
+  while (n >= 1024 && idx < units.length - 1) {
+    n /= 1024
+    idx++
+  }
+  return `${idx === 0 ? n : n.toFixed(n >= 10 ? 0 : 1)} ${units[idx]}`
+}

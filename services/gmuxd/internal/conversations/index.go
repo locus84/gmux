@@ -1,121 +1,218 @@
-// Package conversations maintains an index of conversation files
-// discovered on disk. It maps (kind, slug) to file metadata, enabling
-// URL resolution for dead conversations and (future) fulltext search.
+// Package conversations maintains an index of the conversations each
+// adapter's tool has stored. It maps (adapter, slug) to conversation
+// metadata, enabling URL resolution for dead conversations and (future)
+// fulltext search.
 //
-// The index is populated on startup by scanning adapter session
-// directories and updated as filemon detects new or changed files.
-// It never writes to the session store.
+// The index is populated and kept current by adapter ConversationSources
+// (snapshot at startup, incremental thereafter), which emit opaque
+// conversation refs; the index resolves each ref to metadata via the
+// owning adapter's DescribeConversation and never interprets the ref
+// itself (for file-backed adapters it happens to be a path — that is the
+// adapter's detail). It never writes to the session store.
 package conversations
 
 import (
-	"log"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
-	"github.com/gmuxapp/gmux/packages/adapter/adapters"
 )
 
-// Info holds metadata for a single conversation file.
+// Info holds metadata for a single stored conversation.
 type Info struct {
-	ToolID        string    // full UUID from the session file header
-	Slug          string    // human-readable URL identifier, unique within (kind)
-	Kind          string    // adapter name (claude, codex, pi, shell)
-	Title         string    // display title
-	Cwd           string    // working directory
-	FilePath      string    // absolute path to the session file
-	ResumeCommand []string  // command to resume this conversation
-	Created       time.Time // when the conversation started
+	ConversationID string    // adapter-native conversation ID (typically a UUID)
+	Key            string    // internal lookup key, unique within (adapter)
+	Slug           string    // human-readable URL identifier; empty until titled
+	Adapter        string    // adapter name (claude, codex, pi, shell)
+	Title          string    // display title
+	Cwd            string    // working directory
+	Ref            string    // opaque adapter-scoped conversation ref (a file path for file-backed adapters)
+	ResumeCommand  []string  // command to resume this conversation
+	Created        time.Time // when the conversation started
+	LastActivity   time.Time // adapter-reported most recent activity (zero when unknown)
 }
 
-// Index is a concurrency-safe lookup table for conversation files.
-// It is the authority on slug uniqueness: when two conversations
-// produce the same slug within the same kind, the index assigns
+// Index is a concurrency-safe lookup table for stored conversations.
+// It is the authority on internal-key uniqueness: when two conversations
+// produce the same key within the same adapter, the index assigns
 // -2, -3 suffixes.
 type Index struct {
 	mu sync.RWMutex
-	// byKey maps "kind/slug" → Info.
+	// byKey maps "adapter/key" → Info.
 	byKey map[string]Info
-	// byToolID maps "kind/toolID" → slug for reverse lookup
-	// (e.g., finding a conversation's slug from its tool UUID).
-	byToolID map[string]string
+	// byConversationID maps "adapter/conversationID" → internal key for reverse lookup.
+	byConversationID map[string]string
+	// resumeByRef caches the adapter-derived resume command while the
+	// conversation source is indexing the ref. Rendering the session list is
+	// a hot read path and must not re-read every dead conversation transcript.
+	resumeByRef map[string][]string
+	// removeGen counts Remove/RemoveByRef events per (adapter, ref). Scan
+	// snapshots it before its unlocked DescribeConversation and commits only
+	// if it is unchanged, so a watcher-observed deletion always beats an
+	// in-flight scan of the same ref — otherwise the scan's late Upsert would
+	// resurrect the deleted conversation until restart (zombie). The map only
+	// grows on removal events (manual rm, rotation), which are rare.
+	removeGen map[string]uint64
+	// snapshotDone flips to true once the initial full snapshot of every
+	// adapter ConversationSource has finished (Snapshot or StartSnapshot).
+	// Until then, a lookup miss means "not indexed yet", not "absent".
+	snapshotDone atomic.Bool
 }
 
 // New creates an empty index.
 func New() *Index {
 	return &Index{
-		byKey:    make(map[string]Info),
-		byToolID: make(map[string]string),
+		byKey:            make(map[string]Info),
+		byConversationID: make(map[string]string),
+		resumeByRef:      make(map[string][]string),
+		removeGen:        make(map[string]uint64),
 	}
 }
 
-func indexKey(kind, slug string) string {
-	return kind + "/" + slug
+func indexKey(adapterName, slug string) string {
+	return adapterName + "/" + slug
 }
 
-func toolKey(kind, toolID string) string {
-	return kind + "/" + toolID
+func convKey(adapterName, conversationID string) string {
+	return adapterName + "/" + conversationID
 }
 
-// Lookup returns the conversation info for a (kind, slug) pair.
+func refKey(adapterName, ref string) string {
+	return adapterName + "/" + ref
+}
+
+// LookupResumeCommand returns the command derived when the conversation ref
+// was last observed by its source. The startup snapshot populates this cache
+// progressively (it may still be running while the daemon serves — see
+// SnapshotComplete), and source upserts keep it current. The returned slice
+// is a copy so callers cannot mutate index state.
+func (idx *Index) LookupResumeCommand(adapterName, ref string) []string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return append([]string(nil), idx.resumeByRef[refKey(adapterName, ref)]...)
+}
+
+// Lookup returns the conversation info for an (adapter, key) pair.
 // Returns ok=false if no matching conversation exists.
-func (idx *Index) Lookup(kind, slug string) (Info, bool) {
+func (idx *Index) Lookup(adapterName, key string) (Info, bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	info, ok := idx.byKey[indexKey(kind, slug)]
-	return info, ok
+	if info, ok := idx.byKey[indexKey(adapterName, key)]; ok {
+		return info, true
+	}
+	// A conversation ID (or its old untitled fallback key) keeps resolving
+	// after the key upgraded to a titled slug — deep links must not break.
+	if k, ok := idx.byConversationID[convKey(adapterName, key)]; ok {
+		info, ok := idx.byKey[indexKey(adapterName, k)]
+		return info, ok
+	}
+	return Info{}, false
 }
 
-// LookupByToolID returns the slug for a conversation identified by
-// its adapter-level tool ID. Returns empty string if unknown.
-func (idx *Index) LookupByToolID(kind, toolID string) string {
+// LookupByConversationID returns the internal key for a conversation identified
+// by its agent-native conversation ID. Returns empty string if unknown.
+func (idx *Index) LookupByConversationID(adapterName, conversationID string) string {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.byToolID[toolKey(kind, toolID)]
+	return idx.byConversationID[convKey(adapterName, conversationID)]
 }
 
-// Upsert adds or updates a conversation in the index. If the slug
-// collides with an existing entry of the same kind (but different
-// tool ID), a -2, -3, ... suffix is appended. Returns the final
-// (possibly suffixed) slug.
+// Upsert adds or updates a conversation in the index. If the internal key
+// collides with an existing entry of the same adapter (but different
+// conversation ID), a -2, -3, ... suffix is appended. Returns the final
+// (possibly suffixed) key.
 func (idx *Index) Upsert(info Info) string {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	return idx.upsertLocked(info)
+}
 
-	// If this tool ID already has a slug, update in place.
-	tk := toolKey(info.Kind, info.ToolID)
-	if existing, ok := idx.byToolID[tk]; ok {
-		ik := indexKey(info.Kind, existing)
-		info.Slug = existing
+// upsertLocked is Upsert's body; must be called with idx.mu held.
+func (idx *Index) upsertLocked(info Info) string {
+	// Callers that construct Info directly historically supplied only Slug.
+	// Keep that shorthand for titled conversations.
+	if info.Key == "" {
+		info.Key = info.Slug
+	}
+
+	// If this conversation ID already has a key, update in place — but a
+	// TITLED conversation must stay reachable through its displayed slug
+	// (keys and display slugs are otherwise separate, ADR 0024 §5). So the
+	// key follows the slug: it upgrades from the untitled UUID fallback
+	// when a title first arrives, and re-keys again on rename — the same
+	// slug-follows-rename semantics session URLs have (#348). Conversation-
+	// ID deep links keep resolving via the fallbacks in Lookup/FindByPrefix.
+	// A transiently empty slug (a parse hiccup) keeps the existing key.
+	tk := convKey(info.Adapter, info.ConversationID)
+	if existing, ok := idx.byConversationID[tk]; ok {
+		if info.Slug != "" {
+			// Dedup FIRST (with the old key still in place, so a refresh
+			// that resolves to the same suffixed key is a no-op), then
+			// re-key only on genuine change. Display slug = final key,
+			// always: a collision-suffixed key must be the URL the row
+			// advertises, or the unsuffixed URL resolves a DIFFERENT
+			// conversation.
+			final := idx.uniqueSlugLocked(info.Adapter, info.Slug, info.ConversationID)
+			info.Key = final
+			info.Slug = final
+			if final != existing {
+				delete(idx.byKey, indexKey(info.Adapter, existing))
+				idx.byConversationID[tk] = final
+			}
+			idx.byKey[indexKey(info.Adapter, final)] = info
+			return final
+		}
+		ik := indexKey(info.Adapter, existing)
+		previous := idx.byKey[ik]
+		info.Key = existing
+		info.Slug = previous.Slug
+		if info.Title == "" {
+			info.Title = previous.Title
+		}
 		idx.byKey[ik] = info
 		return existing
 	}
 
-	// Assign a unique slug.
-	info.Slug = idx.uniqueSlugLocked(info.Kind, info.Slug, info.ToolID)
-	ik := indexKey(info.Kind, info.Slug)
+	// Assign a unique internal key; a titled conversation's displayed slug
+	// is the final deduped key, so URLs and display never diverge.
+	info.Key = idx.uniqueSlugLocked(info.Adapter, info.Key, info.ConversationID)
+	if info.Slug != "" {
+		info.Slug = info.Key
+	}
+	ik := indexKey(info.Adapter, info.Key)
 	idx.byKey[ik] = info
-	idx.byToolID[tk] = info.Slug
-	return info.Slug
+	idx.byConversationID[tk] = info.Key
+	return info.Key
 }
 
 // uniqueSlugLocked returns a slug that doesn't collide within the
-// given kind. Appends -2, -3, ... on collision. Must be called with
+// given adapter. Appends -2, -3, ... on collision. Must be called with
 // idx.mu held.
-func (idx *Index) uniqueSlugLocked(kind, slug, toolID string) string {
+func (idx *Index) uniqueSlugLocked(adapterName, slug, conversationID string) string {
 	base := slug
 	for i := 2; ; i++ {
-		ik := indexKey(kind, slug)
+		ik := indexKey(adapterName, slug)
 		existing, occupied := idx.byKey[ik]
-		if !occupied || existing.ToolID == toolID {
+		if !occupied || existing.ConversationID == conversationID {
 			return slug
 		}
 		slug = base + "-" + strconv.Itoa(i)
 	}
+}
+
+// SnapshotComplete reports whether the initial full snapshot across all
+// adapter ConversationSources has finished. While false, a lookup miss is
+// ambiguous: the conversation may simply not have been scanned yet, so
+// callers should surface "index still loading" instead of a hard not-found.
+func (idx *Index) SnapshotComplete() bool {
+	return idx.snapshotDone.Load()
+}
+
+func (idx *Index) markSnapshotComplete() {
+	idx.snapshotDone.Store(true)
 }
 
 // Count returns the number of indexed conversations.
@@ -136,192 +233,181 @@ func (idx *Index) All() []Info {
 	return out
 }
 
-// Scan discovers all conversation files from all SessionFiler adapters
-// and populates the index. Safe to call multiple times; existing entries
-// are updated, new entries are added.
-func (idx *Index) Scan() {
-	for _, a := range adapters.AllAdapters() {
-		sf, ok := a.(adapter.SessionFiler)
-		if !ok {
-			continue
-		}
-		resumer, hasResume := a.(adapter.Resumer)
-
-		root := sf.SessionRootDir()
-		if root == "" {
-			continue
-		}
-
-		var allFiles []string
-		if lister, ok := a.(adapter.SessionFileLister); ok {
-			allFiles = lister.ListSessionFiles()
-		} else {
-			subdirs, err := os.ReadDir(root)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					log.Printf("conversations: read root %s: %v", root, err)
-				}
-				continue
-			}
-			for _, d := range subdirs {
-				if !d.IsDir() {
-					continue
-				}
-				dir := filepath.Join(root, d.Name())
-				allFiles = append(allFiles, adapters.ListSessionFiles(dir)...)
-			}
-		}
-
-		for _, path := range allFiles {
-			fileInfo, err := sf.ParseSessionFile(path)
-			if err != nil {
-				continue
-			}
-
-			if fileInfo.Cwd == "" {
-				continue
-			}
-
-			if hasResume && !resumer.CanResume(path) {
-				continue
-			}
-
-			slug := fileInfo.Slug
-			if slug == "" {
-				slug = adapter.Slugify(fileInfo.ID)
-			}
-
-			var cmd []string
-			if hasResume {
-				cmd = resumer.ResumeCommand(fileInfo)
-			}
-
-			info := Info{
-				ToolID:        fileInfo.ID,
-				Slug:          slug,
-				Kind:          a.Name(),
-				Title:         fileInfo.Title,
-				Cwd:           fileInfo.Cwd,
-				FilePath:      path,
-				ResumeCommand: cmd,
-				Created:       fileInfo.Created,
-			}
-			idx.Upsert(info)
-		}
-	}
-}
-
-// ScanFile indexes a single conversation file. Called by filemon when
-// a file is created or modified. Returns the assigned slug.
-func (idx *Index) ScanFile(a adapter.Adapter, path string) string {
-	sf, ok := a.(adapter.SessionFiler)
+// Scan indexes a single conversation ref (snapshot or live update from an
+// adapter ConversationSource), resolving it to metadata via the owning
+// adapter's DescribeConversation. Returns the assigned slug.
+func (idx *Index) Scan(a adapter.Adapter, ref string) string {
+	desc, ok := a.(adapter.ConversationDescriber)
 	if !ok {
 		return ""
 	}
 
-	fileInfo, err := sf.ParseSessionFile(path)
+	// Snapshot the ref's removal generation before the unlocked describe:
+	// a Remove event that lands while the file is being read/parsed must
+	// win over this scan's results (commitScanLocked re-checks it).
+	gen := idx.refGeneration(a.Name(), ref)
+
+	convInfo, err := desc.DescribeConversation(ref)
 	if err != nil {
+		// Keep stale-good state on transient descriptor failures, matching the
+		// main metadata index. A source Remove event is the authoritative
+		// signal that clears both entries.
 		return ""
-	}
-
-	if fileInfo.Cwd == "" {
-		return ""
-	}
-
-	slug := fileInfo.Slug
-	if slug == "" {
-		slug = adapter.Slugify(fileInfo.ID)
 	}
 
 	var cmd []string
 	if resumer, ok := a.(adapter.Resumer); ok {
-		if !resumer.CanResume(path) {
-			return ""
-		}
-		cmd = resumer.ResumeCommand(fileInfo)
+		cmd = resumer.ResumeCommand(convInfo)
+	}
+
+	addToIndex := convInfo.Cwd != ""
+	if _, ok := a.(adapter.Resumer); ok && len(cmd) == 0 {
+		// An empty command means the adapter considers this conversation
+		// non-resumable (empty/corrupted), so it stays out of the index.
+		addToIndex = false
+	}
+
+	displaySlug := convInfo.Slug
+	key := displaySlug
+	if key == "" {
+		// Untitled conversations still need an internal unique lookup key
+		// for UUID deep links, but that fallback must not surface as a URL slug.
+		key = adapter.Slugify(convInfo.ID)
 	}
 
 	info := Info{
-		ToolID:        fileInfo.ID,
-		Slug:          slug,
-		Kind:          a.Name(),
-		Title:         fileInfo.Title,
-		Cwd:           fileInfo.Cwd,
-		FilePath:      path,
-		ResumeCommand: cmd,
-		Created:       fileInfo.Created,
+		ConversationID: convInfo.ID,
+		Key:            key,
+		Slug:           displaySlug,
+		Adapter:        a.Name(),
+		Title:          convInfo.Title,
+		Cwd:            convInfo.Cwd,
+		Ref:            ref,
+		ResumeCommand:  cmd,
+		Created:        convInfo.Created,
+		LastActivity:   convInfo.LastActivity,
 	}
-	return idx.Upsert(info)
-}
 
-// Remove deletes a conversation from the index by tool ID.
-// Returns true if it was present.
-func (idx *Index) Remove(kind, toolID string) bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	tk := toolKey(kind, toolID)
-	slug, ok := idx.byToolID[tk]
+	if idx.removeGen[refKey(a.Name(), ref)] != gen {
+		// The ref was removed while this scan was describing it; the removal
+		// is authoritative. Committing anyway would resurrect a deleted
+		// conversation with no future event to clear it.
+		return ""
+	}
+	// Cache the resume command before the index eligibility checks above
+	// decided addToIndex. The wire command contract depends only on
+	// ConversationDescriber + Resumer, while the URL index additionally
+	// requires cwd/title metadata. Both writes happen under one lock hold so
+	// a Remove can never land between them.
+	idx.resumeByRef[refKey(a.Name(), ref)] = append([]string(nil), cmd...)
+	if !addToIndex {
+		return ""
+	}
+	return idx.upsertLocked(info)
+}
+
+// refGeneration returns the current removal generation for (adapter, ref).
+func (idx *Index) refGeneration(adapterName, ref string) uint64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.removeGen[refKey(adapterName, ref)]
+}
+
+// Remove deletes a conversation from the index by conversation ID.
+// Returns true if it was present.
+func (idx *Index) Remove(adapterName, conversationID string) bool {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	tk := convKey(adapterName, conversationID)
+	key, ok := idx.byConversationID[tk]
 	if !ok {
 		return false
 	}
-	delete(idx.byToolID, tk)
-	delete(idx.byKey, indexKey(kind, slug))
+	delete(idx.byConversationID, tk)
+	if info, exists := idx.byKey[indexKey(adapterName, key)]; exists {
+		delete(idx.resumeByRef, refKey(adapterName, info.Ref))
+		idx.removeGen[refKey(adapterName, info.Ref)]++
+	}
+	delete(idx.byKey, indexKey(adapterName, key))
 	return true
 }
 
-// RemoveByPath deletes any conversation whose FilePath matches path.
-// Used when filemon observes a deletion event and we don't have the
-// (kind, toolID) handy. Linear walk over the index; that's fine
-// because Remove events are rare (manual `rm`, file rotation) and
-// the index size stays in the hundreds-to-low-thousands range.
-// Returns true if an entry was removed.
-func (idx *Index) RemoveByPath(path string) bool {
+// RemoveByRef deletes the conversation whose (Adapter, Ref) matches.
+// Used when a ConversationSource observes a removal event and we don't have
+// the (adapter, conversationID) handy. Refs are only unique within an
+// adapter (ADR 0022: opaque, adapter-scoped), so the match is scoped to the
+// reporting adapter — two adapters may legitimately use the same ref string.
+// Linear walk over the index; that's fine because Remove events are rare
+// (manual `rm`, file rotation) and the index size stays in the
+// hundreds-to-low-thousands range. Returns true if an entry was removed.
+//
+// Session retirement on conversation-gone deliberately does NOT hang off
+// this method: an unindexed conversation (describe failure,
+// non-resumable, empty cwd) still needs retiring when it disappears, so
+// the source-level sink (sources.go) owns that signal instead.
+func (idx *Index) RemoveByRef(adapterName, ref string) bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	// Bump the removal generation even when nothing is indexed yet: the
+	// entry may be mid-scan (describe in flight), and that scan's commit
+	// must observe this removal and drop its result.
+	idx.removeGen[refKey(adapterName, ref)]++
+	delete(idx.resumeByRef, refKey(adapterName, ref))
 	for key, info := range idx.byKey {
-		if info.FilePath != path {
+		if info.Adapter != adapterName || info.Ref != ref {
 			continue
 		}
 		delete(idx.byKey, key)
-		delete(idx.byToolID, toolKey(info.Kind, info.ToolID))
+		delete(idx.byConversationID, convKey(info.Adapter, info.ConversationID))
 		return true
 	}
 	return false
 }
 
-// SlugExists reports whether a slug is taken within a kind.
-func (idx *Index) SlugExists(kind, slug string) bool {
+// SlugExists reports whether an internal key is taken within an adapter.
+func (idx *Index) SlugExists(adapterName, key string) bool {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	_, ok := idx.byKey[indexKey(kind, slug)]
+	_, ok := idx.byKey[indexKey(adapterName, key)]
 	return ok
 }
 
-// LookupBySlug searches for a conversation by slug across all kinds.
-// Returns the first match. Used when the caller doesn't know the kind
-// (e.g., project session arrays that store bare slugs).
-func (idx *Index) LookupBySlug(slug string) (Info, bool) {
+// LookupBySlug searches for a conversation by internal key across all kinds.
+// Returns the first match. Used when the caller doesn't know the adapter
+// (e.g., project session arrays that store bare legacy slugs or UUID keys).
+func (idx *Index) LookupBySlug(lookupKey string) (Info, bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	for key, info := range idx.byKey {
-		// key is "kind/slug"; check if the slug suffix matches.
-		if i := len(key) - len(slug); i > 0 && key[i-1] == '/' && key[i:] == slug {
+	for indexedKey, info := range idx.byKey {
+		// indexedKey is "adapter/internal-key"; check its suffix.
+		if i := len(indexedKey) - len(lookupKey); i > 0 && indexedKey[i-1] == '/' && indexedKey[i:] == lookupKey {
 			return info, true
 		}
 	}
 	return Info{}, false
 }
 
-// FindByPrefix returns conversations whose slug starts with the given
-// prefix, within a kind. Used for URL resolution when the frontend
-// provides a partial slug (e.g. from session.id.slice(0, 8)).
-func (idx *Index) FindByPrefix(kind, prefix string) (Info, bool) {
+// FindByPrefix returns conversations whose internal key starts with the given
+// prefix, within an adapter. Used for URL resolution when the frontend
+// provides a partial slug (e.g. an abbreviated or legacy session-id
+// prefix); an exact/full id is just the degenerate prefix case.
+func (idx *Index) FindByPrefix(adapterName, prefix string) (Info, bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	keyPrefix := kind + "/" + prefix
+	keyPrefix := adapterName + "/" + prefix
 	for key, info := range idx.byKey {
 		if strings.HasPrefix(key, keyPrefix) {
 			return info, true
+		}
+	}
+	// Conversation-ID prefixes keep resolving after a titled-key upgrade.
+	for ck, key := range idx.byConversationID {
+		if strings.HasPrefix(ck, keyPrefix) {
+			if info, ok := idx.byKey[indexKey(adapterName, key)]; ok {
+				return info, true
+			}
 		}
 	}
 	return Info{}, false

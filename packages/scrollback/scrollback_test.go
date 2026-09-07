@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -592,3 +593,101 @@ func equalLines(a, b []string) bool {
 type errReader struct{ err error }
 
 func (e *errReader) Read(p []byte) (int, error) { return 0, e.err }
+
+// TestRenderTailDoesNotLeakGoroutines pins that RenderTail tears down
+// its drain goroutine. Every call spawns one to soak up emulator
+// write-backs (DSR reports etc.); without closing the emulator it
+// blocks on the pipe forever. One-shot tail requests barely noticed
+// the leak, but gmuxd's output-condition wait calls RenderTail on a
+// ticker, so a leak here grows for as long as a wait is in flight.
+func TestRenderTailDoesNotLeakGoroutines(t *testing.T) {
+	// Cursor-movement-heavy input so the emulator has something to
+	// write back on some terminals; content itself doesn't matter.
+	raw := []byte("hello\r\nworld\x1b[6n\r\n")
+
+	// Warm up (lazy runtime goroutines, pools).
+	for i := 0; i < 3; i++ {
+		if _, err := RenderTail(bytes.NewReader(raw), 80, 24, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		if _, err := RenderTail(bytes.NewReader(raw), 80, 24, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// RenderTail waits for its drain goroutine before returning, so no
+	// settling sleep should be needed; allow a little runtime noise.
+	runtime.GC()
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Fatalf("goroutines grew from %d to %d across %d renders; drain goroutine is leaking", before, after, n)
+	}
+}
+
+// TestRenderTailRaceFreeWithResponses replays input that makes the
+// emulator emit responses into its output pipe (a DSR cursor-position
+// query), which is what forces the concurrent drain goroutine to be
+// mid-Read when RenderTail tears the emulator down. Run under -race
+// this pins the teardown path that closes the response pipe directly
+// instead of calling Emulator.Close, whose unsynchronized closed-flag
+// races with the drain's Read.
+func TestRenderTailRaceFreeWithResponses(t *testing.T) {
+	raw := "before\x1b[6nafter\r\n" // ESC[6n = DSR: emulator writes a report back
+	for i := 0; i < 50; i++ {
+		lines, err := RenderTail(strings.NewReader(raw), 80, 24, 5)
+		if err != nil {
+			t.Fatalf("RenderTail: %v", err)
+		}
+		if len(lines) == 0 {
+			t.Fatal("no lines rendered")
+		}
+	}
+}
+
+func TestRenderTailJoinsSoftWrappedRows(t *testing.T) {
+	texts := []string{
+		strings.Repeat("wrap-provenance-", 8),
+		"the quick brown fox jumps over the lazy dog and then crosses another boundary",
+	}
+	for _, text := range texts {
+		lines, err := RenderTail(strings.NewReader(text+"\r\nHARD\r\n"), 10, 16, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{text, "HARD"}
+		if !equalLines(lines, want) {
+			t.Fatalf("got %q, want %q", lines, want)
+		}
+	}
+}
+
+// The final written space wraps onto a blank continuation row. Trimming that
+// blank visible row leaves a wrap-marked row as the final extracted row, which
+// must still be flushed as a logical line.
+func TestRenderTailOmitsSyntheticWideWrapSkip(t *testing.T) {
+	lines, err := RenderTail(strings.NewReader("abc界X"), 4, 4, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"abc界X"}
+	if !equalLines(lines, want) {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+}
+
+func TestRenderTailFlushesFinalWrappedRow(t *testing.T) {
+	lines, err := RenderTail(strings.NewReader("123456789  "), 10, 4, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"123456789 "}
+	if !equalLines(lines, want) {
+		t.Fatalf("got %q, want %q", lines, want)
+	}
+}

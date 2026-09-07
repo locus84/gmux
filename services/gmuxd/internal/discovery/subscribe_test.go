@@ -74,9 +74,9 @@ func TestSubscribeReplacesExistingForSameID(t *testing.T) {
 	}))
 	t.Cleanup(r2.cleanup)
 
-	const id = "sess-restart-race"
+	const id = "1gmcpop8"
 	sessions := store.New()
-	sessions.Upsert(store.Session{ID: id, Kind: "shell", Alive: true, SocketPath: r1.socketPath})
+	sessions.Upsert(store.Session{ID: id, Adapter: "shell", Alive: true, SocketPath: r1.socketPath})
 
 	subs := NewSubscriptions(sessions)
 	t.Cleanup(func() { subs.UnsubscribeAll() })
@@ -152,9 +152,9 @@ func TestSubscribeOldDeferDoesNotEvictNewEntry(t *testing.T) {
 	}))
 	t.Cleanup(second.cleanup)
 
-	const id = "sess-defer-eviction"
+	const id = "1dxjgwfg"
 	sessions := store.New()
-	sessions.Upsert(store.Session{ID: id, Kind: "shell", Alive: true})
+	sessions.Upsert(store.Session{ID: id, Adapter: "shell", Alive: true})
 
 	subs := NewSubscriptions(sessions)
 	t.Cleanup(func() { subs.UnsubscribeAll() })
@@ -189,11 +189,11 @@ func TestSubscribeOldDeferDoesNotEvictNewEntry(t *testing.T) {
 }
 
 func TestExitEventDoesNotResurrectDismissedSession(t *testing.T) {
-	const id = "sess-dismissed-exit-race"
+	const id = "130fsf81"
 	sessions := store.New()
 	sessions.Upsert(store.Session{
 		ID:      id,
-		Kind:    "shell",
+		Adapter: "shell",
 		Alive:   true,
 		Command: []string{"bash"},
 	})
@@ -201,11 +201,10 @@ func TestExitEventDoesNotResurrectDismissedSession(t *testing.T) {
 	subs := NewSubscriptions(sessions)
 	onExitStarted := make(chan struct{})
 	allowOnExit := make(chan struct{})
-	subs.OnExit = func(sess *store.Session) bool {
+	subs.OnExit = func(sess *store.Session) {
 		close(onExitStarted)
 		<-allowOnExit
 		sess.Command = []string{"bash", "-l"}
-		return true
 	}
 
 	exitDone := make(chan struct{})
@@ -236,29 +235,131 @@ func TestExitEventDoesNotResurrectDismissedSession(t *testing.T) {
 	}
 }
 
-func TestSessionFileEventInvokesHook(t *testing.T) {
+// TestExitEventPreservesTurnStateThroughResumeDerivation pins the
+// turn-state-at-death contract (ADR 0023) at the exit seam: the last
+// Status must survive the exit event even when the OnExit hook
+// transitions the session to resumable. Nil-ing it there ("clean
+// resumable display", as gmuxd once did) silently split the wait
+// contract by timing — a live wait on a cleanly-exited agent resolved
+// "idle" while a wait issued a moment later resolved "died".
+func TestExitEventPreservesTurnStateThroughResumeDerivation(t *testing.T) {
+	const id = "1nift86i"
 	sessions := store.New()
-	subs := NewSubscriptions(sessions)
+	sessions.Upsert(store.Session{
+		ID:      id,
+		Adapter: "pi",
+		Alive:   true,
+		Command: []string{"pi"},
+		Status:  &store.Status{Active: false}, // turn closed before exit
+	})
 
-	var gotID, gotPath string
-	subs.OnSessionFile = func(sessionID, filePath string) {
-		gotID, gotPath = sessionID, filePath
+	subs := NewSubscriptions(sessions)
+	subs.OnExit = func(sess *store.Session) {
+		sess.Command = []string{"pi", "--resume", "abc"} // resumable
 	}
 
-	subs.handleEvent("sess-1", "/sock", "session_file",
-		[]byte(`{"path":"/home/u/.pi/agent/sessions/x/2026_sess.jsonl"}`))
+	subs.handleEvent(id, "", "exit", []byte(`{"exit_code":0}`))
 
-	if gotID != "sess-1" || gotPath != "/home/u/.pi/agent/sessions/x/2026_sess.jsonl" {
-		t.Fatalf("OnSessionFile got (%q,%q)", gotID, gotPath)
+	got, ok := sessions.Get(id)
+	if !ok {
+		t.Fatal("session missing after exit event")
+	}
+	if got.Alive {
+		t.Error("session still alive after exit event")
+	}
+	if !got.Resumable {
+		t.Error("session not resumable despite OnExit setting a resume command")
+	}
+	if got.Status == nil || got.Status.Active {
+		t.Errorf("Status = %+v after exit, want the pre-exit closed-turn state to survive", got.Status)
 	}
 }
 
-func TestSessionFileEventEmptyPathIgnored(t *testing.T) {
-	subs := NewSubscriptions(store.New())
-	called := false
-	subs.OnSessionFile = func(string, string) { called = true }
-	subs.handleEvent("sess-1", "/sock", "session_file", []byte(`{"path":""}`))
-	if called {
-		t.Error("OnSessionFile should not fire for empty path")
+func TestFusedLifetimeExitUpdatesOptionalStatus(t *testing.T) {
+	const id = "1fused00"
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: id, Alive: true, Status: &store.Status{Active: true}})
+	subs := NewSubscriptions(sessions)
+	subs.handleEvent(id, "", "exit", []byte(`{"exit_code":0,"active":false,"error":false,"interrupted":false}`))
+	got, ok := sessions.Get(id)
+	if !ok || got.Alive || got.Status == nil || got.Status.Active || got.Status.Error || got.Status.Interrupted {
+		t.Fatalf("fused exit status not projected: ok=%v session=%+v", ok, got)
+	}
+}
+
+func TestConversationFileEventRecordsPath(t *testing.T) {
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "1vshk4fu", Alive: true})
+	subs := NewSubscriptions(sessions)
+
+	const path = "/home/u/.pi/agent/sessions/x/2026_sess.jsonl"
+	subs.handleEvent("1vshk4fu", "/sock", "conversation_file", []byte(`{"path":"`+path+`"}`))
+
+	got, ok := sessions.Get("1vshk4fu")
+	if !ok || got.ConversationRef != path {
+		t.Fatalf("ConversationRef = %q (ok=%v), want %q", got.ConversationRef, ok, path)
+	}
+}
+
+// Pre-v2 runners emit "session_file" for the same event; long-lived
+// runners survive daemon upgrades, so the daemon must keep accepting it
+// for one release. TODO(v2.1): drop alongside the subscribe.go case.
+func TestLegacySessionFileEventStillAccepted(t *testing.T) {
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "1vshk4fu", Alive: true})
+	subs := NewSubscriptions(sessions)
+
+	const path = "/home/u/.claude/projects/x/old-runner.jsonl"
+	subs.handleEvent("1vshk4fu", "/sock", "session_file", []byte(`{"path":"`+path+`"}`))
+
+	got, ok := sessions.Get("1vshk4fu")
+	if !ok || got.ConversationRef != path {
+		t.Fatalf("ConversationRef = %q (ok=%v), want %q", got.ConversationRef, ok, path)
+	}
+}
+
+func TestConversationFileEventEmptyPathIgnored(t *testing.T) {
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "1vshk4fu", Alive: true})
+	subs := NewSubscriptions(sessions)
+	subs.handleEvent("1vshk4fu", "/sock", "conversation_file", []byte(`{"path":""}`))
+	if got, _ := sessions.Get("1vshk4fu"); got.ConversationRef != "" {
+		t.Errorf("empty path should not set ConversationRef, got %q", got.ConversationRef)
+	}
+}
+
+// TestMetaEventSlugSemantics pins the daemon half of the session-URL slug
+// chain. The runner emits a slug key only on a deliberate SetSlug (the
+// general meta emission omits it), so the daemon distinguishes:
+//
+//   - slug present, non-empty → record it (the web builds URLs from it);
+//   - slug key ABSENT (a title-only meta update) → leave the slug untouched;
+//   - slug present but EMPTY → clear it (session re-bound to an untitled
+//     conversation; the web falls back to the gmux session id).
+func TestMetaEventSlugSemantics(t *testing.T) {
+	sessions := store.New()
+	sessions.Upsert(store.Session{ID: "1vshk4fu", Alive: true})
+	subs := NewSubscriptions(sessions)
+
+	subs.handleEvent("1vshk4fu", "/sock", "meta", []byte(`{"slug":"fix-the-login-bug"}`))
+	if got, _ := sessions.Get("1vshk4fu"); got.Slug != "fix-the-login-bug" {
+		t.Fatalf("Slug = %q, want %q", got.Slug, "fix-the-login-bug")
+	}
+
+	// Title-only update (no slug key): the recorded slug must survive.
+	subs.handleEvent("1vshk4fu", "/sock", "meta", []byte(`{"adapter_title":"Fix the login bug"}`))
+	if got, _ := sessions.Get("1vshk4fu"); got.Slug != "fix-the-login-bug" {
+		t.Errorf("Slug after title-only meta = %q, want %q preserved", got.Slug, "fix-the-login-bug")
+	}
+
+	// Explicit empty slug (re-bind to an untitled conversation): must clear,
+	// so the web falls back to the short session-id prefix.
+	subs.handleEvent("1vshk4fu", "/sock", "meta", []byte(`{"slug":""}`))
+	got, _ := sessions.Get("1vshk4fu")
+	if got.Slug != "" {
+		t.Errorf("Slug after explicit empty = %q, want cleared", got.Slug)
+	}
+	if got.AdapterTitle != "Fix the login bug" {
+		t.Errorf("AdapterTitle = %q, want %q", got.AdapterTitle, "Fix the login bug")
 	}
 }

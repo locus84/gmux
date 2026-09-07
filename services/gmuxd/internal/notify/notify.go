@@ -33,8 +33,8 @@ func DefaultConfig() Config {
 
 // NotifyMessage is sent to the browser over the presence WebSocket.
 type NotifyMessage struct {
-	Type      string `json:"type"`       // "notify"
-	ID        string `json:"id"`         // daemon-assigned notification ID
+	Type      string `json:"type"` // "notify"
+	ID        string `json:"id"`   // daemon-assigned notification ID
 	SessionID string `json:"session_id"`
 	Title     string `json:"title"`
 	Body      string `json:"body"`
@@ -70,9 +70,10 @@ type Router struct {
 }
 
 type sessionSnapshot struct {
-	Working bool
-	Unread  bool
-	Alive   bool
+	Active      bool
+	Interrupted bool
+	Unread      bool
+	Alive       bool
 }
 
 type activeNotif struct {
@@ -103,10 +104,15 @@ func (r *Router) Run(ctx context.Context) {
 	defer cancel()
 
 	// Seed prevState from current sessions so we don't fire notifications
-	// for pre-existing state on startup.
+	// for pre-existing state on startup. Under r.mu like every other
+	// prevState access: Run executes on its own goroutine, and presence
+	// callbacks (CancelForSession et al.) can touch router state
+	// concurrently from the moment the router is wired up.
+	r.mu.Lock()
 	for _, s := range r.sessions.List() {
 		r.prevState[s.ID] = snapshotOf(s)
 	}
+	r.mu.Unlock()
 
 	for {
 		select {
@@ -122,21 +128,22 @@ func (r *Router) Run(ctx context.Context) {
 }
 
 func snapshotOf(s store.Session) sessionSnapshot {
-	working := false
+	active, interrupted := false, false
 	if s.Status != nil {
-		working = s.Status.Working
+		active, interrupted = s.Status.Active, s.Status.Interrupted
 	}
 	return sessionSnapshot{
-		Working: working,
-		Unread:  s.Unread,
-		Alive:   s.Alive,
+		Active:      active,
+		Interrupted: interrupted,
+		Unread:      s.Unread,
+		Alive:       s.Alive,
 	}
 }
 
 func (r *Router) handleEvent(ev store.Event) {
-	if ev.Type != "session-upsert" || ev.Session == nil {
+	if ev.Type != store.EventSessionUpsert || ev.Session == nil {
 		// session-remove: clean up prevState
-		if ev.Type == "session-remove" {
+		if ev.Type == store.EventSessionRemove {
 			r.mu.Lock()
 			delete(r.prevState, ev.ID)
 			r.mu.Unlock()
@@ -156,19 +163,18 @@ func (r *Router) handleEvent(ev store.Event) {
 		return // new session, no transition to detect
 	}
 
-	// Transition: working → idle on a live session
-	if prev.Working && !cur.Working && cur.Alive {
+	// Transition: active → idle on a live session. An intentional stop is
+	// not a completion: the user already knows the turn ended, so ADR 0027
+	// suppresses the "finished" notification for it. The unread transition
+	// below is unaffected — an interrupted turn sets no unread anyway.
+	if prev.Active && !cur.Active && cur.Alive && !cur.Interrupted {
 		body := formatFinishedBody(sess)
 		r.scheduleNotification(sess.ID, "finished", sess.Title, body)
 	}
 
 	// Transition: unread flipped on
 	if !prev.Unread && cur.Unread {
-		body := "New output"
-		if sess.Status != nil && sess.Status.Label != "" {
-			body = sess.Status.Label
-		}
-		r.scheduleNotification(sess.ID, "unread", sess.Title, body)
+		r.scheduleNotification(sess.ID, "unread", sess.Title, "New output")
 	}
 }
 

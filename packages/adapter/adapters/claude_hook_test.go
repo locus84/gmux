@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -71,8 +72,37 @@ func TestClaudeHookBodies_TurnLifecycle(t *testing.T) {
 		t.Fatalf("UserPromptSubmit → turn start, got %v", start)
 	}
 	end := decodeBodies(t, ClaudeHookBodies([]byte(`{"hook_event_name":"SessionEnd"}`)))
-	if len(end) != 1 || end[0]["phase"] != "end" || end[0]["outcome"] != "aborted" {
-		t.Fatalf("SessionEnd → turn end aborted, got %v", end)
+	if len(end) != 1 || end[0]["phase"] != "end" || end[0]["outcome"] != "interrupted" {
+		t.Fatalf("SessionEnd → turn end interrupted, got %v", end)
+	}
+}
+
+// /rename appends a custom-title line to the transcript without firing any
+// hook; the next UserPromptSubmit must refresh the title so the rename isn't
+// invisible until the turn ends.
+func TestClaudeHookBodies_PromptSubmitRefreshesRenamedTitle(t *testing.T) {
+	tr := writeClaudeTranscript(t)
+	ct := `{"type":"custom-title","customTitle":"Renamed Session"}`
+	f, err := os.OpenFile(tr, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(ct + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	in, _ := json.Marshal(map[string]string{"hook_event_name": "UserPromptSubmit", "transcript_path": tr})
+	got := decodeBodies(t, ClaudeHookBodies(in))
+	if len(got) != 2 || got[0]["op"] != "session" || got[1]["op"] != "turn" || got[1]["phase"] != "start" {
+		t.Fatalf("UserPromptSubmit → [session, turn start], got %v", got)
+	}
+	if got[0]["name"] != "Renamed Session" {
+		t.Fatalf("want renamed title, got %v", got[0]["name"])
+	}
+	// Slug follows the rename: slug is the mutable display name, not
+	// identity. The frontend rewrites the URL atomically on slug change.
+	if got[0]["slug"] != "renamed-session" {
+		t.Fatalf("slug must follow rename, got %v", got[0]["slug"])
 	}
 }
 
@@ -82,6 +112,25 @@ func TestClaudeHookBodies_StopRefreshesThenEnds(t *testing.T) {
 	got := decodeBodies(t, ClaudeHookBodies(in))
 	if len(got) != 2 || got[0]["op"] != "session" || got[1]["op"] != "turn" || got[1]["outcome"] != "completed" {
 		t.Fatalf("Stop → [session, turn end completed], got %v", got)
+	}
+}
+
+// StopFailure replaces Stop when the turn ends on an API error (rate limit,
+// auth failure, …). It is a failed turn, not an intentional stop.
+func TestClaudeHookBodies_StopFailureIsTerminalError(t *testing.T) {
+	tr := writeClaudeTranscript(t)
+	in, _ := json.Marshal(map[string]string{
+		"hook_event_name": "StopFailure", "transcript_path": tr,
+		"error": "rate_limit", "error_details": "429 Too Many Requests",
+	})
+	got := decodeBodies(t, ClaudeHookBodies(in))
+	if len(got) != 2 || got[0]["op"] != "session" || got[1]["outcome"] != "error" {
+		t.Fatalf("StopFailure → [session, turn end error], got %v", got)
+	}
+	// Without a transcript there is nothing to bind, but the turn still ends.
+	bare := decodeBodies(t, ClaudeHookBodies([]byte(`{"hook_event_name":"StopFailure"}`)))
+	if len(bare) != 1 || bare[0]["phase"] != "end" || bare[0]["outcome"] != "error" {
+		t.Fatalf("bare StopFailure → turn end error, got %v", bare)
 	}
 }
 
@@ -136,8 +185,13 @@ func TestClaudeHookCommand_Splices(t *testing.T) {
 		t.Fatalf("settings not JSON: %v", err)
 	}
 	hooks, _ := settings["hooks"].(map[string]any)
-	if _, has := hooks["SessionStart"]; !has {
-		t.Fatalf("missing SessionStart hook: %v", settings)
+	// Every turn-state event gmux depends on must be registered: without
+	// StopFailure an API-failed turn would fall through to SessionEnd and be
+	// recorded as an intentional interruption.
+	for _, ev := range []string{"SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"} {
+		if _, has := hooks[ev]; !has {
+			t.Fatalf("missing %s hook: %v", ev, settings)
+		}
 	}
 	if out[len(out)-2] != "--model" || out[len(out)-1] != "opus" {
 		t.Fatalf("user args dropped: %v", out)
@@ -262,5 +316,24 @@ func TestClaudeHookCommand_UserCannotWipeHooks(t *testing.T) {
 	}
 	if n := sessionStartHookCount(mergedSettings(t, out)); n != 1 {
 		t.Fatalf("gmux SessionStart hook must survive hooks:null, got %d", n)
+	}
+}
+
+func TestClaudeHookCommand_InvalidSettingsPreserved(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	for _, args := range [][]string{
+		{"claude", "--settings"},
+		{"claude", "--settings="},
+		{"claude", "--settings", missing, "--model", "opus"},
+		{"claude", "--settings", `{not-json}`, "--model", "opus"},
+	} {
+		original := append([]string(nil), args...)
+		out, ok := (&Claude{}).HookCommand(args, "/usr/bin/gmux")
+		if ok {
+			t.Errorf("invalid settings unexpectedly injected: %v", args)
+		}
+		if !reflect.DeepEqual(out, original) {
+			t.Errorf("invalid settings changed argv: got %v want %v", out, original)
+		}
 	}
 }

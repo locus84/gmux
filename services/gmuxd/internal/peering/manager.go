@@ -6,19 +6,24 @@ import (
 	"sync"
 
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/config"
-	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
 
 // Manager orchestrates connections to all configured spoke peers.
 type Manager struct {
-	mu          sync.RWMutex
-	peers       map[string]*managedPeer
-	store       *store.Store
-	selfName    string // this machine's hostname, for self-echo detection
-	defaultOpts []PeerOption
-	baseCtx     context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	// mutationMu serializes peer lifecycle mutations across the periods where
+	// mu must be released to stop a connection and wait for its callbacks.
+	mutationMu         sync.Mutex
+	mu                 sync.RWMutex
+	peers              map[string]*managedPeer
+	sink               ProjectionSink
+	sessions           map[string][]SessionProjection
+	hooks              EventHooks
+	selfName           string // this machine's hostname, for self-echo detection
+	defaultOpts        []PeerOption
+	baseCtx            context.Context
+	cancel             context.CancelFunc
+	wg                 sync.WaitGroup
+	beforeSleepRestart func(string) // deterministic race-test seam
 
 	// OnPeerRemoved fires after RemovePeer has stopped the peer's
 	// goroutine and pruned its sessions from the store. wasLocal
@@ -37,31 +42,36 @@ type managedPeer struct {
 // NewManager creates a manager but does not start connections.
 // Call Start() to begin subscribing to peers.
 //
-// selfName is the local machine's hostname, used to detect (and drop)
-// sessions that are our own data echoed back through a mutual peer
-// subscription.
-func NewManager(configs []config.PeerConfig, st *store.Store, selfName string, opts ...PeerOption) *Manager {
-	m := &Manager{
-		peers:       make(map[string]*managedPeer, len(configs)),
-		store:       st,
-		selfName:    selfName,
-		defaultOpts: opts,
-	}
-
-	for _, cfg := range configs {
-		p := newPeer(cfg, st, m.onStatus, opts...)
-		p.isKnownOrigin = m.isKnownOrigin
-		m.peers[cfg.Name] = &managedPeer{peer: p}
-	}
-	return m
-}
+// selfName is the local machine's hostname, used by isKnownOrigin as a
+// defensive backstop against our own data echoed back through a mutual
+// peer. NOTE: this is a backstop only, not the load-bearing guard. The
+// actual protection against re-forwarding a network peer's sessions is
+// the ADR 0002 owned-only filter on `?as=peer` streams (see isOwned in
+// cmd/gmuxd/main.go): a spoke only ever ships sessions it owns
+// (Peer=="" or a Local/devcontainer peer), so a well-behaved peer never
+// echoes our own sessions back here. Consequently selfName is *not*
+// required to match this node's tailscale/URL identity (ADR 0007); the
+// two can legitimately diverge (e.g. os.Hostname()==container-id) with
+// no observable effect. Do not "fix" this into a load-bearing check
+// without also revisiting the owned-only filter.
 
 // onStatus broadcasts a peer status change as an SSE event.
 func (m *Manager) onStatus(name string, status Status) {
-	m.store.Broadcast(store.Event{
-		Type: "peer-status",
-		ID:   name,
-	})
+	if m.sink != nil {
+		m.sink.PeerWorldChanged(name)
+	}
+	if m.hooks.PeerWorldDirty != nil {
+		m.hooks.PeerWorldDirty()
+	}
+	if m.IsLocalPeer(name) && status == StatusConnected && m.hooks.LocalPeerConnected != nil {
+		m.hooks.LocalPeerConnected(name, m.peerSessions(name))
+	}
+	// A transport disconnect invalidates the runtime snapshot before durable
+	// Local-peer placements are pruned. removePeerSessions performs that
+	// ordered transition and emits each dirty/prune callback once.
+	if status == StatusDisconnected && m.sink == nil {
+		m.removePeerSessions(name)
+	}
 }
 
 // isKnownOrigin reports whether name refers to this node or a peer we
@@ -88,11 +98,21 @@ func (m *Manager) IsLocalPeer(name string) bool {
 
 // Start begins background goroutines that connect to each peer.
 func (m *Manager) Start() {
+	m.mu.Lock()
+	if m.baseCtx != nil {
+		m.mu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.baseCtx = ctx
 	m.cancel = cancel
-
+	peers := make(map[string]*managedPeer, len(m.peers))
 	for name, mp := range m.peers {
+		peers[name] = mp
+	}
+	m.mu.Unlock()
+
+	for name, mp := range peers {
 		m.startPeer(name, mp)
 	}
 }
@@ -122,13 +142,40 @@ func (m *Manager) OnSleep() {
 	m.mu.RUnlock()
 
 	for name, mp := range peers {
-		if mp.cancel != nil {
-			mp.cancel()
+		m.mu.RLock()
+		cancel, done := mp.cancel, mp.done
+		m.mu.RUnlock()
+		if cancel != nil {
+			cancel()
 		}
-		if mp.done != nil {
-			<-mp.done
+		if done != nil {
+			<-done
 		}
-		m.startPeer(name, mp)
+		if m.beforeSleepRestart != nil {
+			m.beforeSleepRestart(name)
+		}
+		m.mu.Lock()
+		// RemovePeer may have deleted this exact generation while we waited
+		// for its old worker. Never resurrect a removed/replaced peer.
+		if current, ok := m.peers[name]; ok && current == mp && m.baseCtx != nil {
+			m.startPeer(name, mp)
+		}
+		m.mu.Unlock()
+	}
+}
+
+// ReconnectAll signals every peer to retry immediately, cutting short
+// any backoff wait. Used when an external event suggests peers may now
+// be reachable — e.g. a browser client connecting (the user opened or
+// returned to the UI and wants to see peer sessions promptly). Peering
+// is dial-out only, so without a nudge like this a just-online peer is
+// only discovered on its next scheduled retry. A healthy connected
+// peer is unaffected: the signal only shortcuts the reconnect wait.
+func (m *Manager) ReconnectAll() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, mp := range m.peers {
+		mp.peer.Reconnect()
 	}
 }
 
@@ -139,33 +186,65 @@ func (m *Manager) Stop() {
 	}
 	m.wg.Wait()
 
-	// Clean up any remaining peer sessions from the store.
+	// Clean up remaining projections without recursively taking the lock.
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.peers))
 	for name := range m.peers {
-		m.store.RemoveByPeer(name)
+		names = append(names, name)
+	}
+	m.mu.RUnlock()
+	for _, name := range names {
+		m.removePeerSessions(name)
 	}
 }
 
 // AddPeer registers a new peer and starts its connection. If a peer
 // with the same name already exists, AddPeer is a no-op.
 func (m *Manager) AddPeer(cfg config.PeerConfig, opts ...PeerOption) {
+	m.mutationMu.Lock()
+	defer m.mutationMu.Unlock()
+	m.addPeer(cfg, opts...)
+}
+
+func (m *Manager) addPeer(cfg config.PeerConfig, opts ...PeerOption) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.baseCtx == nil {
-		return // manager not started
-	}
 	if _, exists := m.peers[cfg.Name]; exists {
 		return
 	}
 
-	allOpts := append(m.defaultOpts, opts...)
-	p := newPeer(cfg, m.store, m.onStatus, allOpts...)
+	allOpts := append(append([]PeerOption(nil), m.defaultOpts...), opts...)
+	p := newPeer(cfg, m.managerSink(), m.onStatus, allOpts...)
 	p.isKnownOrigin = m.isKnownOrigin
 	mp := &managedPeer{peer: p}
 	m.peers[cfg.Name] = mp
-	m.startPeer(cfg.Name, mp)
+	// Pre-Start reconciliation installs configuration only. Start owns all
+	// connection goroutine creation.
+	if m.baseCtx != nil {
+		m.startPeer(cfg.Name, mp)
+	}
+}
+
+// EnsurePeer atomically ensures that cfg is the installed peer generation.
+// A changed generation is fully stopped and cleaned up before its replacement
+// starts; concurrent AddPeer, RemovePeer, and EnsurePeer calls cannot observe
+// and act on a stale generation between the comparison and replacement.
+func (m *Manager) EnsurePeer(cfg config.PeerConfig) {
+	m.mutationMu.Lock()
+	defer m.mutationMu.Unlock()
+
+	m.mu.RLock()
+	mp := m.peers[cfg.Name]
+	unchanged := mp != nil && mp.peer.Config == cfg
+	m.mu.RUnlock()
+	if unchanged {
+		return
+	}
+	if mp != nil {
+		m.removePeer(cfg.Name)
+	}
+	m.addPeer(cfg)
 }
 
 // RemovePeer stops a peer connection, waits for its goroutine to finish,
@@ -173,6 +252,12 @@ func (m *Manager) AddPeer(cfg config.PeerConfig, opts ...PeerOption) {
 // it fires after store cleanup so the caller can run additional cleanup
 // (e.g. PruneNamespacedKeys for a destroyed devcontainer).
 func (m *Manager) RemovePeer(name string) {
+	m.mutationMu.Lock()
+	defer m.mutationMu.Unlock()
+	m.removePeer(name)
+}
+
+func (m *Manager) removePeer(name string) {
 	m.mu.Lock()
 	mp, ok := m.peers[name]
 	if !ok {
@@ -181,15 +266,19 @@ func (m *Manager) RemovePeer(name string) {
 	}
 	delete(m.peers, name)
 	wasLocal := mp.peer.Config.Local
+	cancel, done := mp.cancel, mp.done
 	m.mu.Unlock()
 
-	if mp.cancel != nil {
-		mp.cancel()
+	if cancel != nil {
+		cancel()
 	}
-	if mp.done != nil {
-		<-mp.done
+	if done != nil {
+		<-done
 	}
-	m.store.RemoveByPeer(name)
+	m.removePeerSessions(name)
+	if wasLocal && m.hooks.LocalPeerDisconnected != nil {
+		m.hooks.LocalPeerDisconnected(name)
+	}
 	if m.OnPeerRemoved != nil {
 		m.OnPeerRemoved(name, wasLocal)
 	}
@@ -219,9 +308,13 @@ func (m *Manager) PeerStatus() []PeerInfo {
 	for _, mp := range m.peers {
 		name := mp.peer.Config.Name
 		alive := 0
-		for _, id := range m.store.ListByPeer(name) {
-			if s, ok := m.store.Get(id); ok && s.Alive {
-				alive++
+		if m.sink != nil {
+			alive = m.sink.AliveSessionCount(name)
+		} else {
+			for _, s := range m.sessions[name] {
+				if s.Alive {
+					alive++
+				}
 			}
 		}
 		info := PeerInfo{
@@ -233,6 +326,7 @@ func (m *Manager) PeerStatus() []PeerInfo {
 			Local:        mp.peer.Config.Local,
 			Source:       mp.peer.Config.Source,
 		}
+		info.SessionsOmitted, info.SessionsOmittedCodes = mp.peer.SessionOmissions()
 		if h, ok := mp.peer.CachedHealth(); ok {
 			info.Version = h.Version
 			info.DefaultLauncher = h.DefaultLauncher
@@ -262,4 +356,158 @@ func (m *Manager) HasPeers() bool {
 	return len(m.peers) > 0
 }
 
+// NewProjectionManager constructs the authority-neutral runtime projection.
+// Unlike NewManager it never selects the legacy store adapter.
+func NewProjectionManager(configs []config.PeerConfig, selfName string, sink ProjectionSink, hooks EventHooks, opts ...PeerOption) *Manager {
+	m := &Manager{peers: make(map[string]*managedPeer, len(configs)), sink: sink, sessions: make(map[string][]SessionProjection), selfName: selfName, defaultOpts: opts, hooks: hooks}
+	for _, cfg := range configs {
+		p := newPeer(cfg, m.managerSink(), m.onStatus, opts...)
+		p.isKnownOrigin = m.isKnownOrigin
+		m.peers[cfg.Name] = &managedPeer{peer: p}
+	}
+	return m
+}
 
+type managerProjectionSink struct{ m *Manager }
+
+func (m *Manager) managerSink() ProjectionSink { return managerProjectionSink{m} }
+func (s managerProjectionSink) ReplacePeerSessions(peer string, rows []SessionProjection) {
+	copyRows := make([]SessionProjection, len(rows))
+	for i := range rows {
+		copyRows[i] = cloneProjection(rows[i])
+	}
+	s.m.mu.Lock()
+	prev, hadPrev := s.m.sessions[peer]
+	s.m.sessions[peer] = copyRows
+	local := false
+	if mp := s.m.peers[peer]; mp != nil {
+		local = mp.peer.Config.Local
+	}
+	s.m.mu.Unlock()
+	// No-op suppression (reciprocal-peering feedback loop). A spoke
+	// re-ships its full snapshot on every change and at its coalescer
+	// cadence, so most deliveries carry a projection we already hold.
+	// Propagating those as dirty made two mutually-peered nodes ping-pong
+	// identical snapshots forever: A's dirty hook recomposes and
+	// broadcasts to B's ?as=peer stream, B replaces an equal projection,
+	// marks dirty, broadcasts back. The legacy store had the equivalent
+	// guard in upsertCommon's `unchanged` check; the authority-neutral
+	// projection path (ADR 0026) lost it, so it lives here — at the one
+	// place that owns the peer projection cache, before any sink write or
+	// hook. State transitions (connect/disconnect/removal) still fire via
+	// onStatus/removePeerSessions, which do not route through here.
+	if hadPrev && projectionsEqual(prev, copyRows) {
+		return
+	}
+	if s.m.sink != nil {
+		s.m.sink.ReplacePeerSessions(peer, copyRows)
+	}
+	if s.m.hooks.PeerSessionsDirty != nil {
+		s.m.hooks.PeerSessionsDirty()
+	}
+	// The sessions hook only marks the sessions kind dirty, but part of the
+	// world payload is derived from this same projection: peers[].session_count
+	// (world.go) and PeerWorld.LocalPeerSessions. Before no-op suppression the
+	// reciprocal storm kept the world recomposing continuously so those stayed
+	// accidentally fresh; now the only other world triggers are peer status
+	// transitions and catalog/projects deltas, so a peer whose session set
+	// changes would show a stale count until an unrelated event. Ask for the
+	// world recompose explicitly, and only for the changes that can actually
+	// move those fields.
+	//
+	// This does not reopen a loop: it is reachable only from a real projection
+	// change (the equality gate above already returned for no-ops), and the
+	// world frame it produces reaches the peer as projects-update, which
+	// fetchProjects absorbs unless the fetched catalog really differs.
+	if s.m.hooks.PeerWorldDirty != nil && worldRelevantSessionChange(prev, copyRows) {
+		s.m.hooks.PeerWorldDirty()
+	}
+	if local && s.m.hooks.LocalPeerConnected != nil {
+		s.m.hooks.LocalPeerConnected(peer, copyRows)
+	}
+}
+func (s managerProjectionSink) RemovePeerSessions(peer string) { s.m.removePeerSessions(peer) }
+func (s managerProjectionSink) PeerWorldChanged(name string) {
+	if s.m.sink != nil {
+		s.m.sink.PeerWorldChanged(name)
+	}
+	// Mirror onStatus: the production central path builds the manager with
+	// sink == nil and recomposes snapshot.world only via hooks.PeerWorldDirty,
+	// so a world-relevant peer change (e.g. an omission marker set/clear from
+	// setSessionOmissions) must fire the hook too or it never reaches
+	// browsers. Callers are change-gated, so this cannot re-open the
+	// reciprocal recompose loop.
+	if s.m.hooks.PeerWorldDirty != nil {
+		s.m.hooks.PeerWorldDirty()
+	}
+}
+func (s managerProjectionSink) AliveSessionCount(peer string) int {
+	s.m.mu.RLock()
+	defer s.m.mu.RUnlock()
+	n := 0
+	for _, r := range s.m.sessions[peer] {
+		if r.Alive {
+			n++
+		}
+	}
+	return n
+}
+func (s managerProjectionSink) SessionActivity(id string) {
+	if s.m.sink != nil {
+		s.m.sink.SessionActivity(id)
+	}
+	if s.m.hooks.SessionActivity != nil {
+		s.m.hooks.SessionActivity(id)
+	}
+}
+func (m *Manager) removePeerSessions(name string) {
+	m.mu.Lock()
+	_, hadProjection := m.sessions[name]
+	delete(m.sessions, name)
+	local := false
+	if mp := m.peers[name]; mp != nil {
+		local = mp.peer.Config.Local
+	}
+	m.mu.Unlock()
+	if m.sink != nil {
+		m.sink.RemovePeerSessions(name)
+	}
+	if hadProjection && m.hooks.PeerSessionsDirty != nil {
+		m.hooks.PeerSessionsDirty()
+	}
+	if local && m.hooks.LocalPeerDisconnected != nil {
+		m.hooks.LocalPeerDisconnected(name)
+	}
+}
+func (m *Manager) peerSessions(name string) []SessionProjection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rows := m.sessions[name]
+	out := make([]SessionProjection, len(rows))
+	for i := range rows {
+		out[i] = cloneProjection(rows[i])
+	}
+	return out
+}
+
+// SessionProjections returns a deep point-in-time copy under the manager lock.
+func (m *Manager) SessionProjections() []SessionProjection {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []SessionProjection
+	for _, rows := range m.sessions {
+		for _, r := range rows {
+			out = append(out, cloneProjection(r))
+		}
+	}
+	return out
+}
+
+// SetEventHooks installs central projection callbacks before Start.
+func (m *Manager) SetEventHooks(h EventHooks) { m.mu.Lock(); m.hooks = h; m.mu.Unlock() }
+
+// ReplacePeerSessions applies a decoded peer snapshot through the runtime
+// projection. It is primarily the protocol/event boundary used by Peer.
+func (m *Manager) ReplacePeerSessions(name string, rows []SessionProjection) {
+	m.managerSink().ReplacePeerSessions(name, rows)
+}

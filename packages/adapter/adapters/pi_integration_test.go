@@ -27,7 +27,7 @@ var piModel = []string{"pi", "--model", "claude-haiku-4-5"}
 // sendAndWaitForTurn sends a message and waits for the assistant response to
 // complete. Pi writes user+assistant messages to the JSONL as a batch after
 // the turn finishes, so we detect completion via file attribution + title
-// rather than transient working status.
+// rather than transient active status.
 func sendAndWaitForTurn(t *testing.T, g *testutil.Gmuxd, send func(string), sessID string) {
 	t.Helper()
 	// Brief pause for TUI input handler to be fully ready after render.
@@ -36,11 +36,11 @@ func sendAndWaitForTurn(t *testing.T, g *testutil.Gmuxd, send func(string), sess
 
 	// Verify pi received the input by checking scrollback.
 	sess, _ := g.GetSession(sessID)
-	g.WaitForScrollback(sess.SocketPath, "say hi", 10*time.Second)
+	g.WaitForScrollback(sess.ID, "say hi", 10*time.Second)
 
 	// Wait for the turn to produce output (scrollback will change when
 	// the assistant responds). Pi's scrollback grows as the response streams.
-	g.WaitForScrollback(sess.SocketPath, "Hi", 60*time.Second)
+	g.WaitForScrollback(sess.ID, "Hi", 60*time.Second)
 
 	// Wait for file attribution (pi writes the full turn to JSONL after completion).
 	g.WaitForSession(sessID, func(s testutil.Session) bool {
@@ -56,8 +56,8 @@ func TestPiTurnAndTitle(t *testing.T) {
 	cwd := t.TempDir()
 
 	sess := g.Launch(piModel, cwd)
-	if sess.Kind != "pi" {
-		t.Fatalf("expected kind=pi, got %q", sess.Kind)
+	if sess.Adapter != "pi" {
+		t.Fatalf("expected adapter=pi, got %q", sess.Adapter)
 	}
 
 	send, _ := g.ConnectSession(sess.ID)
@@ -67,7 +67,7 @@ func TestPiTurnAndTitle(t *testing.T) {
 
 	// Title should come from the first user message.
 	updated := g.WaitForSession(sess.ID, func(s testutil.Session) bool {
-		return s.Title != "" && s.Title != "pi" && s.Title != "(new)"
+		return s.Title != "" && s.Title != "pi"
 	}, 15*time.Second, "title from first user message")
 	t.Logf("title=%q slug=%s", updated.Title, updated.Slug)
 }
@@ -121,7 +121,7 @@ func TestPiSecondTurnKeepsTitle(t *testing.T) {
 
 	// Wait for second response.
 	gSess, _ := g.GetSession(sess.ID)
-	g.WaitForScrollback(gSess.SocketPath, "goodbye", 60*time.Second)
+	g.WaitForScrollback(gSess.ID, "goodbye", 60*time.Second)
 
 	// Brief wait for file to be written and parsed.
 	time.Sleep(3 * time.Second)

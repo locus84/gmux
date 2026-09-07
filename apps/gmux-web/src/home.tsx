@@ -4,15 +4,16 @@
 // remove) lives in Settings → Projects; project navigation lives in
 // the sidebar. The home page is purely an overview surface.
 //
-// Section semantics, sort order, and the recency-bucket boundaries
-// live in store.ts:partitionForHome. This file is presentation.
+// Day-bucket grouping, sort order, and the label boundaries live in
+// store.ts:partitionByDay. This file is presentation.
 
 import {
-  health, folders, homePartition, dismissSession,
+  health, folders, sessions, projects, homePartition, dismissSession, tabHref,
 } from './store'
 import { SessionRow } from './session-row'
-import { sessionPath } from './routing'
-import { IconBell, type NotifPermission } from './sidebar'
+import { hasSessionSlugCollision, sessionPath } from './routing'
+import { cwdBadge } from './cwd-format'
+import { IconBell, IconRefresh, type NotifPermission } from './sidebar'
 import type { Folder, Session } from './types'
 
 export function Home({
@@ -26,7 +27,7 @@ export function Home({
 }) {
   const foldersVal = folders.value
   const hasProjects = folders.value.length > 0
-  const { needsAttention, running, buckets } = homePartition.value
+  const buckets = homePartition.value
 
   // Cheap session→folder lookup: the SessionRow needs a project name
   // and the folder's owning peer to build a correct href. Building a
@@ -36,27 +37,48 @@ export function Home({
     for (const s of f.sessions) folderBySessionId.set(s.id, f)
   }
 
-  const renderRow = (s: Session) => {
+  // Sessions with no folder can't be rendered (no project name / href)
+  // and would otherwise leave a section heading with no rows during the
+  // brief window after a daemon restart where recovered sessions arrive
+  // before their project stamp does. Drop them here so a section only
+  // shows when it has rows to render.
+  // Home shows only the named-day window; the dated tail (8+ days ago)
+  // lives in the sidebar's full Activity list. `placed()` drops folderless
+  // sessions so a day heading never renders with no rows (the brief
+  // post-restart window where recovered sessions arrive unstamped).
+  const placed = (arr: readonly Session[]) => arr.filter(s => folderBySessionId.has(s.id))
+  const shown = buckets
+    .filter(b => b.kind !== 'dated')
+    .map(b => ({ label: b.label, sessions: placed(b.sessions) }))
+    .filter(b => b.sessions.length > 0)
+
+  // compact=false for today (two-line with age), true for older buckets.
+  const renderRow = (s: Session, compact: boolean) => {
     const folder = folderBySessionId.get(s.id)
-    // A session always belongs to a folder once stamps land (post
-    // #228). Defensive fallback: if we somehow get a session
-    // without a folder (mid-arrival race), skip rendering rather
-    // than crashing the dashboard.
+    // Guarded by `placed()` above; the fallback stays as a defensive
+    // guard against a mid-arrival race.
     if (!folder) return null
+    // Surface the session's cwd only when it strays from the project's
+    // canonical folder (a subfolder or worktree/grove workspace);
+    // sessions at the project root stay quiet.
+    const cwd = cwdBadge(s.cwd, folder.launchCwd)
     return (
       <SessionRow
         key={s.id}
         session={s}
-        href={sessionPath(folder.slug, s, folder.peer)}
+        href={tabHref(sessionPath(folder.slug, s, folder.peer, hasSessionSlugCollision(s, sessions.value, projects.value)))}
+        compact={compact}
         showProject
         projectName={folder.name}
         showHost
+        showCwd={!!cwd}
+        cwdLabel={cwd ?? undefined}
         onClose={() => dismissSession(s.id)}
       />
     )
   }
 
-  const anyActivity = needsAttention.length > 0 || running.length > 0 || buckets.length > 0
+  const anyActivity = shown.length > 0
 
   return (
     <div class="page">
@@ -67,23 +89,14 @@ export function Home({
             permission={notifPermission}
             onRequest={onRequestNotifPermission}
           />
+          <button class="mobile-page-refresh" type="button" aria-label="Refresh app" title="Refresh app" onClick={() => location.reload()}>
+            <IconRefresh />
+          </button>
         </div>
       </header>
-      {needsAttention.length > 0 && (
-        <Section title="Waiting">
-          {needsAttention.map(renderRow)}
-        </Section>
-      )}
-
-      {running.length > 0 && (
-        <Section title="Active">
-          {running.map(renderRow)}
-        </Section>
-      )}
-
-      {buckets.map(b => (
-        <Section key={b.label} title={b.label}>
-          {b.sessions.map(renderRow)}
+      {shown.map(b => (
+        <Section key={b.label ?? 'today'} title={b.label ?? undefined}>
+          {b.sessions.map(s => renderRow(s, b.label !== null))}
         </Section>
       ))}
 
@@ -139,12 +152,12 @@ export function Section({
   title,
   children,
 }: {
-  title: string
+  title?: string
   children: preact.ComponentChildren
 }) {
   return (
     <section class="home-section">
-      <h2 class="home-section-title">{title}</h2>
+      {title && <h2 class="home-section-title">{title}</h2>}
       <div class="home-section-body">{children}</div>
     </section>
   )

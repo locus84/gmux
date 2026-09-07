@@ -5,23 +5,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/apiclient"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/config"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessionstream"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sseclient"
-	"github.com/gmuxapp/gmux/services/gmuxd/internal/store"
 )
 
 // defaultStreamIdleTimeout is the maximum time the SSE stream can be
 // silent before we assume the connection is dead and reconnect. 60s
 // is conservative: real events flow every few seconds on an active
-// spoke, and on an idle spoke the reconnect is invisible (sessions
-// stay in the store, the initial dump produces no-op upserts).
+// spoke, and on an idle spoke the reconnect is cheap (the disconnect
+// prunes this peer's projection and the initial dump on the next
+// connect refills it).
 const defaultStreamIdleTimeout = 60 * time.Second
 
 // Peer manages the connection to a single remote gmuxd instance.
@@ -30,22 +33,31 @@ const defaultStreamIdleTimeout = 60 * time.Second
 // in the apiclient package so peering can focus on the peering-specific
 // concerns: namespacing session IDs, ownership filtering, reconnect
 // policy, and status reporting.
+const peerReadProxyLimit = 11 * 1024 * 1024
+
 type Peer struct {
 	Config config.PeerConfig
-	store  *store.Store
+	sink   ProjectionSink
 	api    *apiclient.Client
 
 	mu             sync.RWMutex
 	status         Status
-	lastError      string      // human-readable reason for last disconnect
-	cachedHealth   SpokeHealth // peer's /v1/health data, fetched on connect
-	healthLoaded   bool        // true after first successful health fetch
+	lastError      string         // human-readable reason for last disconnect
+	cachedHealth   SpokeHealth    // peer's /v1/health data, fetched on connect
+	healthLoaded   bool           // true after first successful health fetch
 	cachedProjects []SpokeProject // peer's projects, refreshed on connect and on projects-update
 	projectsLoaded bool
 	// cachedDiscovered is the spoke's self-advertised discovered list
 	// (host-authoritative; see SpokeDiscovered). Refreshed alongside
 	// cachedProjects in fetchProjects.
 	cachedDiscovered []SpokeDiscovered
+	// sessionsOmitted / sessionsOmittedCodes carry the omission accounting of
+	// the peer's last committed protocol-3 session transaction. Non-zero means
+	// the projection currently held for this peer is knowingly incomplete
+	// (rows quarantined at the sender). Cleared by a clean ready or a legacy
+	// snapshot; retained across disconnects, matching the retained rows.
+	sessionsOmitted      int
+	sessionsOmittedCodes map[string]int
 
 	// onStatus is called when connection state changes.
 	onStatus func(name string, status Status)
@@ -57,21 +69,39 @@ type Peer struct {
 	isKnownOrigin func(name string) bool
 
 	// transport is the HTTP round-tripper for all spoke connections.
-	// nil means use the default transport. Set via WithTransport for
-	// tailscale-discovered peers that route through tsnet.
+	// nil means use the default transport. Set via WithTransport; the
+	// hub passes a routed transport that sends same-tailnet MagicDNS
+	// hosts through tsnet.
 	transport http.RoundTripper
 
 	// streamIdleTimeout overrides the default SSE idle timeout.
 	// Zero means use defaultStreamIdleTimeout.
 	streamIdleTimeout time.Duration
+
+	// reconnectBackoff overrides initialBackoff in the run loop.
+	// Zero means use initialBackoff. Test-only: lets the reconnect
+	// tests run at millisecond cadence instead of real seconds.
+	reconnectBackoff time.Duration
+
+	// wake shortcuts the reconnect backoff wait. A signal here makes a
+	// backing-off peer retry immediately and resets its backoff to the
+	// initial interval. Buffered (cap 1) and sent non-blocking, so a
+	// signal that arrives while the peer is connected (not waiting)
+	// simply queues and is consumed at the next disconnect — harmless.
+	// Peering is dial-out only, so this is the only way an external
+	// event (e.g. a browser client connecting) can pull a just-online
+	// peer in faster than the backoff schedule.
+	wake chan struct{}
 }
 
-func newPeer(cfg config.PeerConfig, st *store.Store, onStatus func(string, Status), opts ...PeerOption) *Peer {
+func newPeer(cfg config.PeerConfig, sinkArg any, onStatus func(string, Status), opts ...PeerOption) *Peer {
+	sink := projectionSink(sinkArg)
 	p := &Peer{
 		Config:   cfg,
-		store:    st,
+		sink:     sink,
 		status:   StatusDisconnected,
 		onStatus: onStatus,
+		wake:     make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(p)
@@ -92,6 +122,18 @@ func newPeer(cfg config.PeerConfig, st *store.Store, onStatus func(string, Statu
 	return p
 }
 
+// Reconnect signals the run loop to stop waiting out its backoff and
+// retry immediately, resetting backoff to the initial interval. Safe
+// to call at any time and from any goroutine: the send is
+// non-blocking, so it never stalls the caller, and a signal delivered
+// while the peer is connected (or already pending) is coalesced.
+func (p *Peer) Reconnect() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
 // Status returns the current connection state.
 func (p *Peer) Status() Status {
 	p.mu.RLock()
@@ -104,6 +146,40 @@ func (p *Peer) LastError() string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.lastError
+}
+
+// SessionOmissions returns the omission accounting of the last committed
+// session transaction: how many rows the spoke reported as quarantined
+// (omitted from the projection) and a bounded per-code breakdown. Zero means
+// the held projection is complete as far as the spoke reported.
+func (p *Peer) SessionOmissions() (int, map[string]int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.sessionsOmitted == 0 {
+		return 0, nil
+	}
+	codes := make(map[string]int, len(p.sessionsOmittedCodes))
+	for code, count := range p.sessionsOmittedCodes {
+		codes[code] = count
+	}
+	return p.sessionsOmitted, codes
+}
+
+// setSessionOmissions records a committed transaction's omission summary and,
+// when it changes, marks the world projection dirty so hub subscribers see
+// the incompleteness without waiting for an unrelated world event.
+func (p *Peer) setSessionOmissions(total int, codes map[string]int) {
+	if total <= 0 {
+		total, codes = 0, nil
+	}
+	p.mu.Lock()
+	changed := p.sessionsOmitted != total || !reflect.DeepEqual(p.sessionsOmittedCodes, codes)
+	p.sessionsOmitted = total
+	p.sessionsOmittedCodes = codes
+	p.mu.Unlock()
+	if changed && p.sink != nil {
+		p.sink.PeerWorldChanged(p.Config.Name)
+	}
 }
 
 func (p *Peer) setStatus(s Status) {
@@ -217,16 +293,29 @@ func (p *Peer) fetchProjects(ctx context.Context) {
 	}
 	// The spoke's discovered list is host-authoritative: it ran its
 	// own match rules over its own sessions, so we cache it verbatim
-	// rather than recomputing peer discovery blind (ADR 0002/0005).
+	// rather than recomputing peer discovery blind (ADR 0002/0025).
 	discovered := envelope.Discovered
 	if discovered == nil {
 		discovered = []SpokeDiscovered{}
 	}
 	p.mu.Lock()
+	unchanged := p.projectsLoaded &&
+		reflect.DeepEqual(p.cachedProjects, projects) &&
+		reflect.DeepEqual(p.cachedDiscovered, discovered)
 	p.cachedProjects = projects
 	p.cachedDiscovered = discovered
 	p.projectsLoaded = true
+	status := p.status
 	p.mu.Unlock()
+	// Second reciprocal feedback loop: the hub sets projects-update on
+	// every world frame it ships to ?as=peer subscribers, so a mutual
+	// peer re-fetches /v1/projects, re-broadcasts peer-status, recomposes
+	// its own world, and ships projects-update back. Only signal when the
+	// cached projection actually changed; a re-fetch that produced the
+	// same projects/discovered lists is not externally visible state.
+	if unchanged {
+		return
+	}
 	// Signal a status change so the hub's world coalescer re-emits
 	// snapshot.world with the updated peer_projects entry. Reusing
 	// peer-status keeps the wire surface minimal; the type-name is
@@ -242,7 +331,7 @@ func (p *Peer) fetchProjects(ctx context.Context) {
 		return
 	}
 	if p.onStatus != nil {
-		p.onStatus(p.Config.Name, p.status)
+		p.onStatus(p.Config.Name, status)
 	}
 }
 
@@ -277,15 +366,62 @@ func (p *Peer) ProxyWS(w http.ResponseWriter, r *http.Request, originalID string
 	p.api.ProxyWS(w, r, originalID)
 }
 
+// ProxyGET forwards a bounded read-only API request to this peer. The caller
+// supplies the peer-local path (including the original, unnamespaced session
+// ID); authentication and routed transport stay owned by apiclient.
+func (p *Peer) ProxyGET(w http.ResponseWriter, r *http.Request, path string) {
+	resp, err := p.api.Get(r.Context(), path, r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "peer unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, peerReadProxyLimit+1))
+	if err != nil {
+		http.Error(w, "peer response failed", http.StatusBadGateway)
+		return
+	}
+	if len(body) > peerReadProxyLimit {
+		http.Error(w, "peer response too large", http.StatusBadGateway)
+		return
+	}
+	for _, name := range []string{"Content-Type", "Cache-Control", "Content-Disposition", "Last-Modified", "X-Content-Type-Options"} {
+		if value := resp.Header.Get(name); value != "" {
+			w.Header().Set(name, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+// Backoff bounds for peer reconnects. The ceiling stays at 30s
+// deliberately: peering is a dial-out-only relationship (the hub
+// opens the SSE stream; the spoke cannot push "I'm online"), so
+// reconnect latency is bounded solely by this interval. A longer
+// ceiling would mean a peer that just came online stays invisible
+// for minutes. The log spam that motivated issue #244 is handled by
+// deduping the disconnect log (see run's lastLogged), not by
+// stretching the retry cadence. Transient drops recover fast because
+// backoff resets to initialBackoff after any successful connection.
+const (
+	initialBackoff = 1 * time.Second
+	maxBackoff     = 30 * time.Second
+)
+
 // run connects to the spoke's SSE stream and processes events until
 // the context is cancelled. Handles reconnection with exponential
 // backoff.
 func (p *Peer) run(ctx context.Context) {
-	const (
-		initialBackoff = 1 * time.Second
-		maxBackoff     = 30 * time.Second
-	)
-	backoff := initialBackoff
+	minBackoff := initialBackoff
+	if p.reconnectBackoff > 0 {
+		minBackoff = p.reconnectBackoff
+	}
+	backoff := minBackoff
+	// lastLogged dedupes disconnect logs: repeated identical failures
+	// against a down host are logged once, not on every retry. Any
+	// change in the failure (or a successful connection in between)
+	// logs again.
+	lastLogged := ""
 
 	for {
 		if ctx.Err() != nil {
@@ -296,12 +432,12 @@ func (p *Peer) run(ctx context.Context) {
 		wasConnected := false
 		err := p.subscribe(ctx, func() { wasConnected = true })
 
-		// Sessions stay in the store across reconnects. The spoke's
-		// initial dump on the next successful connect will upsert
-		// current state; anything the spoke no longer reports stays
-		// as stale-but-visible until the user dismisses it.
-		// RemoveByPeer only runs on intentional peer removal (see
-		// Manager.removePeer).
+		// A disconnect prunes this peer's projection
+		// (Manager.onStatus -> removePeerSessions), so nothing stale
+		// survives the gap and the spoke's initial dump on the next
+		// successful connect is always treated as a first delivery
+		// (no previous projection, so the no-op gate in
+		// managerProjectionSink.ReplacePeerSessions cannot suppress it).
 
 		if err != nil && ctx.Err() == nil {
 			p.mu.Lock()
@@ -321,14 +457,27 @@ func (p *Peer) run(ctx context.Context) {
 		// Reset backoff after a successful connection so transient drops
 		// reconnect quickly instead of carrying over stale backoff.
 		if wasConnected {
-			backoff = initialBackoff
+			backoff = minBackoff
+			lastLogged = ""
 		}
 
-		log.Printf("peering: %s: disconnected: %v (retry in %s)", p.Config.Name, err, backoff)
+		msg := fmt.Sprintf("%v", err)
+		if msg != lastLogged {
+			log.Printf("peering: %s: disconnected: %v (retrying, up to every %s)", p.Config.Name, err, maxBackoff)
+			lastLogged = msg
+		}
 
 		select {
 		case <-ctx.Done():
 			return
+		case <-p.wake:
+			// External trigger (e.g. a browser client connected):
+			// retry now and start over from the initial backoff so a
+			// peer that just came online is picked up promptly rather
+			// than after a grown wait.
+			backoff = minBackoff
+			lastLogged = ""
+			continue
 		case <-time.After(backoff):
 		}
 
@@ -345,6 +494,9 @@ func (p *Peer) run(ctx context.Context) {
 // established (used to decide whether to reset backoff).
 func (p *Peer) subscribe(ctx context.Context, onConnected func()) error {
 	sse := p.api.Events()
+	// Staging belongs to one transport connection. If it disconnects before
+	// ready, this local value disappears and no partial projection is visible.
+	var bootstrap peerSessionBootstrap
 
 	err := sse.Subscribe(ctx,
 		func() {
@@ -361,7 +513,7 @@ func (p *Peer) subscribe(ctx context.Context, onConnected func()) error {
 			p.fetchProjects(ctx)
 		},
 		func(ev sseclient.Event) {
-			p.handleEvent(ctx, ev.Type, ev.Data)
+			p.handleStreamEvent(ctx, ev.Type, ev.Data, &bootstrap)
 		},
 	)
 
@@ -389,7 +541,183 @@ type sseActivity struct {
 
 // sseSnapshotSessions is the wire format for snapshot.sessions.
 type sseSnapshotSessions struct {
-	Sessions []store.Session `json:"sessions"`
+	Sessions []SessionProjection `json:"sessions"`
+}
+
+type sessionStreamMode uint8
+
+const (
+	sessionStreamUnknown sessionStreamMode = iota
+	sessionStreamLegacy
+	sessionStreamV3
+	maxPeerSessionDiagnostics = 256
+	// maxPeerOmissionCodes bounds the per-code omission breakdown a peer
+	// transaction can accumulate. Codes come from the remote sender, so both
+	// the number of distinct codes and each code string are clamped; overflow
+	// folds into the "other" bucket. The total and every per-code entry
+	// saturate together at MaxStagedRows (the largest omission a bounded
+	// transaction can express), so the breakdown always sums to the total.
+	maxPeerOmissionCodes   = 8
+	maxPeerOmissionCodeLen = 64
+)
+
+type peerSessionBootstrap struct {
+	mode      sessionStreamMode
+	epoch     uint64
+	lastEpoch uint64
+	active    bool
+	rows      []SessionProjection
+	bytes     int
+	// diagnostics keeps bounded per-row detail for logging; omittedTotal and
+	// omittedCodes carry the exact accounting (including counted summaries
+	// past the detail cap) that ready publishes into the peer's world
+	// projection.
+	diagnostics  []sessionstream.Error
+	omittedTotal int
+	omittedCodes map[string]int
+}
+
+func (s *peerSessionBootstrap) abandon() {
+	s.epoch = 0
+	s.active = false
+	s.rows = nil
+	s.bytes = 0
+	s.diagnostics = nil
+	s.omittedTotal = 0
+	s.omittedCodes = nil
+}
+
+func (s *peerSessionBootstrap) recordOmission(code string, count int) {
+	if count < 1 {
+		count = 1
+	}
+	// Saturate against the shared headroom so the total and the per-code
+	// breakdown always receive the same effective increment: the codes map
+	// sums exactly to omittedTotal, and neither can exceed MaxStagedRows no
+	// matter how many error events a hostile sender streams.
+	if headroom := sessionstream.MaxStagedRows - s.omittedTotal; count > headroom {
+		count = headroom
+	}
+	if count == 0 {
+		return
+	}
+	s.omittedTotal += count
+	if code == "" {
+		code = "row_omitted"
+	}
+	if len(code) > maxPeerOmissionCodeLen {
+		code = code[:maxPeerOmissionCodeLen]
+	}
+	if s.omittedCodes == nil {
+		s.omittedCodes = make(map[string]int)
+	}
+	if _, known := s.omittedCodes[code]; !known && len(s.omittedCodes) >= maxPeerOmissionCodes {
+		code = "other"
+	}
+	s.omittedCodes[code] += count
+}
+
+func (p *Peer) handleStreamEvent(ctx context.Context, eventType string, data []byte, staging *peerSessionBootstrap) {
+	switch eventType {
+	case sessionstream.EventBegin:
+		if staging.mode == sessionStreamLegacy {
+			log.Printf("peering: %s: ignoring protocol-3 begin on legacy session stream", p.Config.Name)
+			return
+		}
+		var begin sessionstream.Begin
+		if err := json.Unmarshal(data, &begin); err != nil || begin.Version != sessionstream.ProtocolVersion || begin.Epoch == 0 {
+			staging.abandon()
+			log.Printf("peering: %s: bad session bootstrap begin", p.Config.Name)
+			return
+		}
+		if begin.Epoch <= staging.lastEpoch {
+			// Ignore replay without destroying a newer in-flight transaction.
+			log.Printf("peering: %s: stale session bootstrap epoch %d (last %d)", p.Config.Name, begin.Epoch, staging.lastEpoch)
+			return
+		}
+		staging.abandon()
+		staging.mode = sessionStreamV3
+		staging.epoch = begin.Epoch
+		staging.lastEpoch = begin.Epoch
+		staging.active = true
+		return
+	case sessionstream.EventBatch:
+		var batch sessionstream.Batch[SessionProjection]
+		if err := json.Unmarshal(data, &batch); err != nil || !staging.active || batch.Epoch != staging.epoch {
+			staging.abandon()
+			log.Printf("peering: %s: bad or out-of-epoch session bootstrap batch", p.Config.Name)
+			return
+		}
+		if len(staging.rows)+len(batch.Sessions) > sessionstream.MaxStagedRows || staging.bytes+len(data) > sessionstream.MaxStagedBytes {
+			staging.abandon()
+			log.Printf("peering: %s: session bootstrap exceeds staging limit", p.Config.Name)
+			return
+		}
+		staging.rows = append(staging.rows, batch.Sessions...)
+		staging.bytes += len(data)
+		return
+	case sessionstream.EventReady:
+		var ready sessionstream.Ready
+		if err := json.Unmarshal(data, &ready); err != nil || !staging.active || ready.Epoch != staging.epoch {
+			staging.abandon()
+			log.Printf("peering: %s: bad or out-of-epoch session bootstrap ready", p.Config.Name)
+			return
+		}
+		rows := staging.rows
+		omittedTotal, omittedCodes := staging.omittedTotal, staging.omittedCodes
+		staging.abandon()
+		p.applySessionsSnapshot(rows)
+		// Publish this transaction's omission accounting after the surviving
+		// rows commit, so the hub's world projection can surface that the
+		// remote list is incomplete instead of losing it in a log line.
+		p.setSessionOmissions(omittedTotal, omittedCodes)
+		return
+	case sessionstream.EventError:
+		// Diagnostics quarantine individual rows; they do not invalidate the
+		// transaction or prevent the remaining rows from reaching ready.
+		var diagnostic sessionstream.Error
+		if err := json.Unmarshal(data, &diagnostic); err != nil {
+			log.Printf("peering: %s: bad session bootstrap diagnostic", p.Config.Name)
+			return
+		}
+		id, message := diagnostic.ID, diagnostic.Message
+		if len(id) > 256 {
+			id = id[:256] + "…"
+		}
+		if len(message) > 512 {
+			message = message[:512] + "…"
+		}
+		diagnostic.ID, diagnostic.Message = id, message
+		if staging.active && diagnostic.Epoch == staging.epoch {
+			// Detail is capped, but the counted total is exact: the sender's
+			// diagnostics_suppressed summary arrives after the detail cap is
+			// full and must still be accounted.
+			staging.recordOmission(diagnostic.Code, diagnostic.Count)
+			if len(staging.diagnostics) < maxPeerSessionDiagnostics {
+				staging.diagnostics = append(staging.diagnostics, diagnostic)
+			}
+		}
+		log.Printf("peering: %s: session %q omitted: %q (%s, count=%d)", p.Config.Name, id, message, diagnostic.Code, max(diagnostic.Count, 1))
+		return
+	case "snapshot.sessions":
+		if staging.mode == sessionStreamV3 {
+			log.Printf("peering: %s: ignoring legacy snapshot on protocol-3 session stream", p.Config.Name)
+			return
+		}
+		var payload sseSnapshotSessions
+		if err := json.Unmarshal(data, &payload); err != nil {
+			log.Printf("peering: %s: bad snapshot.sessions: %v", p.Config.Name, err)
+			return
+		}
+		staging.abandon()
+		staging.mode = sessionStreamLegacy
+		p.applySessionsSnapshot(payload.Sessions)
+		// A legacy single-frame snapshot has no omission channel: it is by
+		// definition complete, so clear any prior incompleteness marker.
+		p.setSessionOmissions(0, nil)
+		return
+	}
+	p.handleEvent(ctx, eventType, data)
 }
 
 // isForwardedFromKnownOrigin checks whether a session ID (before
@@ -409,7 +737,7 @@ func (p *Peer) handleEvent(ctx context.Context, eventType string, data []byte) {
 		// Authoritative replacement: the spoke's view of its owned
 		// sessions. We mirror it into the local store namespaced by
 		// peer name and remove any local entries for this peer that
-		// no longer appear (handles dismiss, kill, slug takeover that
+		// no longer appear (handles dismiss, kill, conversation takeover that
 		// happened on the spoke).
 		var payload sseSnapshotSessions
 		if err := json.Unmarshal(data, &payload); err != nil {
@@ -427,10 +755,9 @@ func (p *Peer) handleEvent(ctx context.Context, eventType string, data []byte) {
 			return
 		}
 		namespacedID := NamespaceID(ev.ID, p.Config.Name)
-		p.store.Broadcast(store.Event{
-			Type: "session-activity",
-			ID:   namespacedID,
-		})
+		if p.sink != nil {
+			p.sink.SessionActivity(namespacedID)
+		}
 
 	case "projects-update":
 		// Spoke's projects.json changed. Refresh the cached
@@ -460,46 +787,49 @@ func (p *Peer) handleEvent(ctx context.Context, eventType string, data []byte) {
 // removed.
 //
 // A spoke re-ships its full snapshot on every change (and at its
-// coalescer cadence), so the common case is that most sessions in a
-// snapshot are identical to what we already hold. We still call
-// UpsertRemote for each one; the store suppresses the redundant
-// session-upsert broadcast when nothing actually changed (see
-// upsertCommon). That dedup lives in the store rather than here
-// because only the store sees the fully-normalized session — after
-// path canonicalization and unique-slug renumbering — which is what
-// a correct equality check has to compare against.
-func (p *Peer) applySessionsSnapshot(remote []store.Session) {
-	seen := make(map[string]bool, len(remote))
-	for i := range remote {
-		sess := remote[i]
-		if p.isForwardedFromKnownOrigin(sess.ID) {
-			// A→B→A loop: B is shipping us back a session whose
-			// origin we already reach directly. Skip.
-			continue
-		}
-		namespacedID := NamespaceID(sess.ID, p.Config.Name)
-		seen[namespacedID] = true
-		sess.ID = namespacedID
-		sess.Peer = p.Config.Name
-		sess.SocketPath = "" // meaningless on hub side
-		// UpsertRemote (not Upsert) because the spoke already resolved
-		// Title and Resumable. Upsert would re-run resolveTitle against
-		// the wire session where ShellTitle/AdapterTitle are absent
-		// (they're internal fields, intentionally off the wire) and
-		// overwrite the correct title with the Kind fallback.
-		p.store.UpsertRemote(sess)
+// coalescer cadence), so the common case is that the whole snapshot is
+// identical to what we already hold. We still hand every delivery down
+// unconditionally; the no-op dedup lives one layer below, in
+// managerProjectionSink.ReplacePeerSessions (see projectionsEqual),
+// because that is the only place that holds both the previous and the
+// new projection. Dropping that guard makes two mutually-peered nodes
+// ping-pong identical snapshots forever — it is load-bearing, not an
+// optimization.
+//
+// What this function must do first is normalize identity, since the
+// gate below compares whole rows: IDs are namespaced, Peer is stamped,
+// and SocketPath is cleared, so nothing peer-local can read as a change.
+func (p *Peer) applySessionsSnapshot(input any) {
+	var remote []SessionProjection
+	switch rows := input.(type) {
+	case []SessionProjection:
+		remote = rows
+	default:
+		b, _ := json.Marshal(rows)
+		_ = json.Unmarshal(b, &remote)
 	}
-
-	// Removal pass: anything we still have for this peer that the
-	// snapshot omitted has either been dismissed, killed, or slug-
-	// renamed on the origin side.
-	for _, s := range p.store.List() {
-		if s.Peer != p.Config.Name {
+	out := make([]SessionProjection, 0, len(remote))
+	for i := range remote {
+		sess := cloneProjection(remote[i])
+		if p.isForwardedFromKnownOrigin(sess.ID) {
 			continue
 		}
-		if !seen[s.ID] {
-			p.store.Remove(s.ID)
+		sess.ID = NamespaceID(sess.ID, p.Config.Name)
+		// Bare parent IDs are owned by the same origin as the child and must
+		// enter the viewer namespace with it. Already-qualified references name
+		// another host (or were explicitly qualified by the origin), so retain
+		// them rather than manufacturing parent@other@this-peer.
+		if sess.ParentSessionID != "" {
+			if _, parentPeer := ParseID(sess.ParentSessionID); parentPeer == "" {
+				sess.ParentSessionID = NamespaceID(sess.ParentSessionID, p.Config.Name)
+			}
 		}
+		sess.Peer = p.Config.Name
+		sess.SocketPath = ""
+		out = append(out, sess)
+	}
+	if p.sink != nil {
+		p.sink.ReplacePeerSessions(p.Config.Name, out)
 	}
 }
 

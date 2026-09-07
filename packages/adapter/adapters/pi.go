@@ -1,7 +1,9 @@
 package adapters
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,17 +11,22 @@ import (
 	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
+	"github.com/gmuxapp/gmux/packages/adapter/filewatch"
 	"github.com/gmuxapp/gmux/packages/paths"
 )
 
 // Compile-time interface checks.
 var (
-	_ adapter.Launchable          = (*Pi)(nil)
-	_ adapter.SessionFiler        = (*Pi)(nil)
-	_ adapter.FileMonitor         = (*Pi)(nil)
-	_ adapter.Resumer             = (*Pi)(nil)
-	_ adapter.SessionExtender     = (*Pi)(nil)
-	_ adapter.PassthroughDetector = (*Pi)(nil)
+	_ adapter.ConversationSource    = (*Pi)(nil)
+	_ adapter.ConversationProber    = (*Pi)(nil)
+	_ adapter.Launchable            = (*Pi)(nil)
+	_ adapter.ConversationDescriber = (*Pi)(nil)
+	_ adapter.ConversationOpener    = (*Pi)(nil)
+	_ adapter.Resumer               = (*Pi)(nil)
+	_ adapter.SessionExtender       = (*Pi)(nil)
+	_ adapter.PassthroughDetector   = (*Pi)(nil)
+	_ adapter.AgentActionEncoder    = (*Pi)(nil)
+	_ adapter.AgentLauncher         = (*Pi)(nil)
 )
 
 // piSubcommands are pi's one-shot CLI verbs (`pi <verb> ...`). pi recognizes
@@ -29,6 +36,10 @@ var (
 // prompt — so a verb missing here means `gmux -- pi <verb>` silently starts a
 // chat instead of running the command. Keep synced with `pi --help`.
 var piSubcommands = map[string]bool{
+	// auth was added after pi 0.82.1. Keeping it in the passthrough superset is
+	// harmless with older pi (where it is not a valid command) and prevents a
+	// newer pi's one-shot auth flow from being silently demoted to a chat prompt.
+	"auth":      true,
 	"install":   true,
 	"remove":    true,
 	"uninstall": true,
@@ -140,20 +151,105 @@ func (p *Pi) Launchers() []adapter.Launcher {
 	}}
 }
 
-// Monitor is a no-op for the pi adapter — status is reported by the gmux pi
-// extension (turn events over the runner socket), not inferred from PTY
-// output. This avoids flicker from spinner redraws.
-func (p *Pi) Monitor(_ []byte) *adapter.Event {
-	return nil
+// piActionReadyTimeout bounds how long a caller waits for pi to report
+// itself ready before abandoning a semantic action. pi is a Node.js
+// program: cold start (interpreter boot, module load, TUI setup) is
+// seconds, not milliseconds, so a short timeout would spuriously fail
+// freshly launched or resumed sessions.
+const piActionReadyTimeout = 10 * time.Second
+
+// EncodeAction maps gmux's semantic turn-control actions to pi's
+// composer keybinds:
+//
+//   - ActionSend is Enter — submits, delivering into the current turn
+//     immediately when pi is streaming;
+//   - ActionSendAfterTurn is Alt+Enter — queues until the current turn
+//     ends, and acts as a plain submit when pi is idle;
+//   - ActionInterrupt is Escape — pi's interactive-mode onEscape aborts
+//     the streaming turn (dist/modes/interactive/interactive-mode.js
+//     restoreQueuedMessagesToEditor({abort:true})).
+//
+// Two pi-specific limitations callers should know about:
+//
+//   - Interrupt is not a clean stop: the same pi handler *restores any
+//     queued follow-ups into the composer*, so after a cancel the
+//     composer may hold text the user never retyped, which a
+//     subsequent submit would send along with the new prompt.
+//   - Both non-Enter encodings target pi's *default* keybindings.
+//     Composer keybinds are user-configurable, so a session whose user
+//     remapped alt+enter or escape silently loses semantic follow-up /
+//     interrupt support: the bytes still arrive, they just no longer
+//     mean that action. Enter is not realistically remappable, so
+//     ActionSend is safe.
+//
+// Encodings are chosen to parse correctly regardless of which keyboard
+// protocol pi negotiated with its startup-attached terminal:
+//
+//   - Enter is "\r": pi-tui parses a bare CR as "enter" in both its
+//     legacy and Kitty-protocol modes.
+//   - Alt+Enter is the Kitty CSI-u encoding "\x1b[13;3u" (codepoint 13,
+//     modifier 3 = 1+alt), NOT the legacy ESC CR ("\x1b\r"): pi-tui
+//     tries CSI-u parsing unconditionally, so this reads as alt+enter
+//     in both modes — whereas ESC CR is misparsed as shift+enter
+//     (newline, no submit) whenever pi negotiated the Kitty protocol,
+//     which happens for any `gmux -- pi` started in the foreground of a
+//     Kitty-protocol terminal (kitty, ghostty, wezterm, foot). Both
+//     behaviors verified against pi-tui's parseKey and live sessions.
+//   - Escape is the Kitty CSI-u encoding "\x1b[27u" (codepoint 27, no
+//     modifier), not a bare "\x1b". pi-tui's escape matcher accepts
+//     both in both modes (`data === "\x1b" || matchesKittySequence(data,
+//     27, 0)` in keys.js), but a lone ESC byte is the prefix of every
+//     escape sequence: if any bytes follow in the same read, pi parses
+//     the combination as some other key. CSI-u is self-delimiting and
+//     therefore unambiguous.
+func (p *Pi) EncodeAction(action adapter.AgentAction) (string, bool) {
+	switch action {
+	case adapter.ActionSend:
+		return "\r", true
+	case adapter.ActionSendAfterTurn:
+		return "\x1b[13;3u", true
+	case adapter.ActionInterrupt:
+		return "\x1b[27u", true
+	}
+	return "", false
 }
 
-// --- SessionFiler ---
+// ActionReadyTimeout implements adapter.AgentActionEncoder.
+func (p *Pi) ActionReadyTimeout() time.Duration { return piActionReadyTimeout }
 
-// SessionRootDir returns pi's top-level sessions directory.
+// LaunchCommand implements adapter.AgentLauncher: a bare interactive pi,
+// plus the two knobs `gmux agent prompt --new` exposes.
+//
+// The flags are pi's own long spellings, verified against `pi --help`:
+// `--model <pattern>` takes a model pattern or id, `--name <name>` sets the
+// session display name. Long forms deliberately — pi's `-n` is --name but a
+// single-letter flag is the kind of thing an agent reshuffles between
+// releases, and this argv is stored on the session forever.
+//
+// No prompt is ever encoded here: the first prompt travels the same
+// readiness-gated semantic path as every later one, so a freshly launched
+// session has one health event (admission) rather than a launch-shaped
+// special case. An empty option is omitted entirely rather than passed empty:
+// `--model ""` asks pi for a model named "", which is not the same request as
+// asking for pi's default.
+func (p *Pi) LaunchCommand(opts adapter.LaunchOptions) ([]string, bool) {
+	argv := []string{"pi"}
+	if opts.Model != "" {
+		argv = append(argv, "--model", opts.Model)
+	}
+	if opts.Name != "" {
+		argv = append(argv, "--name", opts.Name)
+	}
+	return argv, true
+}
+
+// --- Conversation storage (file-backed: refs are absolute JSONL paths) ---
+
+// ConversationRootDir returns pi's top-level sessions directory.
 // Respects PI_CODING_AGENT_DIR (pi's own env var for overriding the
 // agent data directory, default ~/.pi/agent). This lets dev instances
 // use an isolated session store.
-func (p *Pi) SessionRootDir() string {
+func (p *Pi) ConversationRootDir() string {
 	if dir := os.Getenv("PI_CODING_AGENT_DIR"); dir != "" {
 		return filepath.Join(dir, "sessions")
 	}
@@ -164,11 +260,19 @@ func (p *Pi) SessionRootDir() string {
 	return filepath.Join(home, ".pi", "agent", "sessions")
 }
 
-// SessionDir returns pi's session directory for a given cwd.
+// ConversationGone anchors deletion detection on ConversationRootDir
+// (PI_CODING_AGENT_DIR/sessions or ~/.pi/agent/sessions): present root
+// means a missing conversation file was deleted; absent root means the
+// storage is unavailable. Refs are conversation-file paths for pi.
+func (p *Pi) ConversationGone(ref string) (gone bool, ok bool) {
+	return adapter.ConversationGoneAtRoot(ref, p.ConversationRootDir())
+}
+
+// ConversationDir returns pi's session directory for a given cwd.
 // Pi encodes: strip leading /, replace remaining / with -, wrap in --.
 // /home/mg/dev/gmux → --home-mg-dev-gmux--
-func (p *Pi) SessionDir(cwd string) string {
-	root := p.SessionRootDir()
+func (p *Pi) ConversationDir(cwd string) string {
+	root := p.ConversationRootDir()
 	if root == "" {
 		return ""
 	}
@@ -178,9 +282,12 @@ func (p *Pi) SessionDir(cwd string) string {
 	return filepath.Join(root, encoded)
 }
 
-// ParseSessionFile reads a pi JSONL session file and returns display metadata.
-// Title priority: session_info.name > first user message > "(new)".
-func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
+// DescribeConversation reads a pi JSONL conversation file (the ref is the
+// absolute file path) and returns display metadata.
+// Title priority: session_info.name > first user message > "" (no
+// conversation-derived title yet; callers fall back to cwd/adapter).
+func (p *Pi) DescribeConversation(ref string) (*adapter.ConversationInfo, error) {
+	path := ref
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -206,11 +313,12 @@ func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
 
 	created, _ := time.Parse(time.RFC3339Nano, header.Timestamp)
 
-	info := &adapter.SessionFileInfo{
-		ID:       header.ID,
-		Cwd:      header.Cwd,
-		Created:  created,
-		FilePath: path,
+	info := &adapter.ConversationInfo{
+		ID:           header.ID,
+		Cwd:          header.Cwd,
+		Created:      created,
+		LastActivity: fileLastActivity(path),
+		Ref:          path,
 	}
 
 	var name string
@@ -249,7 +357,7 @@ func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
 	case firstUserMsg != "":
 		info.Title = truncateTitle(firstUserMsg, 80)
 	default:
-		info.Title = "(new)"
+		info.Title = "" // no name and no message yet
 	}
 
 	info.Slug = adapter.Slugify(info.Title)
@@ -257,247 +365,21 @@ func (p *Pi) ParseSessionFile(path string) (*adapter.SessionFileInfo, error) {
 	return info, nil
 }
 
-// --- FileMonitor ---
-
-// ParseNewLines receives lines appended to an attributed session file
-// and returns events for meaningful changes.
-//
-// NOTE: this is now vestigial for pi. pi sessions are attributed only by the
-// agent hook (no metadata FileAttributor), so the daemon always suppresses its
-// file parse for them (see filemon.processAttributedFileLocked) and status
-// flows from the hook instead. It's retained — along with FileMonitor — pending
-// a focused follow-up to drop pi's FileMonitor role (which must first settle
-// how unnamed sessions get their first-prompt title, today derived here).
-//
-// Signals:
-//   - session_info with name → title update (no status change)
-//   - message role:"user" → working (assistant will respond)
-//   - message role:"assistant" — status depends on stopReason:
-//   - "toolUse" → working (tool loop continues)
-//   - "stop"    → idle (turn complete)
-//   - "aborted" → idle (user cancelled via Esc)
-//   - "error"   → error state only if retries exhausted (consecutive errors
-//     reach pi's retry limit); otherwise no change (retry expected)
-//
-// Unknown event types and unknown stopReasons produce no state change.
-// Extensions can emit custom events; these must not disrupt existing state.
-func (p *Pi) ParseNewLines(lines []string, filePath string) []adapter.Event {
-	var events []adapter.Event
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		var peek struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal([]byte(line), &peek); err != nil {
-			continue
-		}
-
-		switch peek.Type {
-		case "session":
-			// Session header — emit the canonical project cwd so the daemon
-			// can correct the session's directory if it was resumed from a
-			// different location.
-			var header struct {
-				Cwd string `json:"cwd"`
-			}
-			if err := json.Unmarshal([]byte(line), &header); err == nil && header.Cwd != "" {
-				events = append(events, adapter.Event{Cwd: header.Cwd})
-			}
-
-		case "session_info":
-			var si struct {
-				Name string `json:"name"`
-			}
-			if err := json.Unmarshal([]byte(line), &si); err == nil && si.Name != "" {
-				events = append(events, adapter.Event{
-					Title: strings.TrimSpace(si.Name),
-				})
-			}
-
-		case "message":
-			var msg struct {
-				Message *struct {
-					Role       string `json:"role"`
-					StopReason string `json:"stopReason"`
-				} `json:"message"`
-			}
-			if err := json.Unmarshal([]byte(line), &msg); err != nil || msg.Message == nil {
-				continue
-			}
-
-			switch msg.Message.Role {
-			case "user":
-				// User submitted a message — assistant will start working.
-				events = append(events, adapter.Event{
-					Status: &adapter.Status{Working: true},
-				})
-
-			case "assistant":
-				switch msg.Message.StopReason {
-				case "toolUse":
-					// Assistant wants to call tools — agent loop continues.
-					events = append(events, adapter.Event{
-						Status: &adapter.Status{Working: true},
-					})
-				case "stop":
-					// Assistant finished its turn — clear status, mark unread.
-					events = append(events, adapter.Event{
-						Status: &adapter.Status{},
-						Unread: adapter.BoolPtr(true),
-					})
-				case "aborted":
-					// User pressed Esc to cancel — agent is idle.
-					events = append(events, adapter.Event{
-						Status: &adapter.Status{},
-					})
-				case "error":
-					// Errors are often transient (overloaded, rate-limited)
-					// and pi retries automatically. While retries are
-					// pending, don't change state (stay working). When
-					// retries are exhausted, signal error so the frontend
-					// can show a red dot.
-					if filePath != "" {
-						count, cwd := countTrailingErrors(filePath)
-						if count >= piMaxRetries(cwd) {
-							// Retries exhausted — agent gave up.
-							events = append(events, adapter.Event{
-								Status: &adapter.Status{Error: true},
-							})
-						}
-					}
-					// Unknown stopReasons: no state change.
-				}
-			}
-		}
+// ResumeCommand returns the command to resume a pi session, or nil when the
+// conversation has no messages worth resuming.
+func (p *Pi) ResumeCommand(info *adapter.ConversationInfo) []string {
+	if info == nil || info.MessageCount == 0 {
+		return nil
 	}
-	return events
+	return []string{"pi", "--session", info.Ref, "-c"}
 }
 
-// piDefaultMaxRetries is the fallback when settings can't be read.
-// Pi's default is maxRetries=3, so exhaustion = 1 original + 3 retries = 4.
-const piDefaultMaxRetries = 4
-
-// piMaxRetries reads pi's retry setting from its config files.
-// Returns maxRetries+1 (the total number of error messages when exhausted).
-// Pi merges ~/.pi/agent/settings.json (global) with <cwd>/.pi/settings.json
-// (project-level); project settings take precedence.
-func piMaxRetries(cwd string) int {
-	read := func(path string) int {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return -1
-		}
-		var cfg struct {
-			Retry *struct {
-				MaxRetries *int `json:"maxRetries"`
-			} `json:"retry"`
-		}
-		if err := json.Unmarshal(data, &cfg); err != nil || cfg.Retry == nil || cfg.Retry.MaxRetries == nil {
-			return -1
-		}
-		return *cfg.Retry.MaxRetries
-	}
-
-	// Project-level overrides global (matches pi's deepMergeSettings).
-	if cwd != "" {
-		if v := read(filepath.Join(cwd, ".pi", "settings.json")); v >= 0 {
-			return v + 1
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return piDefaultMaxRetries
-	}
-	if v := read(filepath.Join(home, ".pi", "agent", "settings.json")); v >= 0 {
-		return v + 1
-	}
-	return piDefaultMaxRetries
-}
-
-// countTrailingErrors reads a pi session file and counts consecutive
-// assistant error messages from the end, ignoring non-message lines
-// (custom events, labels, etc.). Also extracts the cwd from the
-// session header for config lookup.
-func countTrailingErrors(filePath string) (count int, cwd string) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return 0, ""
-	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-
-	// Extract cwd from the session header (first line).
-	if len(lines) > 0 {
-		var header struct {
-			Type string `json:"type"`
-			Cwd  string `json:"cwd"`
-		}
-		if err := json.Unmarshal([]byte(lines[0]), &header); err == nil && header.Type == "session" {
-			cwd = header.Cwd
-		}
-	}
-
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		if line == "" {
-			continue
-		}
-		var entry struct {
-			Type    string `json:"type"`
-			Message *struct {
-				Role       string `json:"role"`
-				StopReason string `json:"stopReason"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			continue
-		}
-		// Skip non-message lines (custom events, labels, etc.)
-		if entry.Type != "message" {
-			continue
-		}
-		if entry.Message != nil && entry.Message.Role == "assistant" && entry.Message.StopReason == "error" {
-			count++
-		} else {
-			break // hit a non-error message, stop counting
-		}
-	}
-	return count, cwd
-}
-
-// --- Resumer ---
-
-// ResumeCommand returns the command to resume a pi session.
-func (p *Pi) ResumeCommand(info *adapter.SessionFileInfo) []string {
-	return []string{"pi", "--session", info.FilePath, "-c"}
-}
-
-// CanResume checks if a session file is valid and has content worth resuming.
-func (p *Pi) CanResume(path string) bool {
-	info, err := p.ParseSessionFile(path)
-	if err != nil {
-		return false
-	}
-	return info.MessageCount > 0
+// OpenConversation streams the raw JSONL transcript at ref.
+func (p *Pi) OpenConversation(ref string) (io.ReadCloser, error) {
+	return os.Open(ref)
 }
 
 // --- Helpers ---
-
-// ListSessionFiles returns all .jsonl files in a directory.
-func ListSessionFiles(dir string) []string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
-			files = append(files, filepath.Join(dir, e.Name()))
-		}
-	}
-	return files
-}
 
 func extractFirstUserText(line string) string {
 	var entry struct {
@@ -553,3 +435,19 @@ var (
 type parseError struct{ msg string }
 
 func (e *parseError) Error() string { return e.msg }
+
+// --- ConversationSource ---
+
+func (p *Pi) SnapshotConversations(sink adapter.ConversationSink) {
+	filewatch.Snapshot(p.ConversationRootDir(), ".jsonl", sink.Upsert)
+}
+
+func (p *Pi) WatchConversations(ctx context.Context, sink adapter.ConversationSink) error {
+	return filewatch.Watch(ctx, p.ConversationRootDir(), ".jsonl", func(e filewatch.Event) {
+		if e.Removed {
+			sink.Remove(e.Path)
+		} else {
+			sink.Upsert(e.Path)
+		}
+	})
+}

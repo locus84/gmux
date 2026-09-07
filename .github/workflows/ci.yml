@@ -13,11 +13,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  js:
-    name: JS (lint, build, test)
+  checks:
+    name: Lint, build, test
     runs-on: ubuntu-latest
+    # One source of truth: run the same pnpm entrypoints developers run
+    # locally. The actual commands live once in moon.yml (moon discovers
+    # projects from the workspace globs), so CI can't drift from local.
+    env:
+      GOWORK: ${{ github.workspace }}/go.work
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # moon's VCS layer needs the default branch ref to compute a
+          # touched-files baseline; a shallow checkout has only the PR
+          # head and makes `moon run` fail with git exit 128.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+
+      - name: Verify Go toolchain pins
+        run: ./scripts/go-toolchain.sh
 
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
@@ -28,65 +48,87 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint (Biome)
-        # biome lint (not `biome ci`): the repo enables only the linter;
-        # formatter and import-sort assists are intentionally off, and
-        # `biome ci` would also run those. Match the root `lint` script.
-        # --error-on-warnings: biome.json configures several rules at "warn"
-        # (noEmptyBlockStatements, noUnusedVariables, noUnusedImports); without
-        # this flag they'd surface locally but silently pass CI.
-        run: pnpm exec biome lint --error-on-warnings .
+      - name: Lint
+        run: pnpm lint
 
-      - name: Build protocol
-        run: cd packages/protocol && pnpm exec tsc -p tsconfig.json
+      - name: Build
+        run: pnpm build
 
-      - name: Lint protocol
-        run: cd packages/protocol && pnpm exec tsc --noEmit
+      - name: Test
+        run: pnpm test
 
-      - name: Test protocol
-        run: cd packages/protocol && pnpm exec vitest run --passWithNoTests
-
-      - name: Lint web
-        run: cd apps/gmux-web && pnpm exec tsc --noEmit
-
-      - name: Test web
-        run: cd apps/gmux-web && pnpm exec vitest run --passWithNoTests
-
-      - name: Build web
-        run: cd apps/gmux-web && pnpm exec vite build
-
-  go:
-    name: Go (lint, build, test)
+  central-store-checks:
+    name: Central store generated + cross-build
     runs-on: ubuntu-latest
+    env:
+      GOWORK: ${{ github.workspace }}/go.work
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # These are moon tasks and need the default-branch baseline.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.work
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: "22"
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Central-store (ADR 0026) gates that the pnpm test/build/lint fan-out
+      # does not cover: they live under distinct moon task names, so they
+      # must be invoked explicitly. All are Docker-free and fast.
+      - name: Central store — generated code up to date
+        run: pnpm exec moon run gmuxd:check-centralstore-generated
+
+      - name: Central store — CGO-free cross-build (linux/darwin × amd64/arm64)
+        run: pnpm exec moon run gmuxd:check-centralstore-cross-build
+
+  central-store-race:
+    name: Central store race detector
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: ${{ github.workspace }}/go.work
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          go-version: "1.26"
+          go-version-file: go.work
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
 
-      - name: Vet
-        run: |
-          go vet ./cli/gmux/...
-          go vet ./packages/adapter/...
-          go vet ./services/gmuxd/...
-        env:
-          GOWORK: ${{ github.workspace }}/go.work
+      # Race detector on the concurrency-critical central-store machinery
+      # (coordinator, snapshot composer, peering projection, daemon entry).
+      - name: Central store — race detector (hot packages)
+        working-directory: services/gmuxd
+        run: go test -race ./internal/sessioncoord ./internal/snapshot/central ./internal/peering ./cmd/gmuxd
 
-      - name: Build
-        run: |
-          go build ./cli/gmux/...
-          go build ./services/gmuxd/...
-        env:
-          GOWORK: ${{ github.workspace }}/go.work
+  central-store-e2e:
+    name: Central store E2E (container, fast)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Test
-        run: |
-          go test ./cli/gmux/...
-          go test ./packages/adapter/...
-          go test ./services/gmuxd/...
-        env:
-          GOWORK: ${{ github.workspace }}/go.work
+      # No host Go/Node needed: the Dockerfile builds gmuxd and gmux inside the image.
+      # Runs the built production binaries and synthetic runners inside a
+      # networkless, private-tmpfs Docker container (host isolation is
+      # enforced by the harness guard). This is the real acceptance gate,
+      # including the original unread-on-restart bug. The extended 50-cycle
+      # stress profile runs nightly (central-store-e2e-nightly.yml), not here.
+      - name: Fast production container E2E
+        run: services/gmuxd/tools/production-e2e.sh
 
   e2e:
     name: E2E (Playwright)
@@ -103,7 +145,10 @@ jobs:
 
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          go-version: "1.26"
+          go-version-file: go.work
+          cache-dependency-path: |
+            **/go.sum
+            go.work.sum
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

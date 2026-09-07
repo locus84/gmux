@@ -1,0 +1,445 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/ntfy"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/presence"
+	pushpkg "github.com/gmuxapp/gmux/services/gmuxd/internal/push"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
+	"nhooyr.io/websocket"
+)
+
+type NotifyMessage struct {
+	Type      string `json:"type"`
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	Tag       string `json:"tag"`
+}
+
+type CancelMessage struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+type notifyConfig struct {
+	GracePeriod   time.Duration
+	IdleThreshold time.Duration
+}
+
+func defaultNotifyConfig() notifyConfig {
+	return notifyConfig{GracePeriod: 5 * time.Second, IdleThreshold: 2 * time.Minute}
+}
+
+type notifySessionSnapshot struct {
+	Active      bool
+	Interrupted bool
+	Unread      bool
+	UnreadToken string
+	Alive       bool
+	Title       string
+	Adapter     string
+	Start       string
+	ParentID    string
+}
+
+type pendingCentralNotif struct {
+	sessionID   string
+	notifType   string
+	title       string
+	body        string
+	adapter     string
+	timer       *time.Timer
+	notifID     string
+	resultToken string
+}
+
+type activeCentralNotif struct {
+	sessionID   string
+	clientID    string
+	resultToken string
+}
+
+type externalNotifier interface {
+	Notify(ntfy.Message) bool
+}
+
+type centralNotifyRouter struct {
+	presence *presence.Table
+	config   notifyConfig
+	external externalNotifier
+	push     *pushpkg.Manager
+	store    *centralstore.Store
+
+	// deliveryMu linearizes a timer's complete pending→active→send transition
+	// with cancellation. Without it, cancellation can observe the gap after a
+	// timer dequeues pending attention but before it records/sends the active
+	// notification.
+	deliveryMu         sync.Mutex
+	mu                 sync.Mutex
+	prevState          map[string]notifySessionSnapshot
+	suppressedInactive map[string]bool
+	pending            map[string]*pendingCentralNotif
+	active             map[string]activeCentralNotif
+	nextID             int
+
+	// These are deterministic test seams for the cancellation interleaving.
+	// Production leaves both nil.
+	afterPendingDequeue func()
+	beforeCancelLock    func()
+}
+
+func newCentralNotifyRouter(p *presence.Table, cfg notifyConfig) *centralNotifyRouter {
+	return &centralNotifyRouter{
+		presence: p, config: cfg,
+		prevState: make(map[string]notifySessionSnapshot), suppressedInactive: make(map[string]bool),
+		pending: make(map[string]*pendingCentralNotif), active: make(map[string]activeCentralNotif),
+	}
+}
+
+func (r *centralNotifyRouter) Run(ctx context.Context, seed []sessioncoord.Outcome, events <-chan sessioncoord.Outcome) {
+	r.mu.Lock()
+	for _, outcome := range seed {
+		if outcome.Type != sessioncoord.OutcomeUpserted || outcome.Session == nil {
+			continue
+		}
+		r.prevState[string(outcome.ID)] = notifySnapshot(outcome)
+	}
+	r.mu.Unlock()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case outcome, ok := <-events:
+			if !ok {
+				return
+			}
+			r.handleOutcome(outcome)
+		}
+	}
+}
+
+func notifySnapshot(o sessioncoord.Outcome) notifySessionSnapshot {
+	snap := notifySessionSnapshot{Alive: o.Alive}
+	if o.Session != nil {
+		snap.Active = o.Alive && o.Session.StatusReported && o.Session.Active
+		snap.Interrupted = o.Session.StatusReported && o.Session.Interrupted
+		snap.Unread = o.Session.Unread
+		snap.UnreadToken = o.Session.UnreadToken
+		snap.Title = o.Session.Title
+		snap.Adapter = o.Session.Adapter
+		snap.Start = fmtMillisPtr(o.Session.StartedAt)
+		if o.Session.ParentSessionID != nil {
+			snap.ParentID = string(*o.Session.ParentSessionID)
+		}
+	}
+	return snap
+}
+
+func (r *centralNotifyRouter) handleOutcome(o sessioncoord.Outcome) {
+	if o.Type == sessioncoord.OutcomeRemoved {
+		r.mu.Lock()
+		delete(r.prevState, string(o.ID))
+		delete(r.suppressedInactive, string(o.ID))
+		r.mu.Unlock()
+		return
+	}
+	if o.Type != sessioncoord.OutcomeUpserted || o.Session == nil {
+		return
+	}
+	cur := notifySnapshot(o)
+	id := string(o.ID)
+	r.mu.Lock()
+	prev, existed := r.prevState[id]
+	r.prevState[id] = cur
+	transitionedInactive := existed && prev.Active && !cur.Active
+	inactiveParentChanged := existed && !cur.Active && prev.ParentID != cur.ParentID
+	releasedBySuppression := inactiveParentChanged && r.suppressedInactive[id]
+	// Suppression is decided at the committed child transition using only the
+	// direct parent's latest committed outcome already observed by this router.
+	// Later parent activity never retroactively changes this decision; a parent
+	// edge change while inactive re-decides it. The lookup is intentionally one
+	// hop: an inactive/missing direct parent ends it.
+	if cur.Active {
+		// A new turn gets a fresh completion decision.
+		delete(r.suppressedInactive, id)
+	} else if transitionedInactive || inactiveParentChanged {
+		delete(r.suppressedInactive, id)
+		if cur.ParentID != "" {
+			parent, parentExists := r.prevState[cur.ParentID]
+			r.suppressedInactive[id] = parentExists && parent.Active
+		}
+	}
+	// Runner facts can arrive in separate committed outcomes (for example the
+	// inactive edge before the final unread bit). Once this completion was
+	// suppressed, keep all later attention for that inactive turn suppressed;
+	// parent activity or fact ordering must not resurrect it. Only a changed
+	// parent edge re-decides the latch.
+	suppress := !cur.Active && r.suppressedInactive[id]
+	r.mu.Unlock()
+	if o.AttentionSuppressed {
+		// This bit is the coordinator's committed lifecycle-serialized decision.
+		// Cancel its exact result plus empty-token attention, which is unscoped.
+		// A mismatched non-empty token identifies an older result and survives.
+		r.cancelForSessionResult(id, cur.UnreadToken)
+		return
+	}
+	if !existed {
+		return
+	}
+	// Consumption is also a cancellation boundary. Serialize it through the
+	// same delivery lock as suppression so an unread-clear cannot lose to a
+	// timer already moving pending attention into active delivery.
+	if prev.Unread && !cur.Unread {
+		r.CancelForSession(id)
+	}
+	if suppress {
+		// Remove attention already pending for this child as well as the
+		// completion/unread attention carried by this outcome.
+		r.CancelForSession(id)
+		return
+	}
+	// An intentional stop is not a completion (ADR 0027): no "finished"
+	// notification for a turn the user themselves ended.
+	if transitionedInactive && cur.Alive && !cur.Interrupted {
+		r.scheduleNotification(id, "finished", cur.Title, formatFinishedBodyCentral(cur.Start), cur.Adapter, cur.UnreadToken)
+	}
+	if cur.Unread && (releasedBySuppression || !prev.Unread || prev.UnreadToken != cur.UnreadToken) {
+		r.scheduleNotification(id, "unread", cur.Title, "New output", cur.Adapter, cur.UnreadToken)
+	}
+}
+
+func formatFinishedBodyCentral(start string) string {
+	body := "Task finished"
+	if start == "" {
+		return body
+	}
+	t, err := time.Parse(time.RFC3339, start)
+	if err != nil {
+		return body
+	}
+	dur := time.Since(t).Round(time.Second)
+	if dur < time.Minute {
+		return fmt.Sprintf("Finished (%ds)", int(dur.Seconds()))
+	}
+	m := int(dur.Minutes())
+	s := int(dur.Seconds()) % 60
+	if dur < time.Hour {
+		return fmt.Sprintf("Finished (%dm %ds)", m, s)
+	}
+	h := int(dur.Hours())
+	m = m % 60
+	return fmt.Sprintf("Finished (%dh %dm)", h, m)
+}
+
+func (r *centralNotifyRouter) genID() string {
+	r.nextID++
+	return fmt.Sprintf("notif-%d", r.nextID)
+}
+
+func (r *centralNotifyRouter) scheduleNotification(sessionID, notifType, title, body, adapter string, resultTokens ...string) {
+	resultToken := ""
+	if len(resultTokens) > 0 {
+		resultToken = resultTokens[0]
+	}
+	if r.presence.AnyViewing(sessionID) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.pending[sessionID]; ok {
+		if notifType == "finished" && existing.notifType == "unread" {
+			existing.notifType = notifType
+			existing.title = title
+			existing.body = body
+			existing.adapter = adapter
+		}
+		return
+	}
+	notifID := r.genID()
+	p := &pendingCentralNotif{sessionID: sessionID, notifType: notifType, title: title, body: body, adapter: adapter, notifID: notifID, resultToken: resultToken}
+	p.timer = time.AfterFunc(r.config.GracePeriod, func() { r.firePending(sessionID) })
+	r.pending[sessionID] = p
+}
+
+func (r *centralNotifyRouter) firePending(sessionID string) {
+	r.deliveryMu.Lock()
+	defer r.deliveryMu.Unlock()
+	r.mu.Lock()
+	p, ok := r.pending[sessionID]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.pending, sessionID)
+	pendingCount := len(r.pending) + 1
+	if pendingCount >= 3 {
+		pendings := []*pendingCentralNotif{p}
+		for sid, other := range r.pending {
+			other.timer.Stop()
+			delete(r.pending, sid)
+			pendings = append(pendings, other)
+		}
+		r.mu.Unlock()
+		r.fireCoalesced(len(pendings))
+		if r.push != nil && r.store != nil {
+			for _, pending := range pendings {
+				if !r.presence.AnyViewing(pending.sessionID) {
+					r.sendWebPush(pending)
+				}
+			}
+		}
+		return
+	}
+	r.mu.Unlock()
+	if r.afterPendingDequeue != nil {
+		r.afterPendingDequeue()
+	}
+	if r.presence.AnyViewing(sessionID) {
+		return
+	}
+	if r.push != nil && r.store != nil {
+		r.sendWebPush(p)
+	}
+	if r.external != nil {
+		kind := ntfy.KindUnread
+		if p.notifType == "finished" {
+			kind = ntfy.KindFinished
+		}
+		r.external.Notify(ntfy.Message{Kind: kind, SessionID: sessionID, Adapter: p.adapter})
+	}
+	target := r.presence.BestNotifyTarget(r.config.IdleThreshold)
+	if target == nil {
+		log.Printf("notify: no target for session %s", sessionID)
+		return
+	}
+	msg := NotifyMessage{Type: "notify", ID: p.notifID, SessionID: sessionID, Title: p.title, Body: p.body, Tag: sessionID}
+	r.mu.Lock()
+	r.active[p.notifID] = activeCentralNotif{sessionID: sessionID, clientID: target.ID, resultToken: p.resultToken}
+	r.mu.Unlock()
+	sendNotifyJSON(target.Conn, msg)
+	time.AfterFunc(5*time.Minute, func() {
+		r.mu.Lock()
+		delete(r.active, p.notifID)
+		r.mu.Unlock()
+	})
+}
+
+func (r *centralNotifyRouter) sendWebPush(p *pendingCentralNotif) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := r.store.ReadSnapshot(ctx, centralstore.SnapshotQuery{IncludeSessions: true})
+	if err != nil {
+		log.Printf("push: resolve project: %v", err)
+		return
+	}
+	projectSlug := ""
+	for _, session := range snapshot.Sessions {
+		if string(session.ID) == p.sessionID && session.Placement != nil {
+			projectSlug = session.Placement.ProjectSlug
+			break
+		}
+	}
+	if projectSlug == "" {
+		return
+	}
+	payload, err := json.Marshal(pushpkg.Payload{
+		ID: p.notifID, SessionID: p.sessionID, Title: p.title, Body: p.body,
+		Tag: p.sessionID, URL: "/?notificationSession=" + p.sessionID,
+	})
+	if err != nil {
+		return
+	}
+	r.push.Send(context.Background(), projectSlug, payload)
+}
+
+func (r *centralNotifyRouter) fireCoalesced(count int) {
+	if r.external != nil {
+		r.external.Notify(ntfy.Message{Kind: ntfy.KindCoalesced, Count: count})
+	}
+	target := r.presence.BestNotifyTarget(r.config.IdleThreshold)
+	if target == nil {
+		log.Printf("notify: no target for coalesced notification (%d sessions)", count)
+		return
+	}
+	r.mu.Lock()
+	notifID := r.genID()
+	r.mu.Unlock()
+	sendNotifyJSON(target.Conn, NotifyMessage{Type: "notify", ID: notifID, Title: "gmux", Body: fmt.Sprintf("%d sessions finished", count), Tag: "coalesced"})
+}
+
+func (r *centralNotifyRouter) CancelAllPending() {
+	r.deliveryMu.Lock()
+	defer r.deliveryMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for sid, p := range r.pending {
+		p.timer.Stop()
+		delete(r.pending, sid)
+	}
+}
+
+func (r *centralNotifyRouter) cancelForSessionResult(sessionID, resultToken string) {
+	if resultToken == "" {
+		return
+	}
+	r.cancelForSession(sessionID, resultToken)
+}
+
+func (r *centralNotifyRouter) CancelForSession(sessionID string) {
+	r.cancelForSession(sessionID, "")
+}
+
+func (r *centralNotifyRouter) cancelForSession(sessionID, resultToken string) {
+	if r.beforeCancelLock != nil {
+		r.beforeCancelLock()
+	}
+	r.deliveryMu.Lock()
+	defer r.deliveryMu.Unlock()
+	r.mu.Lock()
+	if p, ok := r.pending[sessionID]; ok && (resultToken == "" || p.resultToken == "" || p.resultToken == resultToken) {
+		p.timer.Stop()
+		delete(r.pending, sessionID)
+	}
+	var cancelIDs []string
+	for id, active := range r.active {
+		if active.sessionID == sessionID && (resultToken == "" || active.resultToken == "" || active.resultToken == resultToken) {
+			cancelIDs = append(cancelIDs, id)
+			delete(r.active, id)
+		}
+	}
+	r.mu.Unlock()
+	for _, id := range cancelIDs {
+		r.broadcastCancel(id)
+	}
+}
+
+func (r *centralNotifyRouter) broadcastCancel(notifID string) {
+	msg := CancelMessage{Type: "cancel", ID: notifID}
+	for _, conn := range r.presence.Conns() {
+		sendNotifyJSON(conn, msg)
+	}
+}
+
+func sendNotifyJSON(conn *websocket.Conn, v any) {
+	if conn == nil {
+		return
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, data); err != nil {
+		log.Printf("notify: write error: %v", err)
+	}
+}

@@ -24,13 +24,14 @@ import (
 	"time"
 
 	"tailscale.com/client/tailscale"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
 // Config mirrors the tailscale section of the gmuxd config file.
 type Config struct {
 	Hostname string
-	Allow    []string // tailscale login names (e.g. "user@github")
+	Allow    []string // tailscale login names (e.g. "user@github") or device tags (e.g. "tag:gmux")
 }
 
 // DiagStatus contains diagnostic information about the Tailscale connection.
@@ -47,22 +48,46 @@ type DiagStatus struct {
 	// AuthURL is set when the node needs login. The user must visit
 	// this URL to register the device in their tailnet.
 	AuthURL string `json:"auth_url,omitempty"`
+	// BackendState is the tailscale backend state (e.g. "Running",
+	// "Starting", "NeedsLogin"). When it is "Running", the netmap is
+	// synced and HTTPS/MagicDNS above are authoritative; otherwise
+	// they may read false simply because the state isn't known yet.
+	BackendState string `json:"backend_state,omitempty"`
 	// Connected is true when the listener is fully operational.
 	Connected bool `json:"connected"`
 }
 
 // Listener manages a tsnet server and its HTTPS listener.
 type Listener struct {
-	srv   *tsnet.Server
-	lc    *tailscale.LocalClient
-	cfg   Config
-	fqdn  string         // resolved tailnet FQDN, set once ready
-	ready chan struct{}   // closed when the listener is fully connected
+	srv         *tsnet.Server
+	lc          *tailscale.LocalClient
+	cfg         Config
+	fqdn        string        // resolved tailnet FQDN, set once ready
+	magicSuffix string        // tailnet MagicDNS suffix (e.g. "tailnet.ts.net"), set once ready
+	ready       chan struct{} // closed when the listener is fully connected
 }
 
 // FQDN returns the full tailnet DNS name (e.g. "gmuxd.angler-map.ts.net")
 // once the listener is ready. Returns "" if tailscale hasn't connected yet.
 func (l *Listener) FQDN() string { return l.fqdn }
+
+// MagicDNSSuffix returns the tailnet's MagicDNS suffix (e.g.
+// "tailnet.ts.net") once the listener is ready. Returns "" if tailscale
+// hasn't connected yet or MagicDNS is disabled.
+func (l *Listener) MagicDNSSuffix() string { return l.magicSuffix }
+
+// StatusMagicDNSSuffix extracts and normalizes the authoritative suffix from a
+// LocalAPI status response, preferring CurrentTailnet over the legacy field.
+func StatusMagicDNSSuffix(status *ipnstate.Status) string {
+	if status == nil {
+		return ""
+	}
+	suffix := status.MagicDNSSuffix
+	if status.CurrentTailnet != nil && status.CurrentTailnet.MagicDNSSuffix != "" {
+		suffix = status.CurrentTailnet.MagicDNSSuffix
+	}
+	return strings.TrimSuffix(suffix, ".")
+}
 
 // Diag returns diagnostic status about the Tailscale connection.
 // Safe to call at any time, including before the listener is ready.
@@ -81,6 +106,7 @@ func (l *Listener) Diag() DiagStatus {
 	if status.AuthURL != "" {
 		ds.AuthURL = status.AuthURL
 	}
+	ds.BackendState = status.BackendState
 	ds.HTTPS = len(status.CertDomains) > 0
 	if status.CurrentTailnet != nil {
 		ds.MagicDNS = status.CurrentTailnet.MagicDNSSuffix != ""
@@ -168,10 +194,16 @@ func (l *Listener) run(handler http.Handler) {
 
 	// Resolve the full tailnet FQDN so users know exactly what to type.
 	fqdn := l.cfg.Hostname
-	if status, err := lc.Status(context.Background()); err == nil && status.Self != nil {
-		if dnsName := strings.TrimSuffix(status.Self.DNSName, "."); dnsName != "" {
-			fqdn = dnsName
+	// Identity/suffix discovery must not hold Ready closed indefinitely. The
+	// caller installs the LocalClient even on timeout and retries suffix
+	// convergence independently.
+	if status, err := statusWithTimeout(context.Background(), lc, 5*time.Second); err == nil {
+		if status.Self != nil {
+			if dnsName := strings.TrimSuffix(status.Self.DNSName, "."); dnsName != "" {
+				fqdn = dnsName
+			}
 		}
+		l.magicSuffix = StatusMagicDNSSuffix(status)
 	}
 	l.fqdn = fqdn
 	close(l.ready)
@@ -199,9 +231,15 @@ func (l *Listener) authMiddleware(next http.Handler) http.Handler {
 		}
 
 		loginName := who.UserProfile.LoginName
+		var tags []string
+		var device string
+		if who.Node != nil {
+			tags = who.Node.Tags
+			device = who.Node.ComputedName
+		}
 
-		if !l.isAllowed(loginName) {
-			log.Printf("tsauth: DENIED %s (login=%s device=%s)", r.RemoteAddr, loginName, who.Node.ComputedName)
+		if !l.isAllowed(loginName, tags) {
+			log.Printf("tsauth: DENIED %s (login=%s tags=%v device=%s)", r.RemoteAddr, loginName, tags, device)
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
@@ -210,20 +248,22 @@ func (l *Listener) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isAllowed checks if the connecting peer's login name matches any entry
-// in the allow list. Login names (e.g. "user@github") are stable identities
-// tied to the user's auth provider. Device names are not checked — use
-// tailscale ACLs for per-device control.
-// Comparison is case-insensitive.
-func (l *Listener) isAllowed(loginName string) bool {
-	if loginName == "" {
-		return false
-	}
-	loginLower := strings.ToLower(loginName)
-
+// isAllowed checks if the connecting peer's login name or one of its
+// device tags matches any entry in the allow list. Login names (e.g.
+// "user@github") are stable identities tied to the user's auth provider.
+// Tagged devices don't carry a user identity (WhoIs reports
+// login=tagged-devices), so they are matched by their ACL tags (e.g.
+// "tag:gmux") instead. Device names are not checked — use tailscale ACLs
+// for per-device control. Comparison is case-insensitive.
+func (l *Listener) isAllowed(loginName string, tags []string) bool {
 	for _, entry := range l.cfg.Allow {
-		if strings.ToLower(entry) == loginLower {
+		if loginName != "" && strings.EqualFold(entry, loginName) {
 			return true
+		}
+		for _, tag := range tags {
+			if strings.EqualFold(entry, tag) {
+				return true
+			}
 		}
 	}
 	return false

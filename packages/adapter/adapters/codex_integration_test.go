@@ -28,12 +28,12 @@ func codexSendAndWait(t *testing.T, g *testutil.Gmuxd, send func(string), sessID
 	t.Helper()
 	// Codex shows a trust prompt for new workspaces — dismiss it.
 	s, _ := g.GetSession(sessID)
-	g.WaitForScrollback(s.SocketPath, "trust", 15*time.Second)
+	g.WaitForScrollback(s.ID, "trust", 15*time.Second)
 	time.Sleep(1 * time.Second)
 	send("\r") // accept "Yes, continue"
 
 	// Wait for Codex prompt to appear (post-trust).
-	g.WaitForScrollback(s.SocketPath, "Codex", 15*time.Second)
+	g.WaitForScrollback(s.ID, "Codex", 15*time.Second)
 	time.Sleep(2 * time.Second)
 
 	// Type message and submit.
@@ -55,8 +55,8 @@ func TestCodexTurnAndTitle(t *testing.T) {
 	cwd := t.TempDir()
 
 	sess := g.Launch(codexModel, cwd)
-	if sess.Kind != "codex" {
-		t.Fatalf("expected kind=codex, got %q", sess.Kind)
+	if sess.Adapter != "codex" {
+		t.Fatalf("expected adapter=codex, got %q", sess.Adapter)
 	}
 	t.Logf("session %s alive", sess.ID)
 
@@ -66,7 +66,7 @@ func TestCodexTurnAndTitle(t *testing.T) {
 	codexSendAndWait(t, g, send, sess.ID)
 
 	updated := g.WaitForSession(sess.ID, func(s testutil.Session) bool {
-		return s.Title != "" && s.Title != "codex" && s.Title != "(new)"
+		return s.Title != "" && s.Title != "codex"
 	}, 15*time.Second, "title from first user message")
 	t.Logf("title: %q", updated.Title)
 
@@ -95,7 +95,7 @@ func TestCodexSecondTurnKeepsTitle(t *testing.T) {
 	send("say goodbye\r")
 
 	gSess, _ := g.GetSession(sess.ID)
-	g.WaitForScrollback(gSess.SocketPath, "goodbye", 60*time.Second)
+	g.WaitForScrollback(gSess.ID, "goodbye", 60*time.Second)
 	time.Sleep(3 * time.Second)
 
 	second, _ := g.GetSession(sess.ID)

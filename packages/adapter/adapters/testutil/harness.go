@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,7 +28,7 @@ import (
 // Session mirrors the gmuxd session schema fields we care about.
 type Session struct {
 	ID           string   `json:"id"`
-	Kind         string   `json:"kind"`
+	Adapter      string   `json:"adapter"`
 	Alive        bool     `json:"alive"`
 	Pid          int      `json:"pid"`
 	Title        string   `json:"title"`
@@ -36,13 +37,13 @@ type Session struct {
 	SocketPath   string   `json:"socket_path"`
 	Status       *Status  `json:"status"`
 	Resumable    bool     `json:"resumable"`
-	Slug    string   `json:"slug"`
+	Slug         string   `json:"slug"`
 	Command      []string `json:"command"`
 }
 
 type Status struct {
-	Label   string `json:"label"`
-	Working bool   `json:"working"`
+	Label  string `json:"label"`
+	Active bool   `json:"active"`
 }
 
 // Gmuxd manages a gmuxd process for testing.
@@ -83,7 +84,7 @@ func StartGmuxd(t *testing.T) *Gmuxd {
 		[]byte(fmt.Sprintf("port = %d\n", port)), 0o644)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, gmuxdBin)
+	cmd := exec.CommandContext(ctx, gmuxdBin, "run")
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("GMUX_SOCKET_DIR=%s", socketDir),
 		fmt.Sprintf("XDG_CONFIG_HOME=%s", configDir),
@@ -115,7 +116,10 @@ func StartGmuxd(t *testing.T) *Gmuxd {
 		cmd.Wait()
 	})
 
-	waitForSocket(t, gmuxdSock, 5*time.Second)
+	// Cold startup may index a large real adapter conversation history before
+	// binding listeners. The state/socket dirs are isolated, but adapter-native
+	// history is intentionally read from the user's configured tools.
+	waitForSocket(t, gmuxdSock, 30*time.Second)
 	return g
 }
 
@@ -134,7 +138,7 @@ func (g *Gmuxd) Launch(command []string, cwd string) Session {
 	}
 
 	return g.WaitFor(func(s Session) bool {
-		return s.Alive && s.Cwd == cwd && s.Kind != "" && s.SocketPath != ""
+		return s.Alive && s.Cwd == cwd && s.Adapter != "" && s.SocketPath != ""
 	}, 15*time.Second, "session to appear alive")
 }
 
@@ -146,7 +150,9 @@ func (g *Gmuxd) Sessions() []Session {
 		g.t.Fatalf("list sessions: %v", err)
 	}
 	defer resp.Body.Close()
-	var env struct{ Data []Session `json:"data"` }
+	var env struct {
+		Data []Session `json:"data"`
+	}
 	json.NewDecoder(resp.Body).Decode(&env)
 	return env.Data
 }
@@ -298,7 +304,9 @@ func findRepoRoot(t *testing.T) string {
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "localhost:0")
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 	return port
@@ -327,17 +335,6 @@ func waitForSocket(t *testing.T, sockPath string, timeout time.Duration) {
 	t.Fatalf("timed out waiting for gmuxd on socket %s", sockPath)
 }
 
-func unixClient(socketPath string) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", socketPath)
-			},
-		},
-		Timeout: 3 * time.Second,
-	}
-}
-
 // RequireBinary skips the test if the binary is not on PATH.
 func RequireBinary(t *testing.T, name string) {
 	t.Helper()
@@ -346,56 +343,74 @@ func RequireBinary(t *testing.T, name string) {
 	}
 }
 
-// ReadScrollback reads the terminal scrollback text from a session's runner.
-func ReadScrollback(t *testing.T, socketPath string) string {
-	t.Helper()
-	client := unixClient(socketPath)
-	resp, err := client.Get("http://localhost/scrollback/text")
+// readScrollback reads the daemon's supported plain-text scrollback view.
+// A large tail preserves the integration harness's whole-buffer behavior while
+// still using the public broker contract that works for live, dead, and peer
+// session refs. The raw endpoint is intentionally not used: its body is the
+// binary PTY byte stream, while harness callers search rendered text.
+func (g *Gmuxd) readScrollback(sessionRef string) (string, error) {
+	const harnessTailLines = 100_000
+	endpoint := fmt.Sprintf("http://localhost/v1/sessions/%s/scrollback?tail=%d",
+		url.PathEscape(sessionRef), harnessTailLines)
+	resp, err := g.client.Get(endpoint)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return string(data)
+	data, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return "", fmt.Errorf("read scrollback response: %w", readErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("scrollback status %d: %.500s", resp.StatusCode, data)
+	}
+	if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
+		return "", fmt.Errorf("scrollback content type %q, want text/plain", contentType)
+	}
+	return string(data), nil
+}
+
+// ReadScrollback reads rendered terminal text through gmuxd's public
+// /v1/sessions/<ref>/scrollback?tail=N endpoint.
+func (g *Gmuxd) ReadScrollback(sessionRef string) string {
+	g.t.Helper()
+	text, err := g.readScrollback(sessionRef)
+	if err != nil {
+		g.t.Fatalf("read scrollback for %s: %v", sessionRef, err)
+	}
+	return text
 }
 
 // WaitForScrollback polls scrollback until it contains the expected string.
-func (g *Gmuxd) WaitForScrollback(socketPath, substr string, timeout time.Duration) {
+func (g *Gmuxd) WaitForScrollback(sessionRef, substr string, timeout time.Duration) {
 	g.t.Helper()
 	deadline := time.Now().Add(timeout)
+	var text string
+	var lastErr error
 	for time.Now().Before(deadline) {
-		text := ReadScrollback(g.t, socketPath)
-		if strings.Contains(text, substr) {
+		text, lastErr = g.readScrollback(sessionRef)
+		if lastErr == nil && strings.Contains(text, substr) {
 			return
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	text := ReadScrollback(g.t, socketPath)
-	g.t.Fatalf("timeout waiting for %q in scrollback. Got:\n%.500s", substr, text)
+	g.t.Fatalf("timeout waiting for %q in session %s scrollback (last error: %v). Got:\n%.500s", substr, sessionRef, lastErr, text)
 }
 
 // WaitForOutput polls the session's scrollback until it contains non-trivial
 // content (indicating the TUI has rendered). Returns the scrollback text.
-func (g *Gmuxd) WaitForOutput(sessionID string, timeout time.Duration) string {
+func (g *Gmuxd) WaitForOutput(sessionRef string, timeout time.Duration) string {
 	g.t.Helper()
-	sess, ok := g.GetSession(sessionID)
-	if !ok {
-		g.t.Fatalf("session %s not found", sessionID)
-	}
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		client := unixClient(sess.SocketPath)
-		resp, err := client.Get("http://localhost/scrollback/text")
-		if err == nil {
-			data, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			text := strings.TrimSpace(string(data))
-			if len(text) > 10 { // non-trivial output
-				return text
-			}
+		text, err := g.readScrollback(sessionRef)
+		lastErr = err
+		if err == nil && len(strings.TrimSpace(text)) > 10 {
+			return text
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	g.t.Fatalf("timeout waiting for output from session %s", sessionID)
+	g.t.Fatalf("timeout waiting for output from session %s (last error: %v)", sessionRef, lastErr)
 	return ""
 }

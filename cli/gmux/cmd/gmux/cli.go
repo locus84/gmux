@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -12,23 +14,31 @@ import (
 type mode int
 
 const (
-	modeHelp      mode = iota // print usage and exit
-	modeVersion               // print version and exit
-	modeOpen                  // open the web UI
-	modeRun                   // run a command in a new session (gmux -- <cmd>)
-	modeList                  // gmux ls
-	modeAttach                // gmux attach <id>
-	modeTail                  // gmux tail <id>
-	modeKill                  // gmux kill <id>
-	modeSend                  // gmux send <id> <text> [keys...]
-	modeSendKeys              // gmux send-keys -t <id> ... (tmux-compat)
-	modeWait                  // gmux wait <id>
-	modeDaemon                // gmux daemon <start|stop|restart|status|log-path>
-	modeAuth                  // gmux auth
-	modeRemote                // gmux remote
-	modeDumpEnv               // (internal) gmux __dump-env
-	modeCodexHook             // (internal) gmux __codex-hook <Event>
-	modeClaudeHook            // (internal) gmux __claude-hook
+	modeHelp       mode = iota // print usage and exit
+	modeVersion                // print version and exit
+	modeOpen                   // open the web UI
+	modeRun                    // run a command in a new session (gmux -- <cmd>)
+	modeList                   // gmux ls
+	modeAttach                 // gmux attach <id>
+	modeTail                   // gmux tail <id>
+	modeKill                   // gmux kill <id>
+	modeDismiss                // gmux dismiss <id> [--tree]
+	modeSend                   // gmux send <id> <text> [keys...]
+	modeSendKeys               // gmux send-keys -t <id> ... (tmux-compat)
+	modeWait                   // gmux wait <id>...
+	modeWorktree               // gmux worktree <current|ps|create>
+	modeProject                // gmux project add <path>
+	modePromote                // gmux promote <id>
+	modeReparent               // gmux reparent <id> <parent-id>
+	modeAgent                  // gmux agent prompt|cancel|output <id>
+	modeEdit                   // gmux edit [file]
+	modeEditChild              // (internal) gmux __edit-child [file]
+	modeDaemon                 // gmux daemon <start|stop|restart|status|log-path|state ...>
+	modeAuth                   // gmux auth
+	modeRemote                 // gmux remote
+	modeDumpEnv                // (internal) gmux __dump-env
+	modeCodexHook              // (internal) gmux __codex-hook <Event>
+	modeClaudeHook             // (internal) gmux __claude-hook
 )
 
 // command is the fully-parsed CLI invocation. One struct for every
@@ -45,41 +55,85 @@ type command struct {
 	initialRows int      // internal: pre-size PTY height
 
 	// session-addressing verbs (attach/tail/kill/send/send-keys/wait)
-	ref string // session reference; may carry an @peer suffix
+	ref      string   // session reference; may carry an @peer suffix
+	waitRefs []string // wait accepts one or more references, in argv order
 
 	// ls
 	all  bool
 	json bool
 
-	// tail
+	// tail (raw PTY output) and `agent logs` (conversation markdown).
+	// One field, two units: tail counts lines, agent logs counts messages.
 	tailLines int
-	raw       bool
 
 	// send
 	sendText *string  // literal text to type (nil = none)
 	sendKeys []string // trailing key-name tokens (Enter, C-c, ...)
+	sendWait bool     // --wait: block until the triggered turn completes
 
 	// send-keys (tmux-compat)
 	keysLiteral bool     // -l: treat args as literal text, not key names
 	keys        []string // key/text arguments
 
+	// agent (modeAgent)
+	agentSub    string  // prompt|cancel|logs
+	agentMode   string  // prompt|follow_up|steer (prompt verb only)
+	agentNoWait bool    // --no-wait: return at the admission boundary
+	promptText  *string // inline prompt text (nil = read stdin)
+	agentNew    bool    // --new: launch the session this prompt starts
+	agentModel  string  // --new only: model selector for the launch
+	agentName   string  // --new only: session display name for the launch
+
+	// dismiss/reparent
+	dismissTree bool
+	parentRef   string
+
+	// help
+	helpTopic string // "agent", "agent prompt", ... ("" = full usage)
+
 	// wait
-	timeout int // --timeout seconds (0 = none)
+	timeout  int    // --timeout seconds (0 = none)
+	forText  string // --for-text: wait for substring in output
+	forRegex string // --for-regex: wait for regex match in output
+	quiet    bool   // --quiet: synchronize only, print no result
+
+	// project
+	projectSub  string
+	projectPath string
+
+	// worktree
+	worktreeSub      string
+	worktreeSelector string
+	worktreeName     string
+	worktreeRepo     string
+	worktreeBase     string
+	worktreePath     string
+	worktreeAgent    string
+	worktreePrompt   string
+
+	// edit
+	editFile string // file path to open
 
 	// daemon
-	daemonSub string // start|stop|restart|status|log-path
+	daemonSub  string   // start|stop|restart|status|log-path|state
+	daemonArgs []string // full argument list forwarded to gmuxd verbatim
 
 	// codex hook (internal __codex-hook)
 	codexHookEvent string // the codex hook event name (SessionStart, ...)
 }
 
-// reservedVerbs is the closed top-level namespace (ADR 0009). Growth
-// happens under namespace groups, not new top-level verbs. Used to give
+// reservedVerbs is the top-level namespace under the ADR 0009 criterion: a
+// top-level verb is an operation on a session addressed by id, which is why
+// `promote` and `reparent` sit beside `wait`, `tail`, and `kill`. Used to give
 // "did you mean?" hints and to distinguish a removed flag from a stray
 // command in the error-only migration shim.
+//
+// `agent` and `daemon` are namespace groups for non-session domains; they grow
+// under `gmux <group> <verb>` without adding top-level verbs. Consumption has
+// no verb at all: it is a side effect of observing a result.
 var reservedVerbs = []string{
-	"open", "ls", "attach", "tail", "kill", "send", "send-keys",
-	"wait", "daemon", "auth", "remote", "version", "help",
+	"open", "ls", "attach", "tail", "kill", "dismiss", "send", "send-keys",
+	"wait", "worktree", "project", "promote", "reparent", "agent", "edit", "daemon", "auth", "remote", "version", "help",
 }
 
 // removedFlags maps every pre-2.0 action flag to the verb that replaced
@@ -90,7 +144,7 @@ var removedFlags = map[string]string{
 	"--attach": "gmux attach <id>", "-a": "gmux attach <id>",
 	"--tail": "gmux tail <id>", "-t": "gmux tail <id>",
 	"--kill": "gmux kill <id>", "-k": "gmux kill <id>",
-	"--send":      "gmux send <id> <text>",
+	"--send":      "gmux send <id> <text> Enter",
 	"--no-submit": "gmux send <id> <text>  (omit a trailing Enter to not submit)",
 	"--wait":      "gmux wait <id>",
 	"--no-attach": "gmux -d -- <cmd>",
@@ -134,13 +188,23 @@ func parseCLI(args []string) (*command, error) {
 	}
 
 	switch head {
-	case "help", "-h", "--help":
-		// Lenient: `gmux help` and `gmux help <anything>` both print the
-		// full usage. Per-verb help is intentionally not implemented (see
-		// ADR 0009); accepting a trailing word avoids an error on the
-		// natural `gmux help send`.
+	case "help", "-h", "--help", "?":
+		// `gmux help <command>` routes to that command's page when one
+		// exists; unknown topics stay lenient and print the synopsis, so
+		// `gmux help whatever` is never an error. Daemon help is served by
+		// the gmuxd binary so the two can never drift apart.
+		if len(rest) > 0 {
+			switch {
+			case rest[0] == "agent":
+				return &command{mode: modeHelp, helpTopic: strings.TrimSpace("agent " + strings.Join(rest[1:], " "))}, nil
+			case rest[0] == "daemon":
+				return &command{mode: modeDaemon, daemonArgs: []string{"help"}}, nil
+			case helpTopicExists(rest[0]):
+				return &command{mode: modeHelp, helpTopic: rest[0]}, nil
+			}
+		}
 		return &command{mode: modeHelp}, nil
-	case "version", "--version":
+	case "version", "--version", "-v":
 		return &command{mode: modeVersion}, nil
 	case "open":
 		if len(rest) > 0 {
@@ -148,20 +212,49 @@ func parseCLI(args []string) (*command, error) {
 		}
 		return &command{mode: modeOpen}, nil
 	case "ls":
-		return parseLs(rest)
+		return dispatchVerb("ls", rest, parseLs)
 	case "attach":
-		return parseRefOnly(modeAttach, "attach", rest)
+		return dispatchVerb("attach", rest, func(a []string) (*command, error) {
+			return parseRefOnly(modeAttach, "attach", a)
+		})
 	case "kill":
-		return parseRefOnly(modeKill, "kill", rest)
+		return dispatchVerb("kill", rest, func(a []string) (*command, error) {
+			return parseRefOnly(modeKill, "kill", a)
+		})
+	case "dismiss":
+		return dispatchVerb("dismiss", rest, parseDismiss)
 	case "tail":
-		return parseTail(rest)
+		return dispatchVerb("tail", rest, parseTail)
 	case "send":
-		return parseSend(rest)
+		return dispatchVerb("send", rest, parseSend)
 	case "send-keys":
-		return parseSendKeys(rest)
+		return dispatchVerb("send-keys", rest, parseSendKeys)
 	case "wait":
-		return parseWait(rest)
+		return dispatchVerb("wait", rest, parseWait)
+	case "worktree":
+		return dispatchVerb("worktree", rest, parseWorktree)
+	case "project":
+		return dispatchVerb("project", rest, parseProject)
+	case "promote":
+		return dispatchVerb("promote", rest, parsePromote)
+	case "reparent":
+		return dispatchVerb("reparent", rest, parseReparent)
+	case "agent":
+		c, err := parseAgent(rest)
+		if err != nil {
+			// A mistake inside the namespace prints the namespace guide,
+			// not the top-level synopsis.
+			return nil, &usageError{topic: "agent", err: err}
+		}
+		return c, nil
+	case "edit":
+		return dispatchVerb("edit", rest, parseEdit)
 	case "daemon":
+		if len(rest) == 0 || isHelpToken(rest[0]) {
+			// gmuxd owns the daemon help page; forward so `gmux daemon`,
+			// `gmux daemon --help` and `gmuxd help` print the same text.
+			return &command{mode: modeDaemon, daemonArgs: []string{"help"}}, nil
+		}
 		return parseDaemon(rest)
 	case "auth":
 		if len(rest) > 0 {
@@ -184,6 +277,17 @@ func parseCLI(args []string) (*command, error) {
 		return &command{mode: modeCodexHook, codexHookEvent: rest[0]}, nil
 	case "__claude-hook":
 		return &command{mode: modeClaudeHook}, nil
+	case "__edit-child":
+		// Child process of an editor session: prompt (if needed) and exec
+		// the fallback editor. Reuses the editFile field.
+		if len(rest) > 1 {
+			return nil, errors.New("__edit-child takes at most one file path")
+		}
+		c := &command{mode: modeEditChild}
+		if len(rest) == 1 {
+			c.editFile = rest[0]
+		}
+		return c, nil
 	}
 
 	// Error-only migration shim (ADR 0009): recognize removed forms and
@@ -205,17 +309,51 @@ func parseCLI(args []string) (*command, error) {
 	// suggestion only when one is close. Never replace the run hint with
 	// the suggestion alone — that misleads when the word is a real command.
 	runHint := "to run a command use: gmux -- " + strings.Join(args, " ")
+	// Agent verbs typed without their namespace get the namespace guide:
+	// `gmux prompt <id> ...` is far more likely a missing `agent` than a
+	// program named prompt.
+	if head == "prompt" || head == "cancel" || head == "logs" {
+		return nil, &usageError{topic: "agent", err: fmt.Errorf(
+			"unknown command %q; agent commands are namespaced: gmux agent %s ... (%s)", head, head, runHint)}
+	}
+	if head == "workspace" {
+		return nil, fmt.Errorf("the workspace command was replaced by the project namespace; use: gmux project add <path>")
+	}
+	if head == "session" {
+		return nil, fmt.Errorf("session operations are top-level verbs; use: gmux dismiss <id>")
+	}
 	if v := didYouMean(head); v != "" {
 		return nil, fmt.Errorf("unknown command %q; did you mean %q? (%s)", head, v, runHint)
 	}
 	return nil, fmt.Errorf("unknown command %q; %s", head, runHint)
 }
 
+// dispatchVerb gives a verb with a dedicated help page uniform help
+// handling: a leading help token (help, --help, -h, ?) prints the page, a
+// -h/--help caught by the flag parser anywhere does too, and any parse
+// error is tagged with the verb's topic so the error message is followed
+// by that page rather than the top-level synopsis.
+func dispatchVerb(topic string, args []string, parse func([]string) (*command, error)) (*command, error) {
+	if len(args) > 0 && isHelpToken(args[0]) {
+		return &command{mode: modeHelp, helpTopic: topic}, nil
+	}
+	c, err := parse(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return &command{mode: modeHelp, helpTopic: topic}, nil
+		}
+		return nil, &usageError{topic: topic, err: err}
+	}
+	return c, nil
+}
+
 func parseLs(args []string) (*command, error) {
 	c := &command{mode: modeList}
 	fs := newFlagSet("ls")
 	fs.BoolVar(&c.all, "all", false, "include sessions from all peers")
+	fs.BoolVar(&c.all, "a", false, "alias of --all")
 	fs.BoolVar(&c.json, "json", false, "emit a JSON array")
+	fs.BoolVar(&c.json, "j", false, "alias of --json")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -225,6 +363,70 @@ func parseLs(args []string) (*command, error) {
 	return c, nil
 }
 
+func parseDismiss(args []string) (*command, error) {
+	c := &command{mode: modeDismiss}
+	fs := newFlagSet("dismiss")
+	fs.BoolVar(&c.dismissTree, "tree", false, "dismiss the full descendant tree")
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
+		return nil, err
+	}
+	if len(pos) != 1 || pos[0] == "" {
+		return nil, errors.New("dismiss requires exactly one session id")
+	}
+	c.ref = pos[0]
+	return c, nil
+}
+
+func parseProject(args []string) (*command, error) {
+	if len(args) > 1 && isHelpToken(args[1]) {
+		return &command{mode: modeHelp, helpTopic: "project"}, nil
+	}
+	if len(args) == 0 {
+		return nil, errors.New("project requires one of: add")
+	}
+	if args[0] != "add" {
+		return nil, fmt.Errorf("unknown project command %q", args[0])
+	}
+	if len(args) != 2 || strings.TrimSpace(args[1]) == "" {
+		return nil, errors.New("project add requires exactly one path")
+	}
+	return &command{mode: modeProject, projectSub: "add", projectPath: args[1]}, nil
+}
+
+func parsePromote(args []string) (*command, error) {
+	return parseMutationRefs(modePromote, "promote", args, 1)
+}
+
+func parseReparent(args []string) (*command, error) {
+	cmd, err := parseMutationRefs(modeReparent, "reparent", args, 2)
+	if err == nil && cmd.mode == modeReparent && len(args) == 2 {
+		cmd.parentRef = args[1]
+	}
+	return cmd, err
+}
+
+func parseMutationRefs(m mode, name string, args []string, arity int) (*command, error) {
+	for _, arg := range args {
+		// A help request anywhere in the argv is a help request. These verbs
+		// carry no flags, so they parse by hand; without this they would be the
+		// only verbs where a trailing --help is an error rather than the page.
+		if isHelpToken(arg) {
+			return &command{mode: modeHelp, helpTopic: name}, nil
+		}
+		if strings.HasPrefix(arg, "-") {
+			return nil, fmt.Errorf("%s: unknown flag %q", name, arg)
+		}
+	}
+	if len(args) != arity {
+		if arity == 1 {
+			return nil, fmt.Errorf("%s requires a session id", name)
+		}
+		return nil, fmt.Errorf("%s requires a session id and parent id", name)
+	}
+	return &command{mode: m, ref: args[0]}, nil
+}
+
 func parseRefOnly(m mode, name string, args []string) (*command, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("%s requires a session id", name)
@@ -232,12 +434,26 @@ func parseRefOnly(m mode, name string, args []string) (*command, error) {
 	return &command{mode: m, ref: args[0]}, nil
 }
 
+// parseTail handles `gmux tail [-n N] <id>`: always the raw PTY view,
+// -n counting lines.
+//
+// tail answers "what is on its screen" and nothing else. The
+// conversation-markdown view it used to default to moved to
+// `gmux agent logs` ("what has it been doing"), so no flag on this verb
+// crosses the raw/semantic boundary any more — and the flags that used
+// to select the view are refused by name rather than reported as
+// unknown, in the spirit of the top-level removedFlags shim.
 func parseTail(args []string) (*command, error) {
 	c := &command{mode: modeTail, tailLines: 100}
+	for _, a := range args {
+		switch strings.SplitN(a, "=", 2)[0] {
+		case "--raw", "-r", "-e":
+			return nil, fmt.Errorf("tail: %s was removed; tail is always the raw terminal view, and the conversation view moved to: gmux agent logs <id>",
+				strings.SplitN(a, "=", 2)[0])
+		}
+	}
 	fs := newFlagSet("tail")
-	fs.IntVar(&c.tailLines, "n", 100, "number of lines to show")
-	fs.BoolVar(&c.raw, "raw", false, "preserve ANSI escapes")
-	fs.BoolVar(&c.raw, "e", false, "preserve ANSI escapes (short)")
+	fs.IntVar(&c.tailLines, "n", 100, "number of terminal lines to show")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, err
@@ -252,16 +468,86 @@ func parseTail(args []string) (*command, error) {
 	return c, nil
 }
 
-// parseSend handles `gmux send <id> [text] [Key...]`. The first
-// positional is the session ref; an optional second positional is the
-// literal text; any further bare tokens are key-name tokens. With no
-// text and no keys, stdin supplies the text.
+// parseSend handles `gmux send [--wait] [--timeout N] [--] <id> [text]
+// [Key...]`. The first positional is the session ref; an optional
+// second positional is the literal text; any further bare tokens are
+// key-name tokens. With no text and no keys, stdin supplies the text.
+//
+// send is raw: it types exactly what the caller specifies and never
+// appends an adapter-derived keystroke. Semantic, adapter-aware prompt
+// submission lives behind the agent layer (ADR 0027), not here.
+//
+// Grammar (ADR 0009 decision 9, verbatim-content rule): behavior
+// modifiers precede the session ref; the ref is the first non-flag
+// token, and *everything after it is verbatim* — including tokens that
+// start with a dash. So `gmux send abc -v` sends the literal `-v`, and
+// `gmux send abc '--weird text'` needs no `--` guard. This deliberately
+// diverges from parsing flags anywhere: send's trailing content is
+// arbitrary user text, so taxing the common case with a `--` guard to
+// support two rare flags is the wrong trade. To wait, put the flag
+// before the id: `gmux send --wait abc 'do it' Enter`. A `--` before
+// the ref is accepted as an explicit end-of-flags marker.
 func parseSend(args []string) (*command, error) {
-	if len(args) < 1 {
+	c := &command{mode: modeSend}
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" { // explicit end-of-flags; ref follows
+			i++
+			break
+		}
+		if !strings.HasPrefix(a, "-") { // first non-flag token is the ref
+			break
+		}
+		switch {
+		case a == "--wait" || a == "-w":
+			c.sendWait = true
+		case a == "--timeout" || strings.HasPrefix(a, "--timeout=") ||
+			a == "-t" || strings.HasPrefix(a, "-t="):
+			// -t takes its value the same three ways --timeout does:
+			// separate argument, --timeout=N, -t=N.
+			val := strings.TrimPrefix(strings.TrimPrefix(a, "--timeout"), "-t")
+			if val == "" {
+				i++
+				if i >= len(args) {
+					return nil, errors.New("--timeout requires a number of seconds")
+				}
+				val = args[i]
+			} else {
+				val = strings.TrimPrefix(val, "=")
+			}
+			n, err := strconv.Atoi(val)
+			if err != nil || n <= 0 {
+				// -t is a universal tmux habit for "target session", and on this
+				// verb it is --timeout, so a non-numeric value is far more likely
+				// a misremembered target than a typo'd duration. Say which flag
+				// the caller actually reached.
+				if strings.HasPrefix(a, "-t") {
+					return nil, fmt.Errorf("send: -t is --timeout here and takes a positive number of seconds (got %q); the session id is positional: gmux send <id> ... (tmux's '-t <id>' target is on 'gmux send-keys')", val)
+				}
+				return nil, errors.New("send: --timeout must be a positive number of seconds")
+			}
+			c.timeout = n
+		case a == "--steering" || strings.HasPrefix(a, "--steering="):
+			// Removed in favour of the semantic verb, and named rather than
+			// reported as "unknown": the replacement is one rename away, and
+			// every script that learned the old flag deserves to be told it.
+			return nil, errors.New("send: --steering was replaced by: gmux agent prompt --steer <id> <prompt>")
+		case a == "--follow-up" || strings.HasPrefix(a, "--follow-up="):
+			return nil, errors.New("send: --follow-up was replaced by: gmux agent prompt --follow-up <id> <prompt>")
+		default:
+			return nil, fmt.Errorf("send: unknown flag %q (flags go before the session id; text after the id is literal)", a)
+		}
+		i++
+	}
+	if c.timeout > 0 && !c.sendWait {
+		return nil, errors.New("send: --timeout only applies with --wait")
+	}
+	if i >= len(args) {
 		return nil, errors.New("send requires a session id")
 	}
-	c := &command{mode: modeSend, ref: args[0]}
-	rest := args[1:]
+	c.ref = args[i]
+	rest := args[i+1:]
 	if len(rest) > 0 {
 		// Heuristic: the first non-key token is the literal text; the
 		// rest are keys. If the first token is itself a key name, there
@@ -270,6 +556,20 @@ func parseSend(args []string) (*command, error) {
 			t := rest[0]
 			c.sendText = &t
 			rest = rest[1:]
+		}
+		// Past the text, every token must name a key. Typing an unrecognized
+		// name as literal text (which is what tmux send-keys does, and what
+		// this verb used to do) is the worst available outcome: `send <id>
+		// 'make test' Etner` would type "Etner" into the terminal, exit 0, and
+		// report the input as delivered — a silent text injection presented as
+		// success, for exactly the tokens a caller is most likely to get wrong
+		// (a typo, or a key gmux deliberately does not encode). Refusing costs
+		// nothing: literal text belongs in the text argument, and send-keys -l
+		// still exists for the tmux contract.
+		for _, k := range rest {
+			if !isKeyName(k) {
+				return nil, fmt.Errorf("send: %q is not a key name (only the first token after the id is literal text; run 'gmux send --help' for the key vocabulary)", k)
+			}
 		}
 		c.sendKeys = rest
 	}
@@ -296,33 +596,139 @@ func parseSendKeys(args []string) (*command, error) {
 	return c, nil
 }
 
+func parseWorktree(args []string) (*command, error) {
+	if len(args) == 0 {
+		return nil, errors.New("worktree requires one of: current, ps, create")
+	}
+	c := &command{mode: modeWorktree, worktreeSub: args[0], worktreeBase: "HEAD"}
+	fs := newFlagSet("worktree " + c.worktreeSub)
+	switch c.worktreeSub {
+	case "current":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return nil, err
+		}
+		if len(fs.Args()) != 0 {
+			return nil, errors.New("worktree current takes no arguments")
+		}
+	case "ps":
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) > 1 {
+			return nil, errors.New("worktree ps takes at most one selector")
+		}
+		if len(pos) == 1 {
+			c.worktreeSelector = pos[0]
+		}
+	case "create":
+		fs.StringVar(&c.worktreeRepo, "repo", "", "repository path (default current directory)")
+		fs.StringVar(&c.worktreeBase, "base", "HEAD", "base ref")
+		fs.StringVar(&c.worktreePath, "path", "", "destination path")
+		fs.StringVar(&c.worktreeAgent, "agent", "", "gmux launcher id")
+		fs.StringVar(&c.worktreePrompt, "prompt", "", "initial agent prompt")
+		fs.BoolVar(&c.json, "json", false, "emit JSON")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return nil, err
+		}
+		if len(pos) != 1 {
+			return nil, errors.New("worktree create requires exactly one name")
+		}
+		c.worktreeName = pos[0]
+		if c.worktreePrompt != "" && c.worktreeAgent == "" {
+			return nil, errors.New("--prompt requires --agent")
+		}
+	default:
+		return nil, fmt.Errorf("unknown worktree command %q", c.worktreeSub)
+	}
+	return c, nil
+}
+
 func parseWait(args []string) (*command, error) {
 	c := &command{mode: modeWait}
 	fs := newFlagSet("wait")
 	fs.IntVar(&c.timeout, "timeout", 0, "fail after N seconds")
+	fs.IntVar(&c.timeout, "t", 0, "alias of --timeout")
+	fs.StringVar(&c.forText, "for-text", "", "wait for this substring in the session's output")
+	fs.StringVar(&c.forRegex, "for-regex", "", "wait for a regex match in the session's output")
+	fs.BoolVar(&c.quiet, "quiet", false, "do not print the agent's result; synchronize only")
+	fs.BoolVar(&c.quiet, "q", false, "alias of --quiet")
 	pos, err := parseInterspersed(fs, args)
 	if err != nil {
 		return nil, err
 	}
-	if len(pos) != 1 {
-		return nil, errors.New("wait requires a session id")
+	if len(pos) == 0 {
+		return nil, errors.New("wait requires at least one session id")
 	}
 	if c.timeout < 0 {
 		return nil, errors.New("--timeout must be a non-negative number of seconds")
 	}
+	if c.forText != "" && c.forRegex != "" {
+		return nil, errors.New("--for-text and --for-regex are mutually exclusive")
+	}
+	if len(pos) > 1 && (c.forText != "" || c.forRegex != "") {
+		return nil, errors.New("--for-text and --for-regex require exactly one session id")
+	}
+	if c.forRegex != "" {
+		// Validate here so a typo fails as a usage error instead of a
+		// daemon round-trip; the daemon validates again server-side.
+		if _, err := regexp.Compile(c.forRegex); err != nil {
+			return nil, fmt.Errorf("--for-regex: %v", err)
+		}
+	}
 	c.ref = pos[0]
+	c.waitRefs = append([]string(nil), pos...)
 	return c, nil
+}
+
+// parseEdit handles `gmux edit [file]`: at most one file path. The verb
+// is designed to be usable as $EDITOR (git commit, etc.): it blocks
+// until the editor session exits and propagates its exit code. With no
+// path (the + launcher menu can't parameterize one) the session prompts
+// for a path interactively. Today it opens a fallback terminal editor
+// in a managed session; a future release renders a browser-based editor
+// tab instead, keeping this interface (0-1 paths, blocking, exit code)
+// unchanged.
+func parseEdit(args []string) (*command, error) {
+	if len(args) > 1 {
+		return nil, errors.New("edit takes at most one file path")
+	}
+	if len(args) == 1 {
+		if strings.HasPrefix(args[0], "-") {
+			return nil, fmt.Errorf("edit takes no flags (got %q)", args[0])
+		}
+		return &command{mode: modeEdit, editFile: args[0]}, nil
+	}
+	return &command{mode: modeEdit}, nil
 }
 
 var daemonSubs = map[string]bool{
 	"start": true, "stop": true, "restart": true, "status": true, "log-path": true,
 }
 
+var daemonStateSubs = map[string]bool{"check": true, "backup": true, "export": true, "reset": true}
+
 func parseDaemon(args []string) (*command, error) {
-	if len(args) != 1 || !daemonSubs[args[0]] {
-		return nil, errors.New("daemon requires one of: start, stop, restart, status, log-path")
+	if len(args) > 0 && args[0] == "state" {
+		// `gmux daemon state check|backup|export|reset [...]` forwards to gmuxd
+		// verbatim (validation and help live server-side in the gmuxd
+		// binary, mirroring the other daemon verbs). Accept -h/--help and
+		// backup's target path as pass-through arguments.
+		if len(args) >= 2 && (args[1] == "-h" || args[1] == "--help") {
+			return &command{mode: modeDaemon, daemonSub: "state", daemonArgs: args}, nil
+		}
+		if len(args) < 2 || !daemonStateSubs[args[1]] {
+			return nil, errors.New("daemon state requires one of: check, backup <path>, export, reset --yes")
+		}
+		return &command{mode: modeDaemon, daemonSub: "state", daemonArgs: args}, nil
 	}
-	return &command{mode: modeDaemon, daemonSub: args[0]}, nil
+	if len(args) != 1 || !daemonSubs[args[0]] {
+		return nil, errors.New("daemon requires one of: start, stop, restart, status, log-path, state")
+	}
+	return &command{mode: modeDaemon, daemonSub: args[0], daemonArgs: args}, nil
 }
 
 // parseInternalRun handles the hidden `gmux __run [directives] -- <cmd>`
@@ -426,36 +832,4 @@ func editDistanceLE1(a, b string) bool {
 		}
 	}
 	return true
-}
-
-// printUsage writes the gmux usage synopsis.
-func printUsage(w io.Writer) {
-	fmt.Fprint(w, `gmux — wrap any command in a managed session you watch in a browser
-
-Run a command:
-  gmux -- <cmd> [args]              run a command in a new session
-  gmux -d -- <cmd> [args]           ... detached; prints the session id
-  (tip: alias gm='gmux --')
-
-Sessions (local by default; address a peer with <id>@<peer>):
-  gmux ls [--all] [--json]          list sessions
-  gmux attach <id>                  reattach to a session
-  gmux tail <id> [-n N] [--raw]     print recent output (snapshot)
-  gmux send <id> <text> [Key...]    type text and/or send keys (e.g. Enter, C-c)
-  gmux send-keys -t <id> <keys...>  tmux-compatible key sending
-  gmux wait <id> [--timeout N]      block until an agent session is idle
-  gmux kill <id>                    terminate a session
-
-UI & pairing:
-  gmux open                         open the web UI
-  gmux remote                       set up / check remote access
-  gmux auth                         reveal this host's login token
-
-Daemon:
-  gmux daemon start|stop|restart|status|log-path
-
-  gmux version · gmux help [verb]
-
-For the daemon process itself, see 'gmuxd --help'.
-`)
 }

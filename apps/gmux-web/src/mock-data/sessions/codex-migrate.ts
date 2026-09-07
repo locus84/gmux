@@ -8,13 +8,13 @@ const CYAN = '\x1b[36m'
 const GRAY = '\x1b[90m'
 
 export default {
-  id: 'sess-codex-pnpm',
+  id: '1wxjv2nr',
   created_at: ago(25),
   command: ['codex'],
-  cwd: '/home/user/dev/my-project',
-  workspace_root: '/home/user/dev/my-project',
-  remotes: { origin: 'github.com/acme/my-project' },
-  kind: 'codex',
+  cwd: '/home/user/dev/api',
+  workspace_root: '/home/user/dev/api',
+  remotes: { origin: 'github.com/acme/api' },
+  adapter: 'codex',
   alive: true,
   pid: 8830,
   exit_code: null,
@@ -22,8 +22,10 @@ export default {
   exited_at: null,
   title: 'migrate to convex',
   subtitle: '',
-  status: { label: '', working: false },
-  unread: false,
+  status: { active: false },
+  unread: true,
+  project_slug: 'api',
+  last_output_at: ago(1),
   socket_path: '/tmp/gmux-sessions/mock.sock',
   peer: 'server',
   terminal: [

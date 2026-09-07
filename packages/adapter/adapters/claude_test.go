@@ -3,6 +3,7 @@ package adapters
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
@@ -62,21 +63,11 @@ func TestClaudeNoMatchOther(t *testing.T) {
 	}
 }
 
-// --- Env / Monitor ---
+// --- Env ---
 
 func TestClaudeEnvNil(t *testing.T) {
 	if env := NewClaude().Env(adapter.EnvContext{}); env != nil {
 		t.Fatalf("expected nil, got %v", env)
-	}
-}
-
-func TestClaudeMonitorNoOp(t *testing.T) {
-	c := NewClaude()
-	if c.Monitor([]byte("⠋ Thinking...")) != nil {
-		t.Fatal("should return nil (file-driven, not PTY)")
-	}
-	if c.Monitor([]byte("some output")) != nil {
-		t.Fatal("should return nil")
 	}
 }
 
@@ -87,14 +78,17 @@ func TestClaudeImplementsCapabilities(t *testing.T) {
 	if _, ok := a.(adapter.Launchable); !ok {
 		t.Fatal("should implement Launchable")
 	}
-	if _, ok := a.(adapter.SessionFiler); !ok {
-		t.Fatal("should implement SessionFiler")
-	}
-	if _, ok := a.(adapter.FileMonitor); !ok {
-		t.Fatal("should implement FileMonitor")
+	if _, ok := a.(adapter.ConversationDescriber); !ok {
+		t.Fatal("should implement ConversationDescriber")
 	}
 	if _, ok := a.(adapter.Resumer); !ok {
 		t.Fatal("should implement Resumer")
+	}
+	// Deliberately NOT an AgentActionEncoder: interactive adapters never
+	// expose gmux's semantic steer action. Raw `gmux send` remains available;
+	// ACP mode will provide typed control separately.
+	if _, ok := a.(adapter.AgentActionEncoder); ok {
+		t.Fatal("interactive Claude must not implement AgentActionEncoder")
 	}
 }
 
@@ -117,9 +111,9 @@ func TestClaudeLaunchers(t *testing.T) {
 	}
 }
 
-// --- SessionDir encoding ---
+// --- ConversationDir encoding ---
 
-func TestClaudeSessionDirEncoding(t *testing.T) {
+func TestClaudeConversationDirEncoding(t *testing.T) {
 	tests := []struct {
 		cwd  string
 		want string
@@ -131,10 +125,10 @@ func TestClaudeSessionDirEncoding(t *testing.T) {
 	}
 	c := NewClaude()
 	for _, tt := range tests {
-		dir := c.SessionDir(tt.cwd)
+		dir := c.ConversationDir(tt.cwd)
 		base := filepath.Base(dir)
 		if base != tt.want {
-			t.Errorf("SessionDir(%q) base = %q, want %q", tt.cwd, base, tt.want)
+			t.Errorf("ConversationDir(%q) base = %q, want %q", tt.cwd, base, tt.want)
 		}
 	}
 }
@@ -155,12 +149,17 @@ func TestEncodeClaudeCwd(t *testing.T) {
 	}
 }
 
-// --- ParseSessionFile ---
+// --- DescribeConversation ---
 
 func writeClaudeJSONL(t *testing.T, lines ...string) string {
 	t.Helper()
+	return writeNamedClaudeJSONL(t, "test-session.jsonl", lines...)
+}
+
+func writeNamedClaudeJSONL(t *testing.T, name string, lines ...string) string {
+	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "test-session.jsonl")
+	path := filepath.Join(dir, name)
 	var content string
 	for _, l := range lines {
 		content += l + "\n"
@@ -169,12 +168,12 @@ func writeClaudeJSONL(t *testing.T, lines ...string) string {
 	return path
 }
 
-func TestClaudeParseSessionFileFirstUserMessage(t *testing.T) {
+func TestClaudeDescribeConversationFirstUserMessage(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"parentUuid":null,"type":"user","sessionId":"abc-123","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp/test","message":{"role":"user","content":[{"type":"text","text":"Fix the auth bug in login.go"}]},"uuid":"u1"}`,
 		`{"parentUuid":"u1","type":"assistant","sessionId":"abc-123","timestamp":"2026-03-15T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll fix that for you."}],"stop_reason":null},"uuid":"a1"}`,
 	)
-	info, err := NewClaude().ParseSessionFile(path)
+	info, err := NewClaude().DescribeConversation(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,307 +194,210 @@ func TestClaudeParseSessionFileFirstUserMessage(t *testing.T) {
 	}
 }
 
-func TestClaudeParseSessionFileCustomTitle(t *testing.T) {
+func TestClaudeDescribeConversationCustomTitle(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"parentUuid":null,"type":"user","sessionId":"abc","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"}]},"uuid":"u1"}`,
 		`{"parentUuid":"u1","type":"assistant","sessionId":"abc","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]},"uuid":"a1"}`,
 		`{"type":"custom-title","customTitle":"  Auth refactor  ","sessionId":"abc"}`,
 	)
-	info, _ := NewClaude().ParseSessionFile(path)
+	info, _ := NewClaude().DescribeConversation(path)
 	if info.Title != "Auth refactor" {
 		t.Errorf("expected custom title, got %q", info.Title)
 	}
-	// Slug uses first user message (immutable), not custom-title.
-	if info.Slug != "fix-the-bug" {
-		t.Errorf("expected slug from first user message, got %q", info.Slug)
+	// Slug follows the resolved title: a rename moves the slug (slug is the
+	// mutable display name, not identity — the Tool ID is).
+	if info.Slug != "auth-refactor" {
+		t.Errorf("expected slug from custom title, got %q", info.Slug)
 	}
 }
 
-func TestClaudeParseSessionFileQueueOnly(t *testing.T) {
+func TestClaudeDescribeConversationQueueOnly(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"type":"queue-operation","operation":"dequeue","timestamp":"2026-03-15T10:00:00Z","sessionId":"q-123"}`,
 	)
-	info, err := NewClaude().ParseSessionFile(path)
+	info, err := NewClaude().DescribeConversation(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.ID != "q-123" {
 		t.Errorf("expected id q-123, got %s", info.ID)
 	}
-	if info.Title != "(new)" {
-		t.Errorf("expected '(new)', got %q", info.Title)
+	if info.Title != "" {
+		t.Errorf("expected empty title for a session with no messages, got %q", info.Title)
 	}
 }
 
-func TestClaudeParseSessionFileStringContent(t *testing.T) {
+func TestClaudeDescribeConversationStringContent(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"type":"user","sessionId":"abc","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":"Help me debug this"},"uuid":"u1"}`,
 	)
-	info, _ := NewClaude().ParseSessionFile(path)
+	info, _ := NewClaude().DescribeConversation(path)
 	if info.Title != "Help me debug this" {
 		t.Errorf("expected string content as title, got %q", info.Title)
 	}
 }
 
-func TestClaudeParseSessionFileLongTitleTruncated(t *testing.T) {
+func TestClaudeDescribeConversationLongTitleTruncated(t *testing.T) {
 	long := "Please help me with this very long request that goes on and on about many different things and really should be truncated for the sidebar"
 	path := writeClaudeJSONL(t,
 		`{"type":"user","sessionId":"abc","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"`+long+`"}]},"uuid":"u1"}`,
 	)
-	info, _ := NewClaude().ParseSessionFile(path)
+	info, _ := NewClaude().DescribeConversation(path)
 	if len(info.Title) > 85 {
 		t.Errorf("title too long: %q", info.Title)
 	}
 }
 
-func TestClaudeParseSessionFileContextRefStripped(t *testing.T) {
+func TestClaudeDescribeConversationContextRefStripped(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"type":"user","sessionId":"abc","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"@file.go\n<context ref=\"file:///tmp/file.go#L1:10\">\nfunc main() {}\n</context>\nFix the bug in main()"}]},"uuid":"u1"}`,
 	)
-	info, _ := NewClaude().ParseSessionFile(path)
+	info, _ := NewClaude().DescribeConversation(path)
 	// Context block removed, leaves @file.go reference + trailing text
 	if info.Title != "@file.go Fix the bug in main()" {
 		t.Errorf("expected context stripped from title, got %q", info.Title)
 	}
 }
 
-func TestClaudeParseSessionFileEmpty(t *testing.T) {
+func TestClaudeDescribeConversationEmpty(t *testing.T) {
 	path := writeClaudeJSONL(t)
-	_, err := NewClaude().ParseSessionFile(path)
+	_, err := NewClaude().DescribeConversation(path)
 	if err == nil {
 		t.Fatal("expected error for empty file")
 	}
 }
 
-func TestClaudeParseSessionFileNoSessionID(t *testing.T) {
+func TestClaudeDescribeConversationNoSessionID(t *testing.T) {
 	path := writeClaudeJSONL(t,
 		`{"type":"unknown","data":"something"}`,
 	)
-	_, err := NewClaude().ParseSessionFile(path)
+	_, err := NewClaude().DescribeConversation(path)
 	if err != errNotSession {
 		t.Errorf("expected errNotSession, got %v", err)
 	}
 }
 
-// --- FileMonitor ---
-
-func TestClaudeParseNewLinesCwd(t *testing.T) {
-	// First user message carries the cwd — should emit a cwd event plus a working event.
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"user","cwd":"/home/user/dev/gmux","message":{"role":"user","content":"fix bug"},"uuid":"u1"}`,
-	}, "")
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events (cwd + working), got %d: %v", len(events), events)
+func TestClaudeDescribeConversationAncestorIDs(t *testing.T) {
+	const (
+		a = "11111111-1111-1111-1111-111111111111"
+		b = "22222222-2222-2222-2222-222222222222"
+		c = "33333333-3333-3333-3333-333333333333"
+	)
+	tests := []struct {
+		name  string
+		file  string
+		lines []string
+		want  []string
+	}{
+		{
+			name: "resumed transcript deduplicates marker and replay", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + a + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"# session-start -- ` + a + `.jsonl\nContinue work"}}`,
+				`{"type":"assistant","sessionId":"` + a + `"}`,
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:01:00Z","message":{"content":"new prompt"}}`,
+			}, want: []string{a},
+		},
+		{
+			name: "chained resume preserves replay order", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + a + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"first"}}`,
+				`{"type":"assistant","sessionId":"` + b + `"}`,
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:01:00Z","message":{"content":"latest"}}`,
+			}, want: []string{a, b},
+		},
+		{
+			name: "single session", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"only"}}`,
+			}, want: nil,
+		},
+		{
+			// An UNCORROBORATED marker (its UUID never appears as a
+			// replayed line sessionId) is user-authorable text and must
+			// NOT forge an ancestor edge — otherwise a crafted first prompt
+			// could evict an unrelated dead conversation (ADR 0024 §2).
+			name: "uncorroborated marker is ignored", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"# session-start -- ` + a + `.jsonl"}}`,
+			}, want: nil,
+		},
+		{
+			// A user pasting the marker string for a REAL other conversation
+			// still cannot forge lineage: no replayed line carries that id.
+			name: "forged marker for a real id is ignored", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"why is # session-start -- ` + b + `.jsonl here"}}`,
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:01:00Z","message":{"content":"go"}}`,
+			}, want: nil,
+		},
+		{
+			name: "lines only", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"` + a + `","timestamp":"2026-03-15T10:00:00Z","message":{"content":"replayed"}}`,
+				`{"type":"user","sessionId":"` + c + `","timestamp":"2026-03-15T10:01:00Z","message":{"content":"new"}}`,
+			}, want: []string{a},
+		},
+		{
+			name: "malformed values are ignored", file: c + ".jsonl",
+			lines: []string{
+				`{"type":"user","sessionId":"not-a-uuid","timestamp":"2026-03-15T10:00:00Z","message":{"content":"# session-start -- definitely-not-a-uuid.jsonl"}}`,
+				`{"type":"assistant","sessionId":"also-not-a-uuid"}`,
+			}, want: nil,
+		},
 	}
-	if events[0].Cwd != "/home/user/dev/gmux" {
-		t.Errorf("expected first event to be cwd, got %+v", events[0])
-	}
-	if events[1].Status == nil || !events[1].Status.Working {
-		t.Errorf("expected second event to be working status, got %+v", events[1])
-	}
-}
-
-func TestClaudeParseNewLinesCwdOnlyEmittedOnce(t *testing.T) {
-	// cwd should only be emitted for the first user message, not subsequent ones.
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"user","cwd":"/home/user/dev/gmux","message":{"role":"user","content":"first"},"uuid":"u1"}`,
-		`{"type":"user","cwd":"/home/user/dev/gmux","message":{"role":"user","content":"second"},"uuid":"u2"}`,
-	}, "")
-	cwdCount := 0
-	for _, ev := range events {
-		if ev.Cwd != "" {
-			cwdCount++
-		}
-	}
-	if cwdCount != 1 {
-		t.Errorf("expected exactly 1 cwd event across 2 user messages, got %d", cwdCount)
-	}
-}
-
-func TestClaudeParseNewLinesCustomTitle(t *testing.T) {
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"custom-title","customTitle":"My session title","sessionId":"abc"}`,
-	}, "")
-	if len(events) != 1 || events[0].Title != "My session title" {
-		t.Errorf("expected 1 title event, got %v", events)
-	}
-}
-
-func TestClaudeParseNewLinesUserMessage(t *testing.T) {
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the bug"}]},"uuid":"u1"}`,
-	}, "")
-	// Should produce: working status only (title comes from ParseSessionFile on attribution)
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event (status), got %d", len(events))
-	}
-	if events[0].Status == nil || !events[0].Status.Working {
-		t.Error("expected working=true status")
-	}
-}
-
-func TestClaudeParseNewLinesAssistantTextOnly(t *testing.T) {
-	// Text-only assistant = turn complete
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stop_reason":null},"uuid":"a1"}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || events[0].Status.Working {
-		t.Error("expected working=false status on text-only assistant")
-	}
-	if events[0].Unread == nil || !*events[0].Unread {
-		t.Error("expected unread=true on text-only assistant (turn complete)")
-	}
-}
-
-func TestClaudeParseNewLinesAssistantToolUse(t *testing.T) {
-	// tool_use in content = still working, emit working=true to re-assert.
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls"}}],"stop_reason":null},"uuid":"a1"}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event for tool_use, got %d", len(events))
-	}
-	if events[0].Status == nil || !events[0].Status.Working {
-		t.Error("expected working=true for tool_use (agent loop continues)")
-	}
-	if events[0].Unread != nil {
-		t.Error("expected unread=nil for tool_use (still working)")
-	}
-}
-
-func TestClaudeParseNewLinesAssistantThinkingOnly(t *testing.T) {
-	// thinking-only = intermediate, no event
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think..."}],"stop_reason":null},"uuid":"a1"}`,
-	}, "")
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for thinking-only, got %d", len(events))
-	}
-}
-
-func TestClaudeParseNewLinesAssistantTextAndToolUse(t *testing.T) {
-	// Text + tool_use = still working (tool_use takes priority)
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll run a command"},{"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls"}}],"stop_reason":null},"uuid":"a1"}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event for text+tool_use, got %d", len(events))
-	}
-	if events[0].Status == nil || !events[0].Status.Working {
-		t.Error("expected working=true for text+tool_use")
-	}
-}
-
-func TestClaudeParseNewLinesAssistantAborted(t *testing.T) {
-	// User pressed Esc — stop_reason="stop_sequence" with text content → idle.
-	// Still marks unread because the response contains text the user hasn't seen.
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I was saying..."}],"stop_reason":"stop_sequence"},"uuid":"a1"}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || events[0].Status.Working {
-		t.Error("expected working=false on stop_sequence (abort)")
-	}
-	if events[0].Unread == nil || !*events[0].Unread {
-		t.Error("expected unread=true (response has text content)")
-	}
-}
-
-func TestClaudeParseNewLinesFullTurnCycle(t *testing.T) {
-	// Complete turn: user → tool_use → tool_use → end_turn
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"user","message":{"role":"user","content":"fix bug"},"uuid":"u1"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}],"stop_reason":null},"uuid":"a1"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"bash","input":{}}],"stop_reason":null},"uuid":"a2"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"stop_reason":"end_turn"},"uuid":"a3"}`,
-	}, "")
-	// user=working, tool_use=working, tool_use=working, end_turn=idle
-	if len(events) != 4 {
-		t.Fatalf("expected 4 events, got %d", len(events))
-	}
-	for i := 0; i < 3; i++ {
-		if events[i].Status == nil || !events[i].Status.Working {
-			t.Errorf("event %d should be working=true", i)
-		}
-	}
-	if events[3].Status == nil || events[3].Status.Working {
-		t.Error("last event should be working=false (end_turn)")
-	}
-}
-
-func TestClaudeParseNewLinesIgnoresNonMessageTypes(t *testing.T) {
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"file-history-snapshot","files":[]}`,
-		`{"type":"system","subtype":"local_command","content":"output"}`,
-		`{"type":"queue-operation","operation":"dequeue"}`,
-		`{"type":"last-prompt","prompt":"something"}`,
-	}, "")
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for non-message types, got %d", len(events))
-	}
-}
-
-func TestClaudeParseNewLinesSystemMessage(t *testing.T) {
-	// System messages should not generate events
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"system","subtype":"local_command","message":"command output"}`,
-	}, "")
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for system, got %d", len(events))
-	}
-}
-
-func TestClaudeParseNewLinesMultiTurn(t *testing.T) {
-	events := NewClaude().ParseNewLines([]string{
-		`{"type":"user","message":{"role":"user","content":"Fix it"},"uuid":"u1"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{}}],"stop_reason":null},"uuid":"a1"}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"All done."}],"stop_reason":"end_turn"},"uuid":"a2"}`,
-	}, "")
-	// user → working, tool_use → working, text → idle
-	if len(events) != 3 {
-		t.Fatalf("expected 3 events, got %d: %v", len(events), events)
-	}
-	if !events[0].Status.Working {
-		t.Error("first event should be working=true (user)")
-	}
-	if !events[1].Status.Working {
-		t.Error("second event should be working=true (tool_use)")
-	}
-	if events[2].Status.Working {
-		t.Error("third event should be working=false (end_turn)")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, err := NewClaude().DescribeConversation(writeNamedClaudeJSONL(t, tt.file, tt.lines...))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(tt.want, info.AncestorIDs) {
+				t.Errorf("AncestorIDs = %v, want %v", info.AncestorIDs, tt.want)
+			}
+		})
 	}
 }
 
 // --- Resumer ---
 
 func TestClaudeResumeCommand(t *testing.T) {
-	cmd := NewClaude().ResumeCommand(&adapter.SessionFileInfo{
-		ID: "abc-123-def",
+	cmd := NewClaude().ResumeCommand(&adapter.ConversationInfo{
+		ID:           "abc-123-def",
+		MessageCount: 1,
 	})
 	if len(cmd) != 3 || cmd[0] != "claude" || cmd[1] != "--resume" || cmd[2] != "abc-123-def" {
 		t.Errorf("unexpected resume command: %v", cmd)
 	}
 }
 
-func TestClaudeCanResume(t *testing.T) {
+// Resumability lives in ResumeCommand: a described-but-empty conversation
+// yields no command.
+func TestClaudeResumeCommandResumability(t *testing.T) {
+	c := NewClaude()
 	valid := writeClaudeJSONL(t,
 		`{"type":"user","sessionId":"abc","timestamp":"2026-03-15T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":"hello"},"uuid":"u1"}`,
 	)
-	if !NewClaude().CanResume(valid) {
-		t.Fatal("should be resumable")
+	info, err := c.DescribeConversation(valid)
+	if err != nil {
+		t.Fatalf("DescribeConversation: %v", err)
+	}
+	if cmd := c.ResumeCommand(info); len(cmd) != 3 {
+		t.Fatalf("should be resumable, got %v", cmd)
 	}
 
 	// Queue-only file has no messages
 	queueOnly := writeClaudeJSONL(t,
 		`{"type":"queue-operation","operation":"dequeue","timestamp":"2026-03-15T10:00:00Z","sessionId":"q-123"}`,
 	)
-	if NewClaude().CanResume(queueOnly) {
-		t.Fatal("queue-only session should not be resumable")
+	info, err = c.DescribeConversation(queueOnly)
+	if err != nil {
+		t.Fatalf("DescribeConversation: %v", err)
+	}
+	if cmd := c.ResumeCommand(info); cmd != nil {
+		t.Fatalf("queue-only session should not be resumable, got %v", cmd)
+	}
+	if cmd := c.ResumeCommand(nil); cmd != nil {
+		t.Fatalf("nil info should not be resumable, got %v", cmd)
 	}
 }
 

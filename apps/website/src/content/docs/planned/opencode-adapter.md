@@ -3,9 +3,11 @@ title: OpenCode Adapter
 description: Adapter for the OpenCode AI coding agent.
 ---
 
-> This feature is not yet implemented. Depends on [folder management](/planned/folder-management/).
+:::note[Not implemented]
+The original blocker (project management) shipped in 2.0. The mechanism sketched below predates the current architecture: discovery would now be an adapter-owned [`ConversationSource`](/develop/writing-adapters/#conversationsource) (ADR 0014), and live status should come from an [agent hook](/develop/adapter-architecture/#live-session-state-comes-from-the-agent-hook) (ADR 0013/0015) rather than DB polling.
+:::
 
-[OpenCode](https://opencode.ai) is an open-source AI coding agent that runs in the terminal. Unlike Claude Code, pi, and Codex (which write JSONL session files to central directories), OpenCode stores sessions in a SQLite database at `.opencode/opencode.db` relative to the working directory. This per-project storage model requires the folder management refactor before the adapter can discover sessions.
+[OpenCode](https://opencode.ai) is an open-source AI coding agent that runs in the terminal. Unlike Claude Code, pi, and Codex (which write JSONL conversation files to central directories), OpenCode stores sessions in a SQLite database at `.opencode/opencode.db` relative to the working directory. This per-project storage model is why the adapter needs an adapter-owned conversation source to discover sessions.
 
 ## Phases
 
@@ -17,14 +19,14 @@ Implement the core `Adapter` and `Launchable` interfaces.
 - **Binary**: `opencode`
 - **Match**: scan command args for `opencode` (same pattern as claude/codex)
 - **Discover**: `exec.LookPath("opencode")`
-- **Monitor**: no-op. OpenCode uses a full-screen bubbletea TUI with animated spinners, making PTY byte parsing unreliable for status detection.
+- **Turn state**: no PTY parsing (OpenCode's animated bubbletea TUI makes byte inference unreliable); until a hook exists, sessions run the runner's default turn model.
 - **Launcher**: `{ id: "opencode", label: "OpenCode", command: ["opencode"], description: "Coding Agent" }`
 
 This is enough for sessions to appear in gmux and be launchable from the UI. No working/idle status, no session discovery, no resume.
 
 ### Phase 2: Session discovery via SQLite
 
-Requires the folder management refactor. With scoped scanning, the scanner checks each configured folder for `.opencode/opencode.db` and queries it for sessions.
+The adapter's `ConversationSource` checks each configured project directory for `.opencode/opencode.db` and queries it for sessions.
 
 OpenCode's SQLite schema stores sessions and messages in two tables:
 
@@ -44,9 +46,11 @@ parts TEXT NOT NULL default '[]',  -- JSON array
 finished_at INTEGER
 ```
 
-The adapter would implement `SessionFiler` by:
-- Querying `SELECT id, title, message_count, created_at FROM sessions ORDER BY updated_at DESC`
-- Mapping results to `SessionFileInfo` structs
+The adapter would implement `ConversationDescriber` (with the session row's `id` as the opaque conversation ref — ADR 0022) by:
+- Querying `SELECT id, title, message_count, updated_at, created_at FROM sessions WHERE id = ?`
+- Mapping results to `ConversationInfo` structs (`updated_at` → `LastActivity`)
+
+Enumeration comes from a `ConversationSource` that snapshots the sessions table and watches the WAL for changes, emitting row-id refs to the sink.
 
 This requires a SQLite dependency. `modernc.org/sqlite` (pure Go, no CGo) is preferred to avoid requiring a C compiler in the build chain.
 
@@ -56,7 +60,7 @@ Detect working/idle state by monitoring the SQLite database for changes.
 
 The approach: watch the `.opencode/opencode.db-wal` file via inotify. On change, query the messages table for the latest message in the active session. If the most recent message has `role = "user"` and no subsequent assistant message with `finished_at IS NOT NULL`, the session is working. Otherwise idle.
 
-An alternative is to propose that OpenCode write a lightweight status file (e.g. `.opencode/status.json`) upstream, which would let gmux use the existing `FileMonitor` infrastructure.
+An alternative is to propose that OpenCode write a lightweight status file (e.g. `.opencode/status.json`) upstream, which a `ConversationSource` (or a future status hook) could consume.
 
 ### Phase 4: Session resume
 

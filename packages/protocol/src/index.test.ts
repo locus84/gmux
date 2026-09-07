@@ -4,32 +4,32 @@ import {
   SessionSchema,
   successEnvelope,
   SessionStatusSchema,
+  ProjectWorktreesResponseSchema,
 } from './index.js'
 
 describe('protocol schemas', () => {
   it('parses session (schema v2)', () => {
     const result = SessionSchema.parse({
-      id: 'sess-1',
+      id: '1vshk4fu',
       kind: 'pi',
       alive: true,
       pid: 12345,
       title: 'test session',
-      status: { label: 'thinking', working: true },
+      status: { active: true },
       terminal_cols: 120,
       terminal_rows: 40,
     })
 
-    expect(result.id).toBe('sess-1')
+    expect(result.id).toBe('1vshk4fu')
     expect(result.alive).toBe(true)
-    expect(result.status?.working).toBe(true)
-    expect(result.status?.label).toBe('thinking')
+    expect(result.status?.active).toBe(true)
     expect(result.terminal_cols).toBe(120)
     expect(result.terminal_rows).toBe(40)
   })
 
   it('parses session with null status', () => {
     const result = SessionSchema.parse({
-      id: 'sess-2',
+      id: '155mk8b7',
       kind: 'generic',
       alive: false,
       status: null,
@@ -42,12 +42,12 @@ describe('protocol schemas', () => {
   it('validates session-upsert event', () => {
     const event = SessionEventSchema.parse({
       type: 'session-upsert',
-      id: 'sess-1',
+      id: '1vshk4fu',
       session: {
-        id: 'sess-1',
+        id: '1vshk4fu',
         kind: 'pi',
         alive: true,
-        status: { label: 'running', working: true },
+        status: { active: true },
       },
     })
 
@@ -57,17 +57,36 @@ describe('protocol schemas', () => {
     }
   })
 
+  it('defaults the orthogonal status facts', () => {
+    const status = SessionStatusSchema.parse({ active: true })
+    expect(status).toEqual({ active: true, error: false, interrupted: false })
+    const stopped = SessionStatusSchema.parse({ active: false, interrupted: true })
+    expect(stopped?.interrupted).toBe(true)
+  })
+
   it('validates session-remove event', () => {
     const event = SessionEventSchema.parse({
       type: 'session-remove',
-      id: 'sess-1',
+      id: '1vshk4fu',
     })
     expect(event.type).toBe('session-remove')
   })
 
+  it('parses project worktree inventories', () => {
+    const parsed = ProjectWorktreesResponseSchema.parse({
+      ok: true,
+      data: {
+        project_slug: 'gmux',
+        primary_path: '/repo',
+        worktrees: [{ path: '/repo', branch: 'main', primary: true }],
+      },
+    })
+    expect(parsed.ok && parsed.data.worktrees[0].branch).toBe('main')
+  })
+
   it('builds typed success envelopes', () => {
     const Schema = successEnvelope(SessionStatusSchema)
-    const parsed = Schema.parse({ ok: true, data: { label: 'test', working: false } })
-    expect(parsed.data.label).toBe('test')
+    const parsed = Schema.parse({ ok: true, data: { active: false } })
+    expect(parsed.data.active).toBe(false)
   })
 })

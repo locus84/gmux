@@ -48,18 +48,22 @@ func TestAnyViewing(t *testing.T) {
 	c := nilClient("a", "desktop", "granted", nowSecs())
 	tbl.Add(c)
 
-	tbl.Update("a", ClientState{Focused: true, SelectedSessionID: "sess-1"})
+	tbl.Update("a", ClientState{Visibility: "visible", Focused: true, SelectedSessionID: "1vshk4fu"})
 
-	if !tbl.AnyViewing("sess-1") {
-		t.Fatal("should detect client viewing sess-1")
+	if !tbl.AnyViewing("1vshk4fu") {
+		t.Fatal("should detect client viewing 1vshk4fu")
 	}
-	if tbl.AnyViewing("sess-2") {
-		t.Fatal("should not detect client viewing sess-2")
+	if tbl.AnyViewing("155mk8b7") {
+		t.Fatal("should not detect client viewing 155mk8b7")
 	}
 
-	// Unfocused client viewing a session should not count.
-	tbl.Update("a", ClientState{Focused: false, SelectedSessionID: "sess-1"})
-	if tbl.AnyViewing("sess-1") {
+	// Hidden or unfocused clients should not count.
+	tbl.Update("a", ClientState{Visibility: "hidden", Focused: true, SelectedSessionID: "1vshk4fu"})
+	if tbl.AnyViewing("1vshk4fu") {
+		t.Fatal("hidden client should not count as viewing")
+	}
+	tbl.Update("a", ClientState{Visibility: "visible", Focused: false, SelectedSessionID: "1vshk4fu"})
+	if tbl.AnyViewing("1vshk4fu") {
 		t.Fatal("unfocused client should not count as viewing")
 	}
 }
@@ -208,5 +212,31 @@ func TestRemove(t *testing.T) {
 	tbl.Remove("a")
 	if tbl.AnyFocused() {
 		t.Fatal("removed client should not be counted")
+	}
+}
+
+// TestOnClientConnectedFires verifies the callback fires exactly once
+// per Add, carrying the client's ID. This is the hook peering uses to
+// nudge dial-out-only peers to reconnect when a user shows up.
+func TestOnClientConnectedFires(t *testing.T) {
+	var gotIDs []string
+	tbl := New(Callbacks{
+		OnClientConnected: func(id string) { gotIDs = append(gotIDs, id) },
+	})
+
+	tbl.Add(nilClient("a", "desktop", "granted", nowSecs()))
+	tbl.Add(nilClient("b", "mobile", "granted", nowSecs()))
+
+	if len(gotIDs) != 2 || gotIDs[0] != "a" || gotIDs[1] != "b" {
+		t.Errorf("want callback fired for [a b], got %v", gotIDs)
+	}
+}
+
+// TestOnClientConnectedNilSafe verifies Add works when no callback is set.
+func TestOnClientConnectedNilSafe(t *testing.T) {
+	tbl := New(Callbacks{})
+	tbl.Add(nilClient("a", "desktop", "granted", nowSecs())) // must not panic
+	if got := len(tbl.Conns()); got != 1 {
+		t.Errorf("client should be registered, got %d conns", got)
 	}
 }

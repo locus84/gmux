@@ -2,6 +2,8 @@ package adapters
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +18,8 @@ import (
 // highest-precedence-but-merged layer whose hook arrays concatenate across
 // sources, so ours add to — never clobber — the user's hooks. The injected
 // hooks run `gmux __claude-hook`, which relays an authoritative event to the
-// runner socket. The metadata FileAttributor stays as the fallback for launches
-// the hook can't cover (e.g. a shell-wrapped argv where injection is lost).
+// runner socket. Launches the hook can't cover (e.g. a shell-wrapped argv where
+// injection is lost) run without daemon-reported live state (no fallback).
 var _ adapter.SessionHookCommand = (*Claude)(nil)
 
 // HookCommand splices `--settings <inline-json>` in right after the claude
@@ -31,7 +33,10 @@ func (c *Claude) HookCommand(args []string, selfBin string) ([]string, bool) {
 	if i < 0 || selfBin == "" {
 		return args, false
 	}
-	tail, userSettings := extractClaudeSettings(args[i+1:])
+	tail, userSettings, err := extractClaudeSettings(args[i+1:])
+	if err != nil {
+		return args, false
+	}
 	settingsJSON, err := buildClaudeSettings(selfBin, userSettings)
 	if err != nil {
 		return args, false
@@ -59,7 +64,7 @@ func claudeBinaryIndex(args []string) int {
 // extractClaudeSettings removes `--settings <value>` / `--settings=<value>`
 // pairs from tokens, returning the filtered tokens and the collected values.
 // Stops at a bare `--` so a positional prompt is never misread as a flag value.
-func extractClaudeSettings(tokens []string) (filtered, values []string) {
+func extractClaudeSettings(tokens []string) (filtered, values []string, err error) {
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
 		if tok == "--" {
@@ -68,17 +73,22 @@ func extractClaudeSettings(tokens []string) (filtered, values []string) {
 		}
 		switch {
 		case tok == "--settings":
-			if i+1 < len(tokens) {
-				values = append(values, tokens[i+1])
-				i++
+			if i+1 >= len(tokens) || tokens[i+1] == "--" {
+				return nil, nil, errors.New("claude --settings requires a value")
 			}
+			values = append(values, tokens[i+1])
+			i++
 		case strings.HasPrefix(tok, "--settings="):
-			values = append(values, strings.TrimPrefix(tok, "--settings="))
+			value := strings.TrimPrefix(tok, "--settings=")
+			if value == "" {
+				return nil, nil, errors.New("claude --settings requires a value")
+			}
+			values = append(values, value)
 		default:
 			filtered = append(filtered, tok)
 		}
 	}
-	return filtered, values
+	return filtered, values, nil
 }
 
 // buildClaudeSettings returns the inline JSON for `--settings`: gmux's session
@@ -86,9 +96,11 @@ func extractClaudeSettings(tokens []string) (filtered, values []string) {
 func buildClaudeSettings(selfBin string, userSettings []string) (string, error) {
 	var base any = claudeGmuxHooks(selfBin)
 	for _, us := range userSettings {
-		if obj, ok := parseClaudeSettings(us); ok {
-			base = mergeClaudeSettings(base, obj)
+		obj, err := parseClaudeSettings(us)
+		if err != nil {
+			return "", fmt.Errorf("invalid Claude settings %q: %w", us, err)
 		}
+		base = mergeClaudeSettings(base, obj)
 	}
 	out, err := json.Marshal(base)
 	if err != nil {
@@ -104,10 +116,16 @@ func buildClaudeSettings(selfBin string, userSettings []string) (string, error) 
 //
 //   - SessionStart    → bind held transcript + id + title/slug; fires on
 //     startup AND resume/clear/compact, so it rebinds on /resume.
-//   - UserPromptSubmit → turn start (working).
+//   - UserPromptSubmit → title refresh + turn start (active); the refresh
+//     picks up a /rename, which fires no hook of its own.
 //   - Stop             → rebind + turn end completed.
-//   - SessionEnd       → turn end aborted; covers Ctrl+C / exit where Stop
-//     does not fire.
+//   - StopFailure      → rebind + turn end error; Claude fires it INSTEAD of
+//     Stop when a turn ends on an API error (rate_limit, overloaded,
+//     authentication_failed, …). An API failure is a failed turn, not a user
+//     interruption.
+//   - SessionEnd       → turn end interrupted; covers Ctrl+C / exit mid-turn,
+//     where neither Stop nor StopFailure fires. The runner ignores it when the
+//     turn is already closed, so a normal exit after Stop stays completed.
 func claudeGmuxHooks(selfBin string) map[string]any {
 	cmd := shellQuote(selfBin) + " __claude-hook"
 	entry := func(timeout int) []any {
@@ -124,6 +142,7 @@ func claudeGmuxHooks(selfBin string) map[string]any {
 			"SessionStart":     entry(10),
 			"UserPromptSubmit": entry(10),
 			"Stop":             entry(10),
+			"StopFailure":      entry(10),
 			"SessionEnd":       entry(5),
 		},
 	}
@@ -131,7 +150,7 @@ func claudeGmuxHooks(selfBin string) map[string]any {
 
 // parseClaudeSettings interprets a user `--settings` value as inline JSON
 // (starts with `{`) or a path to a JSON file.
-func parseClaudeSettings(value string) (map[string]any, bool) {
+func parseClaudeSettings(value string) (map[string]any, error) {
 	trimmed := strings.TrimSpace(value)
 	var data []byte
 	if strings.HasPrefix(trimmed, "{") {
@@ -139,15 +158,15 @@ func parseClaudeSettings(value string) (map[string]any, bool) {
 	} else {
 		b, err := os.ReadFile(trimmed)
 		if err != nil {
-			return nil, false
+			return nil, err
 		}
 		data = b
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(data, &obj); err != nil {
-		return nil, false
+		return nil, err
 	}
-	return obj, true
+	return obj, nil
 }
 
 // mergeClaudeSettings deep-merges over onto base. Objects merge recursively;
@@ -209,18 +228,33 @@ func ClaudeHookBodies(input []byte) [][]byte {
 			return [][]byte{b}
 		}
 	case "UserPromptSubmit":
-		return [][]byte{turn("start", "")}
-	case "Stop":
-		// Stop fires only on a clean finish — Claude routes interrupts/API errors
-		// elsewhere (StopFailure, which we don't wire) — so "completed" is
-		// accurate here (unlike codex, whose Stop can't tell completion from
-		// abort). An Esc-interrupted turn stays working until the next prompt.
+		// /rename fires no hook of its own — it only appends a custom-title
+		// line to the transcript. Refresh the title here (custom-title wins in
+		// DescribeConversation) so a mid-session rename shows up at the next
+		// prompt instead of waiting for the turn to end.
 		if b, ok := claudeSessionBody(in.TranscriptPath, in.SessionID, "", in.SessionTitle); ok {
-			return [][]byte{b, turn("end", "completed")} // refresh title/slug, then end the turn
+			return [][]byte{b, turn("start", "")}
 		}
-		return [][]byte{turn("end", "completed")}
+		return [][]byte{turn("start", "")}
+	case "Stop", "StopFailure":
+		// Claude fires exactly one of these per turn: Stop on a clean finish,
+		// StopFailure instead when the turn ends on an API error. So "completed"
+		// is accurate for Stop (unlike codex, whose Stop can't tell completion
+		// from abort), and StopFailure is a terminal error — NOT an intentional
+		// interruption: nobody chose to stop a rate-limited turn.
+		outcome := "completed"
+		if in.HookEventName == "StopFailure" {
+			outcome = "error"
+		}
+		if b, ok := claudeSessionBody(in.TranscriptPath, in.SessionID, "", in.SessionTitle); ok {
+			return [][]byte{b, turn("end", outcome)} // refresh title/slug, then end the turn
+		}
+		return [][]byte{turn("end", outcome)}
 	case "SessionEnd":
-		return [][]byte{turn("end", "aborted")}
+		// Only reaches durable state when the turn is still OPEN (the runner
+		// gates terminal ends on turn polarity), i.e. the session was exited
+		// mid-turn. After Stop/StopFailure closed the turn this is a no-op.
+		return [][]byte{turn("end", "interrupted")}
 	}
 	return nil
 }
@@ -254,8 +288,8 @@ func claudeTitleSlug(transcriptPath, sessionTitle string) (title, slug string) {
 	if t := strings.TrimSpace(sessionTitle); t != "" {
 		return t, adapter.Slugify(t)
 	}
-	info, err := NewClaude().ParseSessionFile(transcriptPath)
-	if err != nil || info == nil || info.Title == "" || info.Title == "(new)" {
+	info, err := NewClaude().DescribeConversation(transcriptPath)
+	if err != nil || info == nil || info.Title == "" {
 		return "", ""
 	}
 	return info.Title, info.Slug

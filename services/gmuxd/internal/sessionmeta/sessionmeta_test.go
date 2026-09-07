@@ -20,8 +20,8 @@ func newStore(t *testing.T) *Store {
 func sampleSession() store.Session {
 	exit := 42
 	return store.Session{
-		ID:           "sess-test123",
-		Kind:         "shell",
+		ID:           "12euhm4k",
+		Adapter:      "shell",
 		Command:      []string{"bash", "-l"},
 		Cwd:          "/home/u/proj",
 		Alive:        false,
@@ -39,7 +39,7 @@ func sampleSession() store.Session {
 // claim of this package: persisted sessions come back with the
 // internal Title-precedence fields (ShellTitle, AdapterTitle) intact.
 // Without this, a restored session loses its title resolution and
-// shows up as the bare Kind ("shell") instead of "proj".
+// shows up as the bare adapter name ("shell") instead of "proj".
 func TestRoundTripPreservesInternalFields(t *testing.T) {
 	s := newStore(t)
 	in := sampleSession()
@@ -77,11 +77,11 @@ func TestRoundTripFullSession(t *testing.T) {
 	s := newStore(t)
 	exit := 7
 	in := store.Session{
-		ID:            "sess-full",
+		ID:            "1894363z",
 		CreatedAt:     "2026-04-26T10:00:00Z",
 		Command:       []string{"bash", "-c", "echo hi"},
 		Cwd:           "~/work",
-		Kind:          "shell",
+		Adapter:       "shell",
 		WorkspaceRoot: "~/work/repo",
 		Remotes:       map[string]string{"origin": "github.com/me/repo"},
 		Alive:         false,
@@ -91,10 +91,10 @@ func TestRoundTripFullSession(t *testing.T) {
 		ExitedAt:      "2026-04-26T10:05:00Z",
 		Title:         "my title",
 		Subtitle:      "my subtitle",
-		Status:        &store.Status{Label: "working", Working: true, Error: false},
+		Status:        &store.Status{Active: true, Error: false},
 		Unread:        true,
 		Resumable:     true,
-		SocketPath:    "/tmp/gmux-sessions/sess-full.sock",
+		SocketPath:    "/tmp/gmux-sessions/1894363z.sock",
 		TerminalCols:  120,
 		TerminalRows:  40,
 		Slug:          "my-slug",
@@ -102,7 +102,7 @@ func TestRoundTripFullSession(t *testing.T) {
 		BinaryHash:    "abc123",
 		ShellTitle:    "shell-title",
 		AdapterTitle:  "adapter-title",
-		LastActivityAt: "2026-04-26T10:04:30Z",
+		LastOutputAt:  "2026-04-26T10:04:30Z",
 	}
 
 	if err := s.Write(in); err != nil {
@@ -127,7 +127,7 @@ func TestWriteAtomicNoTempLeftover(t *testing.T) {
 	if err := s.Write(sampleSession()); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	entries, err := os.ReadDir(s.SessionDir("sess-test123"))
+	entries, err := os.ReadDir(s.SessionDir("12euhm4k"))
 	if err != nil {
 		t.Fatalf("ReadDir: %v", err)
 	}
@@ -164,14 +164,14 @@ func TestWriteFilePermissions(t *testing.T) {
 	if err := s.Write(sampleSession()); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	info, err := os.Stat(filepath.Join(s.SessionDir("sess-test123"), metaFile))
+	info, err := os.Stat(filepath.Join(s.SessionDir("12euhm4k"), metaFile))
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
 	if got := info.Mode().Perm(); got != fileMode {
 		t.Errorf("file mode: got %o, want %o", got, fileMode)
 	}
-	dirInfo, err := os.Stat(s.SessionDir("sess-test123"))
+	dirInfo, err := os.Stat(s.SessionDir("12euhm4k"))
 	if err != nil {
 		t.Fatalf("Stat dir: %v", err)
 	}
@@ -180,18 +180,81 @@ func TestWriteFilePermissions(t *testing.T) {
 	}
 }
 
+// TestReadLegacyPreV2Keys covers the legacy-read shim: pre-v2 meta.json
+// files carry "kind" and "session_file" instead of "adapter" and
+// "conversation_file". meta.json has no schema version, so Read falls
+// back to the old keys. TODO(v2.1): drop alongside the shim.
+func TestReadLegacyPreV2Keys(t *testing.T) {
+	s := newStore(t)
+	legacy := []byte(`{
+		"id": "1d9w2nu9",
+		"kind": "pi",
+		"session_file": "/home/u/.pi/agent/sessions/x/conv.jsonl",
+		"alive": false,
+		"cwd": "/home/u/proj"
+	}`)
+	dir := s.SessionDir("1d9w2nu9")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, metaFile), legacy, 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	got, err := s.Read("1d9w2nu9")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.Adapter != "pi" {
+		t.Errorf("Adapter = %q, want %q (legacy \"kind\" fallback)", got.Adapter, "pi")
+	}
+	if want := "/home/u/.pi/agent/sessions/x/conv.jsonl"; got.ConversationRef != want {
+		t.Errorf("SessionFile = %q, want %q (legacy \"session_file\" fallback)", got.ConversationRef, want)
+	}
+}
+
+// TestWriteEmitsOnlyNewKeys pins the write side of the shim: new
+// meta.json files must not contain the legacy keys.
+func TestWriteEmitsOnlyNewKeys(t *testing.T) {
+	s := newStore(t)
+	sess := sampleSession()
+	sess.ConversationRef = "/tmp/conv.jsonl"
+	if err := s.Write(sess); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.SessionDir(sess.ID), metaFile))
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("parse meta.json: %v", err)
+	}
+	for _, legacy := range []string{"kind", "session_file"} {
+		if _, ok := raw[legacy]; ok {
+			t.Errorf("meta.json still contains legacy key %q", legacy)
+		}
+	}
+	if _, ok := raw["adapter"]; !ok {
+		t.Error("meta.json missing \"adapter\" key")
+	}
+	if _, ok := raw["conversation_file"]; !ok {
+		t.Error("meta.json missing \"conversation_file\" key")
+	}
+}
+
 func TestRemoveIsIdempotent(t *testing.T) {
 	s := newStore(t)
 	if err := s.Write(sampleSession()); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if err := s.Remove("sess-test123"); err != nil {
+	if err := s.Remove("12euhm4k"); err != nil {
 		t.Fatalf("first Remove: %v", err)
 	}
-	if err := s.Remove("sess-test123"); err != nil {
+	if err := s.Remove("12euhm4k"); err != nil {
 		t.Fatalf("second Remove (must be idempotent): %v", err)
 	}
-	if err := s.Remove("sess-never-existed"); err != nil {
+	if err := s.Remove("1lma67dw"); err != nil {
 		t.Fatalf("Remove of non-existent: %v", err)
 	}
 }
@@ -199,9 +262,9 @@ func TestRemoveIsIdempotent(t *testing.T) {
 func TestSweepLoadsAllSessionsAsAliveFalse(t *testing.T) {
 	s := newStore(t)
 	a := sampleSession()
-	a.ID = "sess-aaa"
+	a.ID = "1dzpwwj8"
 	b := sampleSession()
-	b.ID = "sess-bbb"
+	b.ID = "1r4ep3kh"
 	b.Alive = true // Sweep must downgrade — we only persist after death
 
 	for _, sess := range []store.Session{a, b} {
@@ -226,15 +289,17 @@ func TestSweepLoadsAllSessionsAsAliveFalse(t *testing.T) {
 
 func TestSweepRemovesOrphanDirs(t *testing.T) {
 	s := newStore(t)
-	// Orphan: dir exists with non-meta content (a scrollback file
-	// the runner wrote) but no meta.json. Sweep should treat the
-	// whole dir as orphan and clean it up.
-	orphan := s.SessionDir("sess-orphan")
+	// Orphan: dir exists with non-meta, non-scrollback junk but no
+	// meta.json. Sweep should treat the whole dir as orphan and clean
+	// it up. (A dir containing scrollback is NOT an orphan — it is a
+	// live, never-died runner's dir; see
+	// TestSweepSparesLiveRunnerScrollbackDir.)
+	orphan := s.SessionDir("1c80rqj5")
 	if err := os.MkdirAll(orphan, dirMode); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(orphan, "scrollback"), []byte("xyz"), fileMode); err != nil {
-		t.Fatalf("write orphan scrollback: %v", err)
+	if err := os.WriteFile(filepath.Join(orphan, "meta.json.tmp-junk"), []byte("xyz"), fileMode); err != nil {
+		t.Fatalf("write orphan junk: %v", err)
 	}
 
 	if _, err := s.Sweep(); err != nil {
@@ -252,7 +317,7 @@ func TestSweepKeepsValidSessionsAlongsideOrphan(t *testing.T) {
 	if err := s.Write(good); err != nil {
 		t.Fatalf("Write good: %v", err)
 	}
-	orphan := s.SessionDir("sess-orphan")
+	orphan := s.SessionDir("1c80rqj5")
 	if err := os.MkdirAll(orphan, dirMode); err != nil {
 		t.Fatalf("mkdir orphan: %v", err)
 	}
@@ -277,7 +342,7 @@ func TestSweepKeepsValidSessionsAlongsideOrphan(t *testing.T) {
 // keep going. Operator can inspect manually if curious.
 func TestSweepSkipsUnparseableMeta(t *testing.T) {
 	s := newStore(t)
-	bad := s.SessionDir("sess-bad")
+	bad := s.SessionDir("1u44a1lf")
 	if err := os.MkdirAll(bad, dirMode); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -318,15 +383,15 @@ func TestSweepReturnsEmptyForMissingDir(t *testing.T) {
 // on-disk record; events of other types do not; the loop terminates
 // cleanly when the channel closes.
 //
-// This is the catch-all for slug-takeover orphans (and any other
+// This is the catch-all for conversation-takeover orphans (and any other
 // store removal not paired with an explicit Remove call). A
 // regression here would silently leak per-session directories.
 func TestWatchRemovalsRemovesOnSessionRemoveEvent(t *testing.T) {
 	s := newStore(t)
 	target := sampleSession()
-	target.ID = "sess-target"
+	target.ID = "11q9rc89"
 	survivor := sampleSession()
-	survivor.ID = "sess-survivor"
+	survivor.ID = "19n9hnyp"
 
 	for _, sess := range []store.Session{target, survivor} {
 		if err := s.Write(sess); err != nil {
@@ -350,7 +415,7 @@ func TestWatchRemovalsRemovesOnSessionRemoveEvent(t *testing.T) {
 
 	// Removal of an ID we never persisted is a no-op (peer sessions,
 	// sessions removed before any Alive=false upsert).
-	events <- store.Event{Type: "session-remove", ID: "sess-never-existed"}
+	events <- store.Event{Type: "session-remove", ID: "1lma67dw"}
 
 	// Closing the channel must terminate the loop.
 	close(events)
@@ -416,10 +481,10 @@ func TestWriteOverwritesExisting(t *testing.T) {
 func TestWriteRejectsUnsafeID(t *testing.T) {
 	s := newStore(t)
 	unsafe := []string{
-		"sess-../../../etc/cron.d/x",
-		"sess-..",
+		"bad/../../../etc/cron.d/x",
+		"bad/..",
 		"../escape",
-		"sess-a/b",
+		"1mw5c5n9/b",
 	}
 	for _, id := range unsafe {
 		sess := sampleSession()
@@ -449,10 +514,10 @@ func TestSessionDirContainsUnsafeIDs(t *testing.T) {
 	s := newStore(t)
 	base := filepath.Clean(s.Dir())
 	unsafe := []string{
-		"sess-../../../etc",
+		"bad/../../../etc",
 		"..",
 		"../escape",
-		"sess-a/b",
+		"1mw5c5n9/b",
 		"",
 	}
 	for _, id := range unsafe {
@@ -466,12 +531,12 @@ func TestSessionDirContainsUnsafeIDs(t *testing.T) {
 	}
 }
 
-// TestWriteAcceptsWellFormedID confirms normal sess-<hex> IDs still
+// TestWriteAcceptsWellFormedID confirms normal 8-character base36 IDs still
 // persist after the validation guard was added.
 func TestWriteAcceptsWellFormedID(t *testing.T) {
 	s := newStore(t)
 	sess := sampleSession()
-	sess.ID = "sess-abcd1234"
+	sess.ID = "1va8lvdv"
 	if err := s.Write(sess); err != nil {
 		t.Fatalf("Write(well-formed id) = %v, want nil", err)
 	}

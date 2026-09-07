@@ -59,18 +59,11 @@ func TestCodexNoMatchOther(t *testing.T) {
 	}
 }
 
-// --- Env / Monitor ---
+// --- Env ---
 
 func TestCodexEnvNil(t *testing.T) {
 	if env := NewCodex().Env(adapter.EnvContext{}); env != nil {
 		t.Fatalf("expected nil, got %v", env)
-	}
-}
-
-func TestCodexMonitorNoOp(t *testing.T) {
-	c := NewCodex()
-	if c.Monitor([]byte("⠋ Thinking...")) != nil {
-		t.Fatal("should return nil (file-driven)")
 	}
 }
 
@@ -81,17 +74,17 @@ func TestCodexImplementsCapabilities(t *testing.T) {
 	if _, ok := a.(adapter.Launchable); !ok {
 		t.Fatal("should implement Launchable")
 	}
-	if _, ok := a.(adapter.SessionFiler); !ok {
-		t.Fatal("should implement SessionFiler")
-	}
-	if _, ok := a.(adapter.SessionFileLister); !ok {
-		t.Fatal("should implement SessionFileLister")
-	}
-	if _, ok := a.(adapter.FileMonitor); !ok {
-		t.Fatal("should implement FileMonitor")
+	if _, ok := a.(adapter.ConversationDescriber); !ok {
+		t.Fatal("should implement ConversationDescriber")
 	}
 	if _, ok := a.(adapter.Resumer); !ok {
 		t.Fatal("should implement Resumer")
+	}
+	// Deliberately NOT an AgentActionEncoder: interactive adapters never
+	// expose gmux's semantic steer action. Raw `gmux send` remains available;
+	// ACP mode will provide typed control separately.
+	if _, ok := a.(adapter.AgentActionEncoder); ok {
+		t.Fatal("interactive Codex must not implement AgentActionEncoder")
 	}
 }
 
@@ -111,7 +104,7 @@ func TestCodexLaunchers(t *testing.T) {
 	}
 }
 
-// --- ParseSessionFile ---
+// --- DescribeConversation ---
 
 func writeCodexJSONL(t *testing.T, lines ...string) string {
 	t.Helper()
@@ -125,13 +118,13 @@ func writeCodexJSONL(t *testing.T, lines ...string) string {
 	return path
 }
 
-func TestCodexParseSessionFileBasic(t *testing.T) {
+func TestCodexDescribeConversationBasic(t *testing.T) {
 	path := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc-123","timestamp":"2026-03-17T01:00:00Z","cwd":"/home/mg/dev/test"}}`,
 		`{"timestamp":"2026-03-17T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the auth bug"}]}}`,
 		`{"timestamp":"2026-03-17T01:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll fix that for you."}]}}`,
 	)
-	info, err := NewCodex().ParseSessionFile(path)
+	info, err := NewCodex().DescribeConversation(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,9 +140,12 @@ func TestCodexParseSessionFileBasic(t *testing.T) {
 	if info.MessageCount != 2 {
 		t.Errorf("expected 2 messages, got %d", info.MessageCount)
 	}
+	if len(info.AncestorIDs) != 0 {
+		t.Errorf("expected no ancestors for in-place codex resume, got %v", info.AncestorIDs)
+	}
 }
 
-func TestCodexParseSessionFileSkipsSystemContext(t *testing.T) {
+func TestCodexDescribeConversationSkipsSystemContext(t *testing.T) {
 	path := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-17T01:00:00Z","cwd":"/tmp"}}`,
 		`{"timestamp":"2026-03-17T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<permissions instructions>sandboxing...</permissions instructions>"}]}}`,
@@ -157,163 +153,58 @@ func TestCodexParseSessionFileSkipsSystemContext(t *testing.T) {
 		`{"timestamp":"2026-03-17T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp\n<INSTRUCTIONS>...</INSTRUCTIONS>"}]}}`,
 		`{"timestamp":"2026-03-17T01:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"What files are in this directory?"}]}}`,
 	)
-	info, _ := NewCodex().ParseSessionFile(path)
+	info, _ := NewCodex().DescribeConversation(path)
 	if info.Title != "What files are in this directory?" {
 		t.Errorf("expected user prompt as title (skipping system context), got %q", info.Title)
 	}
 }
 
-func TestCodexParseSessionFileNoMessages(t *testing.T) {
+func TestCodexDescribeConversationNoMessages(t *testing.T) {
 	path := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-17T01:00:00Z","cwd":"/tmp"}}`,
 	)
-	info, _ := NewCodex().ParseSessionFile(path)
-	if info.Title != "(new)" {
-		t.Errorf("expected '(new)', got %q", info.Title)
+	info, _ := NewCodex().DescribeConversation(path)
+	if info.Title != "" {
+		t.Errorf("expected empty title for a session with no messages, got %q", info.Title)
 	}
 }
 
-func TestCodexParseSessionFileLongTitle(t *testing.T) {
+func TestCodexDescribeConversationLongTitle(t *testing.T) {
 	long := "Please help me with this very long request that goes on and on about many different things and really should be truncated for the sidebar"
 	path := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-17T01:00:00Z","cwd":"/tmp"}}`,
 		`{"timestamp":"2026-03-17T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"`+long+`"}]}}`,
 	)
-	info, _ := NewCodex().ParseSessionFile(path)
+	info, _ := NewCodex().DescribeConversation(path)
 	if len(info.Title) > 85 {
 		t.Errorf("title too long: %q", info.Title)
 	}
 }
 
-func TestCodexParseSessionFileEmpty(t *testing.T) {
+func TestCodexDescribeConversationEmpty(t *testing.T) {
 	path := writeCodexJSONL(t)
-	_, err := NewCodex().ParseSessionFile(path)
+	_, err := NewCodex().DescribeConversation(path)
 	if err == nil {
 		t.Fatal("expected error for empty file")
 	}
 }
 
-func TestCodexParseSessionFileNotSessionMeta(t *testing.T) {
+func TestCodexDescribeConversationNotSessionMeta(t *testing.T) {
 	path := writeCodexJSONL(t,
 		`{"type":"response_item","payload":{"type":"message","role":"user"}}`,
 	)
-	_, err := NewCodex().ParseSessionFile(path)
+	_, err := NewCodex().DescribeConversation(path)
 	if err != errNotSession {
 		t.Errorf("expected errNotSession, got %v", err)
-	}
-}
-
-// --- FileMonitor ---
-
-func TestCodexParseNewLinesCwd(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-19T10:00:00Z","cwd":"/home/user/dev/gmux"}}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d: %v", len(events), events)
-	}
-	if events[0].Cwd != "/home/user/dev/gmux" {
-		t.Errorf("expected cwd '/home/user/dev/gmux', got %q", events[0].Cwd)
-	}
-}
-
-func TestCodexParseNewLinesUserMessage(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the bug"}]}}`,
-		`{"type":"event_msg","payload":{"type":"user_message"}}`,
-	}, "")
-	// Should produce: working status only (title comes from ParseSessionFile on attribution)
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || !events[0].Status.Working {
-		t.Error("expected working=true status")
-	}
-}
-
-func TestCodexParseNewLinesTaskComplete(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"event_msg","payload":{"type":"task_complete"}}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || events[0].Status.Working {
-		t.Error("expected working=false")
-	}
-	if events[0].Unread == nil || !*events[0].Unread {
-		t.Error("expected unread=true on task_complete")
-	}
-}
-
-func TestCodexParseNewLinesTurnAborted(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"event_msg","payload":{"type":"turn_aborted"}}`,
-	}, "")
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || events[0].Status.Working {
-		t.Error("expected working=false on turn_aborted")
-	}
-	// User-initiated cancel: no unread.
-	if events[0].Unread != nil {
-		t.Error("expected unread=nil on turn_aborted (user cancelled)")
-	}
-}
-
-func TestCodexParseNewLinesSkipsSystemContext(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<permissions instructions>sandbox rules</permissions instructions>"}]}}`,
-		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/tmp</cwd></environment_context>"}]}}`,
-		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the bug"}]}}`,
-		`{"type":"event_msg","payload":{"type":"user_message"}}`,
-	}, "")
-	// Should produce: working status only (title comes from ParseSessionFile)
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-	if events[0].Status == nil || !events[0].Status.Working {
-		t.Error("expected working=true status")
-	}
-}
-
-func TestCodexParseNewLinesAgentMessage(t *testing.T) {
-	// agent_message alone should not generate events
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"event_msg","payload":{"type":"agent_message"}}`,
-	}, "")
-	if len(events) != 0 {
-		t.Errorf("expected 0 events for agent_message, got %d", len(events))
-	}
-}
-
-func TestCodexParseNewLinesMultiTurn(t *testing.T) {
-	events := NewCodex().ParseNewLines([]string{
-		`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix it"}]}}`,
-		`{"type":"event_msg","payload":{"type":"user_message"}}`,
-		`{"type":"response_item","payload":{"type":"function_call"}}`,
-		`{"type":"response_item","payload":{"type":"function_call_output"}}`,
-		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}}`,
-		`{"type":"event_msg","payload":{"type":"task_complete"}}`,
-	}, "")
-	// user_message → working, task_complete → idle
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d: %v", len(events), events)
-	}
-	if !events[0].Status.Working {
-		t.Error("first should be working=true")
-	}
-	if events[1].Status.Working {
-		t.Error("second should be working=false")
 	}
 }
 
 // --- Resumer ---
 
 func TestCodexResumeCommand(t *testing.T) {
-	cmd := NewCodex().ResumeCommand(&adapter.SessionFileInfo{
-		ID: "019cf93a-c782-7942-ab76-010c81df6744",
+	cmd := NewCodex().ResumeCommand(&adapter.ConversationInfo{
+		ID:           "019cf93a-c782-7942-ab76-010c81df6744",
+		MessageCount: 1,
 	})
 	expected := []string{"codex", "resume", "019cf93a-c782-7942-ab76-010c81df6744"}
 	if len(cmd) != 3 || cmd[0] != expected[0] || cmd[1] != expected[1] || cmd[2] != expected[2] {
@@ -321,59 +212,33 @@ func TestCodexResumeCommand(t *testing.T) {
 	}
 }
 
-func TestCodexCanResume(t *testing.T) {
+func TestCodexResumeCommandResumability(t *testing.T) {
+	c := NewCodex()
 	valid := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-17T01:00:00Z","cwd":"/tmp"}}`,
 		`{"timestamp":"2026-03-17T01:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`,
 	)
-	if !NewCodex().CanResume(valid) {
-		t.Fatal("should be resumable")
+	info, err := c.DescribeConversation(valid)
+	if err != nil {
+		t.Fatalf("DescribeConversation: %v", err)
+	}
+	if cmd := c.ResumeCommand(info); len(cmd) != 3 {
+		t.Fatalf("should be resumable, got %v", cmd)
 	}
 
 	empty := writeCodexJSONL(t,
 		`{"timestamp":"2026-03-17T01:00:00Z","type":"session_meta","payload":{"id":"abc","timestamp":"2026-03-17T01:00:00Z","cwd":"/tmp"}}`,
 	)
-	if NewCodex().CanResume(empty) {
-		t.Fatal("empty session should not be resumable")
+	info, err = c.DescribeConversation(empty)
+	if err != nil {
+		t.Fatalf("DescribeConversation: %v", err)
 	}
-}
-
-// --- ListSessionFiles ---
-
-func TestCodexListSessionFilesNested(t *testing.T) {
-	// Create a fake date-nested directory structure
-	root := t.TempDir()
-	c := &Codex{}
-
-	// Override root by creating the structure directly
-	dir := filepath.Join(root, "2026", "03", "17")
-	os.MkdirAll(dir, 0755)
-	os.WriteFile(filepath.Join(dir, "rollout-a.jsonl"), []byte("{}"), 0644)
-	os.WriteFile(filepath.Join(dir, "rollout-b.jsonl"), []byte("{}"), 0644)
-
-	dir2 := filepath.Join(root, "2026", "03", "16")
-	os.MkdirAll(dir2, 0755)
-	os.WriteFile(filepath.Join(dir2, "rollout-c.jsonl"), []byte("{}"), 0644)
-	os.WriteFile(filepath.Join(dir2, "not-a-session.txt"), []byte("nope"), 0644)
-
-	// Test the walk function directly since we can't override home dir
-	var files []string
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !d.IsDir() && filepath.Ext(path) == ".jsonl" {
-			files = append(files, path)
-		}
-		return nil
-	})
-
-	if len(files) != 3 {
-		t.Errorf("expected 3 jsonl files, got %d: %v", len(files), files)
+	if cmd := c.ResumeCommand(info); cmd != nil {
+		t.Fatalf("empty session should not be resumable, got %v", cmd)
 	}
-
-	// Verify SessionFileLister is implemented
-	var _ adapter.SessionFileLister = c
+	if cmd := c.ResumeCommand(nil); cmd != nil {
+		t.Fatalf("nil info should not be resumable, got %v", cmd)
+	}
 }
 
 // --- Helpers ---
@@ -426,19 +291,25 @@ func TestExtractCodexUserText(t *testing.T) {
 }
 
 func TestIsCodexSystemContext(t *testing.T) {
-	if !isCodexSystemContext("<permissions instructions>stuff") {
-		t.Error("should detect permissions")
+	for _, context := range []string{
+		"<permissions instructions>stuff</permissions instructions>",
+		"<environment_context>stuff</environment_context>",
+		"# AGENTS.md instructions for /tmp\n<INSTRUCTIONS>stuff</INSTRUCTIONS>",
+		"<turn_aborted>The user aborted</turn_aborted>",
+	} {
+		if !isCodexSystemContext(context) {
+			t.Errorf("should detect complete context %q", context)
+		}
 	}
-	if !isCodexSystemContext("<environment_context>stuff") {
-		t.Error("should detect environment_context")
-	}
-	if !isCodexSystemContext("# AGENTS.md instructions for /tmp") {
-		t.Error("should detect AGENTS.md")
-	}
-	if !isCodexSystemContext("<turn_aborted>The user aborted") {
-		t.Error("should detect turn_aborted")
-	}
-	if isCodexSystemContext("Fix the auth bug") {
-		t.Error("should not flag user text as system context")
+	for _, prompt := range []string{
+		"Fix the auth bug",
+		"<permissions please explain the deployment steps",
+		"<environment_context> is an XML element; explain it",
+		"# AGENTS.md is the heading I want to use",
+		"<turn_aborted> can appear in documentation",
+	} {
+		if isCodexSystemContext(prompt) {
+			t.Errorf("should retain ambiguous user prompt %q", prompt)
+		}
 	}
 }

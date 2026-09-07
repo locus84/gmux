@@ -8,13 +8,13 @@ const MAGENTA = '\x1b[35m'
 const GRAY = '\x1b[90m'
 
 export default {
-  id: 'sess-pi-scroll',
+  id: '1h46pdtl',
   created_at: ago(5),
   command: ['pi'],
   cwd: '/home/user/dev/my-project',
   workspace_root: '/home/user/dev/my-project',
   remotes: { origin: 'github.com/acme/my-project' },
-  kind: 'pi',
+  adapter: 'pi',
   alive: true,
   pid: 44300,
   exit_code: null,
@@ -22,10 +22,11 @@ export default {
   exited_at: null,
   title: 'fix scrollback',
   subtitle: '',
-  status: { label: '', working: false },
+  status: { active: false },
   unread: false,
+  project_slug: 'my-project',
+  last_output_at: ago(4),
   socket_path: '/tmp/gmux-sessions/mock.sock',
-  peer: 'devcontainer',
   terminal: [
     `${GRAY}╭──────────────────────────────────────────────────────╮${RST}`,
     `${GRAY}│${RST} ${BOLD}${MAGENTA}●${RST} ${BOLD}pi${RST} ${DIM}— fix scrollback${RST}${GRAY}                                  │${RST}`,

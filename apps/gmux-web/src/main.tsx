@@ -1,33 +1,44 @@
-import { render } from 'preact'
+import { batch } from '@preact/signals'
+import { Component, type ComponentChildren, Fragment, render } from 'preact'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks'
-import { LocationProvider, Router, Route, lazy, useLocation } from 'preact-iso'
+import { LocationProvider, lazy, Route, Router, useLocation } from 'preact-iso'
 import '@xterm/xterm/css/xterm.css'
 import './styles.css'
 
-import { applyArmedModifiers } from './keyboard'
-import { isTouchDevice } from './touch'
-import { ReplayView } from './replay-view'
-import { TerminalView } from './terminal'
-import { useArrivalPulse } from './use-arrival-pulse'
-import { Sidebar } from './sidebar'
-import { usePresence } from './use-presence'
-
-import type { Session } from './types'
-import { SettingsModal } from './settings'
-import { ProjectHub } from './project-hub'
+import { copyText } from './clipboard'
+import { familyAncestors, familyRoot, familySegments, hasFamily, promotionAction, promotionCopy } from './family'
+import { FamilyDrawer } from './family-drawer'
+import { familyDrawerRoot } from './family-drawer-state'
+import { FamilyIcon } from './family-icon'
+import { FileBrowserView } from './file-browser-view'
+import { fileBrowserPath } from './file-browser'
 import { Home } from './home'
+import { applyArmedModifiers } from './keyboard'
+import { MenuButton } from './menu-button'
 import { installCopySession } from './mock-data/export-session'
-import { installVersionWatch } from './version-watch'
-
+import { ReplayView } from './replay-view'
+import { viewToPath } from './routing'
+import { lifecycleAction } from './session-actions'
+import { SettingsModal } from './settings'
+import { Sidebar } from './sidebar'
 import {
-  sessions, connState, selected, selectedId, view, health, peers,
-  terminalOptions, keybinds, macCommandIsCtrl,
-  unreadCount, keyboardOpen, terminalScrolledUp, terminalScrollToBottom,
-  urlPath, urlSearch,
-  initStore, setNavigate, navigateToSession,
-  dismissSession, resumeSession, restartSession,
-  sessionStaleness,
+  acknowledgePromotionAnnouncement, activityMap, beginPromotion, connState, 
+  dismissSession, familyActivityById, health, 
+  initStore, isPromotionAnnouncementDelivered,keybinds, 
+  keyboardOpen, macCommandIsCtrl,navigate, navigateToSession,peers, projects,promoteSession, promotionAnnouncements,
+  promotionPending, reparentSession,restartSession, resumeSession, selected, selectedId, sessionDotState, 
+  sessionStaleness, 
+  sessions, setNavigate, settlePromotion, tabHref,terminalFindOpen, 
+  terminalOptions, terminalScrolledUp, terminalScrollToBottom,urlHash,
+  urlPath, urlSearch, view, 
 } from './store'
+import { TerminalView } from './terminal'
+import { ToastHost } from './toast-host'
+import { pushError } from './toasts'
+import { isTouchDevice } from './touch'
+import type { Session } from './types'
+import { usePresence } from './use-presence'
+import { installVersionWatch } from './version-watch'
 
 // Lazy-loaded routes (code-split, not bundled with the main app)
 const InputDiagnostics = lazy(() => import('./input-diagnostics'))
@@ -45,13 +56,38 @@ const KEYBOARD_PRESENCE_PX = 60
 // Mock mode: hide close buttons and other interactive chrome via CSS.
 if (USE_MOCK) document.documentElement.classList.add('mock-mode')
 
+// Scrollbar flavor: platforms with overlay scrollbars keep them native
+// (styles.css only declares color-scheme so they render dark); hosts
+// whose classic scrollbars consume layout space get the slim custom
+// skin instead. No CSS can tell the two apart, so measure once: a
+// classic scrollbar eats into a probe's client width, an overlay one
+// doesn't. Runs before render, so nothing repaints under the class.
+{
+  const probe = document.createElement('div')
+  probe.style.cssText = 'position:absolute;top:-9999px;width:100px;height:100px;overflow:scroll'
+  document.body.appendChild(probe)
+  if (probe.offsetWidth - probe.clientWidth > 0)
+    document.documentElement.classList.add('classic-scrollbars')
+  probe.remove()
+}
+
 // Debug: __gmuxCopySession() in devtools console
 installCopySession()
+// Debug: whole store namespace for console poking in mock mode.
+if (USE_MOCK) {
+  import('./store').then(m => { (window as unknown as Record<string, unknown>).__store = m })
+}
 
 // Auto-reload when the bundle goes stale relative to the daemon.
 // Mock mode is offline-only and the daemon version is fixed, so the
 // watcher is pointless there and would risk masking real bugs.
 if (!USE_MOCK) installVersionWatch()
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(err => console.warn('service worker registration failed:', err))
+  })
+}
 
 // Disable pinch-to-zoom app-wide. This is a terminal, not a document;
 // page zoom only breaks the layout. iOS Safari ignores user-scalable=no
@@ -62,12 +98,121 @@ for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
   document.addEventListener(type, e => e.preventDefault(), { passive: false })
 }
 
+// ── Error boundary ──
+
+const GITHUB_ISSUES_URL = 'https://github.com/gmuxapp/gmux/issues/new'
+const DISCORD_URL = 'https://discord.gg/Mg6EJHFZxu'
+
+/** Build a copyable crash report. Mirrors input-diagnostics' buildReport:
+ *  environment first, then the error + stacks. The `gmux` version comes
+ *  from the last health snapshot (may be unknown if we crashed before it
+ *  arrived). */
+function buildCrashReport(err: unknown, componentStack?: string): string {
+  const lines: string[] = []
+  lines.push('=== gmux Crash Report ===')
+  lines.push(`Date: ${new Date().toISOString()}`)
+  lines.push(`gmux: ${health.value?.version ?? 'unknown'}`)
+  lines.push(`URL: ${location.pathname}${location.search}`)
+  lines.push(`User-Agent: ${navigator.userAgent}`)
+  lines.push('')
+  lines.push(`Error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`)
+  if (err instanceof Error && err.stack) {
+    lines.push('Stack:')
+    lines.push(err.stack)
+  }
+  if (componentStack) {
+    lines.push('Component stack:')
+    lines.push(componentStack.trim())
+  }
+  lines.push('=== End Report ===')
+  return lines.join('\n')
+}
+
+// A thrown render error used to white-screen the whole app with nothing
+// in the UI. This catches it (render-phase throws only — async/event
+// failures go through toasts instead), shows a recoverable fallback with
+// a copyable crash report + report links, and pushes an error toast.
+// Preact supports componentDidCatch / getDerivedStateFromError on class
+// components.
+class ErrorBoundary extends Component<
+  { children: ComponentChildren },
+  { failed: boolean; report: string; copied: boolean }
+> {
+  state = { failed: false, report: '', copied: false }
+
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+
+  componentDidCatch(err: unknown, info: { componentStack?: string }) {
+    console.error('render error caught by boundary:', err)
+    pushError(`Something broke: ${err instanceof Error ? err.message : 'render error'}`)
+    this.setState({ report: buildCrashReport(err, info?.componentStack) })
+  }
+
+  copyReport = async () => {
+    if (await copyText(this.state.report)) this.setState({ copied: true })
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <div class="state-message crash-fallback">
+          <div class="state-icon" style={{ color: 'var(--status-error)' }}>⚠</div>
+          <div class="state-title">Something broke</div>
+          <div class="state-subtitle">
+            gmux hit an unexpected error and couldn't render this view.
+          </div>
+          <div class="crash-report-links">
+            Please report it so we can fix it:{' '}
+            <a href={GITHUB_ISSUES_URL} target="_blank" rel="noreferrer">GitHub Issues</a>
+            {' · '}
+            <a href={DISCORD_URL} target="_blank" rel="noreferrer">Discord</a>
+          </div>
+          <pre class="crash-report">{this.state.report}</pre>
+          <div class="crash-actions">
+            <button class="btn" onClick={this.copyReport}>
+              {this.state.copied ? 'Copied!' : 'Copy report'}
+            </button>
+            <button class="btn btn-primary" onClick={() => location.reload()}>
+              Reload
+            </button>
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 // ── Components ──
 
-function MainHeader({ session, onRestart }: {
+function MainHeader({ session, onRestart, onResume, resuming }: {
   session: Session | null
   onRestart?: () => void
+  onResume?: (id: string) => void
+  resuming?: boolean
 }) {
+  const familyTriggerRef = useRef<HTMLButtonElement>(null)
+  const showFamily = session ? hasFamily(session, sessions.value) : false
+  const rootId = session && showFamily ? familyRoot(session, sessions.value).id : null
+  // Open-ness is a comparison, not stored state: the drawer shows while
+  // the selected session belongs to the family named in the signal.
+  const familyOpen = rootId !== null && familyDrawerRoot.value === rootId
+  const closeFamily = useCallback(() => { familyDrawerRoot.value = null }, [])
+  // Leaving the family closes its drawer — otherwise returning later
+  // would pop it back open. Keyed to what the header *is* (its session
+  // and that session's family), never to the signal: a sidebar press on
+  // another family writes the signal before navigating, and that moment
+  // moves neither dependency, so the press survives the trip. Anything
+  // that genuinely moves the header — navigation, or a reparent that
+  // changes this session's root under it — settles the signal here.
+  useEffect(() => {
+    if (familyDrawerRoot.value !== null && familyDrawerRoot.value !== rootId) {
+      familyDrawerRoot.value = null
+    }
+  }, [session?.id, rootId])
+
   if (!session) {
     return (
       <div class="main-header">
@@ -78,40 +223,128 @@ function MainHeader({ session, onRestart }: {
     )
   }
 
-  const shortCwd = session.cwd.replace(/^\/home\/[^/]+/, '~')
-
   return (
     <div class={`main-header ${keyboardOpen.value ? 'keyboard-collapsed' : ''}`}>
       <div class="main-header-left">
+        {showFamily && (
+          <FamilyTrigger
+            session={session}
+            open={familyOpen}
+            triggerRef={familyTriggerRef}
+            onToggle={() => { familyDrawerRoot.value = familyOpen ? null : rootId }}
+          />
+        )}
+        {showFamily && <HeaderCrumbs session={session} />}
         <div class="main-header-title">
           {session.title}
         </div>
-        <div class="main-header-meta">
-          <span class="main-header-cwd">{shortCwd}</span>
-        </div>
       </div>
       <div class="main-header-right">
-        {session.status?.label && (
-          <div class={`main-header-status ${session.status.error ? 'error' : session.status.working ? 'working' : ''}`}>
-            <span
-              class={`session-dot ${session.status.error ? 'error' : session.status.working ? 'working' : 'idle'}`}
-              style={{ width: 5, height: 5 }}
-            />
-            {session.status.label}
-          </div>
-        )}
-        <SessionMenu session={session} onRestart={onRestart} />
+        <SessionMenu session={session} onRestart={onRestart} onResume={onResume} resuming={resuming} />
       </div>
+      {showFamily && familyOpen && (
+        <FamilyDrawer selected={session} onClose={closeFamily} triggerRef={familyTriggerRef} />
+      )}
     </div>
   )
 }
 
-function SessionMenu({ session, onRestart }: {
+/** The family panel's trigger: a pill wearing the standard family
+ * summary segments — `familySegments` over `familyActivityById`, exactly
+ * the same derivation and display order as the sidebar's line. The panel
+ * reuses the agent segments and turns the running segment into its broader
+ * process-history control. Nothing here depends on which session you are
+ * viewing: the count is a fact about the family, not the viewport. A
+ * family with nothing to report shows the tree icon instead; no count
+ * with it, because the segments' numbers are news and a quiet family
+ * has none. */
+function FamilyTrigger({ session, open, triggerRef, onToggle }: {
+  session: Session
+  open: boolean
+  triggerRef: { current: HTMLButtonElement | null }
+  onToggle: () => void
+}) {
+  const rootId = familyRoot(session, sessions.value).id
+  const segments = familySegments(familyActivityById.value.get(rootId))
+  return (
+    <button
+      ref={triggerRef}
+      class="family-trigger"
+      type="button"
+      aria-label="Session family"
+      title="Session family"
+      aria-expanded={open}
+      aria-controls="agent-family-drawer"
+      onClick={onToggle}
+    >
+      {segments.length > 0
+        ? segments.map(segment => (
+          <span key={segment.state} class="family-trigger-seg">
+            {segment.dot
+              ? <span class={`session-dot-indicator ${segment.dot}`} aria-hidden="true" />
+              : <span class="family-trigger-proc" aria-hidden="true">$</span>}
+            {segment.count}
+          </span>
+        ))
+        : <FamilyIcon class="family-trigger-icon" />}
+    </button>
+  )
+}
+
+/** Ancestor breadcrumbs in the title row: `●root › ●parent › title`. Each
+ * crumb is a live-dotted ghost link; the current session is the plain bold
+ * title that follows. Depth > 3 collapses the middle to a static `…` — the
+ * panel still shows the full structure. */
+function HeaderCrumbs({ session }: { session: Session }) {
+  const ancestors = familyAncestors(session, sessions.value)
+  if (ancestors.length === 0) return null
+  const shown: (Session | null)[] = ancestors.length > 3
+    ? [ancestors[0], null, ancestors[ancestors.length - 1]]
+    : [...ancestors]
+  const am = activityMap.value
+  return (
+    <nav class="header-crumbs" aria-label="Ancestor agents">
+      {shown.map((ancestor) => {
+        const dot = ancestor ? sessionDotState(ancestor, am) : 'none'
+        return (
+          <Fragment key={ancestor?.id ?? 'gap'}>
+            {ancestor
+              ? (
+                <a class="header-crumb" href={sessionHref(ancestor)}>
+                  {/* The sidebar's `none` dot is an invisible placeholder
+                    * that holds a column; a crumb has no column, so a
+                    * quiet ancestor would just wear a permanent hole
+                    * where its dot should be. */}
+                  {dot !== 'none' && <span class={`session-dot-indicator ${dot}`} aria-hidden="true" />}
+                  <span class="header-crumb-title">{ancestor.title}</span>
+                </a>
+              )
+              : <span class="header-crumb-gap" title="More ancestors in the family panel">…</span>}
+            <span class="header-crumb-sep" aria-hidden="true">›</span>
+          </Fragment>
+        )
+      })}
+    </nav>
+  )
+}
+
+function sessionHref(session: Session): string | undefined {
+  const path = viewToPath({ kind: 'session', sessionId: session.id }, projects.value, sessions.value)
+  return path ? tabHref(path) : undefined
+}
+
+function SessionMenu({ session, onRestart, onResume, resuming }: {
   session: Session
   onRestart?: () => void
+  onResume?: (id: string) => void
+  resuming?: boolean
 }) {
   const [open, setOpen] = useState(false)
+  // Copy feedback for the ID row; the trigger resets it on open, so a
+  // reopened menu offers the copy fresh instead of a stale check.
+  const [copied, setCopied] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
   const healthVal = health.value
 
   // For remote sessions, compare against the peer's version (not the local
@@ -125,18 +358,34 @@ function SessionMenu({ session, onRestart }: {
     : healthVal
   const staleKind = sessionStaleness(session, compareTarget)
 
-  // Close on outside click or Escape.
-  useEffect(() => {
+  // Close on outside press or Escape. pointerdown rather than mousedown:
+  // the terminal cancels the synthesized mouse cascade on its touch
+  // gestures, so a tap into the terminal would otherwise leave this menu
+  // open on top of it (see FamilyDrawer for the same fix).
+  //
+  // useLayoutEffect, not useEffect: a passive effect is deferred to a later
+  // task, so a fast keyboard user's very first Escape after opening could
+  // arrive before the listener existed and leave the menu stranded open.
+  // The layout effect attaches synchronously with the commit that mounts
+  // the dropdown, so no keystroke can slip through the gap.
+  useLayoutEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    const onClick = (e: MouseEvent) => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      setOpen(false)
+      // A keyboard user may have tabbed into the dropdown; closing unmounts
+      // the focused item and would strand focus on <body>. Same convention
+      // as FamilyDrawer's Escape: hand focus back to the trigger.
+      triggerRef.current?.focus()
+    }
+    const onPointerDown = (e: PointerEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false)
     }
     document.addEventListener('keydown', onKey)
-    document.addEventListener('mousedown', onClick)
+    document.addEventListener('pointerdown', onPointerDown)
     return () => {
       document.removeEventListener('keydown', onKey)
-      document.removeEventListener('mousedown', onClick)
+      document.removeEventListener('pointerdown', onPointerDown)
     }
   }, [open])
 
@@ -146,37 +395,156 @@ function SessionMenu({ session, onRestart }: {
       ? session.binary_hash.slice(0, 8)
       : 'unknown'
 
-  const hasActions = session.alive && onRestart
+  // Find works whenever the live terminal is mounted, i.e. the session is
+  // alive. This is the touch path to the find bar (no hardware keyboard
+  // for the secondary+F keybind).
+  const canFind = session.alive
+
+  // One lifecycle action per state (Restart alive, Resume/Rerun dead).
+  // The menu is where muscle memory expects it in both states; for dead
+  // sessions the same action is deliberately mirrored as the primary
+  // button in ReplayView's action bar.
+  const action = lifecycleAction(session, resuming)
+  const actionHandler = action?.id === 'restart' ? onRestart
+    : action?.id === 'resume' && onResume ? () => onResume(session.id)
+    : undefined
+  const showStale = action?.id === 'restart' && !!staleKind
+
+  // Presentation promotion (ADR 0026 §8). Eligibility mirrors the family
+  // projection's own edge rule and is null for peer-projected sessions, so
+  // the menu never offers a mutation the daemon would refuse. The `⋮` menu
+  // is deliberately the only surface carrying these verbs: it exists for
+  // every session view (desktop and mobile, alive and dead), and a promoted
+  // session — no longer a family member — has no family panel to demote from.
+  const promotion = promotionAction(session, sessions.value, projects.value)
+  // In-flight guard: the menu closes on activation, but reopening it before
+  // the authoritative snapshot lands would offer the same verb again — a
+  // second POST per click (reproduced in e2e). The entry lives in the
+  // module-level map (survives navigation), is keyed by session, and speaks
+  // only for the action kind it started: once the snapshot flips the offered
+  // action, the entry is spent. Failures settle their own generation — and
+  // nobody else's — re-arming the item beside the failure toast.
+  const pendingEntry = promotionPending.value.get(session.id)
+  const promotionInFlight = !!promotion && pendingEntry?.kind === promotion.kind
+  const promotionBlocked = promotion?.blocked !== undefined
+  const promotionWords = promotion ? promotionCopy(promotion, promotionInFlight) : null
 
   return (
     <div class="session-menu" ref={menuRef}>
       <button
+        ref={triggerRef}
         class={`session-menu-trigger${staleKind ? ' stale' : ''}`}
-        onClick={() => setOpen(!open)}
+        onClick={() => { if (!open) setCopied(false); setOpen(!open) }}
         title="Session actions"
+        // The visible content is a bare "⋮" glyph, which is also what a
+        // screen reader would announce without this (every other icon
+        // button in the app carries its name the same way).
+        aria-label="Session actions"
         aria-expanded={open}
+        aria-controls="session-menu-dropdown"
       >
         <span class="session-menu-icon">⋮</span>
         {staleKind && <span class="session-menu-badge" />}
       </button>
+      {/* Pending/success status for promote/demote. Lives outside the
+        * dropdown so it survives the close-on-activation, and is sr-only:
+        * sighted feedback is the sidebar row moving / the reopened item's
+        * busy label. Failures are deliberately absent — the error toast's
+        * live region already announces those once. */}
       {open && (
-        <div class="session-menu-dropdown">
-          {hasActions && (
-            <>
-              <button
-                class={`session-menu-action${staleKind ? ' stale' : ''}`}
-                onClick={() => { setOpen(false); onRestart!() }}
-              >
-                Restart session
-                {staleKind && <span class="session-menu-action-tag">outdated</span>}
-              </button>
-              <div class="session-menu-divider" />
-            </>
+        <div class="session-menu-dropdown" id="session-menu-dropdown">
+          {canFind && (
+            <button
+              class="session-menu-action"
+              onClick={() => { setOpen(false); terminalFindOpen.value = true }}
+            >
+              Find in terminal
+            </button>
           )}
+          <button
+            class="session-menu-action"
+            onClick={() => {
+              setOpen(false)
+              navigate(fileBrowserPath(session.id))
+            }}
+          >
+            Browse files
+          </button>
+          {promotion && promotionWords && (
+            <button
+              class="session-menu-action session-menu-promotion"
+              disabled={promotionInFlight}
+              aria-disabled={promotionBlocked ? 'true' : undefined}
+              aria-describedby={promotionWords.note ? 'session-promotion-note' : undefined}
+              onClick={e => {
+                if (promotionInFlight || promotionBlocked) {
+                  e.preventDefault()
+                  return
+                }
+                setOpen(false)
+                // Focus back to the trigger: the activated item unmounts with
+                // the dropdown, and a keyboard user shouldn't land on <body>.
+                triggerRef.current?.focus()
+                const id = session.id
+                const targetParent = promotion.kind === 'promote' ? null : promotion.parent.id
+                const seq = beginPromotion(id, promotion.kind, targetParent)
+                void (promotion.kind === 'promote'
+                  ? promoteSession(id)
+                  : reparentSession(id, targetParent, 'Return to family')
+                ).then(ok => {
+                  // Rejection re-arms exactly the entry this request created
+                  // (generation-checked), beside its failure toast; success
+                  // leaves the entry until the snapshot's kind flip spends it.
+                  if (!ok) settlePromotion(id, seq)
+                })
+              }}
+            >
+              {promotionWords.label}
+              {promotionWords.note && (
+                <span id="session-promotion-note" class="session-menu-action-note">{promotionWords.note}</span>
+              )}
+            </button>
+          )}
+          {/* Lifecycle last: Restart/Resume is the heaviest verb here, and a
+            * fixed bottom slot keeps it out of the muscle-memory path of the
+            * lighter actions above. */
+          }
+          {action && actionHandler && (
+            <button
+              class={`session-menu-action${showStale ? ' stale' : ''}`}
+              disabled={action.disabled}
+              onClick={() => { setOpen(false); actionHandler() }}
+            >
+              {action.label}
+              {showStale && <span class="session-menu-action-tag">outdated</span>}
+            </button>
+          )}
+          <div class="session-menu-divider" />
           <div class="session-menu-section-title">Session info</div>
           <div class="session-menu-row">
+            <span class="session-menu-label">ID</span>
+            <span class="session-menu-value session-menu-id">
+              {session.id}
+              <button
+                class="session-menu-copy"
+                aria-label="Copy session ID"
+                title="Copy session ID"
+                onClick={() => {
+                  // The check reports the write, not the wish: over plain
+                  // http the async API is missing entirely.
+                  void copyText(session.id).then(ok => { if (ok) setCopied(true) })
+                }}
+              >
+                {copied ? <IconCheck /> : <IconCopy />}
+              </button>
+            </span>
+          </div>
+          <div class="session-menu-row">
             <span class="session-menu-label">Adapter</span>
-            <span class="session-menu-value">{session.kind}</span>
+            <span class="session-menu-value">
+              {session.adapter}
+              {session.drive_mode === 'acp' ? ' (acp)' : ''}
+            </span>
           </div>
           <div class="session-menu-row">
             <span class="session-menu-label">Version</span>
@@ -196,6 +564,18 @@ function SessionMenu({ session, onRestart }: {
   )
 }
 
+const IconCopy = () => (
+  <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round">
+    <rect x="4.5" y="4.5" width="7" height="7" rx="1.5" />
+    <path d="M9.5 3V2.5A1.5 1.5 0 0 0 8 1H3.5A1.5 1.5 0 0 0 2 2.5V8a1.5 1.5 0 0 0 1.5 1.5H3" />
+  </svg>
+)
+const IconCheck = () => (
+  <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 7.5 5.5 10.5 11.5 3.5" />
+  </svg>
+)
+
 // ── Mobile nav icons ─────────────────────────────────────────────────────────
 
 const S = { fill: 'none', stroke: 'currentColor', 'stroke-width': '1.4', 'stroke-linecap': 'round' as const, 'stroke-linejoin': 'round' as const }
@@ -209,6 +589,7 @@ const IconWordLeft  = () => <svg viewBox="0 0 18 14" width="20" height="16" {...
 const IconWordRight = () => <svg viewBox="0 0 18 14" width="20" height="16" {...S}><line x1="14.5" y1="3" x2="14.5" y2="11"/><path d="M5 7h7m0 0-3-3m3 3-3 3"/></svg>
 const IconSend = () => <svg viewBox="0 0 14 14" width="16" height="16" fill="currentColor" stroke="none"><path d="M3 2.5l8 4.5-8 4.5V8.5L7.5 7 3 5.5z"/></svg>
 const IconEnd = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M7 2v7m0 0-3-3m3 3 3-3"/><path d="M3.5 12h7"/></svg>
+const IconAttach = () => <svg viewBox="0 0 14 14" width="16" height="16" {...S}><path d="M5 7.5 8.8 3.7a2 2 0 0 1 2.8 2.8l-5 5a3 3 0 0 1-4.2-4.2l5.2-5.2"/><path d="M9.5 5 4.3 10.2a1 1 0 0 1-1.4-1.4L7.7 4"/></svg>
 
 // Press-and-hold auto-repeat for the navigation keys: fire once on press,
 // then after a short delay repeat until release. Arrows repeat briskly;
@@ -248,32 +629,34 @@ function MobileTerminalBar({
   canSend,
   ctrlArmed,
   altArmed,
+  shiftArmed,
   onMenu,
   onSend,
+  onPaste,
+  onAttachFile,
   onToggleCtrl,
   onToggleAlt,
+  onToggleShift,
   onCtrlConsumed,
   onAltConsumed,
+  onShiftConsumed,
 }: {
   canSend: boolean
   ctrlArmed: boolean
   altArmed: boolean
+  shiftArmed: boolean
   onMenu: () => void
   onSend: (data: string) => void
+  onPaste: () => void
+  onAttachFile: (file: File) => void
   onToggleCtrl: () => void
   onToggleAlt: () => void
+  onToggleShift: () => void
   onCtrlConsumed: () => void
   onAltConsumed: () => void
+  onShiftConsumed: () => void
 }) {
-  // Read signals directly; no props needed for these. The hamburger
-  // badge surfaces only the waiting (unread) state — working/active are
-  // deliberately omitted. unreadCount excludes the selected session and
-  // its value re-fires the arrival pulse when another session starts
-  // waiting.
-  const waitingCount = unreadCount.value
-  const waiting = waitingCount > 0
-  const arrival = useArrivalPulse(waiting ? 'unread' : 'none', waitingCount)
-
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // Don't steal focus from the terminal: a control tap leaves the
   // keyboard exactly as it is (open or closed). Bytes reach the PTY via
   // the raw input channel (onSend), independent of DOM focus, so every
@@ -281,14 +664,13 @@ function MobileTerminalBar({
   // is the whole point of arrows/esc being reachable while navigating.
   const keepFocus = (ev: Event) => ev.preventDefault()
 
-  // Modifier-aware send: the toolbar writes through the raw input
-  // channel (bypassing the arm logic in sendInput), so armed ctrl/alt
-  // are encoded here. Consumes whichever arms were actually applied.
-  // ctrl+esc / ctrl+↑ / alt+esc all encode correctly via CSI-u.
+  // Toolbar keys bypass TerminalView's arm logic, so compose and consume the
+  // same one-shot modifiers here before writing through the raw channel.
   const sendKey = (seq: string) => {
-    const r = applyArmedModifiers(seq, ctrlArmed, altArmed)
+    const r = applyArmedModifiers(seq, ctrlArmed, altArmed, shiftArmed)
     if (r.ctrlApplied && ctrlArmed) onCtrlConsumed()
     if (r.altApplied) onAltConsumed()
+    if (r.shiftApplied) onShiftConsumed()
     onSend(r.seq)
   }
 
@@ -296,9 +678,10 @@ function MobileTerminalBar({
   // regardless of armed state, fold in an armed alt (→ ctrl+alt+arrow),
   // and consume both arms so neither leaks to the next key.
   const sendWord = (arrow: string) => {
-    const r = applyArmedModifiers(arrow, true, altArmed)
+    const r = applyArmedModifiers(arrow, true, altArmed, shiftArmed)
     if (ctrlArmed) onCtrlConsumed()
     if (r.altApplied) onAltConsumed()
+    if (r.shiftApplied) onShiftConsumed()
     onSend(r.seq)
   }
 
@@ -307,40 +690,84 @@ function MobileTerminalBar({
 
   // The bar is a CSS grid laid out via named areas (.mk-* → grid-area), so the
   // DOM order below is only tab/reading order — the visual arrangement lives
-  // in styles.css. Narrow phones get a 7×2 grid (empty top-left corner;
+  // in styles.css. Narrow phones get a 7×2 grid (Esc sits above the hamburger;
   // scroll-end or empty top-right). Wider viewports (landscape / tablets)
   // collapse to a single row, and the widest step folds the word-jumps back
   // in. Keys never relabel; ctrl/alt only arm + highlight.
   const armedClass = (armed: boolean) => `mobile-bottom-action${armed ? ' armed' : ''}`
+  const chooseFile = () => fileInputRef.current?.click()
+  const handleFileChange = (event: Event) => {
+    const input = event.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    input.value = ''
+    if (file) onAttachFile(file)
+  }
 
   return (
     <div class="mobile-bottom-bar" role="toolbar" aria-label="Terminal keys" onMouseDown={keepFocus}>
-      <button
-        class={`mobile-bottom-action menu-btn mk-menu${waiting ? ' bg-waiting' : ''}${arrival ? ` bg-${arrival}` : ''}`}
-        onClick={() => {
-          // Dismiss the on-screen keyboard when opening the menu. keepFocus
-          // holds focus on the textarea through pointerdown, so it's still
-          // the active element here; blurring it slides the keyboard away.
-          (document.activeElement as HTMLElement | null)?.blur()
-          onMenu()
-        }}
-        title="Open sessions"
-      ><span class="mkey-face">☰</span></button>
-      <button class="mobile-bottom-action mk-esc" disabled={!canSend} onClick={() => sendKey('\x1b')} title="Escape"><span class="mkey-face">esc</span></button>
-      <button class="mobile-bottom-action mk-tab" disabled={!canSend} onClick={() => sendKey('\t')} title="Tab"><span class="mkey-face">tab</span></button>
+      <MenuButton variant="bar" onMenu={onMenu} />
+      <button class="mobile-bottom-action mk-esc" disabled={!canSend} aria-label="Escape" onClick={() => sendKey('\x1b')} title="Escape"><span class="mkey-face">esc</span></button>
+      <button class={`${armedClass(shiftArmed)} mk-shift-tab`} disabled={!canSend} aria-label="Shift modifier" aria-pressed={shiftArmed} onClick={onToggleShift} title={shiftArmed ? 'Shift armed for next key' : 'Arm Shift'}><span class="mkey-face">shift</span></button>
+      <button class="mobile-bottom-action mk-tab" disabled={!canSend} aria-label="Tab" onClick={() => sendKey('\t')} title="Tab"><span class="mkey-face">tab</span></button>
       <button class={`${armedClass(ctrlArmed)} mk-ctrl`} disabled={!canSend} aria-pressed={ctrlArmed} onClick={onToggleCtrl} title={ctrlArmed ? 'Ctrl armed for next key' : 'Arm Ctrl'}><span class="mkey-face">ctrl</span></button>
       <button class={`${armedClass(altArmed)} mk-alt`} disabled={!canSend} aria-pressed={altArmed} onClick={onToggleAlt} title={altArmed ? 'Alt armed for next key' : 'Arm Alt'}><span class="mkey-face">alt</span></button>
       <button class="mobile-bottom-action mk-wl" disabled={!canSend} {...repeat(() => sendWord('\x1b[D'), WORD_REPEAT_MS)} title="Word left"><span class="mkey-face"><IconWordLeft /></span></button>
       <button class="mobile-bottom-action mk-al" disabled={!canSend} {...repeat(() => sendKey('\x1b[D'), ARROW_REPEAT_MS)} title="Left arrow"><span class="mkey-face"><IconLeft /></span></button>
-      <button class="mobile-bottom-action mk-ad" disabled={!canSend} {...repeat(() => sendKey('\x1b[B'), ARROW_REPEAT_MS)} title="Down arrow"><span class="mkey-face"><IconDown /></span></button>
       <button class="mobile-bottom-action mk-au" disabled={!canSend} {...repeat(() => sendKey('\x1b[A'), ARROW_REPEAT_MS)} title="Up arrow"><span class="mkey-face"><IconUp /></span></button>
+      <button class="mobile-bottom-action mk-ad" disabled={!canSend} {...repeat(() => sendKey('\x1b[B'), ARROW_REPEAT_MS)} title="Down arrow"><span class="mkey-face"><IconDown /></span></button>
       <button class="mobile-bottom-action mk-ar" disabled={!canSend} {...repeat(() => sendKey('\x1b[C'), ARROW_REPEAT_MS)} title="Right arrow"><span class="mkey-face"><IconRight /></span></button>
       <button class="mobile-bottom-action mk-wr" disabled={!canSend} {...repeat(() => sendWord('\x1b[C'), WORD_REPEAT_MS)} title="Word right"><span class="mkey-face"><IconWordRight /></span></button>
+      <button class="mobile-bottom-action mk-paste" disabled={!canSend} onClick={onPaste} title="Paste clipboard" aria-label="Paste clipboard"><span class="mkey-face">paste</span></button>
       {terminalScrolledUp.value && (
         <button class="mobile-bottom-action mk-end" onClick={() => terminalScrollToBottom.value?.()} title="Scroll to bottom"><span class="mkey-face"><IconEnd /></span></button>
       )}
+      <button class={`mobile-bottom-action mk-attach${terminalScrolledUp.value ? ' scroll-end-visible' : ''}`} disabled={!canSend} onClick={chooseFile} title="Attach file"><span class="mkey-face"><IconAttach /></span></button>
+      <input ref={fileInputRef} class="mobile-attach-input" type="file" onChange={handleFileChange} />
       <button class="mobile-bottom-action send-btn mk-send" disabled={!canSend} onClick={() => sendKey('\r')} title={altArmed ? 'Send Alt+Enter' : 'Send'}><span class="mkey-face"><IconSend /></span></button>
     </div>
+  )
+}
+
+// ── Promotion status ──
+
+/** Stable announcement host: unlike SessionMenu, this survives the selected
+ * session's route/header remount during a promote or demote snapshot. The
+ * store owns reconciliation; this component owns only one screen-reader
+ * delivery, keyed by session and request token. */
+function PromotionAnnouncementHost() {
+  const id = selectedId.value
+  const pending = id ? promotionPending.value.get(id) : undefined
+  const announcement = id ? promotionAnnouncements.value.get(id) : undefined
+  const [message, setMessage] = useState('')
+  const lastSessionIdRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!id) {
+      // URL replacement can transiently clear selectedId while the session
+      // remains the same. Keep that identity so its already-delivered result
+      // can survive the route remount without being re-announced.
+      setMessage('')
+      return
+    }
+    const sameSession = lastSessionIdRef.current === id
+    lastSessionIdRef.current = id
+    if (pending) {
+      setMessage(pending.kind === 'promote' ? 'Promoting to root…' : 'Returning to family…')
+      return
+    }
+    if (announcement) {
+      const delivered = isPromotionAnnouncementDelivered(id, announcement.seq)
+      if (!delivered || sameSession) setMessage(announcement.message)
+      if (!delivered) acknowledgePromotionAnnouncement(id, announcement.seq)
+      return
+    }
+    setMessage('')
+  }, [id, pending?.kind, pending?.seq, announcement?.seq])
+
+  return (
+    <span class="sr-only" data-promotion-status role="status" aria-live="polite" aria-atomic="true">
+      {message}
+    </span>
   )
 }
 
@@ -416,12 +843,31 @@ function App() {
   // useLayoutEffect ensures urlPath updates before paint, so the view
   // computed reacts before the browser renders a stale frame.
   useLayoutEffect(() => {
-    urlPath.value = loc.path
-    // Derive the query string from loc.url (path+search) so query-only
-    // navigations (?project=, ?cwd=) reactively re-filter sessions.
-    const q = loc.url.indexOf('?')
-    urlSearch.value = q >= 0 ? loc.url.slice(q) : ''
+    // Publish one coherent location snapshot so repair effects cannot run
+    // against a new path with the previous entry's query or fragment. Read
+    // search/hash from the browser's parsed location: preact-iso's `loc.url`
+    // is not consistent about retaining fragments across initial and SPA
+    // navigation, and fragments must never be fed to URLSearchParams.
+    batch(() => {
+      urlPath.value = loc.path
+      urlSearch.value = location.search
+      urlHash.value = location.hash
+    })
   }, [loc.url])
+
+  useEffect(() => {
+    const sessionId = new URLSearchParams(urlSearch.value).get('notificationSession')
+    if (sessionId) navigateToSession(sessionId, true)
+  }, [loc.url, sessions.value, projects.value])
+
+  // Preact-iso routes path/query changes but deliberately ignores hash-only
+  // navigation. Keep the fragment signal current for native hash links and
+  // hash-only Back/Forward entries as well.
+  useEffect(() => {
+    const syncHash = () => { urlHash.value = location.hash }
+    window.addEventListener('hashchange', syncHash)
+    return () => window.removeEventListener('hashchange', syncHash)
+  }, [])
 
   // Settings modal is driven by the `?settings` query param rather than
   // local state, so it's deep-linkable and shareable. It's read off the
@@ -438,13 +884,13 @@ function App() {
     // doesn't stack a duplicate history entry that Back has to clear.
     const alreadyActive = params.get('settings') === tab
     params.set('settings', tab)
-    loc.route(`${loc.path}?${params.toString()}`, replace || alreadyActive)
+    navigate(`${loc.path}?${params.toString()}${location.hash}`, replace || alreadyActive)
   }, [loc])
   const closeSettings = useCallback(() => {
     const params = new URLSearchParams(location.search)
     params.delete('settings')
     const qs = params.toString()
-    loc.route(qs ? `${loc.path}?${qs}` : loc.path, true)
+    navigate((qs ? `${loc.path}?${qs}` : loc.path) + location.hash, true)
   }, [loc])
 
   // Initialize the store (SSE, data fetching, effects).
@@ -454,8 +900,11 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [ctrlArmed, setCtrlArmed] = useState(false)
   const [altArmed, setAltArmed] = useState(false)
+  const [shiftArmed, setShiftArmed] = useState(false)
 
   const terminalInputRef = useRef<((data: string) => void) | null>(null)
+  const terminalAttachFileRef = useRef<((file: File) => void) | null>(null)
+  const terminalPasteRef = useRef<(() => void) | null>(null)
   const terminalFocusRef = useRef<(() => void) | null>(null)
 
   // Read signals.
@@ -479,9 +928,12 @@ function App() {
 
   const handleResume = useCallback((id: string) => {
     setResumingId(id)
-    resumeSession(id).catch(err => {
-      console.error('resume failed:', err)
-      setResumingId(prev => prev === id ? null : prev)
+    // resumeSession never rejects (postAction converts failures to false
+    // and surfaces the toast itself); branch on the boolean to clear the
+    // "resuming…" spinner immediately on rejection instead of letting it
+    // linger until the 10s timeout.
+    void resumeSession(id).then(ok => {
+      if (!ok) setResumingId(prev => prev === id ? null : prev)
     })
   }, [])
 
@@ -491,6 +943,7 @@ function App() {
     setResumingId(null)
     setCtrlArmed(false)
     setAltArmed(false)
+    setShiftArmed(false)
     // Don't auto-open the keyboard on touch when switching sessions.
     if (!isTouchDevice()) requestAnimationFrame(() => terminalFocusRef.current?.())
   }, [selId])
@@ -517,12 +970,18 @@ function App() {
 
   // Clear modifiers when terminal isn't attachable.
   useEffect(() => {
-    if (!canAttach) { setCtrlArmed(false); setAltArmed(false) }
+    if (!canAttach) { setCtrlArmed(false); setAltArmed(false); setShiftArmed(false) }
   }, [canAttach])
 
   // ── Terminal callbacks ──
   const handleTerminalInputReady = useCallback((send: ((data: string) => void) | null) => {
     terminalInputRef.current = send
+  }, [])
+  const handleTerminalAttachFileReady = useCallback((attach: ((file: File) => void) | null) => {
+    terminalAttachFileRef.current = attach
+  }, [])
+  const handleTerminalPasteReady = useCallback((paste: (() => void) | null) => {
+    terminalPasteRef.current = paste
   }, [])
   const handleTerminalFocusReady = useCallback((focus: (() => void) | null) => {
     terminalFocusRef.current = focus
@@ -531,6 +990,8 @@ function App() {
     if (!isTouchDevice()) focus?.()
   }, [])
   const handleMobileInput = useCallback((data: string) => { terminalInputRef.current?.(data) }, [])
+  const handleMobileAttachFile = useCallback((file: File) => { terminalAttachFileRef.current?.(file) }, [])
+  const handleMobilePaste = useCallback(() => { terminalPasteRef.current?.() }, [])
   const handleToggleCtrl = useCallback(() => {
     if (!canAttach) return
     setCtrlArmed(armed => !armed)
@@ -541,9 +1002,41 @@ function App() {
     setAltArmed(armed => !armed)
   }, [canAttach])
   const handleAltConsumed = useCallback(() => { setAltArmed(false) }, [])
+  const handleToggleShift = useCallback(() => {
+    if (!canAttach) return
+    setShiftArmed(armed => !armed)
+  }, [canAttach])
+  const handleShiftConsumed = useCallback(() => { setShiftArmed(false) }, [])
+  const handleModifiersCancelled = useCallback(() => {
+    setCtrlArmed(false)
+    setAltArmed(false)
+    setShiftArmed(false)
+  }, [])
+
+  const openSidebar = useCallback(() => setSidebarOpen(true), [])
+
+  // The key bar only accompanies an attached (or mock) terminal; dead
+  // sessions carry ☰ in ReplayView's action bar instead of a full set of
+  // disabled keys. Everything else (home, transient states)
+  // gets the floating ☰ so the sidebar overlay stays reachable on touch.
+  const keyBarShown = !!selectedVal && (canAttach || USE_MOCK) && !!termOpts && !!keybindsVal
+  const replayShown = !keyBarShown && !!selectedVal && !selectedVal.alive && !!termOpts && !USE_MOCK
+
+  // App-level reconnecting cue for the SSE control-plane. Distinct from
+  // the per-terminal WS pill: it covers the sidebar / home / project
+  // views where no terminal WS is active. When a terminal *is* attached
+  // its own "Connection lost, reconnecting…" pill already owns the
+  // offline cue for that view, so we suppress this one to avoid a
+  // doubled-up message on the same screen.
+  const showReconnecting = connVal === 'reconnecting' && !(selectedVal && canAttach)
 
   return (
     <div class="app-layout">
+      {showReconnecting && (
+        <div class="reconnecting-pill app-reconnecting-pill" role="status">
+          Connection lost, reconnecting…
+        </div>
+      )}
       <Sidebar
         resumingId={resumingId}
         onCloseSession={handleCloseSession}
@@ -560,10 +1053,12 @@ function App() {
       />
 
       <div class="main-panel">
-        {viewVal !== null && viewVal.kind !== 'project' && viewVal.kind !== 'home' && (
+        {viewVal !== null && viewVal.kind !== 'home' && (
           <MainHeader
             session={selectedVal}
-            onRestart={selectedVal ? () => { restartSession(selectedVal.id).catch(err => console.error('restart failed:', err)) } : undefined}
+            onRestart={selectedVal ? () => { void restartSession(selectedVal.id) } : undefined}
+            onResume={handleResume}
+            resuming={!!selectedVal && resumingId === selectedVal.id}
           />
         )}
 
@@ -582,12 +1077,6 @@ function App() {
               Retry
             </button>
           </div>
-        ) : viewVal?.kind === 'project' ? (
-          <ProjectHub
-            projectSlug={viewVal.projectSlug}
-            projectPeer={viewVal.projectPeer}
-            onCloseSession={handleCloseSession}
-          />
         ) : selectedVal && (canAttach || USE_MOCK) && termOpts && keybindsVal ? (
           <TerminalView
             session={selectedVal}
@@ -598,7 +1087,12 @@ function App() {
             onCtrlConsumed={handleCtrlConsumed}
             altArmed={altArmed}
             onAltConsumed={handleAltConsumed}
+            shiftArmed={shiftArmed}
+            onShiftConsumed={handleShiftConsumed}
+            onModifiersCancelled={handleModifiersCancelled}
             onInputReady={handleTerminalInputReady}
+            onAttachFileReady={handleTerminalAttachFileReady}
+            onPasteReady={handleTerminalPasteReady}
             onFocusReady={handleTerminalFocusReady}
           />
         ) : selectedVal && !selectedVal.alive && termOpts && !USE_MOCK ? (
@@ -607,6 +1101,7 @@ function App() {
             terminalOptions={termOpts}
             onResume={handleResume}
             resuming={resumingId === selectedVal.id}
+            onMenu={openSidebar}
           />
         ) : selectedVal ? (
           <div class="state-message">
@@ -620,30 +1115,57 @@ function App() {
           />
         )}
 
-        {selectedVal && (canAttach || USE_MOCK) && termOpts && keybindsVal && (
+        {keyBarShown && (
           <MobileTerminalBar
-            canSend={canAttach}
+            canSend={canAttach || USE_MOCK}
             ctrlArmed={ctrlArmed}
             altArmed={altArmed}
-            onMenu={() => setSidebarOpen(true)}
+            shiftArmed={shiftArmed}
+            onMenu={openSidebar}
             onSend={handleMobileInput}
+            onPaste={handleMobilePaste}
+            onAttachFile={handleMobileAttachFile}
             onToggleCtrl={handleToggleCtrl}
             onToggleAlt={handleToggleAlt}
+            onToggleShift={handleToggleShift}
             onCtrlConsumed={handleCtrlConsumed}
             onAltConsumed={handleAltConsumed}
+            onShiftConsumed={handleShiftConsumed}
           />
         )}
+
+        {/* On touch the sidebar is an off-canvas overlay, so every screen
+            must carry a ☰ somewhere. The key bar and ReplayView's action
+            bar have their own; everything else (home,
+            connecting/error states) gets the floating one. Hidden on fine
+            pointers via CSS. */}
+        {!keyBarShown && !replayShown && (
+          <MenuButton variant="floating" onMenu={openSidebar} />
+        )}
+
+        <FileBrowserView />
       </div>
     </div>
   )
 }
 
 render(
-  <LocationProvider>
-    <Router>
-      <Route path="/_/input-diagnostics" component={InputDiagnostics} />
-      <Route default component={App} />
-    </Router>
-  </LocationProvider>,
+  // ToastHost is a *sibling* of the boundary, not a child: when the
+  // boundary fires it unmounts its children, so a ToastHost nested
+  // inside would be gone exactly when componentDidCatch pushes its
+  // error toast (the signal would update with no mounted consumer).
+  // Keeping it outside means toasts survive an app crash.
+  <Fragment>
+    <ErrorBoundary>
+      <LocationProvider>
+        <Router>
+          <Route path="/_/input-diagnostics" component={InputDiagnostics} />
+          <Route default component={App} />
+        </Router>
+      </LocationProvider>
+    </ErrorBoundary>
+    <ToastHost />
+    <PromotionAnnouncementHost />
+  </Fragment>,
   document.getElementById('app')!,
 )

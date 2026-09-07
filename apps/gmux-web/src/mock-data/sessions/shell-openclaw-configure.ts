@@ -5,13 +5,13 @@ const DIM = '\x1b[2m'
 const GREEN = '\x1b[32m'
 
 export default {
-  id: 'sess-openclaw-cfg',
+  id: '1u3n0gci',
   created_at: ago(10),
   command: ['openclaw', 'configure'],
   cwd: '/home/user/dev/openclaw',
   workspace_root: '/home/user/dev/openclaw',
   remotes: { origin: 'github.com/acme/openclaw' },
-  kind: 'shell',
+  adapter: 'shell',
   alive: true,
   pid: 9100,
   exit_code: null,
@@ -19,10 +19,11 @@ export default {
   exited_at: null,
   title: 'openclaw configure',
   subtitle: '',
-  status: { label: '', working: false },
+  status: { active: false },
   unread: false,
+  project_slug: 'openclaw',
+  last_output_at: ago(8),
   socket_path: '/tmp/gmux-sessions/mock.sock',
-  peer: 'server',
   terminal: [
     `${GREEN}✓${RST} Configuration written to openclaw.toml`,
     `${GREEN}✓${RST} API key validated`,
