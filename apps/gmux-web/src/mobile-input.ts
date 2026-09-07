@@ -55,6 +55,7 @@ type SendFn = (data: string) => void
 type ActiveWebKitIme = {
   shouldSkip(data: string): boolean
   flushPending(): void
+  flushLineBreak(): void
 }
 
 let activeWebKitIme: ActiveWebKitIme | null = null
@@ -136,11 +137,19 @@ export function flushMobileWebKitImePending(): void {
   if (isAppleMobileWebKit()) activeWebKitIme?.flushPending()
 }
 
+export function flushMobileWebKitImeLineBreak(): void {
+  if (isAppleMobileWebKit()) activeWebKitIme?.flushLineBreak()
+}
+
 export function shouldBlockMobileWebKitImeKey(ev: KeyboardEvent): boolean {
   if (!isAppleMobileWebKit()) return false
   // Some iPad Korean IMEs report Backspace with keyCode 229; let the mobile
   // input handler process editing keys instead of xterm's generic IME block.
   if (ev.key === 'Backspace' || ev.key === 'Delete' || ev.keyCode === 8 || ev.keyCode === 46) return false
+  // Enter must reach the terminal keyboard handler so it can commit the
+  // preedit synchronously before sending the line break, even when WebKit
+  // reports the IME event with the generic 229 key code.
+  if (ev.key === 'Enter') return false
   return ev.keyCode === 229 || isCompatibilityJamo(ev.key ?? '')
 }
 
@@ -411,6 +420,10 @@ export function attachMobileInputHandler(
   const wkController: ActiveWebKitIme = {
     shouldSkip: shouldSkipWkData,
     flushPending: wkCommit,
+    flushLineBreak: () => {
+      wkCommit()
+      flushKoreanJamo()
+    },
   }
   activeWebKitIme = wkController
 
@@ -490,7 +503,7 @@ export function attachMobileInputHandler(
     // beforeinput/onData. Stop xterm's DOM key path, but do not preventDefault:
     // WebKit's native IME still needs the keystroke. Backspace is handled above
     // because some iPad Korean IMEs report Backspace with keyCode 229.
-    if (ev.keyCode === 229 || isCompatibilityJamo(ev.key ?? '')) {
+    if ((ev.keyCode === 229 && ev.key !== 'Enter') || isCompatibilityJamo(ev.key ?? '')) {
       ev.stopImmediatePropagation()
       return
     }

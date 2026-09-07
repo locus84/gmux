@@ -354,6 +354,15 @@ describe('attachMobileInputHandler', () => {
     expect(r.immediateStopped).toBe(true)
   })
 
+  it('lets iOS WebKit Enter reported as 229 reach line-break handling', () => {
+    setNavigatorUserAgent('Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1')
+
+    const r = container.dispatch('keydown', { key: 'Enter', keyCode: 229 })
+
+    expect(r.immediateStopped).toBe(false)
+    expect(shouldBlockMobileWebKitImeKey({ key: 'Enter', keyCode: 229 } as KeyboardEvent)).toBe(false)
+  })
+
   it('blocks iOS WebKit jamo keydown without flushing held preedit', () => {
     setNavigatorUserAgent('Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1')
 

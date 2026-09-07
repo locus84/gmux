@@ -24,6 +24,7 @@ interface XtermPrivateTerminal {
 }
 
 const textareaValueBeforeImeKey = new WeakMap<HTMLTextAreaElement, string>()
+const residueCompositionEnd = new WeakMap<HTMLTextAreaElement, () => void>()
 
 /**
  * Flush an active xterm IME composition before sending toolbar bytes.
@@ -155,6 +156,10 @@ function suppressResidualImeEvents(term: Terminal): void {
     ev.stopImmediatePropagation()
     resetCompositionState(term)
     clearTextarea(term)
+    // The capture listener above intentionally blocks the native event from
+    // xterm, but the residue guard also tracks composition in local closure
+    // state. Explicitly finish that state so later input can re-arm cleanup.
+    residueCompositionEnd.get(ta)?.()
     setTimeout(cleanup, 0)
   }
 
@@ -214,6 +219,7 @@ export function attachImeResidueGuard(term: Terminal, delayMs = 50): () => void 
     composing = false
     schedule()
   }
+  residueCompositionEnd.set(ta, handleCompositionEnd)
   const handleKeydown = () => {
     // Re-arm after every keydown so the clear cannot land between xterm's
     // keyCode-229 handling and its delayed textarea diff read. Also snapshot
@@ -239,6 +245,7 @@ export function attachImeResidueGuard(term: Terminal, delayMs = 50): () => void 
     ta.removeEventListener('keydown', handleKeydown)
     ta.removeEventListener('beforeinput', handleInput)
     ta.removeEventListener('input', handleInput)
+    if (residueCompositionEnd.get(ta) === handleCompositionEnd) residueCompositionEnd.delete(ta)
     dataDisposable?.dispose()
   }
 }
@@ -247,10 +254,10 @@ export function sendAfterFlushingComposition(
   term: Terminal,
   send: (data: string) => void,
   data: string,
+  flushBeforeSend = data.includes('\r'),
 ): void {
-  const isSubmit = data.includes('\r')
-  const flushed = isSubmit && flushPendingComposition(term)
-  const flushedPendingDiff = !flushed && isSubmit && flushPendingTextareaDiff(term, send)
+  const flushed = flushBeforeSend && flushPendingComposition(term)
+  const flushedPendingDiff = !flushed && flushBeforeSend && flushPendingTextareaDiff(term, send)
   if (flushed || flushedPendingDiff) {
     suppressResidualImeEvents(term)
   } else {

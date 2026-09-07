@@ -101,6 +101,23 @@ describe('toolbar composition flushing', () => {
     expect(helper._compositionPosition).toEqual({ start: 0, end: 0 })
   })
 
+  it('finalizes active composition before a forced multiline newline', () => {
+    const events: string[] = []
+    const helper = liveHelper({
+      _isComposing: true,
+      keydown: vi.fn(() => {
+        events.push('composition')
+        return true
+      }),
+    })
+    const term = termWithHelper(helper)
+
+    sendAfterFlushingComposition(term, data => events.push(data), '\n', true)
+
+    expect(helper.keydown).toHaveBeenCalledOnce()
+    expect(events).toEqual(['composition', '\n'])
+  })
+
   it('flushes xterm composition that is waiting for its delayed compositionend send', () => {
     const events: string[] = []
     const helper = liveHelper({
@@ -266,6 +283,33 @@ describe('toolbar composition flushing', () => {
       vi.runAllTimers()
       textarea.dispatch('input')
       expect(events).toEqual(['composition', '\r', 'native input'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-arms residue cleanup after swallowing a forced-flush compositionend', () => {
+    vi.useFakeTimers()
+    try {
+      const textarea = createFakeTextarea()
+      textarea.value = '미완성'
+      textarea.selectionStart = textarea.selectionEnd = 3
+      const helper = liveHelper({ _isComposing: true, keydown: vi.fn(() => true) })
+      const term = termWithHelper(helper, textarea)
+      const dispose = attachImeResidueGuard(term, 50)
+
+      textarea.dispatch('compositionstart')
+      sendAfterFlushingComposition(term, () => {}, '\n', true)
+      textarea.dispatch('compositionend')
+      vi.runAllTimers()
+
+      textarea.value = 'later residue'
+      textarea.selectionStart = textarea.selectionEnd = textarea.value.length
+      textarea.dispatch('input')
+      vi.advanceTimersByTime(50)
+
+      expect(textarea.value).toBe('')
+      dispose()
     } finally {
       vi.useRealTimers()
     }

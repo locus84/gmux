@@ -22,9 +22,10 @@ import {
   keyComboToSequence,
   type ResolvedKeybind,
 } from './config'
-import { shouldBlockMobileWebKitImeKey } from './mobile-input'
+import { flushMobileWebKitImeLineBreak, shouldBlockMobileWebKitImeKey } from './mobile-input'
 import { selectionToText } from './selection'
 import { terminalFindOpen } from './store'
+import { sendAfterFlushingComposition } from './xterm-composition'
 
 type SendFn = (data: string) => void
 
@@ -158,7 +159,10 @@ export function attachKeyboardHandler(
     // \r when they are ready to submit.
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey
         && isTouchDevice()) {
-      if (ev.type === 'keydown') send('\n')
+      if (ev.type === 'keydown') {
+        flushMobileWebKitImeLineBreak()
+        sendAfterFlushingComposition(term, send, '\n', true)
+      }
       ev.preventDefault()
       return false
     }
@@ -200,7 +204,16 @@ export function attachKeyboardHandler(
       // For shift+enter we need to block all event types (keydown, keypress,
       // keyup) to prevent the Kitty keyboard protocol sequence from leaking.
       if (kb.baseKey === 'enter' && kb.shift) {
-        if (ev.type === 'keydown') executeAction(kb, term, send, getPasteDestination, onPasteFeedback)
+        if (ev.type === 'keydown') {
+          flushMobileWebKitImeLineBreak()
+          executeAction(
+            kb,
+            term,
+            data => sendAfterFlushingComposition(term, send, data, true),
+            getPasteDestination,
+            onPasteFeedback,
+          )
+        }
         ev.preventDefault()
         return false
       }

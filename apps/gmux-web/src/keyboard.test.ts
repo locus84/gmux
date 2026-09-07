@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { applyArmedModifiers, ctrlSequenceFor, formatPasteText, handleBlobPasteAction, handlePasteAction, type PasteDestination, pickBinaryDataTransferItem } from './keyboard'
+import type { Terminal } from '@xterm/xterm'
+import { applyArmedModifiers, attachKeyboardHandler, ctrlSequenceFor, formatPasteText, handleBlobPasteAction, handlePasteAction, type PasteDestination, pickBinaryDataTransferItem } from './keyboard'
+import type { ResolvedKeybind } from './config'
 
 // Build an array-like stand-in for DataTransferItemList. Vitest runs in
 // node by default, where the real DOM type isn't available; a plain
@@ -25,6 +27,58 @@ function binaryClipboard(getType: () => Promise<Blob>): Clipboard {
     read: async () => [{ types: ['image/png'], getType }],
   } as unknown as Clipboard
 }
+
+describe('IME line breaks', () => {
+  function composingTerminal(events: string[]): { term: Terminal; dispatch: (event: KeyboardEvent) => boolean } {
+    let handler: ((event: KeyboardEvent) => boolean) | undefined
+    const helper = {
+      isComposing: true,
+      _isComposing: true,
+      keydown: vi.fn(() => {
+        events.push('composition')
+        return true
+      }),
+    }
+    const term = {
+      _core: { _compositionHelper: helper },
+      attachCustomKeyEventHandler(fn: (event: KeyboardEvent) => boolean) { handler = fn },
+    } as unknown as Terminal
+    return { term, dispatch: event => handler!(event) }
+  }
+
+  it('commits Korean composition before physical Shift+Enter inserts a newline', () => {
+    const events: string[] = []
+    const { term, dispatch } = composingTerminal(events)
+    const shiftEnter = {
+      key: 'shift+enter', action: 'sendText', args: '\n',
+      ctrl: false, shift: true, alt: false, meta: false, baseKey: 'enter',
+    } as ResolvedKeybind
+    attachKeyboardHandler(term, data => events.push(data), [shiftEnter])
+
+    dispatch({
+      type: 'keydown', key: 'Enter', keyCode: 13,
+      shiftKey: true, ctrlKey: false, altKey: false, metaKey: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent)
+
+    expect(events).toEqual(['composition', '\n'])
+  })
+
+  it('commits Korean composition before touch Enter inserts a multiline newline', () => {
+    vi.stubGlobal('window', { matchMedia: () => ({ matches: true }) })
+    const events: string[] = []
+    const { term, dispatch } = composingTerminal(events)
+    attachKeyboardHandler(term, data => events.push(data), [])
+
+    dispatch({
+      type: 'keydown', key: 'Enter', keyCode: 13,
+      shiftKey: false, ctrlKey: false, altKey: false, metaKey: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent)
+
+    expect(events).toEqual(['composition', '\n'])
+  })
+})
 
 describe('paste destination binding', () => {
   it('uploads a file chosen from the mobile toolbar and types its path', async () => {
