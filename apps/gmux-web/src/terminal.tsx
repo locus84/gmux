@@ -622,21 +622,20 @@ export function TerminalView({
     if (!containerRef.current || USE_MOCK || !fontReady) return
     disposed.current = false
 
+    const activateWebLink = (_event: MouseEvent, text: string) => {
+      const current = sessionRef.current
+      window.open(resolveTerminalWebUrl(text, vsCodeServerUrl.value, current.peer), '_blank', 'noopener')
+    }
     // Add non-serializable options that can't live in JSON config.
     const term = new Terminal({
       ...terminalOptions,
-      linkHandler: {
-        activate(_event, text) {
-          const current = sessionRef.current
-          window.open(resolveTerminalWebUrl(text, vsCodeServerUrl.value, current.peer), '_blank', 'noopener')
-        },
-      },
+      linkHandler: { activate: activateWebLink },
     })
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.loadAddon(new ImageAddon())
     // Detect plain-text URLs in terminal output and make them clickable.
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(new WebLinksAddon(activateWebLink))
     // Find-in-terminal (the find bar drives it; see terminal-find.tsx).
     const searchAddon = new SearchAddon()
     term.loadAddon(searchAddon)
@@ -1762,7 +1761,11 @@ export function TerminalView({
         </button>
       )}
       {linkSheet && (
-        <LinkActionSheet link={linkSheet} onClose={() => setLinkSheet(null)} />
+        <LinkActionSheet
+          link={linkSheet}
+          onClose={() => setLinkSheet(null)}
+          resolveUrl={uri => resolveTerminalWebUrl(uri, vsCodeServerUrl.value, session.peer)}
+        />
       )}
       {textSheet && (
         <TerminalTextSheet
