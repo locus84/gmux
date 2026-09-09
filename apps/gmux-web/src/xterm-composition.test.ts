@@ -240,7 +240,7 @@ describe('toolbar composition flushing', () => {
 
   it('does not clear while xterm has a textarea diff timer pending', () => {
     const events: string[] = []
-    const timer = setTimeout(() => {}, 1000) as unknown as number
+    const timer = setTimeout(() => { /* stand in for xterm's pending timer */ }, 1000) as unknown as number
     const textarea = { value: '오케이', selectionStart: 3, selectionEnd: 3 }
     const helper = liveHelper({ _textareaChangeTimer: timer })
     const term = termWithHelper(helper, textarea)
@@ -299,7 +299,7 @@ describe('toolbar composition flushing', () => {
       const dispose = attachImeResidueGuard(term, 50)
 
       textarea.dispatch('compositionstart')
-      sendAfterFlushingComposition(term, () => {}, '\n', true)
+      sendAfterFlushingComposition(term, () => { /* output is irrelevant here */ }, '\n', true)
       textarea.dispatch('compositionend')
       vi.runAllTimers()
 

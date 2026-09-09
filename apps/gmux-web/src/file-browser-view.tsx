@@ -229,8 +229,8 @@ export function FileBrowserView() {
       if (!base) return
 
       const oldRect = focal ? image.getBoundingClientRect() : null
-      const anchorX = oldRect && oldRect.width ? (focal!.fromX - oldRect.left) / oldRect.width : 0.5
-      const anchorY = oldRect && oldRect.height ? (focal!.fromY - oldRect.top) / oldRect.height : 0.5
+      const anchorX = oldRect?.width ? (focal!.fromX - oldRect.left) / oldRect.width : 0.5
+      const anchorY = oldRect?.height ? (focal!.fromY - oldRect.top) / oldRect.height : 0.5
       const zoom = clampImageZoom(requestedZoom)
       const width = base.width * zoom
       const height = base.height * zoom

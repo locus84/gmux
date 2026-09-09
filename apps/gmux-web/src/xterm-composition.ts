@@ -181,7 +181,7 @@ function suppressResidualImeEvents(term: Terminal): void {
  */
 export function attachImeResidueGuard(term: Terminal, delayMs = 50): () => void {
   const ta = textarea(term)
-  if (!ta || isScreenReaderMode(term)) return () => {}
+  if (!ta || isScreenReaderMode(term)) return () => { /* guard was not attached */ }
 
   let disposed = false
   let composing = false

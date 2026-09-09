@@ -353,7 +353,7 @@ export function TerminalView({
   // Drop initial-attach input until replay and viewport claim commit.
   const inputClaimedRef = useRef(false)
   const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
-  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => { /* set when the file overlay mounts */ })
   const fileOverlayOpenRef = useRef(false)
 
   // True once the terminal's font is downloaded; gates xterm mount.
