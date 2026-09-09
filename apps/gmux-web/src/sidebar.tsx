@@ -12,7 +12,7 @@ import { hasSessionSlugCollision, sessionPath, viewToPath } from './routing'
 import { FamilyIcon } from './family-icon'
 import { familyDrawerRoot } from './family-drawer-state'
 import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
-import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
+import { reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { projectFileBrowserPath } from './file-browser'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { LaunchButton } from './launcher'
@@ -656,11 +656,17 @@ function FolderGroup({
   // mobile scroll-into-view). The header reads as collapsed; the one
   // row just sits beneath it.
   const shown = collapsed ? displayItems.filter(s => s.id === selId) : displayItems
-  const checkoutGroups = groupSessionsByCheckout(
-    { ...folder, sessions: shown },
-    inventory?.data?.worktrees,
-    inventory?.data?.primary_path,
-  )
+  // Worktrees are managed in the project's dedicated inventory sheet.
+  // Keep the steering sidebar session/family-only so its hierarchy does not
+  // compete with family parentage or hide a child's actual checkout.
+  const checkoutGroups: CheckoutGroup[] = [{
+    key: `sessions:${folder.key}`,
+    path: folder.launchCwd ?? '',
+    label: 'Sessions',
+    primary: true,
+    sessions: shown,
+    fallback: true,
+  }]
   // Drag-reorder is disabled while collapsed (the visible subset no
   // longer maps onto the stored order) or under the alive-only toggle.
   const dragDisabled = collapsed || !!aliveOnly

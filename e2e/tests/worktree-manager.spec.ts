@@ -13,6 +13,7 @@ test.describe('managed worktrees', () => {
     const project = page.locator('.folder').filter({ has: page.locator('.folder-name-label', { hasText: 'my-project' }) })
     await expect(project.locator('.folder-worktree-count')).toHaveText('WT 2')
     await expect(project.locator('.folder-worktree-count')).toHaveAttribute('title', '2 linked worktrees')
+    await expect(project.locator('.checkout-header')).toHaveCount(0)
 
     await project.getByRole('button', { name: /Project actions for my-project/ }).click()
     await page.getByText('Manage worktrees…', { exact: true }).click()
