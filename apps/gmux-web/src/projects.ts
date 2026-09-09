@@ -533,6 +533,39 @@ function deepestCheckout(groups: CheckoutGroup[], cwd: string): CheckoutGroup | 
   return best
 }
 
+/** Resolve a path to the most specific managed checkout that contains it. */
+export function worktreeForPath(worktrees: readonly Worktree[], path: string): Worktree | undefined {
+  let best: Worktree | undefined
+  for (const worktree of worktrees) {
+    if (checkoutPathContains(worktree.path, path)
+      && (!best || normalizeCheckoutPath(worktree.path).length > normalizeCheckoutPath(best.path).length)) best = worktree
+  }
+  return best
+}
+
+/** Inventory every session physically inside a project's managed checkouts.
+ * Unlike the sidebar projection, this intentionally keeps family children. */
+export function sessionsByManagedWorktree(
+  worktrees: readonly Worktree[],
+  sessions: readonly Session[],
+  projectSlug: string,
+  peer?: string,
+): ReadonlyMap<string, readonly Session[]> {
+  const grouped = new Map<string, Session[]>()
+  for (const session of sessions) {
+    if ((session.peer ?? '') !== (peer ?? '')) continue
+    // A server-owned stamp wins over path fallback and prevents a nested,
+    // separately managed project from leaking into this inventory.
+    if (session.project_slug && session.project_slug !== projectSlug) continue
+    const worktree = worktreeForPath(worktrees, session.cwd)
+    if (!worktree) continue
+    const members = grouped.get(worktree.path) ?? []
+    members.push(session)
+    grouped.set(worktree.path, members)
+  }
+  return grouped
+}
+
 export function checkoutPathContains(root: string, candidate: string): boolean {
   root = normalizeCheckoutPath(root)
   candidate = normalizeCheckoutPath(candidate)

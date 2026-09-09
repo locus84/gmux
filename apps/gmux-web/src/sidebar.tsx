@@ -595,6 +595,7 @@ function FolderGroup({
     }
   }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
   const inventory = projectWorktreeInventories.value[projectWorktreeInventoryKey(folder.slug, folder.peer)]
+  const linkedWorktreeCount = inventory?.data?.worktrees.filter(worktree => !worktree.primary).length ?? 0
   const toggleFavorite = async () => {
     if (favoritePending) return
     setFavoritePending(true)
@@ -720,6 +721,9 @@ function FolderGroup({
         >
           <IconChevron className={`folder-chevron${collapsed ? ' collapsed' : ''}`} />
           <span class="folder-name-label">{folder.name}</span>
+          {linkedWorktreeCount > 0 && (
+            <span class="folder-worktree-count" title={`${linkedWorktreeCount} linked ${linkedWorktreeCount === 1 ? 'worktree' : 'worktrees'}`}>WT {linkedWorktreeCount}</span>
+          )}
           <HostSuffix peer={folder.peer ?? localHostLabel.value} local={!folder.peer} />
           {folder.missing && <span class="folder-missing-icon" title="Project missing on host — remove in Settings → Projects">?</span>}
           {folder.unresolved && (
@@ -762,7 +766,7 @@ function FolderGroup({
               }] : []),
             ]}
             footerAction={!folder.unresolved && !folder.missing
-              ? { label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }
+              ? { label: 'Manage worktrees…', onSelect: () => { onClick?.(); setWorktreesOpen(true) } }
               : undefined}
           />
         </div>

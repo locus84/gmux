@@ -27,7 +27,7 @@ import {
   createFamilyIndex, 
   type FamilyActivity, type FamilyIndex,familyAncestors, familyIndex, familyRootId, familyStateOf, isProcessSession, promotionAction,
 } from './family'
-import { MOCK_SESSIONS, mockWorld } from './mock-data/index'
+import { MOCK_PROJECT_WORKTREES, MOCK_SESSIONS, mockWorld } from './mock-data/index'
 import { isWaitingPresentation, type SessionPresentationState, sessionPresentationState } from './presentation'
 import { buildProjectFolders, discoverProjects, type TemporaryPresentationPlacement } from './projects'
 import {
@@ -132,6 +132,13 @@ export async function ensureProjectWorktrees(slug: string, peer?: string, force 
   const key = projectWorktreeInventoryKey(slug, peer)
   const current = projectWorktreeInventories.value[key]
   if (!force && (current?.loading || current?.data)) return
+  if (typeof location !== 'undefined' && location.search.includes('mock') && !peer && slug === 'my-project') {
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: MOCK_PROJECT_WORKTREES, loading: false },
+    }
+    return
+  }
   const requestId = (projectWorktreeInventoryRequests.get(key) ?? 0) + 1
   projectWorktreeInventoryRequests.set(key, requestId)
   projectWorktreeInventories.value = { ...projectWorktreeInventories.value, [key]: { ...current, loading: true, error: undefined } }
@@ -2535,6 +2542,10 @@ export function initStore(): () => void {
     batch(() => {
       _setRawWorld(mockWorld(location.search))
       _rawSessions.value = mockSessions
+      projectWorktreeInventories.value = {
+        ...projectWorktreeInventories.value,
+        [projectWorktreeInventoryKey('my-project')]: { data: MOCK_PROJECT_WORKTREES, loading: false },
+      }
       sessionsLoaded.value = true
       worldLoaded.value = true
       connState.value = 'connected'

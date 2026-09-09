@@ -95,6 +95,16 @@ export const MOCK_BY_ID: Record<string, MockSession> = Object.fromEntries(
  * These feed into buildProjectFolders the same way
  * the server-side project config does.
  */
+export const MOCK_PROJECT_WORKTREES = {
+  project_slug: 'my-project',
+  primary_path: '/home/user/dev/my-project',
+  worktrees: [
+    { path: '/home/user/dev/my-project', branch: 'main', head: '4f82a19', primary: true, detached: false, bare: false, locked: false, prunable: false },
+    { path: '/home/user/dev/my-project-worktrees/version-clear-confirm', branch: 'version-clear-confirm', head: 'a18d2c4', primary: false, detached: false, bare: false, locked: false, prunable: false },
+    { path: '/home/user/dev/my-project-worktrees/mobile-file-viewer', branch: 'mobile-file-viewer', head: '90ef1bc', primary: false, detached: false, bare: false, locked: false, prunable: false },
+  ],
+}
+
 export const MOCK_PROJECTS: ProjectItem[] = [
   {
     slug: 'my-project',
