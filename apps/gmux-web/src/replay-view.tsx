@@ -11,6 +11,8 @@ import { JumpToBottom } from './jump-to-bottom'
 import { lifecycleAction } from './session-actions'
 import { MenuButton } from './menu-button'
 import { isTouchDevice } from './touch'
+import { vsCodeServerUrl } from './store'
+import { resolveTerminalWebUrl } from './vscode-server'
 
 // gmuxd caps scrollback at 1 MiB × 2 files (~2 MiB max). xterm's default
 // scrollback line cap (1000) would silently truncate most of that for
@@ -79,6 +81,9 @@ export function ReplayView({
     const recordedCols = session.terminal_cols ?? 80
     const recordedRows = session.terminal_rows ?? 24
 
+    const activateWebLink = (_event: MouseEvent, text: string) => {
+      window.open(resolveTerminalWebUrl(text, vsCodeServerUrl.value, session.peer), '_blank', 'noopener')
+    }
     const term = new Terminal({
       ...terminalOptions,
       cols: recordedCols,
@@ -87,16 +92,12 @@ export function ReplayView({
       disableStdin: true,
       cursorBlink: false,
       cursorInactiveStyle: 'none',
-      linkHandler: {
-        activate(_event, text) {
-          window.open(text, '_blank', 'noopener')
-        },
-      },
+      linkHandler: { activate: activateWebLink },
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.loadAddon(new ImageAddon())
-    term.loadAddon(new WebLinksAddon())
+    term.loadAddon(new WebLinksAddon(activateWebLink))
     term.open(containerRef.current)
     loadWebglRenderer(term)
     // Vertical-only fit: use FitAddon's proposal for rows, but keep cols

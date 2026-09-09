@@ -18,13 +18,14 @@ import { CopyButton, SheetBackdrop, SheetButton } from './sheet'
 export interface LinkActionSheetProps {
   link: LinkInfo
   onClose: () => void
+  resolveUrl?: (uri: string) => string
 }
 
-export function LinkActionSheet({ link, onClose }: LinkActionSheetProps) {
+export function LinkActionSheet({ link, onClose, resolveUrl }: LinkActionSheetProps) {
   const showLabel = link.label !== link.uri
 
   const handleOpen = () => {
-    window.open(link.uri, '_blank', 'noopener,noreferrer')
+    window.open(resolveUrl ? resolveUrl(link.uri) : link.uri, '_blank', 'noopener,noreferrer')
     onClose()
   }
 

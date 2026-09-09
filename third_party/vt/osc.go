@@ -125,12 +125,14 @@ func (e *Emulator) handleWorkingDirectory(cmd int, data []byte) {
 }
 
 func (e *Emulator) handleHyperlink(cmd int, data []byte) {
-	parts := bytes.Split(data, []byte{';'})
+	// OSC 8 ; params ; URI — semicolons after the second separator belong
+	// to the URI, not additional OSC fields.
+	parts := bytes.SplitN(data, []byte{';'}, 3)
 	if len(parts) != 3 || cmd != 8 {
 		// Invalid, ignore
 		return
 	}
 
-	e.scr.cur.Link.URL = string(parts[1])
-	e.scr.cur.Link.Params = string(parts[2])
+	e.scr.cur.Link.Params = string(parts[1])
+	e.scr.cur.Link.URL = string(parts[2])
 }

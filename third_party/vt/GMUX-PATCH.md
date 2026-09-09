@@ -1,8 +1,7 @@
 # gmux wrap-provenance patch
 
 This directory is the unmodified source of `github.com/charmbracelet/x/vt` at
-`v0.0.0-20260330094520-2dce04b6f8a4`, plus one isolated terminal-state change
-intended for upstreaming.
+`v0.0.0-20260330094520-2dce04b6f8a4`, plus terminal-state and OSC 8 fixes intended for upstreaming.
 
 ## Delta
 
@@ -48,5 +47,11 @@ intended for upstreaming.
   Amortizing repeated reflows caused by `shrinkForReconnect` remains a known
   follow-up.
 
-No parser, cell, rendering, or hyperlink representation was replaced. In
-particular, `ultraviolet.Cell.Link` and existing ANSI rendering remain intact.
+- `osc.go` corrects OSC 8 field order (`params;URI`, not `URI;params`)
+  and preserves semicolons within the URI. `hyperlink_test.go` covers IDs,
+  empty params, URI semicolons, and link termination. The previous parser
+  stored a normal hyperlink's URI as params, so replay rendered an empty
+  destination: underlined labels were not clickable.
+
+No cell, rendering, or hyperlink representation was replaced.
+`ultraviolet.Cell.Link` and existing ANSI rendering remain intact.
