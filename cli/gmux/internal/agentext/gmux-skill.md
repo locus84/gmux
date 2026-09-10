@@ -64,6 +64,12 @@ Before creating an agent checkout, run `gmux worktree ps --json` in the target
 repository and reuse a matching branch, path, or live session. Create at most
 one worktree per logical task; retries and follow-ups stay in that session.
 
+For projects with expensive checkout setup or asset imports, such as Unity
+projects, prefer a durable existing worktree over creating a fresh checkout for
+each task. Give that worktree directory a name that describes its dedicated
+purpose, but keep its existing branch name unchanged: rename only the worktree
+directory, never the branch.
+
 ```bash
 gmux worktree ps --json
 result=$(gmux worktree create fix-login --base origin/main --agent pi \
