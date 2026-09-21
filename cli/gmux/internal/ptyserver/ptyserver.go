@@ -2398,7 +2398,9 @@ func (s *Server) waitChild() {
 //     frontend's actual capabilities don't depend on what the parent
 //     thinks: TERM_PROGRAM=gmux, TERM_PROGRAM_VERSION=<version>,
 //     COLORTERM=truecolor, KITTY_WINDOW_ID=1 (xterm.js + image addon
-//     handles kitty graphics, sixel, and iTerm2 images);
+//     handles kitty graphics, sixel, and iTerm2 images). Pi uses existing
+//     viewer links instead: PI_IMAGE_PROTOCOL=none prevents its TUI from
+//     allocating tall, empty image rows when browser image refs are ignored;
 //  4. TERM=xterm-256color, but only if no earlier layer provided one.
 //     When gmuxd is launched from a non-interactive context (systemd
 //     unit, browser-launched shell inheriting the daemon's env) TERM
@@ -2430,6 +2432,7 @@ func buildChildEnv(parent, extra []string, version string) []string {
 		"TERM_PROGRAM_VERSION="+version,
 		"COLORTERM=truecolor",
 		"KITTY_WINDOW_ID=1",
+		"PI_IMAGE_PROTOCOL=none",
 	)
 	if !hasEnv(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")

@@ -35,8 +35,6 @@ import { resolveCheckpointGeometry } from './terminal-checkpoint-geometry'
 import { TerminalFindBar } from './terminal-find'
 import { createTerminalFileLinkProvider, terminalFileTargetAtPoint, type TerminalFileLinkContext } from './terminal-file-link'
 import { canSendTerminalInput } from './terminal-input'
-import { installTerminalImages, type TerminalImageAsset, type TerminalImageController } from './terminal-images'
-import { TerminalImageViewer } from './terminal-image-viewer'
 import { createTerminalIO, type TerminalSize } from './terminal-io'
 import { type LinkInfo, linkAtPoint, openLinkAtPoint } from './terminal-link'
 import { decideViewportResize, sameSize, shouldQueueResizeEcho } from './terminal-resize'
@@ -334,10 +332,7 @@ export function TerminalView({
 }) {
   const shellRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
-  const imageTrayRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
-  const imageControllerRef = useRef<TerminalImageController | null>(null)
-  const imageViewerOpenRef = useRef(false)
   // Session ID and socket form one atomic connection identity.
   const connectionRef = useRef<SessionConnection | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -370,9 +365,6 @@ export function TerminalView({
   const [viewportSize, setViewportSize] = useState<TerminalSize | null>(null)
   const [linkSheet, setLinkSheet] = useState<LinkInfo | null>(null)
   const [textSheet, setTextSheet] = useState<{ lines: string[]; anchorRow: number } | null>(null)
-  const [imageViewer, setImageViewer] = useState<{ asset: TerminalImageAsset; sessionId: string } | null>(null)
-  const closeImageViewer = useCallback(() => setImageViewer(null), [])
-  imageViewerOpenRef.current = imageViewer?.sessionId === session.id
   // The paste trigger lives in the attach effect (it reads bracketed-paste
   // mode + clipboard fresh), so bridge it out to the sheet's Paste button
   // via a ref.
@@ -569,7 +561,7 @@ export function TerminalView({
     if (!isTouchDevice()) return
     // The find bar's input/buttons need default mousedown behavior to
     // gain focus, so exempt it alongside the grid.
-    if (!(ev.target instanceof Element) || !ev.target.closest('.xterm, .terminal-find-bar, .terminal-image-viewer')) ev.preventDefault()
+    if (!(ev.target instanceof Element) || !ev.target.closest('.xterm, .terminal-find-bar')) ev.preventDefault()
   }, [])
 
   const handleShellClick = useCallback((ev: MouseEvent) => {
@@ -650,15 +642,6 @@ export function TerminalView({
     term.loadAddon(searchAddon)
     searchAddonRef.current = searchAddon
     term.open(containerRef.current)
-    const imageController = imageTrayRef.current
-      ? installTerminalImages(term, imageTrayRef.current, asset => {
-          // Bind ownership while parsing the reference. A later session switch
-          // must never make an old button fetch from the newly selected session.
-          const sessionId = connectionRef.current?.sessionId ?? sessionRef.current.id
-          return () => setImageViewer({ asset, sessionId })
-        })
-      : null
-    imageControllerRef.current = imageController
     const disposeImeResidueGuard = attachImeResidueGuard(term)
     const getFileLinkContext = (): TerminalFileLinkContext => {
       const current = sessionRef.current
@@ -846,7 +829,7 @@ export function TerminalView({
       const tag = (ev.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
       if (containerRef.current?.contains(ev.target as Node)) return
-      if (fileOverlayOpenRef.current || imageViewerOpenRef.current) return
+      if (fileOverlayOpenRef.current) return
       term.focus()
     }
     window.addEventListener('keydown', handleGlobalKeydown, true)
@@ -855,7 +838,7 @@ export function TerminalView({
     // Overlays (the link action sheet) render inside the shell; their
     // touches must not arm tap/pan/long-press handling.
     const isInteractiveTarget = (target: EventTarget | null) => target instanceof HTMLElement
-      && !!target.closest('button, input, textarea, select, a, label, [role="button"], .modal-backdrop, .terminal-image-button, .terminal-image-viewer')
+      && !!target.closest('button, input, textarea, select, a, label, [role="button"], .modal-backdrop')
 
     // Long-press on a link → action sheet (copy / open / inspect the
     // real target of OSC 8 hyperlinks). A ≥500ms hold is a distinct
@@ -1191,8 +1174,6 @@ export function TerminalView({
       disposeImeResidueGuard()
       fileLinkDisposable.dispose()
       osc52Disposable.dispose()
-      imageController?.dispose()
-      if (imageControllerRef.current === imageController) imageControllerRef.current = null
       dataDisposable.dispose()
       scrollDisposable.dispose()
       busyDisposable.dispose()
@@ -1292,11 +1273,7 @@ export function TerminalView({
     // not authoritative. Reset only on that actual ID transition:
     // same-session reconnect attempts retain the last committed screen and
     // parser state during the outage.
-    if (sessionChanged) {
-      imageControllerRef.current?.clear()
-      setImageViewer(null)
-      termRef.current.reset()
-    }
+    if (sessionChanged) termRef.current.reset()
 
     // Reset sizes so stale values from a previous session can't trigger a
     // spurious pill while the loading overlay is visible (before ws.onopen).
@@ -1502,8 +1479,9 @@ export function TerminalView({
 
       const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const wsParams = new URLSearchParams({ client: 'browser' })
-      // Opt in only after the synchronous OSC handler and its host are live.
-      if (imageControllerRef.current?.installed) wsParams.set('images', 'refs-v1')
+      // Pi uses existing viewer links, not inline images. Strip its legacy
+      // payloads as ignored OSC refs; other applications keep native graphics.
+      if (session.adapter === 'pi') wsParams.set('images', 'refs-v1')
       const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${session.id}?${wsParams}`)
       ws.binaryType = 'arraybuffer'
       const connection: SessionConnection = { sessionId: session.id, ws }
@@ -1772,7 +1750,6 @@ export function TerminalView({
         </div>
       )}
       <div ref={containerRef} class="terminal-container" />
-      <div ref={imageTrayRef} class="terminal-image-tray" hidden aria-label="Terminal images" />
       {termLoading && (
         <div class="terminal-loading">
           Waiting for output…
@@ -1799,13 +1776,6 @@ export function TerminalView({
           onClose={() => setTextSheet(null)}
         />
       )}
-      {imageViewer?.sessionId === session.id && (
-        <TerminalImageViewer
-          sessionId={imageViewer.sessionId}
-          asset={imageViewer.asset}
-          onClose={closeImageViewer}
-        />
-      )}
     </div>
   )
 }
@@ -1815,8 +1785,6 @@ export function TerminalView({
 /** Read-only xterm instance showing pre-baked ANSI content for mock/demo mode. */
 export function MockTerminal({ sessionId }: { sessionId: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const imageTrayRef = useRef<HTMLDivElement>(null)
-  const [imageViewer, setImageViewer] = useState<{ asset: TerminalImageAsset; sessionId: string } | null>(null)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -1832,12 +1800,6 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(containerRef.current)
-    const images = imageTrayRef.current
-      ? installTerminalImages(term, imageTrayRef.current, asset => {
-          const ownerSessionId = sessionId
-          return () => setImageViewer({ asset, sessionId: ownerSessionId })
-        })
-      : null
     loadWebglRenderer(term)
     // Fit like the real terminal: measureTerminalFit reserves the mobile
     // control bar's height (rounding rows up so one row tucks behind the
@@ -1870,7 +1832,6 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
     return () => {
       window.removeEventListener('resize', onResize)
       if ((window as any).__gmuxTerm === term) (window as any).__gmuxTerm = null
-      images?.dispose()
       term.dispose()
     }
   }, [sessionId])
@@ -1878,10 +1839,6 @@ export function MockTerminal({ sessionId }: { sessionId: string }) {
   return (
     <div class="terminal-shell">
       <div ref={containerRef} class="terminal-container" />
-      <div ref={imageTrayRef} class="terminal-image-tray" hidden aria-label="Terminal images" />
-      {imageViewer?.sessionId === sessionId && (
-        <TerminalImageViewer sessionId={sessionId} asset={imageViewer.asset} onClose={() => setImageViewer(null)} />
-      )}
     </div>
   )
 }

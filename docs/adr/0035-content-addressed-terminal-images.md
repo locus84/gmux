@@ -1,7 +1,25 @@
 # ADR 0035: content-addressed terminal images
 
-**Status:** Implemented draft; awaiting visual approval and deployment
+**Status:** Transport retained; image-reference UI withdrawn
 **Date:** 2026-09-15
+
+## Current policy (2026-09-21)
+
+Use existing viewer/file links only. The browser no longer creates image
+placeholders, decorations, a tray, or a separate asset viewer. For Pi sessions
+only, it requests `images=refs-v1` to avoid decoding legacy payloads, and ignores the
+resulting OSC references. Runner caches and authenticated retrieval routes are
+retained for protocol compatibility, not exposed as a new UI.
+
+New gmux PTY children receive `PI_IMAGE_PROTOCOL=none`: Pi's automatic image
+capability detection then avoids allocating image-height blank rows. Explicit
+Pi `terminal.images` settings can override this environment policy. Other
+applications retain their native graphics capability. Existing processes and
+recorded terminal geometry are not rewritten; adopting the producer policy
+requires a newly started process. Do not strip arbitrary blank terminal rows.
+
+The original design below records the transport rationale; its placeholder,
+tray, preview, and click-to-fetch UI policy is superseded by this section.
 
 ## Context
 
