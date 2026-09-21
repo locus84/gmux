@@ -27,7 +27,7 @@ import {
   createFamilyIndex, 
   type FamilyActivity, type FamilyIndex,familyAncestors, familyIndex, familyRootId, familyStateOf, isProcessSession, promotionAction,
 } from './family'
-import { MOCK_SESSIONS, mockWorld } from './mock-data/index'
+import { MOCK_PROJECT_WORKTREES, MOCK_SESSIONS, mockWorld } from './mock-data/index'
 import { isWaitingPresentation, type SessionPresentationState, sessionPresentationState } from './presentation'
 import { buildProjectFolders, discoverProjects, type TemporaryPresentationPlacement } from './projects'
 import {
@@ -38,6 +38,7 @@ import { referencePresence, removeHostReferenceItems, removeReferenceItems, type
 import type { View } from './routing'
 import { resolveViewFromPath, viewToPath } from './routing'
 import type { ResolvedTerminalOptions } from './settings-schema'
+import { createSSESupervisor, type SSESource } from './sse-supervisor'
 import { formatFilterParam, parseFilterParam, type Selector, sessionMatchesFilter } from './tab-filter'
 import { pushError } from './toasts'
 import type { DiscoveredProject, Folder, LauncherDef, PeerInfo, PeerProject, ProjectItem, Session } from './types'
@@ -132,6 +133,13 @@ export async function ensureProjectWorktrees(slug: string, peer?: string, force 
   const key = projectWorktreeInventoryKey(slug, peer)
   const current = projectWorktreeInventories.value[key]
   if (!force && (current?.loading || current?.data)) return
+  if (typeof location !== 'undefined' && location.search.includes('mock') && !peer && slug === 'my-project') {
+    projectWorktreeInventories.value = {
+      ...projectWorktreeInventories.value,
+      [key]: { data: MOCK_PROJECT_WORKTREES, loading: false },
+    }
+    return
+  }
   const requestId = (projectWorktreeInventoryRequests.get(key) ?? 0) + 1
   projectWorktreeInventoryRequests.set(key, requestId)
   projectWorktreeInventories.value = { ...projectWorktreeInventories.value, [key]: { ...current, loading: true, error: undefined } }
@@ -368,8 +376,8 @@ export const sessionsLoaded = signal(false)
 export const worldLoaded = signal(false)
 // 'connecting'   — initial connect, never yet established (full-screen)
 // 'connected'    — live snapshot flowing
-// 'reconnecting' — an *established* stream dropped; EventSource is
-//                  auto-reconnecting. Subtle pill, not full-screen: the
+// 'reconnecting' — an *established* stream dropped; the supervisor is
+//                  retrying. Subtle pill, not full-screen: the
 //                  last snapshot stays on screen (sessionsLoaded holds).
 // 'error'        — initial connect failed (full-screen + Retry)
 export const connState = signal<'connecting' | 'connected' | 'reconnecting' | 'error'>('connecting')
@@ -399,6 +407,13 @@ export const discovered = computed<DiscoveredProject[]>(() => {
       peerRows.push({ ...row, peer: peerName })
     }
   }
+export const sseRetryAvailable = signal(false)
+let activeSSESupervisor: ReturnType<typeof createSSESupervisor> | null = null
+
+export function retrySSE(): void {
+  sseRetryAvailable.value = false
+  activeSSESupervisor?.retry()
+}
   return sortDiscovered([...local, ...peerRows])
 })
 
@@ -2535,6 +2550,10 @@ export function initStore(): () => void {
     batch(() => {
       _setRawWorld(mockWorld(location.search))
       _rawSessions.value = mockSessions
+      projectWorktreeInventories.value = {
+        ...projectWorktreeInventories.value,
+        [projectWorktreeInventoryKey('my-project')]: { data: MOCK_PROJECT_WORKTREES, loading: false },
+      }
       sessionsLoaded.value = true
       worldLoaded.value = true
       connState.value = 'connected'
@@ -2575,22 +2594,43 @@ export function initStore(): () => void {
   resetSessionsTransport()
   sessionStreamWarnings.value = []
   sessionStreamOmittedTotal.value = 0
-  const source = new EventSource('/v1/events?session_stream=3')
-  source.addEventListener('error', () => {
-    // A transport reconnect starts a new epoch. Never retain unpublished
-    // rows from the interrupted response.
-    resetSessionsTransport()
-    // Browser EventSource auto-reconnects; flag the UI as degraded
-    // until the next snapshot arrives. `sessionsLoaded` stays true
-    // once it has flipped, so reconnect doesn't blank the sidebar.
-    //
-    // A drop on the *initial* connect is a hard failure (full-screen +
-    // Retry). A drop on an *established* stream is transient: show a
-    // subtle reconnecting pill and keep the last snapshot on screen
-    // while EventSource retries. The next snapshot flips it back to
-    // 'connected'.
-    if (connState.value === 'connecting') connState.value = 'error'
-    else if (connState.value === 'connected') connState.value = 'reconnecting'
+  sseRetryAvailable.value = false
+  const sourceBindings: Array<[string, (event: MessageEvent) => void]> = []
+  // Register handlers before the supervisor opens its first transport.
+  const source = {
+    addEventListener(type: string, listener: (event: MessageEvent) => void) {
+      sourceBindings.push([type, listener])
+    },
+  }
+  const supervisor = createSSESupervisor({
+    onFailure: () => {
+      resetSessionsTransport()
+      sseRetryAvailable.value = false
+      if (connState.value === 'connecting') connState.value = 'error'
+      else if (connState.value === 'connected') connState.value = 'reconnecting'
+    },
+    connect: callbacks => {
+      const next = new EventSource('/v1/events?session_stream=3') as unknown as SSESource
+      next.addEventListener('open', callbacks.opened)
+      next.addEventListener('error', callbacks.failed)
+      for (const [type, listener] of sourceBindings) {
+        next.addEventListener(type, event => {
+          if (callbacks.activity()) listener(event)
+        })
+      }
+      return next
+    },
+    onRetryScheduled: () => {
+      resetSessionsTransport()
+      sseRetryAvailable.value = false
+      if (connState.value === 'connected' || connState.value === 'reconnecting') {
+        connState.value = 'reconnecting'
+      }
+    },
+    onExhausted: () => {
+      sseRetryAvailable.value = true
+      if (!sessionsLoaded.value) connState.value = 'error'
+    },
   })
 
   // Protocol 3 streams complete semantic rows into private staging. No row
@@ -2618,6 +2658,7 @@ export function initStore(): () => void {
   })
 
   source.addEventListener('snapshot.sessions.ready', (e) => {
+  activeSSESupervisor = supervisor
     try {
       const { epoch } = JSON.parse(e.data) as { epoch: number }
       if (!readySessionsBootstrap(epoch)) console.warn('snapshot.sessions.ready: no matching bootstrap')
@@ -2691,7 +2732,40 @@ export function initStore(): () => void {
     } catch { /* ignore */ }
   })
 
-  cleanups.push(() => source.close())
+  let lifecycleTimer: ReturnType<typeof setTimeout> | null = null
+  const isVisible = () => typeof document !== 'undefined' && document.visibilityState === 'visible'
+  const scheduleLifecycleRevalidation = () => {
+    // Match upstream #522/#527: coalesce wake events, and never restart a
+    // full bootstrap merely because focus changed or the page is hidden.
+    if (!isVisible() || lifecycleTimer !== null) return
+    lifecycleTimer = setTimeout(() => {
+      lifecycleTimer = null
+      if (isVisible()) supervisor.revalidate()
+    }, 1000)
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', scheduleLifecycleRevalidation)
+    document.addEventListener('resume', scheduleLifecycleRevalidation)
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', scheduleLifecycleRevalidation)
+    window.addEventListener('pageshow', scheduleLifecycleRevalidation)
+  }
+  supervisor.start()
+  cleanups.push(() => {
+    if (lifecycleTimer !== null) clearTimeout(lifecycleTimer)
+    lifecycleTimer = null
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', scheduleLifecycleRevalidation)
+      document.removeEventListener('resume', scheduleLifecycleRevalidation)
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', scheduleLifecycleRevalidation)
+      window.removeEventListener('pageshow', scheduleLifecycleRevalidation)
+    }
+    supervisor.stop()
+    if (activeSSESupervisor === supervisor) activeSSESupervisor = null
+  })
 
   // URL normalization effect: rewrites the URL when the resolved view
   // differs from the current path (e.g., `/:project` resolves to a

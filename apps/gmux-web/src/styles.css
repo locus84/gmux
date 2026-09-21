@@ -753,6 +753,16 @@ body {
   white-space: nowrap;
 }
 
+.folder-worktree-count {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font: 600 9px/1.35 'Instrument Sans', sans-serif;
+  letter-spacing: .02em;
+}
+
 .folder-chevron {
   flex-shrink: 0;
   width: 12px;
@@ -3138,6 +3148,18 @@ body {
   top: 0;
   height: 0;
   overflow: visible;
+.app-reconnecting-pill button {
+  pointer-events: auto;
+  border: 0;
+  min-height: 44px;
+  min-width: 44px;
+  background: transparent;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
   display: flex;
   justify-content: flex-end;
   /* The anchor is height:0; the default align-items:stretch would crush
@@ -4810,12 +4832,26 @@ body {
 .worktree-sheet-header p { margin-top: 3px; color: var(--text-muted); font-size: 12px; }
 .worktree-close, .worktree-remove { min-width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--text-secondary); }
 .worktree-close { font-size: 24px; }
-.worktree-list { min-height: 80px; overflow: auto; padding: 8px; }
-.worktree-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 10px 8px; border-bottom: 1px solid var(--border); }
-.worktree-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.worktree-row-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.worktree-list { min-height: 80px; overflow: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.worktree-card { overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in oklch, var(--bg) 55%, var(--bg-surface)); }
+.worktree-card-head { display: flex; align-items: center; gap: 8px; padding: 12px; }
+.worktree-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.worktree-branch-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.worktree-row-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .worktree-row-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-family: "JetBrains Mono", monospace; font-size: 10px; }
-.worktree-row-main small { color: var(--accent); }
+.worktree-branch-line small { flex: none; padding: 1px 6px; border-radius: 999px; background: color-mix(in oklch, var(--accent) 13%, transparent); color: var(--accent); font-size: 10px; }
+.worktree-stats { color: var(--text-muted); font-size: 11px; }
+.worktree-stats b { color: var(--active); font-weight: 600; }
+.worktree-card-actions { flex: none; display: flex; align-items: center; gap: 2px; }
+.worktree-session-list { border-top: 1px solid var(--border); padding: 5px 9px 7px; }
+.worktree-session { min-height: 44px; display: flex; align-items: center; gap: 8px; padding: 0 4px; border-radius: 7px; color: var(--text-secondary); font-size: 12px; text-decoration: none; }
+.worktree-session:hover, .worktree-session:focus-visible { background: var(--bg-hover); }
+.worktree-session-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--text-muted); opacity: .45; }
+.worktree-session-dot.active { box-sizing: border-box; border: 1.5px solid var(--active); background: transparent; opacity: 1; }
+.worktree-session-dot.unread { background: var(--unread); opacity: 1; }
+.worktree-session-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.worktree-session small { flex: none; color: var(--text-muted); font-size: 10px; }
+.worktree-session-empty, .worktree-session-more { padding: 7px 4px; color: var(--text-muted); font-size: 11px; }
 .worktree-launch .launch-btn { min-width: 44px; min-height: 44px; }
 .worktree-remove { padding: 0 8px; font-size: 12px; }
 .worktree-remove.confirm { background: var(--danger, #b54141); color: white; }

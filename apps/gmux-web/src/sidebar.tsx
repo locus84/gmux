@@ -12,7 +12,7 @@ import { hasSessionSlugCollision, sessionPath, viewToPath } from './routing'
 import { FamilyIcon } from './family-icon'
 import { familyDrawerRoot } from './family-drawer-state'
 import { selectorLabel, folderMatchesFilter, type Selector } from './tab-filter'
-import { groupSessionsByCheckout, reorderKeysForFolder, type CheckoutGroup } from './projects'
+import { reorderKeysForFolder, type CheckoutGroup } from './projects'
 import { projectFileBrowserPath } from './file-browser'
 import { buildVSCodeServerUrl } from './vscode-server'
 import { LaunchButton } from './launcher'
@@ -595,6 +595,7 @@ function FolderGroup({
     }
   }, [folder.slug, folder.peer, folder.unresolved, folder.missing, ownerStatus])
   const inventory = projectWorktreeInventories.value[projectWorktreeInventoryKey(folder.slug, folder.peer)]
+  const linkedWorktreeCount = inventory?.data?.worktrees.filter(worktree => !worktree.primary).length ?? 0
   const toggleFavorite = async () => {
     if (favoritePending) return
     setFavoritePending(true)
@@ -655,11 +656,17 @@ function FolderGroup({
   // mobile scroll-into-view). The header reads as collapsed; the one
   // row just sits beneath it.
   const shown = collapsed ? displayItems.filter(s => s.id === selId) : displayItems
-  const checkoutGroups = groupSessionsByCheckout(
-    { ...folder, sessions: shown },
-    inventory?.data?.worktrees,
-    inventory?.data?.primary_path,
-  )
+  // Worktrees are managed in the project's dedicated inventory sheet.
+  // Keep the steering sidebar session/family-only so its hierarchy does not
+  // compete with family parentage or hide a child's actual checkout.
+  const checkoutGroups: CheckoutGroup[] = [{
+    key: `sessions:${folder.key}`,
+    path: folder.launchCwd ?? '',
+    label: 'Sessions',
+    primary: true,
+    sessions: shown,
+    fallback: true,
+  }]
   // Drag-reorder is disabled while collapsed (the visible subset no
   // longer maps onto the stored order) or under the alive-only toggle.
   const dragDisabled = collapsed || !!aliveOnly
@@ -720,6 +727,9 @@ function FolderGroup({
         >
           <IconChevron className={`folder-chevron${collapsed ? ' collapsed' : ''}`} />
           <span class="folder-name-label">{folder.name}</span>
+          {linkedWorktreeCount > 0 && (
+            <span class="folder-worktree-count" title={`${linkedWorktreeCount} linked ${linkedWorktreeCount === 1 ? 'worktree' : 'worktrees'}`}>WT {linkedWorktreeCount}</span>
+          )}
           <HostSuffix peer={folder.peer ?? localHostLabel.value} local={!folder.peer} />
           {folder.missing && <span class="folder-missing-icon" title="Project missing on host — remove in Settings → Projects">?</span>}
           {folder.unresolved && (
@@ -762,7 +772,7 @@ function FolderGroup({
               }] : []),
             ]}
             footerAction={!folder.unresolved && !folder.missing
-              ? { label: 'Manage worktrees…', onSelect: () => setWorktreesOpen(true) }
+              ? { label: 'Manage worktrees…', onSelect: () => { onClick?.(); setWorktreesOpen(true) } }
               : undefined}
           />
         </div>

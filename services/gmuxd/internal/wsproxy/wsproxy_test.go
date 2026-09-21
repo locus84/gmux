@@ -6,17 +6,27 @@ import (
 )
 
 func TestBrowserAttachQueryAllowlist(t *testing.T) {
-	for name, query := range map[string]string{
-		"browser":         "client=browser",
-		"missing":         "",
-		"other":           "client=browser&route=secret",
-		"wrong value":     "client=1",
-		"duplicate":       "client=browser&client=browser",
-		"empty duplicate": "client=browser&client=",
-	} {
-		t.Run(name, func(t *testing.T) {
-			if got := browserAttachQuery(mustParseQuery(t, query)); got != (name == "browser") {
-				t.Fatalf("browserAttachQuery(%q) = %v", query, got)
+	cases := []struct {
+		name              string
+		query             string
+		browser, imageRef bool
+	}{
+		{"browser", "client=browser", true, false},
+		{"image refs", "client=browser&images=refs-v1", true, true},
+		{"missing browser", "images=refs-v1", false, false},
+		{"missing", "", false, false},
+		{"other", "client=browser&route=secret", false, false},
+		{"wrong image value", "client=browser&images=raw", false, false},
+		{"duplicate image", "client=browser&images=refs-v1&images=refs-v1", false, false},
+		{"wrong value", "client=1", false, false},
+		{"duplicate", "client=browser&client=browser", false, false},
+		{"empty duplicate", "client=browser&client=", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			browser, imageRef := browserAttachQuery(mustParseQuery(t, tc.query))
+			if browser != tc.browser || imageRef != tc.imageRef {
+				t.Fatalf("browserAttachQuery(%q) = (%v,%v), want (%v,%v)", tc.query, browser, imageRef, tc.browser, tc.imageRef)
 			}
 		})
 	}

@@ -518,7 +518,7 @@ func TestDialWS_BrowserCapabilityIsAllowlisted(t *testing.T) {
 	}
 }
 
-func TestProxyWS_ForwardsBrowserCapability(t *testing.T) {
+func TestProxyWS_ForwardsBrowserImageCapability(t *testing.T) {
 	gotQuery := make(chan string, 1)
 	spoke := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery <- r.URL.RawQuery
@@ -536,7 +536,7 @@ func TestProxyWS_ForwardsBrowserCapability(t *testing.T) {
 	defer hub.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	wsURL := "ws" + strings.TrimPrefix(hub.URL, "http") + "/?client=browser"
+	wsURL := "ws" + strings.TrimPrefix(hub.URL, "http") + "/?client=browser&images=refs-v1"
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		t.Fatalf("browser dial: %v", err)
@@ -544,8 +544,8 @@ func TestProxyWS_ForwardsBrowserCapability(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 	select {
 	case query := <-gotQuery:
-		if query != "client=browser" {
-			t.Fatalf("query = %q, want client=browser", query)
+		if query != "client=browser&images=refs-v1" {
+			t.Fatalf("query = %q, want client=browser&images=refs-v1", query)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())

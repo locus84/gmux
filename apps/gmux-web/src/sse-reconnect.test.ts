@@ -32,6 +32,7 @@ describe('SSE reconnecting state', () => {
   let cleanup: () => void
 
   beforeEach(() => {
+    vi.useFakeTimers()
     connState.value = 'connecting'
     FakeEventSource.instances = []
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
@@ -46,10 +47,11 @@ describe('SSE reconnecting state', () => {
   afterEach(() => {
     cleanup?.()
     vi.unstubAllGlobals()
+    vi.useRealTimers()
   })
 
   function source(): FakeEventSource {
-    return FakeEventSource.instances[0]
+    return FakeEventSource.instances[FakeEventSource.instances.length - 1]
   }
 
   function ready(epoch = 1, sessions: unknown[] = []) {
@@ -108,6 +110,9 @@ describe('SSE reconnecting state', () => {
     ready()
     source().emit('error')
     expect(connState.value).toBe('reconnecting')
+    expect(source().closed).toBe(true)
+    vi.advanceTimersByTime(600)
+    expect(FakeEventSource.instances).toHaveLength(2)
     ready(2)
     expect(connState.value).toBe('connected')
   })
@@ -127,6 +132,10 @@ describe('SSE reconnecting state', () => {
     source().emit('snapshot.sessions.batch', { epoch: 2, sessions: [] })
     source().emit('snapshot.sessions.ready', { epoch: 2 })
     expect(_rawSessions.value.map(s => s.id)).toEqual(['old'])
+    // The supervisor replaces the transport after its jittered backoff;
+    // the retired source cannot publish recovery snapshots.
+    vi.advanceTimersByTime(600)
+    expect(FakeEventSource.instances).toHaveLength(2)
     // Epochs restart on the new transport.
     ready(1, [{ id: 'fresh', adapter: 'shell', alive: true, status: null, unread: false, unread_token: '' }])
     expect(_rawSessions.value.map(s => s.id)).toEqual(['fresh'])

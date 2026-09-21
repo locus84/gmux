@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +29,11 @@ import (
 
 //go:embed pi-ext.mjs
 var extSource []byte
+
+//go:generate cp ../../../../skills/gmux/SKILL.md gmux-skill.md
+
+//go:embed gmux-skill.md
+var skillSource []byte
 
 var (
 	once    = new(sync.Once)
@@ -56,7 +62,15 @@ func materialize() (string, error) {
 		return "", fmt.Errorf("agentext: mkdir %s: %w", dir, err)
 	}
 	p := filepath.Join(dir, fmt.Sprintf("pi-ext-%s.mjs", short))
-	return materializePath(p, extSource)
+	if _, err := materializePath(p, extSource); err != nil {
+		return "", err
+	}
+	// Pi.ExtendCommand derives this adjacent path from the extension path and
+	// passes it via --skill. Keep both artifacts under the same content key.
+	if _, err := materializePath(strings.TrimSuffix(p, filepath.Ext(p))+"-skill.md", skillSource); err != nil {
+		return "", err
+	}
+	return p, nil
 }
 
 // materializePath publishes source at its content-addressed path. Detached

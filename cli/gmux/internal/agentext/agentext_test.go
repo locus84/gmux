@@ -240,6 +240,16 @@ func assertNoPrivateTemps(t *testing.T, dir, p string) {
 	}
 }
 
+func TestEmbeddedSkillMatchesRepositorySkill(t *testing.T) {
+	canonical, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "skills", "gmux", "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(skillSource, canonical) {
+		t.Fatal("embedded gmux skill does not match skills/gmux/SKILL.md")
+	}
+}
+
 func TestPathMaterializesReadableExtension(t *testing.T) {
 	// Path intentionally memoizes for the life of a production process. Give
 	// this test invocation a private memoization cell because -count repeats
@@ -266,6 +276,14 @@ func TestPathMaterializesReadableExtension(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "session_start") {
 		t.Error("materialized extension missing session_start handler")
+	}
+	skillPath := strings.TrimSuffix(p, filepath.Ext(p)) + "-skill.md"
+	skill, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read materialized skill: %v", err)
+	}
+	if !bytes.Equal(skill, skillSource) {
+		t.Error("materialized skill differs from embedded source")
 	}
 
 	// Idempotent: a second call returns the same path.

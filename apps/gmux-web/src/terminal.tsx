@@ -353,7 +353,7 @@ export function TerminalView({
   // Drop initial-attach input until replay and viewport claim commit.
   const inputClaimedRef = useRef(false)
   const fileHrefRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => string>(() => '')
-  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => {})
+  const openFileRef = useRef<(sessionId: string, path: string, pasteImage: boolean) => void>(() => { /* set when the file overlay mounts */ })
   const fileOverlayOpenRef = useRef(false)
 
   // True once the terminal's font is downloaded; gates xterm mount.
@@ -1478,7 +1478,11 @@ export function TerminalView({
       })
 
       const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${session.id}?client=browser`)
+      const wsParams = new URLSearchParams({ client: 'browser' })
+      // Pi uses existing viewer links, not inline images. Strip its legacy
+      // payloads as ignored OSC refs; other applications keep native graphics.
+      if (session.adapter === 'pi') wsParams.set('images', 'refs-v1')
+      const ws = new WebSocket(`${wsProtocol}//${location.host}/ws/${session.id}?${wsParams}`)
       ws.binaryType = 'arraybuffer'
       const connection: SessionConnection = { sessionId: session.id, ws }
       connectionRef.current = connection

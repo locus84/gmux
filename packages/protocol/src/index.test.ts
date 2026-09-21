@@ -5,6 +5,7 @@ import {
   successEnvelope,
   SessionStatusSchema,
   ProjectWorktreesResponseSchema,
+  TerminalImageMessageSchema,
 } from './index.js'
 
 describe('protocol schemas', () => {
@@ -82,6 +83,22 @@ describe('protocol schemas', () => {
       },
     })
     expect(parsed.ok && parsed.data.worktrees[0].branch).toBe('main')
+  })
+
+  it('validates terminal image reference actions', () => {
+    expect(TerminalImageMessageSchema.parse({
+      version: 1,
+      action: 'put',
+      hash: 'a'.repeat(64),
+      id: 12,
+      cols: 40,
+      rows: 10,
+      bytes: 4096,
+      mime: 'image/png',
+    }).action).toBe('put')
+    expect(TerminalImageMessageSchema.parse({ version: 1, action: 'delete', all: true }).action).toBe('delete')
+    expect(() => TerminalImageMessageSchema.parse({ version: 1, action: 'delete', id: 0 })).toThrow()
+    expect(() => TerminalImageMessageSchema.parse({ version: 1, action: 'delete', all: true, id: 12 })).toThrow()
   })
 
   it('builds typed success envelopes', () => {
