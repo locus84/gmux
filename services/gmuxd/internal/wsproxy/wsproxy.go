@@ -96,8 +96,12 @@ func (p *Proxy) Handler() http.HandlerFunc {
 		// The runner only needs this explicit browser capability. Do not
 		// forward arbitrary client query parameters into the Unix-socket
 		// protocol, where they could become future routing/auth inputs.
-		if browserAttachQuery(r.URL.Query()) {
+		browser, imageRefs := browserAttachQuery(r.URL.Query())
+		if browser {
 			backendURL += "?client=browser"
+			if imageRefs {
+				backendURL += "&images=refs-v1"
+			}
 		}
 		backendConn, _, err := websocket.Dial(ctx, backendURL, &websocket.DialOptions{
 			HTTPClient: &http.Client{
@@ -163,12 +167,22 @@ func (p *Proxy) Handler() http.HandlerFunc {
 	}
 }
 
-// browserAttachQuery is deliberately strict: client=browser is a capability
-// marker, not a general query proxy. Reject duplicate values and every other
-// key so routing/auth parameters cannot cross into the runner protocol.
-func browserAttachQuery(q url.Values) bool {
-	values, ok := q["client"]
-	return ok && len(q) == 1 && len(values) == 1 && values[0] == "browser"
+// browserAttachQuery is deliberately strict. images=refs-v1 is negotiated
+// only together with client=browser; duplicates, unknown values, and every
+// other key are dropped rather than crossing into the runner protocol.
+func browserAttachQuery(q url.Values) (browser, imageRefs bool) {
+	clients, ok := q["client"]
+	if !ok || len(clients) != 1 || clients[0] != "browser" || len(q) > 2 {
+		return false, false
+	}
+	images, hasImages := q["images"]
+	if !hasImages {
+		return len(q) == 1, false
+	}
+	if len(q) != 2 || len(images) != 1 || images[0] != "refs-v1" {
+		return false, false
+	}
+	return true, true
 }
 
 // proxyClientToBackend forwards all client messages to the backend.

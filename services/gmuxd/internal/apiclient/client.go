@@ -342,6 +342,11 @@ func (c *Client) proxyHTTP(w http.ResponseWriter, r *http.Request, path string) 
 // endpoint, injecting bearer auth and honoring the client's transport.
 // The caller owns the returned connection and must close it.
 func (c *Client) DialWS(ctx context.Context, sessionID string, browser ...bool) (*websocket.Conn, error) {
+	browserEnabled := len(browser) > 0 && browser[0]
+	return c.dialWS(ctx, sessionID, browserEnabled, false)
+}
+
+func (c *Client) dialWS(ctx context.Context, sessionID string, browser, imageRefs bool) (*websocket.Conn, error) {
 	base := strings.TrimRight(c.baseURL, "/")
 	switch {
 	case strings.HasPrefix(base, "https://"):
@@ -350,8 +355,11 @@ func (c *Client) DialWS(ctx context.Context, sessionID string, browser ...bool) 
 		base = "ws://" + base[len("http://"):]
 	}
 	spokeURL := fmt.Sprintf("%s/ws/%s", base, sessionID)
-	if len(browser) > 0 && browser[0] {
+	if browser {
 		spokeURL += "?client=browser"
+		if imageRefs {
+			spokeURL += "&images=refs-v1"
+		}
 	}
 
 	dialOpts := &websocket.DialOptions{}
@@ -408,12 +416,12 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 	// Only propagate the one browser capability understood by the spoke.
 	// Never forward arbitrary hub query parameters across the authenticated
 	// peer boundary.
-	browserAttach := browserAttachQuery(r.URL.Query())
+	browserAttach, imageRefs := browserAttachQuery(r.URL.Query())
 	// Bound the post-upgrade peer dial. Without a deadline the browser sees an
 	// OPEN hub socket that can remain silent forever while the spoke route is
 	// blackholed, so its reconnect loop has no failure to react to.
 	dialCtx, cancelDial := context.WithTimeout(r.Context(), 12*time.Second)
-	spokeConn, err := c.DialWS(dialCtx, sessionID, browserAttach)
+	spokeConn, err := c.dialWS(dialCtx, sessionID, browserAttach, imageRefs)
 	cancelDial()
 	if err != nil {
 		log.Printf("apiclient ProxyWS: dial %s: %v", sessionID, err)
@@ -429,12 +437,21 @@ func (c *Client) ProxyWS(w http.ResponseWriter, r *http.Request, sessionID strin
 	c.pipeWS(r.Context(), clientConn, spokeConn, sessionID)
 }
 
-// browserAttachQuery is deliberately strict: client=browser is a capability
-// marker, not a general query proxy. Reject duplicate values and every other
-// key so routing/auth parameters cannot cross the authenticated peer hop.
-func browserAttachQuery(q url.Values) bool {
-	values, ok := q["client"]
-	return ok && len(q) == 1 && len(values) == 1 && values[0] == "browser"
+// browserAttachQuery is deliberately strict. images=refs-v1 is forwarded only
+// with the browser marker; no arbitrary query input crosses the peer boundary.
+func browserAttachQuery(q url.Values) (browser, imageRefs bool) {
+	clients, ok := q["client"]
+	if !ok || len(clients) != 1 || clients[0] != "browser" || len(q) > 2 {
+		return false, false
+	}
+	images, hasImages := q["images"]
+	if !hasImages {
+		return len(q) == 1, false
+	}
+	if len(q) != 2 || len(images) != 1 || images[0] != "refs-v1" {
+		return false, false
+	}
+	return true, true
 }
 
 // pipeWS runs the bidirectional copy loop between an already-accepted

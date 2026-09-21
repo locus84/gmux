@@ -959,6 +959,20 @@ func serveCentral(stderr io.Writer, replace bool) int {
 			}
 			sessionTempImageContentHandler(w, r, id, storeHandle, os.TempDir())
 		})
+		mux.HandleFunc("GET /v1/sessions/{id}/images/{hash}", func(w http.ResponseWriter, r *http.Request) {
+			id, hash := r.PathValue("id"), r.PathValue("hash")
+			if !validTerminalImageHash(hash) {
+				writeError(w, http.StatusBadRequest, "invalid_hash", "image hash must be 64 lowercase hexadecimal characters")
+				return
+			}
+			if peerManager != nil {
+				if peer, originalID := peerManager.FindPeer(id); peer != nil {
+					peer.ProxyGET(w, r, "/v1/sessions/"+originalID+"/images/"+hash)
+					return
+				}
+			}
+			terminalImageHandler(w, r, id, hash, storeHandle, boot.Registry)
+		})
 		mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
 			handleCentralSessionAction(w, r, boot, fanout, converter, peerManager, sessionDirs, gmuxBin, notifier)
 		})
