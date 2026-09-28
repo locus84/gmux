@@ -407,6 +407,39 @@ func TestReconcileClaimedRowIsNotACandidate(t *testing.T) {
 	}
 }
 
+func TestAssignRetentionRanksNewestFirstWithoutReordering(t *testing.T) {
+	oldest := centralstore.UnixMillis(10)
+	newest := centralstore.UnixMillis(30)
+	middle := centralstore.UnixMillis(20)
+	candidates := []ReconcileCandidate{
+		{ID: "oldest", Adapter: "shell", RetentionAt: &oldest},
+		{ID: "conversation", Adapter: "shell", ConversationRef: "ref", RetentionAt: &newest},
+		{ID: "undated", Adapter: "shell"},
+		{ID: "newest", Adapter: "shell", RetentionAt: &newest},
+		{ID: "middle", Adapter: "shell", RetentionAt: &middle},
+		{ID: "other", Adapter: "pi", RetentionAt: &oldest},
+	}
+	assignRetentionRanks(candidates)
+
+	wantIDs := []centralstore.SessionID{"oldest", "conversation", "undated", "newest", "middle", "other"}
+	for i, id := range wantIDs {
+		if candidates[i].ID != id {
+			t.Fatalf("candidate order changed: got %v", candidates)
+		}
+	}
+	wantRanks := map[centralstore.SessionID]int{
+		"undated": 0, "newest": 1, "middle": 2, "oldest": 3, "other": 0,
+	}
+	for _, candidate := range candidates {
+		if candidate.ConversationRef != "" {
+			continue
+		}
+		if candidate.RetentionRank != wantRanks[candidate.ID] {
+			t.Errorf("%s rank=%d, want %d", candidate.ID, candidate.RetentionRank, wantRanks[candidate.ID])
+		}
+	}
+}
+
 func TestReconcileBatchesPerAdapterInOrder(t *testing.T) {
 	ctx := context.Background()
 	dur := newFakeDurable(0)
