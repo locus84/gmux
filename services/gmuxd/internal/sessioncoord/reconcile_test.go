@@ -469,6 +469,36 @@ func TestReconcileBatchesPerAdapterInOrder(t *testing.T) {
 	}
 }
 
+func TestReconcileBoundsRemovalBacklogPerPass(t *testing.T) {
+	ctx := context.Background()
+	dur := newFakeDurable(0)
+	dur.listSessions = func() ([]centralstore.Session, error) {
+		rows := make([]centralstore.Session, maxReconcileRemovalsPerPass+5)
+		for i := range rows {
+			rows[i] = deadSession(sid(i+1), "shell", "", 1)
+		}
+		return rows, nil
+	}
+	rec := &fakeReconciler{fn: func(_ string, batch []ReconcileCandidate) ([]ReconcileDecision, error) {
+		out := make([]ReconcileDecision, len(batch))
+		for i, candidate := range batch {
+			out[i] = ReconcileDecision{ID: candidate.ID, Disposition: DispositionRemove}
+		}
+		return out, nil
+	}}
+	coord := New(nil, newFakeClient(RunnerMeta{}), dur, &fakeDirtySink{}, nil,
+		WithAdapterReconciler(rec), WithReconcileBatchSize(16))
+	closeBarrier(t, coord)
+
+	removed, _, err := coord.Reconcile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != maxReconcileRemovalsPerPass || len(dur.removeCalls) != maxReconcileRemovalsPerPass {
+		t.Fatalf("removed=%d calls=%d, want %d", len(removed), len(dur.removeCalls), maxReconcileRemovalsPerPass)
+	}
+}
+
 func TestReconcileSingleFlight(t *testing.T) {
 	ctx := context.Background()
 	dur := newFakeDurable(0)
