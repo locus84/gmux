@@ -9,6 +9,8 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 )
 
+const maxReconcileRemovalsPerPass = 64
+
 var (
 	// ErrNoAdapterReconciler marks a Reconcile call without a configured
 	// adapter boundary.
@@ -316,6 +318,13 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]centralstore.SessionID, 
 		coverageValid := false
 		if owner, hit := covered[cand.ID]; hit {
 			_, coverageValid = c.registry.current(owner)
+		}
+		// Large retention backlogs must not turn one reconciliation into
+		// thousands of placement-normalizing transactions. Later periodic
+		// passes continue draining the backlog.
+		if (adapterConfirmed || coverageValid) && len(removed) >= maxReconcileRemovalsPerPass {
+			c.mu.Unlock()
+			continue
 		}
 		// A verdict invalidated during this pass (registration, Remove) must
 		// not be re-set by this pass's stale probe results.
