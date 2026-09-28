@@ -678,10 +678,13 @@ type Server struct {
 	// hiddenReconnectShrink means ptyCols is exactly one below the logical
 	// size. It is a one-shot fallback for streams without a raw image replay.
 	hiddenReconnectShrink bool
-	cursorHidden          bool      // tracks DECTCEM via callback (guarded by mu)
-	ptmxClosed            bool      // true once ptmx is closed by Shutdown (guarded by mu)
-	screenPending         []byte    // raw PTY data not yet fed to screen (guarded by mu)
-	replay                rawReplay // image-capable raw reconnect checkpoint (guarded by mu)
+	cursorHidden          bool              // tracks DECTCEM via callback (guarded by mu)
+	ptmxClosed            bool              // true once ptmx is closed by Shutdown (guarded by mu)
+	screenPending         []byte            // raw PTY data not yet fed to screen (guarded by mu)
+	replay                rawReplay         // original-byte reconnect checkpoint (guarded by mu)
+	imageReplay           rawReplay         // refs-v1 reconnect checkpoint (guarded by mu)
+	imageTransform        *imageTransformer // PTY stream → refs-v1 stream (guarded by mu)
+	images                *imageCache
 	lastClientLeft        time.Time // when the last WS client disconnected (guarded by mu)
 
 	done        chan struct{}      // closed when child exits
@@ -697,11 +700,12 @@ type wsWrite struct {
 }
 
 type wsClient struct {
-	conn     *websocket.Conn
-	ctx      context.Context
-	cancel   context.CancelFunc
-	readonly bool
-	writes   chan wsWrite
+	conn      *websocket.Conn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	readonly  bool
+	imageRefs bool
+	writes    chan wsWrite
 }
 
 func (c *wsClient) runWriter() {
@@ -933,11 +937,13 @@ func New(cfg Config) (*Server, error) {
 		ptyDone:     make(chan struct{}),
 		screenFlush: make(chan chan struct{}),
 		incarnation: newIncarnation(),
+		images:      newImageCache(imageCacheLimit),
 
 		adapter:     cfg.Adapter,
 		readyCh:     make(chan struct{}),
 		deliverSlot: make(chan struct{}, 1),
 	}
+	s.imageTransform = newImageTransformer(s.images)
 	s.deliverBytes = s.WritePTY
 	// Retain the ownership handle from BindSocket. Tests may inject a bare
 	// net.Listener; those servers own no pathname and never unlink one.
@@ -1246,6 +1252,7 @@ func (s *Server) serve() {
 	mux.HandleFunc("PUT /status", s.handlePutStatus)
 	mux.HandleFunc("PUT /slug", s.handlePutSlug)
 	mux.HandleFunc("GET /events", s.handleEvents)
+	mux.HandleFunc("GET /images/{hash}", s.handleImage)
 	mux.HandleFunc("POST /kill", s.handleKill)
 	mux.HandleFunc("POST /reap", s.handleReap)
 
@@ -1803,10 +1810,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// lockReplayBoundary waits until the raw stream parser is outside an opaque
-// control string, then returns with s.mu held. Attach must not start halfway
-// through a Kitty/Sixel/IIP payload.
-func (s *Server) lockReplayBoundary(ctx context.Context) bool {
+// lockReplayBoundary waits until the original stream parser is outside an
+// opaque control string, then returns with s.mu held. A refs-v1 attach also
+// waits for the image transformer to finish its multipart transaction. Raw
+// clients deliberately do not: complete Kitty APC chunks are already legal
+// attach boundaries for their byte-for-byte stream.
+func (s *Server) lockReplayBoundary(ctx context.Context, imageRefs bool) bool {
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	deadline := time.NewTimer(5 * time.Second)
@@ -1814,7 +1823,7 @@ func (s *Server) lockReplayBoundary(ctx context.Context) bool {
 
 	for {
 		s.mu.Lock()
-		if s.replay.safeBoundary() {
+		if s.replay.safeBoundary() && (!imageRefs || s.imageTransform.safeBoundary()) {
 			return true
 		}
 		s.mu.Unlock()
@@ -1827,6 +1836,8 @@ func (s *Server) lockReplayBoundary(ctx context.Context) bool {
 			// use the emulator snapshot at a synthetic boundary.
 			s.mu.Lock()
 			s.replay.abandonUnsafe()
+			// EOF cannot complete a multipart transfer. Its bytes are published
+			// verbatim by readPTY before ptyDone closes.
 			return true
 		case <-deadline.C:
 			return false
@@ -1854,6 +1865,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	go client.runWriter()
 
+	browserClient := r.URL.Query().Get("client") == "browser"
+	imageRefs := browserClient && r.URL.Query().Get("images") == "refs-v1"
+	client.imageRefs = imageRefs
+
 	// Serialize the flush barrier and restoration with concurrent viewer
 	// resizes; neither may slip output between another barrier and mutation.
 	s.resizeMu.Lock()
@@ -1862,7 +1877,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// A PTY flush can split an opaque Kitty/Sixel/IIP payload. Wait for a
 	// legal stream boundary before taking the replay snapshot; this returns
 	// with s.mu held so live output cannot overtake replay registration.
-	if !s.lockReplayBoundary(ctx) {
+	if !s.lockReplayBoundary(ctx, imageRefs) {
 		s.resizeMu.Unlock()
 		conn.Close(websocket.StatusTryAgainLater, "terminal output frame is incomplete")
 		cancel()
@@ -1884,7 +1899,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Snapshot sequence: BSU → reset → scrollback + screen → cursor → ESU.
 	// Browser buffer selection is separate metadata so `gmux attach` never
 	// receives browser-specific 1049 bytes.
-	browserClient := r.URL.Query().Get("client") == "browser"
 	// Restore the runner-owned one-column fallback before declaring replay
 	// geometry. There were no viewers when it was created, and handleWS holds
 	// s.mu until this client is registered, so no user resize can race or be
@@ -1895,6 +1909,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.drainScreenLocked()
 	checkpoint, suffix := s.replay.parts()
+	if imageRefs {
+		// Never send the original Kitty/base64 checkpoint on the negotiated
+		// path. The transformed replay has its own size accounting, so a large
+		// original image cannot invalidate a tiny reference checkpoint.
+		checkpoint, suffix = s.imageReplay.parts()
+	}
 	frame := snapshotFrameWithScreen(s.screen, s.cursorHidden, !browserClient || !s.screen.IsAltScreen())
 	if browserClient {
 		activeBuffer := "normal"
@@ -2037,6 +2057,7 @@ func (s *Server) flushScreenBeforeGeometry() {
 func (s *Server) applyGeometryLocked(ws *pty.Winsize) {
 	s.drainScreenLocked()
 	s.replay.geometryChanged()
+	s.imageReplay.geometryChanged()
 	s.geometryGeneration.Add(1)
 	s.ptyCols = ws.Cols
 	s.ptyRows = ws.Rows
@@ -2210,10 +2231,13 @@ func (s *Server) readPTY() {
 		// atomically so new clients always see their replay frame first.
 		s.mu.Lock()
 		s.replay.write(data)
+		imageData := s.imageTransform.feed(data)
+		s.imageReplay.write(imageData)
 		if unsafeGeometry || generation != s.geometryGeneration.Load() {
 			// Preserve parser continuity, but never retain a candidate or suffix
 			// containing bytes read across an old/new geometry boundary.
 			s.replay.geometryChanged()
+			s.imageReplay.geometryChanged()
 		}
 		s.screenPending = append(s.screenPending, data...)
 		localOut := s.localOut
@@ -2222,7 +2246,13 @@ func (s *Server) readPTY() {
 		// before these bytes, which were parsed at the old geometry. enqueue is
 		// bounded and never performs network I/O under the global lock.
 		for c := range s.clients {
-			c.enqueue(websocket.MessageBinary, data)
+			published := data
+			if c.imageRefs {
+				published = imageData
+			}
+			if len(published) > 0 {
+				c.enqueue(websocket.MessageBinary, published)
+			}
 		}
 		lastLeft := s.lastClientLeft
 		s.mu.Unlock()
@@ -2314,6 +2344,18 @@ func (s *Server) readPTY() {
 				}
 			}
 			flush()
+			// An incomplete/malformed candidate must reach refs clients exactly
+			// as emitted. No bytes remain hidden in the transformer at EOF.
+			s.mu.Lock()
+			if tail := s.imageTransform.flush(); len(tail) > 0 {
+				s.imageReplay.write(tail)
+				for c := range s.clients {
+					if c.imageRefs {
+						c.enqueue(websocket.MessageBinary, tail)
+					}
+				}
+			}
+			s.mu.Unlock()
 			return
 		}
 	}
@@ -2356,7 +2398,9 @@ func (s *Server) waitChild() {
 //     frontend's actual capabilities don't depend on what the parent
 //     thinks: TERM_PROGRAM=gmux, TERM_PROGRAM_VERSION=<version>,
 //     COLORTERM=truecolor, KITTY_WINDOW_ID=1 (xterm.js + image addon
-//     handles kitty graphics, sixel, and iTerm2 images);
+//     handles kitty graphics, sixel, and iTerm2 images). Pi uses existing
+//     viewer links instead: PI_IMAGE_PROTOCOL=none prevents its TUI from
+//     allocating tall, empty image rows when browser image refs are ignored;
 //  4. TERM=xterm-256color, but only if no earlier layer provided one.
 //     When gmuxd is launched from a non-interactive context (systemd
 //     unit, browser-launched shell inheriting the daemon's env) TERM
@@ -2388,6 +2432,7 @@ func buildChildEnv(parent, extra []string, version string) []string {
 		"TERM_PROGRAM_VERSION="+version,
 		"COLORTERM=truecolor",
 		"KITTY_WINDOW_ID=1",
+		"PI_IMAGE_PROTOCOL=none",
 	)
 	if !hasEnv(env, "TERM") {
 		env = append(env, "TERM=xterm-256color")

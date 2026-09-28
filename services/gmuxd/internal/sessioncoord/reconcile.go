@@ -9,6 +9,8 @@ import (
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 )
 
+const maxReconcileRemovalsPerPass = 64
+
 var (
 	// ErrNoAdapterReconciler marks a Reconcile call without a configured
 	// adapter boundary.
@@ -31,6 +33,12 @@ type ReconcileCandidate struct {
 	ConversationRef string
 	Command         []string
 	Version         centralstore.RowVersion
+	// RetentionAt is the best available last-use timestamp: exit, activity,
+	// then creation. RetentionRank is zero for the newest conversation-less
+	// dead row owned by this adapter. Adapters use these common facts to apply
+	// age/LRU policy without receiving an unbounded probe batch.
+	RetentionAt   *centralstore.UnixMillis
+	RetentionRank int
 }
 
 // Disposition is the adapter's answer for one candidate (ADR 0026 §5:
@@ -209,9 +217,11 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]centralstore.SessionID, 
 		candidates = append(candidates, ReconcileCandidate{
 			ID: s.ID, Adapter: s.Adapter, ConversationRef: s.ConversationRef,
 			Command: append([]string(nil), s.Command...), Version: s.Version,
+			RetentionAt: retentionTime(s),
 		})
 	}
 	c.mu.Unlock()
+	assignRetentionRanks(candidates)
 
 	// ── Probe (no locks; adapter I/O) ────────────────────────────────────
 	byAdapter := make(map[string][]ReconcileCandidate)
@@ -309,6 +319,13 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]centralstore.SessionID, 
 		if owner, hit := covered[cand.ID]; hit {
 			_, coverageValid = c.registry.current(owner)
 		}
+		// Large retention backlogs must not turn one reconciliation into
+		// thousands of placement-normalizing transactions. Later periodic
+		// passes continue draining the backlog.
+		if (adapterConfirmed || coverageValid) && len(removed) >= maxReconcileRemovalsPerPass {
+			c.mu.Unlock()
+			continue
+		}
 		// A verdict invalidated during this pass (registration, Remove) must
 		// not be re-set by this pass's stale probe results.
 		invalidated := c.verdictsInvalidated[cand.ID]
@@ -357,4 +374,45 @@ func (c *Coordinator) Reconcile(ctx context.Context) ([]centralstore.SessionID, 
 		c.emitOutcomes(ctx, removedSeqs[i], id)
 	}
 	return removed, verdictsChanged, nil
+}
+
+func retentionTime(s centralstore.Session) *centralstore.UnixMillis {
+	for _, candidate := range []*centralstore.UnixMillis{s.ExitedAt, s.LastActivityAt} {
+		if candidate != nil {
+			v := *candidate
+			return &v
+		}
+	}
+	if s.CreatedAt != 0 {
+		v := s.CreatedAt
+		return &v
+	}
+	return nil
+}
+
+// assignRetentionRanks ranks conversation-less candidates newest-first within
+// each adapter while preserving their store order for bounded probe batching.
+// Undated rows sort as newest and are therefore retained conservatively.
+func assignRetentionRanks(candidates []ReconcileCandidate) {
+	byAdapter := make(map[string][]int)
+	for i := range candidates {
+		if candidates[i].ConversationRef == "" {
+			byAdapter[candidates[i].Adapter] = append(byAdapter[candidates[i].Adapter], i)
+		}
+	}
+	for _, indexes := range byAdapter {
+		sort.SliceStable(indexes, func(i, j int) bool {
+			a, b := candidates[indexes[i]], candidates[indexes[j]]
+			if (a.RetentionAt == nil) != (b.RetentionAt == nil) {
+				return a.RetentionAt == nil
+			}
+			if a.RetentionAt != nil && *a.RetentionAt != *b.RetentionAt {
+				return *a.RetentionAt > *b.RetentionAt
+			}
+			return a.ID < b.ID
+		})
+		for rank, index := range indexes {
+			candidates[index].RetentionRank = rank
+		}
+	}
 }

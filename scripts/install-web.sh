@@ -6,17 +6,22 @@
 #
 #   web_dir = "~/.local/state/gmux/web"
 #
-# Usage: ./scripts/install-web.sh [--dir <target-dir>]
+# Usage: ./scripts/install-web.sh [--dir <target-dir>] [--skip-build]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${GMUX_WEB_INSTALL_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gmux/web}"
+SKIP_BUILD=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dir)
       TARGET="${2:?--dir requires a path}"
       shift 2
+      ;;
+    --skip-build)
+      SKIP_BUILD=true
+      shift
       ;;
     -h|--help)
       sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
@@ -43,8 +48,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "-> Building frontend..."
-(cd "$ROOT/apps/gmux-web" && pnpm build)
+if [ "$SKIP_BUILD" = false ]; then
+  echo "-> Building frontend..."
+  (cd "$ROOT/apps/gmux-web" && pnpm build)
+fi
+if [[ ! -f "$ROOT/apps/gmux-web/dist/index.html" ]]; then
+  echo "error: frontend build is missing; run without --skip-build first" >&2
+  exit 1
+fi
 
 echo "-> Installing web assets to $TARGET..."
 mkdir -p "$PARENT"

@@ -75,7 +75,7 @@ function relativeToRoot(path: string, root: string): string | null {
 /** Resolve terminal text to a path scoped by the existing session file API. */
 export function resolveTerminalFilePath(text: string, context: TerminalFileLinkContext): string | null {
   if (!text.includes('/') || text.includes('://') || text.startsWith('//')) return null
-  if (/[<>|*?\x00-\x1f]/u.test(text)) return null
+  if (/[<>|*?]/u.test(text) || [...text].some(char => (char.codePointAt(0) ?? 0) <= 0x1f)) return null
   // Avoid treating fractions and similar numeric output as paths.
   if (!/[\p{L}._-]/u.test(text)) return null
 

@@ -65,7 +65,7 @@ export function usePresence(): UsePresenceResult {
         for (const notification of await reg.getNotifications()) {
           if ((notification.data as { id?: string } | undefined)?.id === msg.id) notification.close()
         }
-      }).catch(() => {})
+      }).catch(() => { /* service worker readiness is best-effort */ })
     }
   }, [])
 

@@ -35,8 +35,7 @@ async function returnToFamilyMember(page: Page) {
   // the route back into the family map; choose the member there.
   await family.locator('.session-item').first().click()
   await family.locator('.family-activity').click()
-  await page.locator('#agent-family-drawer .family-row')
-    .filter({ hasText: 'wire up the protocol' }).click()
+  await page.locator('#agent-family-drawer .family-row[href*="/~fam2kid"]').click()
 }
 
 test.describe('promote/demote in the ⋮ session menu (mock fixtures)', () => {

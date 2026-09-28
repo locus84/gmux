@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
 	"github.com/gmuxapp/gmux/packages/adapter/adapters"
 	"github.com/gmuxapp/gmux/packages/paths"
 	"github.com/gmuxapp/gmux/packages/socklease"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/discovery"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
 )
@@ -114,11 +116,39 @@ func (productionConversationResolver) DescribeConversation(ctx context.Context, 
 	return sessioncoord.ConversationInfo{ID: info.ID, AncestorIDs: append([]string(nil), info.AncestorIDs...)}, nil
 }
 
-// productionAdapterReconciler probes one coordinator-bounded batch. A missing
-// prober is Unknown, preserving retained rows conservatively.
-type productionAdapterReconciler struct{}
+// productionAdapterReconciler probes one coordinator-bounded batch. Shell
+// sessions have no conversation storage to probe, so their adapter-owned
+// policy uses the configured age/LRU bounds. Any other missing prober is
+// Unknown, preserving retained rows conservatively.
+type productionAdapterReconciler struct {
+	shellMaxAge   time.Duration
+	shellMaxCount int
+	now           func() centralstore.UnixMillis
+}
 
-func (productionAdapterReconciler) ReconcileRetained(ctx context.Context, name string, batch []sessioncoord.ReconcileCandidate) ([]sessioncoord.ReconcileDecision, error) {
+func (r productionAdapterReconciler) ReconcileRetained(ctx context.Context, name string, batch []sessioncoord.ReconcileCandidate) ([]sessioncoord.ReconcileDecision, error) {
+	if name == adapters.DefaultFallback().Name() {
+		now := centralstore.UnixMillis(time.Now().UnixMilli())
+		if r.now != nil {
+			now = r.now()
+		}
+		out := make([]sessioncoord.ReconcileDecision, 0, len(batch))
+		for _, candidate := range batch {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			d := sessioncoord.DispositionRetain
+			agedOut := r.shellMaxAge > 0 && candidate.RetentionAt != nil &&
+				time.Duration(now-*candidate.RetentionAt)*time.Millisecond > r.shellMaxAge
+			countedOut := r.shellMaxCount > 0 && candidate.RetentionRank >= r.shellMaxCount
+			if agedOut || countedOut {
+				d = sessioncoord.DispositionRemove
+			}
+			out = append(out, sessioncoord.ReconcileDecision{ID: candidate.ID, Disposition: d})
+		}
+		return out, nil
+	}
+
 	p, ok := adapters.FindByAdapter(name).(adapter.ConversationProber)
 	if !ok {
 		return nil, nil

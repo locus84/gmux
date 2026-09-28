@@ -407,6 +407,39 @@ func TestReconcileClaimedRowIsNotACandidate(t *testing.T) {
 	}
 }
 
+func TestAssignRetentionRanksNewestFirstWithoutReordering(t *testing.T) {
+	oldest := centralstore.UnixMillis(10)
+	newest := centralstore.UnixMillis(30)
+	middle := centralstore.UnixMillis(20)
+	candidates := []ReconcileCandidate{
+		{ID: "oldest", Adapter: "shell", RetentionAt: &oldest},
+		{ID: "conversation", Adapter: "shell", ConversationRef: "ref", RetentionAt: &newest},
+		{ID: "undated", Adapter: "shell"},
+		{ID: "newest", Adapter: "shell", RetentionAt: &newest},
+		{ID: "middle", Adapter: "shell", RetentionAt: &middle},
+		{ID: "other", Adapter: "pi", RetentionAt: &oldest},
+	}
+	assignRetentionRanks(candidates)
+
+	wantIDs := []centralstore.SessionID{"oldest", "conversation", "undated", "newest", "middle", "other"}
+	for i, id := range wantIDs {
+		if candidates[i].ID != id {
+			t.Fatalf("candidate order changed: got %v", candidates)
+		}
+	}
+	wantRanks := map[centralstore.SessionID]int{
+		"undated": 0, "newest": 1, "middle": 2, "oldest": 3, "other": 0,
+	}
+	for _, candidate := range candidates {
+		if candidate.ConversationRef != "" {
+			continue
+		}
+		if candidate.RetentionRank != wantRanks[candidate.ID] {
+			t.Errorf("%s rank=%d, want %d", candidate.ID, candidate.RetentionRank, wantRanks[candidate.ID])
+		}
+	}
+}
+
 func TestReconcileBatchesPerAdapterInOrder(t *testing.T) {
 	ctx := context.Background()
 	dur := newFakeDurable(0)
@@ -433,6 +466,36 @@ func TestReconcileBatchesPerAdapterInOrder(t *testing.T) {
 		rec.calls[1].adapter != "pi" || len(rec.calls[1].batch) != 1 ||
 		rec.calls[2].adapter != "shell" || len(rec.calls[2].batch) != 1 {
 		t.Fatalf("batching=%#v", rec.calls)
+	}
+}
+
+func TestReconcileBoundsRemovalBacklogPerPass(t *testing.T) {
+	ctx := context.Background()
+	dur := newFakeDurable(0)
+	dur.listSessions = func() ([]centralstore.Session, error) {
+		rows := make([]centralstore.Session, maxReconcileRemovalsPerPass+5)
+		for i := range rows {
+			rows[i] = deadSession(sid(i+1), "shell", "", 1)
+		}
+		return rows, nil
+	}
+	rec := &fakeReconciler{fn: func(_ string, batch []ReconcileCandidate) ([]ReconcileDecision, error) {
+		out := make([]ReconcileDecision, len(batch))
+		for i, candidate := range batch {
+			out[i] = ReconcileDecision{ID: candidate.ID, Disposition: DispositionRemove}
+		}
+		return out, nil
+	}}
+	coord := New(nil, newFakeClient(RunnerMeta{}), dur, &fakeDirtySink{}, nil,
+		WithAdapterReconciler(rec), WithReconcileBatchSize(16))
+	closeBarrier(t, coord)
+
+	removed, _, err := coord.Reconcile(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != maxReconcileRemovalsPerPass || len(dur.removeCalls) != maxReconcileRemovalsPerPass {
+		t.Fatalf("removed=%d calls=%d, want %d", len(removed), len(dur.removeCalls), maxReconcileRemovalsPerPass)
 	}
 }
 

@@ -465,6 +465,7 @@ func TestConversationRootDirDefaultWithoutEnvVar(t *testing.T) {
 func TestPiExtendCommand(t *testing.T) {
 	p := NewPi()
 	const ext = "/cache/pi-ext.mjs"
+	const skill = "/cache/pi-ext-skill.md"
 	eq := func(a, b []string) bool {
 		if len(a) != len(b) {
 			return false
@@ -481,13 +482,13 @@ func TestPiExtendCommand(t *testing.T) {
 		args []string
 		want []string
 	}{
-		{"direct", []string{"pi", "--name", "x"}, []string{"pi", "-e", ext, "--name", "x"}},
-		{"bare", []string{"pi"}, []string{"pi", "-e", ext}},
+		{"direct", []string{"pi", "--name", "x"}, []string{"pi", "-e", ext, "--skill", skill, "--name", "x"}},
+		{"bare", []string{"pi"}, []string{"pi", "-e", ext, "--skill", skill}},
 		// The binary is not args[0]: -e must go after pi, not the wrapper, or the
 		// wrapper rejects it (the env/npx-pi launch-failure bug).
-		{"env wrapper", []string{"env", "pi", "--name", "x"}, []string{"env", "pi", "-e", ext, "--name", "x"}},
-		{"npx wrapper", []string{"npx", "pi"}, []string{"npx", "pi", "-e", ext}},
-		{"path-qualified", []string{"/usr/bin/pi", "-c"}, []string{"/usr/bin/pi", "-e", ext, "-c"}},
+		{"env wrapper", []string{"env", "pi", "--name", "x"}, []string{"env", "pi", "-e", ext, "--skill", skill, "--name", "x"}},
+		{"npx wrapper", []string{"npx", "pi"}, []string{"npx", "pi", "-e", ext, "--skill", skill}},
+		{"path-qualified", []string{"/usr/bin/pi", "-c"}, []string{"/usr/bin/pi", "-e", ext, "--skill", skill, "-c"}},
 		// No pi token before --: inject nothing.
 		{"no pi", []string{"echo", "hi"}, []string{"echo", "hi"}},
 	}

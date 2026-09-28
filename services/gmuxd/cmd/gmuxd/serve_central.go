@@ -339,7 +339,7 @@ func serveCentral(stderr io.Writer, replace bool) int {
 		return discovery.ResolveResumeCommandFor(legacy.Adapter, legacy.ConversationRef)
 	}}
 
-	boot, err = newBootstrap(BootstrapConfig{Store: storeHandle, Runners: productionRunnerClient{}, Control: productionRunnerControl{}, Spawner: spawner, Resolver: productionConversationResolver{}, Reconciler: productionAdapterReconciler{}, LocalPeers: peerAdapter.LocalPeerMatchInputs, Peers: peerAdapter, PeerSessions: peerAdapter, Converter: converter, Endpoints: productionEndpointSource{}, MaxSubagentsByDepth: cfg.Agent.MaxSubagentsByDepth.Values, SubagentBudgetDisabled: cfg.Agent.MaxSubagentsByDepth.Disabled, SemanticAgent: func(name string) bool { return converter.SemanticAgents[name] }, Errors: sessioncoord.ErrorSinkFunc(func(_ context.Context, err error) { log.Printf("gmuxd: %v", err) }), Frames: func(_ context.Context, frames wire.Frames) {
+	boot, err = newBootstrap(BootstrapConfig{Store: storeHandle, Runners: productionRunnerClient{}, Control: productionRunnerControl{}, Spawner: spawner, Resolver: productionConversationResolver{}, Reconciler: productionAdapterReconciler{shellMaxAge: retention.MaxAge, shellMaxCount: retention.MaxCount}, LocalPeers: peerAdapter.LocalPeerMatchInputs, Peers: peerAdapter, PeerSessions: peerAdapter, Converter: converter, Endpoints: productionEndpointSource{}, MaxSubagentsByDepth: cfg.Agent.MaxSubagentsByDepth.Values, SubagentBudgetDisabled: cfg.Agent.MaxSubagentsByDepth.Disabled, SemanticAgent: func(name string) bool { return converter.SemanticAgents[name] }, Errors: sessioncoord.ErrorSinkFunc(func(_ context.Context, err error) { log.Printf("gmuxd: %v", err) }), Frames: func(_ context.Context, frames wire.Frames) {
 		// The converter builds world.health.launchers but not the top-level
 		// world.launchers/default_launcher that the web UI's "+" menu reads
 		// (parity with the legacy composeWorld). Inject the static launch
@@ -958,6 +958,20 @@ func serveCentral(stderr io.Writer, replace bool) int {
 				}
 			}
 			sessionTempImageContentHandler(w, r, id, storeHandle, os.TempDir())
+		})
+		mux.HandleFunc("GET /v1/sessions/{id}/images/{hash}", func(w http.ResponseWriter, r *http.Request) {
+			id, hash := r.PathValue("id"), r.PathValue("hash")
+			if !validTerminalImageHash(hash) {
+				writeError(w, http.StatusBadRequest, "invalid_hash", "image hash must be 64 lowercase hexadecimal characters")
+				return
+			}
+			if peerManager != nil {
+				if peer, originalID := peerManager.FindPeer(id); peer != nil {
+					peer.ProxyGET(w, r, "/v1/sessions/"+originalID+"/images/"+hash)
+					return
+				}
+			}
+			terminalImageHandler(w, r, id, hash, storeHandle, boot.Registry)
 		})
 		mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
 			handleCentralSessionAction(w, r, boot, fanout, converter, peerManager, sessionDirs, gmuxBin, notifier)

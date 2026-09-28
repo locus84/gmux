@@ -146,7 +146,16 @@ export function attachKeyboardHandler(
   getPasteDestination: GetPasteDestination = () => null,
   onPasteFeedback: PasteFeedback = defaultPasteFeedback,
 ): void {
+  // Ownership belongs to the keydown, not each event's modifier snapshot:
+  // some browsers drop Shift on the following Enter keypress.
+  let consumedEnter = false
   term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    if (ev.type === 'keydown') consumedEnter = false
+    else if (consumedEnter && (ev.key === 'Enter' || ev.keyCode === 13)) {
+      if (ev.type === 'keyup') consumedEnter = false
+      ev.preventDefault()
+      return false
+    }
     // iPadOS Korean IME can leak compatibility jamo through xterm's keydown
     // path. Block xterm processing while leaving the native IME event intact.
     if (ev.type === 'keydown' && shouldBlockMobileWebKitImeKey(ev)) {
@@ -160,6 +169,7 @@ export function attachKeyboardHandler(
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey
         && isTouchDevice()) {
       if (ev.type === 'keydown') {
+        consumedEnter = true
         flushMobileWebKitImeLineBreak()
         sendAfterFlushingComposition(term, send, '\n', true)
       }
@@ -205,6 +215,7 @@ export function attachKeyboardHandler(
       // keyup) to prevent the Kitty keyboard protocol sequence from leaking.
       if (kb.baseKey === 'enter' && kb.shift) {
         if (ev.type === 'keydown') {
+          consumedEnter = true
           flushMobileWebKitImeLineBreak()
           executeAction(
             kb,

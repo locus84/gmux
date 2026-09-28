@@ -23,6 +23,8 @@
 import { test, expect, type Page } from '@playwright/test'
 import { openApp, gotoTestSession } from '../helpers'
 
+const COPY_SHORTCUT = process.platform === 'darwin' ? 'Meta+KeyC' : 'Control+Shift+KeyC'
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
@@ -140,7 +142,7 @@ test.describe('copy from TUI output', () => {
     async ({ page }) => {
       const range = await injectLines(page, piTranscript)
       await selectRows(page, range.startRow, range.endRow)
-      await page.keyboard.press('Control+Shift+KeyC')
+      await page.keyboard.press(COPY_SHORTCUT)
 
       const clipboard = await lastClipboardWrite(page)
       expect(clipboard).toBe(' hello world\n Hello! How can I help you today?')
@@ -154,7 +156,7 @@ test.describe('copy from TUI output', () => {
     async ({ page }) => {
       const range = await injectLines(page, piTranscript)
       await selectRows(page, range.endRow, range.endRow)
-      await page.keyboard.press('Control+Shift+KeyC')
+      await page.keyboard.press(COPY_SHORTCUT)
 
       const clipboard = await lastClipboardWrite(page)
       expect(clipboard).toBe(' Hello! How can I help you today?')

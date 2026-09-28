@@ -36,7 +36,12 @@ export const DEMO_FAMILY: MockSession[] = [
   fam({ id: 'fam1kid', title: 'implement drawer', parent_session_id: 'fam0root', unread: true, last_output_at: ago(2) }),
   // Active-error is a transient retry: the selected row stays in the active
   // family bucket but renders the same hollow active ring in red.
-  fam({ id: 'fam2kid', title: 'wire up the protocol adapter layer end to end', parent_session_id: 'fam1kid', status: { active: true, error: true }, last_output_at: ago(1) }),
+  fam({
+    id: 'fam2kid', title: 'confirm version reset behavior', parent_session_id: 'fam1kid',
+    cwd: '/home/user/dev/my-project-worktrees/version-clear-confirm',
+    workspace_root: '/home/user/dev/my-project-worktrees/version-clear-confirm',
+    status: { active: true, error: true }, last_output_at: ago(1),
+  }),
   fam({ id: 'fam3kid', title: 'refactor session store', parent_session_id: 'fam2kid', last_output_at: ago(20) }),
   fam({
     id: 'fam4kid',

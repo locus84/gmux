@@ -17,6 +17,8 @@ import {
   placeChildSessions,
   groupSessionsByCheckout,
   checkoutPathContains,
+  worktreeForPath,
+  sessionsByManagedWorktree,
   favoriteProjectsFirst,
 } from './projects'
 import { makeSession } from './test-helpers'
@@ -70,6 +72,27 @@ describe('worktree checkout grouping', () => {
     expect(checkoutPathContains('/repo', '/repo-other')).toBe(false)
     expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend/src')).toBe(true)
     expect(checkoutPathContains('~/WorkSpace/backend', '/Users/rhee/WorkSpace/backend-other')).toBe(false)
+
+    const primary = { path: '/repo', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false }
+    const linked = { path: '/repo/.worktrees/fix', branch: 'fix', primary: false, detached: false, bare: false, locked: false, prunable: false }
+    expect(worktreeForPath([primary, linked], '/repo/.worktrees/fix/src')?.branch).toBe('fix')
+    expect(worktreeForPath([primary, linked], '/elsewhere')).toBeUndefined()
+  })
+
+  it('inventories family children by actual checkout without crossing project or peer ownership', () => {
+    const primary = { path: '/repo', branch: 'main', primary: true, detached: false, bare: false, locked: false, prunable: false }
+    const linked = { path: '/worktrees/fix', branch: 'fix', primary: false, detached: false, bare: false, locked: false, prunable: false }
+    const grouped = sessionsByManagedWorktree([primary, linked], [
+      makeSession({ id: 'root', cwd: '/repo', project_slug: 'backend' }),
+      makeSession({ id: 'child', cwd: '/worktrees/fix/src', project_slug: 'backend', parent_session_id: 'root' }),
+      makeSession({ id: 'other-project', cwd: '/repo/nested', project_slug: 'nested' }),
+      makeSession({ id: 'other-peer', cwd: '/worktrees/fix', project_slug: 'backend', peer: 'server' }),
+    ], 'backend')
+
+    expect([...grouped].map(([path, sessions]) => [path, sessions.map(session => session.id)])).toEqual([
+      ['/repo', ['root']],
+      ['/worktrees/fix', ['child']],
+    ])
   })
 })
 

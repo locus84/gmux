@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/gmuxapp/gmux/packages/adapter"
 	"github.com/gmuxapp/gmux/packages/adapter/adapters"
+	"github.com/gmuxapp/gmux/services/gmuxd/internal/centralstore"
 	"github.com/gmuxapp/gmux/services/gmuxd/internal/sessioncoord"
 )
 
@@ -62,6 +64,50 @@ func withAdapters(t *testing.T, values ...adapter.Adapter) {
 	old := adapters.All
 	adapters.All = append([]adapter.Adapter(nil), values...)
 	t.Cleanup(func() { adapters.All = old })
+}
+
+func TestProductionShellRetention(t *testing.T) {
+	now := centralstore.UnixMillis(100 * 24 * time.Hour / time.Millisecond)
+	recent := now - centralstore.UnixMillis(24*time.Hour/time.Millisecond)
+	old := now - centralstore.UnixMillis(31*24*time.Hour/time.Millisecond)
+	batch := []sessioncoord.ReconcileCandidate{
+		{ID: "recent-1", RetentionAt: &recent, RetentionRank: 0},
+		{ID: "recent-2", RetentionAt: &recent, RetentionRank: 1},
+		{ID: "over-count", RetentionAt: &recent, RetentionRank: 2},
+		{ID: "too-old", RetentionAt: &old, RetentionRank: 0},
+		{ID: "undated", RetentionRank: 0},
+	}
+	r := productionAdapterReconciler{
+		shellMaxAge:   30 * 24 * time.Hour,
+		shellMaxCount: 2,
+		now:           func() centralstore.UnixMillis { return now },
+	}
+	got, err := r.ReconcileRetained(context.Background(), "shell", batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []sessioncoord.Disposition{
+		sessioncoord.DispositionRetain,
+		sessioncoord.DispositionRetain,
+		sessioncoord.DispositionRemove,
+		sessioncoord.DispositionRemove,
+		sessioncoord.DispositionRetain,
+	}
+	for i := range want {
+		if got[i].Disposition != want[i] {
+			t.Fatalf("decision[%d]=%v, want %v", i, got[i].Disposition, want[i])
+		}
+	}
+
+	unbounded, err := (productionAdapterReconciler{now: r.now}).ReconcileRetained(context.Background(), "shell", batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, decision := range unbounded {
+		if decision.Disposition != sessioncoord.DispositionRetain {
+			t.Fatalf("disabled policy decision[%d]=%v", i, decision.Disposition)
+		}
+	}
 }
 
 func TestProductionConversationCapabilitiesDispatch(t *testing.T) {
