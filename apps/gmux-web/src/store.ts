@@ -407,6 +407,9 @@ export const discovered = computed<DiscoveredProject[]>(() => {
       peerRows.push({ ...row, peer: peerName })
     }
   }
+  return sortDiscovered([...local, ...peerRows])
+})
+
 export const sseRetryAvailable = signal(false)
 let activeSSESupervisor: ReturnType<typeof createSSESupervisor> | null = null
 
@@ -414,8 +417,6 @@ export function retrySSE(): void {
   sseRetryAvailable.value = false
   activeSSESupervisor?.retry()
 }
-  return sortDiscovered([...local, ...peerRows])
-})
 
 /** Sort discovered suggestions by recency, then active count, then
  *  session count, then suggested_slug, then originating path. Mirrors
