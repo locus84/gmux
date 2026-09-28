@@ -13,7 +13,7 @@ const binding = {
 function event(type: string, shiftKey = false): KeyboardEvent {
   return { type, key: 'Enter', keyCode: 13, charCode: 13,
     shiftKey, ctrlKey: false, altKey: false, metaKey: false,
-    preventDefault() {}, stopPropagation() {},
+    preventDefault() { /* test event stub */ }, stopPropagation() { /* test event stub */ },
   } as unknown as KeyboardEvent
 }
 
