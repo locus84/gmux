@@ -172,7 +172,7 @@ func TestClaudeHookBodies_BindsBeforeTranscriptHasContent(t *testing.T) {
 }
 
 func TestClaudeHookCommand_Splices(t *testing.T) {
-	out, ok := (&Claude{}).HookCommand([]string{"claude", "--model", "opus"}, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand([]string{"claude", "--model", "opus"}, "/usr/bin/gmux", "/tmp/runner.sock")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -200,7 +200,7 @@ func TestClaudeHookCommand_Splices(t *testing.T) {
 
 func TestClaudeHookCommand_NoBinaryNoInject(t *testing.T) {
 	args := []string{"bash", "-c", "echo hi"}
-	out, ok := (&Claude{}).HookCommand(args, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand(args, "/usr/bin/gmux", "/tmp/runner.sock")
 	if ok {
 		t.Fatalf("no claude binary → ok=false, got %v", out)
 	}
@@ -209,7 +209,7 @@ func TestClaudeHookCommand_NoBinaryNoInject(t *testing.T) {
 func TestClaudeHookCommand_MergesUserSettings(t *testing.T) {
 	out, ok := (&Claude{}).HookCommand(
 		[]string{"claude", "--settings", `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"user"}]}]},"model":"opus"}`},
-		"/usr/bin/gmux",
+		"/usr/bin/gmux", "/tmp/runner.sock",
 	)
 	if !ok {
 		t.Fatal("expected ok")
@@ -267,7 +267,7 @@ func TestClaudeHookCommand_MergesUserSettingsFile(t *testing.T) {
 	if err := os.WriteFile(userFile, []byte(`{"model":"haiku","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"user"}]}]}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, ok := (&Claude{}).HookCommand([]string{"claude", "--settings", userFile}, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand([]string{"claude", "--settings", userFile}, "/usr/bin/gmux", "/tmp/runner.sock")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -281,7 +281,7 @@ func TestClaudeHookCommand_MergesUserSettingsFile(t *testing.T) {
 }
 
 func TestClaudeHookCommand_MergesEqualsForm(t *testing.T) {
-	out, ok := (&Claude{}).HookCommand([]string{"claude", `--settings={"model":"opus"}`}, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand([]string{"claude", `--settings={"model":"opus"}`}, "/usr/bin/gmux", "/tmp/runner.sock")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -293,7 +293,7 @@ func TestClaudeHookCommand_MergesEqualsForm(t *testing.T) {
 func TestClaudeHookCommand_StopsAtDoubleDash(t *testing.T) {
 	// Tokens after `--` are positional and must be passed through verbatim — a
 	// `--settings` there is a prompt, not a flag to extract.
-	out, ok := (&Claude{}).HookCommand([]string{"claude", "--", "--settings", "hi"}, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand([]string{"claude", "--", "--settings", "hi"}, "/usr/bin/gmux", "/tmp/runner.sock")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -310,7 +310,7 @@ func TestClaudeHookCommand_StopsAtDoubleDash(t *testing.T) {
 func TestClaudeHookCommand_UserCannotWipeHooks(t *testing.T) {
 	// A user `hooks: null` must not erase gmux's hooks (our attribution would
 	// silently break). The deep-merge keeps gmux's container over a null.
-	out, ok := (&Claude{}).HookCommand([]string{"claude", "--settings", `{"hooks":null}`}, "/usr/bin/gmux")
+	out, ok := (&Claude{}).HookCommand([]string{"claude", "--settings", `{"hooks":null}`}, "/usr/bin/gmux", "/tmp/runner.sock")
 	if !ok {
 		t.Fatal("expected ok")
 	}
@@ -328,7 +328,7 @@ func TestClaudeHookCommand_InvalidSettingsPreserved(t *testing.T) {
 		{"claude", "--settings", `{not-json}`, "--model", "opus"},
 	} {
 		original := append([]string(nil), args...)
-		out, ok := (&Claude{}).HookCommand(args, "/usr/bin/gmux")
+		out, ok := (&Claude{}).HookCommand(args, "/usr/bin/gmux", "/tmp/runner.sock")
 		if ok {
 			t.Errorf("invalid settings unexpectedly injected: %v", args)
 		}

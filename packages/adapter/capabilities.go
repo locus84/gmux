@@ -186,7 +186,8 @@ type SessionHookCommand interface {
 	// binary token may not be args[0] (e.g. `env codex`). Returns ok=false (and
 	// args unchanged) when the agent version doesn't support hooks, so the
 	// runner launches unmodified and the daemon's fallback attribution applies.
-	HookCommand(args []string, selfBin string) (out []string, ok bool)
+	// socketPath identifies this launch's runner, independently of inherited env.
+	HookCommand(args []string, selfBin, socketPath string) (out []string, ok bool)
 }
 
 // HookDriven reports whether sessions of this adapter derive their

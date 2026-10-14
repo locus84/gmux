@@ -7,6 +7,15 @@ adapter posts fire-and-forget JSON to `POST /hook/event`. Events are translated
 at the adapter's typed API boundary; the runner never parses adapter-native
 conversation files or events.
 
+Claude command hooks pin the launch's runner with `gmux __claude-hook --socket
+PATH` in the injected settings. This explicit destination takes precedence over
+`GMUX_SESSION_SOCK`: background workers may inherit a shared daemon's stale
+environment. Hooks injected by older runners (without `--socket`) retain the
+legacy environment fallback; existing sessions must be relaunched to gain the
+binding. Failed explicit delivery never falls back to another socket. Transport
+and non-2xx HTTP errors are reported on stderr, while stdout stays empty and
+hook delivery failures still exit zero so they cannot block the agent.
+
 ## Events
 
 ```jsonc

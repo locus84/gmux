@@ -119,7 +119,8 @@ type command struct {
 	daemonArgs []string // full argument list forwarded to gmuxd verbatim
 
 	// codex hook (internal __codex-hook)
-	codexHookEvent string // the codex hook event name (SessionStart, ...)
+	codexHookEvent   string  // the codex hook event name (SessionStart, ...)
+	claudeHookSocket *string // nil: legacy environment fallback; explicit value takes precedence
 }
 
 // reservedVerbs is the top-level namespace under the ADR 0009 criterion: a
@@ -276,7 +277,15 @@ func parseCLI(args []string) (*command, error) {
 		}
 		return &command{mode: modeCodexHook, codexHookEvent: rest[0]}, nil
 	case "__claude-hook":
-		return &command{mode: modeClaudeHook}, nil
+		cmd := &command{mode: modeClaudeHook}
+		if len(args) == 1 {
+			return cmd, nil // Hooks injected by older runners use the environment.
+		}
+		if len(args) != 3 || args[1] != "--socket" || args[2] == "" {
+			return nil, fmt.Errorf("usage: gmux __claude-hook [--socket PATH]")
+		}
+		cmd.claudeHookSocket = &args[2]
+		return cmd, nil
 	case "__edit-child":
 		// Child process of an editor session: prompt (if needed) and exec
 		// the fallback editor. Reuses the editFile field.
