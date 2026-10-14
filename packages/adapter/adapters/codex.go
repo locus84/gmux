@@ -259,7 +259,7 @@ func (c *Codex) hooksSupported() bool {
 // (a SessionFlags config layer) — ephemeral, like pi's `-e`, with no mutation of
 // the user's ~/.codex. Returns ok=false (args unchanged) when codex is too old
 // to support hooks.
-func (c *Codex) HookCommand(args []string, selfBin string) ([]string, bool) {
+func (c *Codex) HookCommand(args []string, selfBin, _ string) ([]string, bool) {
 	if !c.hooksSupported() {
 		return args, false
 	}

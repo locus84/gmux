@@ -1927,10 +1927,10 @@ func (hookTestAdapter) Name() string                    { return "test-hook" }
 func (hookTestAdapter) Discover() bool                  { return false }
 func (hookTestAdapter) Match([]string) bool             { return false }
 func (hookTestAdapter) Env(adapter.EnvContext) []string { return nil }
-func (hookTestAdapter) HookCommand(args []string, _ string) ([]string, bool) {
+func (hookTestAdapter) HookCommand(args []string, _ string, socketPath string) ([]string, bool) {
 	// Append a fixed marker that does NOT start with '-' so Go flag.Parse in
 	// the subprocess helper treats it as a non-flag positional argument.
-	return append(args, "HOOK_MARKER"), true
+	return append(args, "HOOK_MARKER", socketPath), true
 }
 
 // TestPTYServerCommandWrapperAndExtraFiles exercises the production wiring of
@@ -1995,7 +1995,7 @@ func TestPTYServerCommandWrapperAndExtraFiles(t *testing.T) {
 	// wrapper prefix in the final argv.
 	// The hookTestAdapter extends Config.Command with HOOK_MARKER before
 	// wrapping, so the expected subprocess os.Args[2:] is:
-	//   [user-cmd, user-arg, HOOK_MARKER]
+	//   [user-cmd, user-arg, HOOK_MARKER, socket-path]
 	srv, err := New(Config{
 		CommandWrapper: []string{os.Args[0], "-test.run=^TestPTYServerCommandWrapperAndExtraFiles$"},
 		Command:        []string{"user-cmd", "user-arg"},
@@ -2034,9 +2034,9 @@ func TestPTYServerCommandWrapperAndExtraFiles(t *testing.T) {
 	}
 
 	// (1) Argv order: user-cmd comes first, then user-arg, then the
-	//     adapter-extended HOOK_MARKER. This exact string fails if the
+	//     adapter-extended HOOK_MARKER and launch socket. This fails if the
 	//     wrapper and command are reversed, or if extension is dropped.
-	wantArgs := "ARGS=user-cmd,user-arg,HOOK_MARKER"
+	wantArgs := "ARGS=user-cmd,user-arg,HOOK_MARKER," + sockPath
 	if !strings.Contains(result, wantArgs) {
 		t.Errorf("argv order wrong; want %q in %q", wantArgs, result)
 	}

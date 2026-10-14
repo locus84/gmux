@@ -61,7 +61,7 @@ func TestClaudeHookExitsZero(t *testing.T) {
 	os.Stdin = r
 	defer func() { os.Stdin = old; r.Close() }()
 	r.Close() // EOF immediately
-	if code := claudeHook(); code != 0 {
+	if code := claudeHook(nil); code != 0 {
 		t.Fatalf("claudeHook must exit 0, got %d", code)
 	}
 }

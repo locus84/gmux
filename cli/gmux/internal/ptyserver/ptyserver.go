@@ -867,8 +867,9 @@ func New(cfg Config) (*Server, error) {
 	// SessionExtender splices a loader flag (pi: -e <materialized ext>);
 	// SessionHookCommand injects a command hook via the agent's config-override
 	// flags with the gmux binary as the hook program (codex: -c hooks.X=...).
-	// Both are ephemeral, scoped to this launch, and no-op without
-	// GMUX_SESSION_SOCK. GMUX_NO_AGENT_HOOK opts out.
+	// Both are ephemeral and scoped to this launch. Command hooks also receive
+	// the socket explicitly so they can bind it independently of inherited env.
+	// GMUX_NO_AGENT_HOOK opts out.
 	if agentHookDisabled() {
 		_, isExt := cfg.Adapter.(adapter.SessionExtender)
 		_, isHC := cfg.Adapter.(adapter.SessionHookCommand)
@@ -889,7 +890,7 @@ func New(cfg Config) (*Server, error) {
 		// itself (`gmux __codex-hook <Event>`), so the runner passes its own path.
 		if self, err := os.Executable(); err != nil {
 			log.Printf("ptyserver: cannot resolve gmux binary for %s hook: %v", cfg.Adapter.Name(), err)
-		} else if extended, ok := hc.HookCommand(cmd.Args, self); ok {
+		} else if extended, ok := hc.HookCommand(cmd.Args, self, cfg.SocketPath); ok {
 			cmd.Args = extended
 			cmd.Env = append(cmd.Env, "GMUX_SESSION_SOCK="+cfg.SocketPath)
 		}

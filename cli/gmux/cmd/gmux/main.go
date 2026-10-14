@@ -99,7 +99,7 @@ func main() {
 	case modeCodexHook:
 		os.Exit(codexHook(cmd.codexHookEvent))
 	case modeClaudeHook:
-		os.Exit(claudeHook())
+		os.Exit(claudeHook(cmd.claudeHookSocket))
 	}
 }
 

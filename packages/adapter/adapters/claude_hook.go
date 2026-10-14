@@ -28,7 +28,7 @@ var _ adapter.SessionHookCommand = (*Claude)(nil)
 // arrays). Returns ok=false (args unchanged) if the binary isn't found or
 // anything fails, so the runner launches unmodified and the daemon's fallback
 // attribution applies.
-func (c *Claude) HookCommand(args []string, selfBin string) ([]string, bool) {
+func (c *Claude) HookCommand(args []string, selfBin, socketPath string) ([]string, bool) {
 	i := claudeBinaryIndex(args)
 	if i < 0 || selfBin == "" {
 		return args, false
@@ -37,7 +37,7 @@ func (c *Claude) HookCommand(args []string, selfBin string) ([]string, bool) {
 	if err != nil {
 		return args, false
 	}
-	settingsJSON, err := buildClaudeSettings(selfBin, userSettings)
+	settingsJSON, err := buildClaudeSettings(selfBin, socketPath, userSettings)
 	if err != nil {
 		return args, false
 	}
@@ -93,8 +93,8 @@ func extractClaudeSettings(tokens []string) (filtered, values []string, err erro
 
 // buildClaudeSettings returns the inline JSON for `--settings`: gmux's session
 // hooks, with any user-provided settings deep-merged on top.
-func buildClaudeSettings(selfBin string, userSettings []string) (string, error) {
-	var base any = claudeGmuxHooks(selfBin)
+func buildClaudeSettings(selfBin, socketPath string, userSettings []string) (string, error) {
+	var base any = claudeGmuxHooks(selfBin, socketPath)
 	for _, us := range userSettings {
 		obj, err := parseClaudeSettings(us)
 		if err != nil {
@@ -126,8 +126,10 @@ func buildClaudeSettings(selfBin string, userSettings []string) (string, error) 
 //   - SessionEnd       → turn end interrupted; covers Ctrl+C / exit mid-turn,
 //     where neither Stop nor StopFailure fires. The runner ignores it when the
 //     turn is already closed, so a normal exit after Stop stays completed.
-func claudeGmuxHooks(selfBin string) map[string]any {
-	cmd := shellQuote(selfBin) + " __claude-hook"
+func claudeGmuxHooks(selfBin, socketPath string) map[string]any {
+	// Background workers can inherit a shared daemon's stale environment.
+	// Bind the destination in the per-launch settings, not in that environment.
+	cmd := shellQuote(selfBin) + " __claude-hook --socket " + shellQuote(socketPath)
 	entry := func(timeout int) []any {
 		return []any{map[string]any{
 			"hooks": []any{map[string]any{
